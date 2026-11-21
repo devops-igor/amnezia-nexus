@@ -1,8 +1,10 @@
 package policy
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -16,11 +18,14 @@ import (
 //     correct state for existing and fresh installs: no migration and no
 //     default row are required, because an absent settings row deserializes to
 //     a zero value whose Enabled is false.
-//   - The policy authority is the destination classifier (committed Russian
-//     allocation plus the CDN exclusion set). This record adds one operator
-//     input on top: an IPv4 PROXY exception list whose prefixes are forced to
-//     PROXY ahead of the classifier. It never selects a source and never
-//     fetches a list, so an activated policy needs no external availability.
+//   - The policy authority is the destination classifier: the committed Russian
+//     allocation plus the CDN exclusion set decides every destination. This
+//     record adds exactly one operator input on top, an IPv4 PROXY exception
+//     list whose prefixes are forced to PROXY ahead of the classifier.
+//   - No source is ever fetched. A control an operator can see must actually
+//     work, and a fetched list is both an availability dependency and a second
+//     policy authority that silently outranks the classifier. Addresses an
+//     operator needs proxied belong in the exception list.
 //   - Invalid settings are rejected; they never overwrite a last working
 //     configuration. Validation is pure so a handler can reject before writing.
 //
@@ -43,12 +48,10 @@ const (
 	MaxSyncInterval = 24 * time.Hour
 	// DefaultSyncInterval is applied when the operator does not choose one.
 	DefaultSyncInterval = DefaultRefreshInterval
-	// MaxCustomURLs bounds custom sources. The Syncer's total source budget is
-	// larger because the aggregate manifest contributes 24 reviewed sources.
-	MaxCustomURLs = 4
-	// MaxSyncSources bounds the total source list, including the aggregate
-	// manifest and the local source.
-	MaxSyncSources = 32
+	// MaxLocalExceptions bounds the operator IPv4 exception list. The cap
+	// matches the pasted-form size: a body past this is a mistake, not a
+	// routing set.
+	MaxLocalExceptions = 4096
 	// MaxInventoryOverrideEntries bounds the operator inventory override. It
 	// matches the local-rule cap because the override is pasted into a form field
 	// like a local list: a body past that size is a mistake, not a routing set.
@@ -57,46 +60,114 @@ const (
 
 // Settings is the persisted policy-routing configuration.
 //
-// Field names are part of the admin API contract and the settings-table JSON,
-// so they are stable. SyncInterval is stored in whole seconds because it travels
-// as JSON through both the settings row and the HTTP request body.
+// Field names are part of the admin API contract and the settings-table JSON, so
+// they are stable. SyncInterval is stored in whole seconds because it travels as
+// JSON through both the settings row and the HTTP request body.
 type Settings struct {
 	// Enabled reports whether policy-based routing is turned on. Disabled (the
 	// default) means every client uses its assigned proxy backend, unchanged.
 	Enabled bool `json:"enabled"`
-	// Preset is the selected list source. Empty means the operator has not
-	// chosen one; it is not silently replaced by a default source.
-	Preset PresetID `json:"preset"`
-	// CustomURLs holds operator-supplied HTTPS list URLs. It is only meaningful
-	// when Preset is PresetCustom, and must be empty for a built-in preset.
-	CustomURLs []string `json:"custom_urls"`
-	// LocalEntries holds operator-supplied domain/CIDR rules merged on top of the
-	// selected external source. It is additive and works with every preset.
-	LocalEntries []string `json:"local_entries,omitempty"`
-	// ExcludedDomains holds operator-supplied domains that must never enter the
-	// PROXY set. It is applied with the built-in never-proxy guard and works
-	// with every preset.
-	ExcludedDomains []string `json:"excluded_domains,omitempty"`
+	// ProxyExceptions holds operator-supplied IPv4 prefixes that are forced to
+	// PROXY ahead of the destination classifier, so an operator can always take
+	// an address off the direct path. Lines are prefixes or single addresses;
+	// blank lines and comments are ignored.
+	//
+	// The wire name is "proxy_exceptions". A record written by an earlier build
+	// carries the same operator addresses under "local_entries"; UnmarshalJSON
+	// accepts that key so an upgrade does not silently drop them, and a save
+	// always writes the current name.
+	ProxyExceptions []string `json:"proxy_exceptions,omitempty"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`
 	// InventoryOverride holds operator-supplied IPv4 prefixes that take
 	// precedence over the committed Russian allocation inventory for every
 	// address they contain, so a deployment can correct the shipped set without
 	// waiting for a release. Empty is the default and means "the shipped set
-	// alone". The body uses the same line shape as LocalEntries (blank lines and
-	// comments are ignored), but this field is an IPv4 prefix list: a body with
-	// no prefix, or one that also carries a domain rule, is refused rather than
-	// stored as an override that would apply only part of what was submitted.
+	// alone". The body uses the same line shape as ProxyExceptions (blank lines
+	// and comments are ignored), but this field is an IPv4 prefix list: a body
+	// with no prefix, or one that also carries a domain rule, is refused rather
+	// than stored as an override that would apply only part of what was
+	// submitted.
 	InventoryOverride []string `json:"inventory_override,omitempty"`
 }
 
+// legacySettings is the record shape earlier builds persisted. It exists only to
+// migrate a stored row: the preset, custom-URL and excluded-domain selections no
+// longer exist, and domain rules no longer reach a packet decision.
+type legacySettings struct {
+	Enabled           bool     `json:"enabled"`
+	Preset            string   `json:"preset"`
+	CustomURLs        []string `json:"custom_urls"`
+	LocalEntries      []string `json:"local_entries"`
+	ExcludedDomains   []string `json:"excluded_domains"`
+	SyncInterval      int64    `json:"sync_interval_seconds"`
+	InventoryOverride []string `json:"inventory_override"`
+}
+
+// UnmarshalJSON accepts the current wire shape and the shape an earlier build
+// wrote.
+//
+// The exception list was called "local_entries" when it also accepted domain
+// lines. A stored record still carries the operator's addresses under that key, so
+// reading only the new name would silently discard a configuration the operator
+// saved — the opposite of what a rename should do. The old key is read as a
+// fallback and only when the new one is absent, so a record carrying both is read
+// from the current field.
+//
+// The other legacy fields decode into nothing: their content cannot be represented
+// any more, and migrateLegacyRecord reports what a stored record could not carry.
+func (s *Settings) UnmarshalJSON(data []byte) error {
+	type current Settings
+	var decoded current
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	// A separate pass reads only the legacy exception key. Decoding it into the
+	// legacy struct keeps the field names in one place.
+	if len(decoded.ProxyExceptions) == 0 {
+		var legacy wireLegacyExceptions
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		decoded.ProxyExceptions = legacy.LocalEntries
+	}
+	*s = Settings(decoded)
+	return nil
+}
+
+// wireLegacyExceptions is the one legacy field a load still honors.
+type wireLegacyExceptions struct {
+	LocalEntries []string `json:"local_entries"`
+}
+
+// migrateLegacyRecord reports which stored values cannot be carried into the
+// current record, so loading a row written by an earlier build is an explained
+// downgrade rather than a silent loss.
+//
+// The exception list survives: an operator's IPv4 prefixes under the old
+// local_entries key are still the prefixes this build proxies. What cannot
+// survive is the source selection and its fetched content — there is no feed any
+// more — and the domain half of the old record, because a domain rule never
+// determined a packet's route.
+func migrateLegacyRecord(legacy legacySettings) []string {
+	var dropped []string
+	if legacy.Preset != "" {
+		dropped = append(dropped, fmt.Sprintf("source selection %q", legacy.Preset))
+	}
+	if len(legacy.CustomURLs) > 0 {
+		dropped = append(dropped, fmt.Sprintf("%d custom list URL(s)", len(legacy.CustomURLs)))
+	}
+	if len(legacy.ExcludedDomains) > 0 {
+		dropped = append(dropped, fmt.Sprintf("%d excluded domain name(s)", len(legacy.ExcludedDomains)))
+	}
+	return dropped
+}
+
 // DefaultSettings returns the fresh-install configuration: policy routing
-// disabled, no preset selected, no custom URLs and the default refresh interval.
+// disabled, no exceptions and the default refresh interval.
 func DefaultSettings() Settings {
 	return Settings{
 		Enabled:      false,
-		Preset:       "",
-		CustomURLs:   nil,
 		SyncInterval: int64(DefaultSyncInterval / time.Second),
 	}
 }
@@ -104,26 +175,14 @@ func DefaultSettings() Settings {
 // Normalize fills in a valid default refresh interval when the field is absent
 // (zero), and returns a copy with owned slices so a caller cannot mutate shared
 // state through the returned value.
-//
-// Normalize deliberately does NOT invent a preset. Selecting a source is an
-// operator action, and a synthesized default would be the "dummy policy" the
-// issue forbids.
 func (s Settings) Normalize() Settings {
 	out := s
 	if out.SyncInterval == 0 {
 		out.SyncInterval = int64(DefaultSyncInterval / time.Second)
 	}
-	if s.CustomURLs != nil {
-		out.CustomURLs = make([]string, len(s.CustomURLs))
-		copy(out.CustomURLs, s.CustomURLs)
-	}
-	if s.LocalEntries != nil {
-		out.LocalEntries = make([]string, len(s.LocalEntries))
-		copy(out.LocalEntries, s.LocalEntries)
-	}
-	if s.ExcludedDomains != nil {
-		out.ExcludedDomains = make([]string, len(s.ExcludedDomains))
-		copy(out.ExcludedDomains, s.ExcludedDomains)
+	if s.ProxyExceptions != nil {
+		out.ProxyExceptions = make([]string, len(s.ProxyExceptions))
+		copy(out.ProxyExceptions, s.ProxyExceptions)
 	}
 	if s.InventoryOverride != nil {
 		out.InventoryOverride = make([]string, len(s.InventoryOverride))
@@ -140,21 +199,21 @@ func (s Settings) Interval() time.Duration {
 // IsZero reports whether the record says nothing at all.
 //
 // An absent settings row deserializes to this value, so "zero" is the
-// fresh-install state: policy routing disabled, no source selected. Three
-// callers need exactly that distinction — the admin handler's loader, the
-// panel's startup loader, and the compensation path that must restore "no
-// record" rather than materialize a default one — so the predicate lives with
-// the type instead of being repeated as a field-by-field comparison.
+// fresh-install state: policy routing disabled, no exceptions. Three callers
+// need exactly that distinction — the admin handler's loader, the panel's
+// startup loader, and the compensation path that must restore "no record" rather
+// than materialize a default one — so the predicate lives with the type instead
+// of being repeated as a field-by-field comparison.
 //
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.InventoryOverride) == 0
+	return !s.Enabled && s.SyncInterval == 0 && len(s.ProxyExceptions) == 0 && len(s.InventoryOverride) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
-// means the record is internally coherent and every URL is fetchable under the
-// same SSRF rules the fetcher enforces.
+// means the record is internally coherent: every exception line is an IPv4
+// prefix, and every override line is a prefix the classifier could apply.
 //
 // Validate intentionally does not consult live runtime state: whether enablement
 // is currently possible depends on a published snapshot and direct egress, which
@@ -163,13 +222,7 @@ func (s Settings) Validate() error {
 	if err := s.validateInterval(); err != nil {
 		return err
 	}
-	if err := s.validateSourceSelection(); err != nil {
-		return err
-	}
-	if err := s.validateExcludedDomains(); err != nil {
-		return err
-	}
-	if err := s.validateLocalEntries(); err != nil {
+	if err := s.validateProxyExceptions(); err != nil {
 		return err
 	}
 	return s.validateInventoryOverride()
@@ -186,72 +239,63 @@ func (s Settings) validateInterval() error {
 	return nil
 }
 
-func (s Settings) validateSourceSelection() error {
-	// No source selection is the shipped shape. The destination classifier is
-	// the policy authority, and the operator contributes address exceptions
-	// locally, so a record with no preset and no external source is complete.
-	// An external source is still available as an optional extra, and the rules
-	// below keep the one-selection-at-a-time contract for records that use one.
-	if s.Preset == "" {
-		if len(s.CustomURLs) > 0 {
-			return fmt.Errorf("custom URLs require the %q source selection; a record with no selection fetches nothing", PresetCustom)
+// ErrLocalRuleNotPrefix means an exception line was not an IPv4 prefix.
+//
+// The list is documented as an address set, and the packet path matches it
+// against the destination address. A domain line here would be saved and never
+// applied — a control that looks configured and decides nothing — so the
+// boundary refuses it with this reason instead of storing it.
+var ErrLocalRuleNotPrefix = errors.New("proxy exception must be an IPv4 address or prefix")
+
+// validateProxyExceptions refuses an exception body the packet path could not
+// apply.
+//
+// It deliberately does not judge whether a prefix overlaps a prohibited
+// destination. The packet path's first row drops such a destination before any
+// PROXY rule can route it, and the one authoritative prohibited set lives in the
+// forwarder (IsProhibitedIPv4Destination). Restating that set here would create a
+// second copy to drift from, and refusing the line would reject a body earlier
+// builds accepted. The honest position is the one the routing contract already
+// states: an exception naming such a range cannot route it, and the drop wins.
+func (s Settings) validateProxyExceptions() error {
+	if len(s.ProxyExceptions) > MaxLocalExceptions {
+		return fmt.Errorf("%d local entries exceed the maximum of %d", len(s.ProxyExceptions), MaxLocalExceptions)
+	}
+	for _, raw := range s.ProxyExceptions {
+		line := strings.TrimSpace(raw)
+		if isIgnoredLine(line) {
+			continue
 		}
-		return nil
-	}
-	if !s.Preset.Valid() {
-		return fmt.Errorf("unknown policy preset %q", s.Preset)
-	}
-	if s.Preset == PresetCustom {
-		return s.validateCustomURLs()
-	}
-	if len(s.CustomURLs) > 0 {
-		return fmt.Errorf("preset %q cannot be combined with custom URLs; select the %q preset to use them", s.Preset, PresetCustom)
-	}
-	if s.Preset == PresetAggregate {
-		for _, src := range AggregateSources() {
-			if _, err := ValidateFetchURL(src.URL); err != nil {
-				return fmt.Errorf("aggregate source %q has an unusable URL: %w", src.ID, err)
-			}
+		if _, err := ParseIPv4Rule(line); err != nil {
+			return fmt.Errorf("proxy exception rejected: %w", err)
 		}
-		return nil
-	}
-	// Defense in depth: the built-in constants must still satisfy the same
-	// fetch rules the operator-supplied URLs are held to.
-	preset, _ := LookupPreset(s.Preset)
-	if _, err := ValidateFetchURL(preset.URL); err != nil {
-		return fmt.Errorf("built-in preset %q has an unusable source URL: %w", s.Preset, err)
 	}
 	return nil
 }
 
-func (s Settings) validateExcludedDomains() error {
-	if len(s.ExcludedDomains) > MaxExcludedDomains {
-		return fmt.Errorf("%d excluded domains exceed the maximum of %d", len(s.ExcludedDomains), MaxExcludedDomains)
-	}
-	if _, err := ParseExcludedDomains(s.ExcludedDomains); err != nil {
-		return fmt.Errorf("excluded domain rejected: %w", err)
-	}
-	return nil
-}
-
-func (s Settings) validateLocalEntries() error {
-	if len(s.LocalEntries) > 4096 {
-		return fmt.Errorf("%d local entries exceed the maximum of 4096", len(s.LocalEntries))
-	}
-	local, _, err := ParseLocalRules(s.LocalEntries)
-	if err != nil {
-		return fmt.Errorf("local entry rejected: %w", err)
-	}
-	exclusions, err := ParseExcludedDomains(s.ExcludedDomains)
-	if err != nil {
-		return fmt.Errorf("excluded domain rejected: %w", err)
-	}
-	for base := range local.Domains {
-		if _, excluded := neverProxyReason(base, exclusions); excluded {
-			return fmt.Errorf("local entry rejected: %q is also listed in excluded_domains; a name cannot be both proxied and excluded", base)
+// ProxyExceptionPrefixes returns the parsed, deduplicated prefixes of the
+// exception list in declaration order. A blank line or comment is ignored. The
+// caller has already validated the body, so a parse error here means the stored
+// record changed underneath validation; it is returned rather than swallowed.
+func (s Settings) ProxyExceptionPrefixes() ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(s.ProxyExceptions))
+	seen := make(map[netip.Prefix]struct{}, len(s.ProxyExceptions))
+	for _, raw := range s.ProxyExceptions {
+		line := strings.TrimSpace(raw)
+		if isIgnoredLine(line) {
+			continue
 		}
+		prefix, err := ParseIPv4Rule(line)
+		if err != nil {
+			return nil, fmt.Errorf("proxy exception rejected: %w", err)
+		}
+		if _, duplicate := seen[prefix]; duplicate {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		out = append(out, prefix)
 	}
-	return nil
+	return out, nil
 }
 
 // ErrInventoryOverrideNotPrefixOnly means the stored override carried a rule
@@ -309,100 +353,24 @@ func (s Settings) ParsedInventoryOverride() (*InventoryOverride, error) {
 	return ParseInventoryOverride([]byte(strings.Join(s.InventoryOverride, "\n")))
 }
 
-func (s Settings) validateCustomURLs() error {
-	if len(s.CustomURLs) == 0 {
-		return fmt.Errorf("preset %q requires at least one custom URL", PresetCustom)
-	}
-	if len(s.CustomURLs) > MaxCustomURLs {
-		return fmt.Errorf("%d custom URLs exceed the maximum of %d", len(s.CustomURLs), MaxCustomURLs)
-	}
-	seen := make(map[string]struct{}, len(s.CustomURLs))
-	for i, raw := range s.CustomURLs {
-		u, err := ValidateFetchURL(raw)
-		if err != nil {
-			return fmt.Errorf("custom URL %d rejected: %w", i+1, err)
-		}
-		canonical := u.String()
-		if _, dup := seen[canonical]; dup {
-			return fmt.Errorf("custom URL %d duplicates an earlier entry", i+1)
-		}
-		seen[canonical] = struct{}{}
-	}
-	return nil
-}
-
-// Sources derives the ordered policy sources for the current selection. The
-// order is deterministic so the Syncer's config hash, conditional validators and
-// per-source statistics stay stable across restarts.
+// SyncConfig derives the Syncer configuration for the current record using the
+// production parse bounds. ForceShrink stays false: a suspiciously short list
+// must fail rather than silently replace a valid active policy.
 //
-// No selection yields NO sources, and that is a complete configuration rather
-// than an error: the classifier is the policy authority and the operator's IPv4
-// exception list is supplied locally, so an activated policy fetches nothing.
-//
-// A built-in preset yields exactly one preset source. The custom preset yields
-// one strictly parsed source per URL, in the operator's order.
-func (s Settings) Sources() ([]Source, error) {
-	if err := s.Validate(); err != nil {
-		return nil, err
-	}
-	if s.Preset == "" {
-		return nil, nil
-	}
-	if s.Preset == PresetAggregate {
-		return AggregateSources(), nil
-	}
-	if s.Preset != PresetCustom {
-		preset, _ := LookupPreset(s.Preset)
-		return []Source{{
-			ID:             string(preset.ID),
-			URL:            preset.URL,
-			Format:         preset.Format,
-			BareDomainMode: preset.BareDomainMode,
-			IsPreset:       true,
-		}}, nil
-	}
-
-	sources := make([]Source, 0, len(s.CustomURLs))
-	for i, raw := range s.CustomURLs {
-		u, err := ValidateFetchURL(raw)
-		if err != nil {
-			// Validate already rejected this; keep the error path honest rather
-			// than trusting the caller to have validated.
-			return nil, fmt.Errorf("custom URL %d rejected: %w", i+1, err)
-		}
-		sources = append(sources, Source{
-			ID:             fmt.Sprintf("custom-%d", i+1),
-			URL:            u.String(),
-			Format:         FormatMixed,
-			BareDomainMode: DomainModeInclusiveSuffix,
-			IsPreset:       false,
-		})
-	}
-	return sources, nil
-}
-
-// SyncConfig derives the Syncer configuration for the current selection using
-// the production fetch and parse bounds. ForceShrink stays false: a suspiciously
-// small download must fail rather than silently replace a valid active policy.
+// The derived configuration has no sources. The classifier is the policy
+// authority and the exception list is local, so the cycle compiles the operator's
+// prefixes alone and needs no network.
 func (s Settings) SyncConfig() (SyncConfig, error) {
-	sources, err := s.Sources()
-	if err != nil {
+	if err := s.Validate(); err != nil {
 		return SyncConfig{}, err
 	}
-	localRules, _, err := ParseLocalRules(s.LocalEntries)
-	if err != nil {
-		return SyncConfig{}, err
-	}
-	excludedDomains, err := ParseExcludedDomains(s.ExcludedDomains)
+	prefixes, err := s.ProxyExceptionPrefixes()
 	if err != nil {
 		return SyncConfig{}, err
 	}
 	return SyncConfig{
-		Sources:         sources,
-		LocalRules:      localRules,
-		ExcludedDomains: excludedDomains,
+		LocalRules:      ParsedRules{CIDRs: prefixes},
 		RefreshInterval: s.Interval(),
-		FetchLimits:     DefaultFetchLimits(),
 		ParseLimits:     DefaultParseLimits(),
 		ForceShrink:     false,
 	}, nil

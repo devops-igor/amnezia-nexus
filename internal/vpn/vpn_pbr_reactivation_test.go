@@ -152,37 +152,20 @@ func seededStore(t *testing.T) policy.Store {
 		GenerationID:  "gen-seed",
 		Version:       1,
 		ConfigHash:    policyConfigHashFor(t, repeatedEnableSettings(t)),
-		Domains:       map[string]uint32{"example.com": 1},
+		CIDRs:         []string{"203.0.113.0/24"},
 	}
-	gen.ContentHash = policy.ComputeContentHash(gen.Domains, gen.CIDRs)
+	gen.ContentHash = policy.ComputeContentHash(gen.CIDRs)
 	m.committed = gen
 	return m
 }
 
-// policyConfigHashFor returns the configuration hash a syncer commits for these
-// settings, so a seeded fixture records the same configuration identity production
-// does instead of restating the hash format.
-func policyConfigHashFor(t *testing.T, settings policy.Settings) string {
-	t.Helper()
-	cfg, err := settings.SyncConfig()
-	if err != nil {
-		t.Fatalf("SyncConfig: %v", err)
-	}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, &memoryStore{}, cfg)
-	if err != nil {
-		t.Fatalf("NewSyncer: %v", err)
-	}
-	return syncer.ConfigHash()
-}
-
 // repeatedEnableSettings returns valid settings representing what an operator
-// re-saves: the source list and interval.
+// re-saves: the exception list and interval.
 func repeatedEnableSettings(t *testing.T) policy.Settings {
 	t.Helper()
 	s := policy.DefaultSettings()
 	s.Enabled = true
-	s.Preset = policy.PresetCustom
-	s.CustomURLs = []string{"https://lists.example/policy.lst"}
+	s.ProxyExceptions = []string{"203.0.113.0/24"}
 	s.SyncInterval = int64(policy.MinSyncInterval.Seconds())
 	if err := s.Validate(); err != nil {
 		t.Fatalf("fixture settings invalid: %v", err)
@@ -192,7 +175,7 @@ func repeatedEnableSettings(t *testing.T) policy.Settings {
 
 // activateOnce starts policy routing through the production entry point.
 func activateOnce(svc *Service, settings policy.Settings, store policy.Store) error {
-	return svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset))
+	return svc.StartPolicyRouting(context.Background(), settings, store)
 }
 
 // TestRepeatedEnableDoesNotRebuildWANDevice is the reproduction oracle for
@@ -305,11 +288,11 @@ func TestRepeatedEnableFailureKeepsPreviousConfiguration(t *testing.T) {
 	firstMatcher := svc.PolicyMatcher()
 	firstEgress := svc.DirectEgress()
 
-	// A store that cannot load and a source that cannot resolve: the update has no
-	// usable snapshot to publish.
+	// A store that cannot load and a record with no rules: the update has no usable
+	// snapshot to publish.
 	broken := &memoryStore{loadErr: errors.New("durable store unavailable")}
 	unresolvable := repeatedEnableSettings(t)
-	unresolvable.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	unresolvable.ProxyExceptions = nil
 
 	err := activateOnce(svc, unresolvable, broken)
 	if err == nil {

@@ -45,26 +45,14 @@ type Generation struct {
 	// being treated as a change (equivalence.go).
 	AttributionHash string                `json:"attribution_hash,omitempty"`
 	SourcesMeta     map[string]SourceMeta `json:"sources_meta"`
-	Domains         map[string]uint32     `json:"domains"`
 	CIDRs           []string              `json:"cidrs"`
-	DomainCount     int                   `json:"domain_count"`
 	CIDRCount       int                   `json:"cidr_count"`
 	ContentHash     string                `json:"content_hash"`
 }
 
 // ComputeContentHash computes a deterministic SHA-256 digest over normalized rules.
-func ComputeContentHash(domains map[string]uint32, cidrs []string) string {
+func ComputeContentHash(cidrs []string) string {
 	h := sha256.New()
-
-	// Hash sorted domain entries
-	domainKeys := make([]string, 0, len(domains))
-	for k := range domains {
-		domainKeys = append(domainKeys, k)
-	}
-	sort.Strings(domainKeys)
-	for _, k := range domainKeys {
-		_, _ = fmt.Fprintf(h, "D:%s:%d\n", k, domains[k])
-	}
 
 	// Hash sorted CIDR entries
 	sortedCIDRs := make([]string, len(cidrs))
@@ -102,8 +90,7 @@ func (s *FileStore) Commit(ctx context.Context, gen *Generation) error {
 		return fmt.Errorf("unsupported generation schema version %d", gen.SchemaVersion)
 	}
 
-	gen.ContentHash = ComputeContentHash(gen.Domains, gen.CIDRs)
-	gen.DomainCount = len(gen.Domains)
+	gen.ContentHash = ComputeContentHash(gen.CIDRs)
 	gen.CIDRCount = len(gen.CIDRs)
 
 	data, err := json.MarshalIndent(gen, "", "  ")
@@ -181,7 +168,7 @@ func (s *FileStore) Load(ctx context.Context) (*Generation, error) {
 		return nil, errors.New("invalid cache generation metadata: zero version or empty ID")
 	}
 
-	expectedHash := ComputeContentHash(gen.Domains, gen.CIDRs)
+	expectedHash := ComputeContentHash(gen.CIDRs)
 	if gen.ContentHash != expectedHash {
 		return nil, fmt.Errorf("corrupted cache: content hash mismatch (stored=%s, calculated=%s)", gen.ContentHash, expectedHash)
 	}
@@ -193,11 +180,6 @@ func (s *FileStore) Load(ctx context.Context) (*Generation, error) {
 func GenerationToSnapshot(gen *Generation) (*Snapshot, error) {
 	if gen == nil {
 		return nil, errors.New("nil generation")
-	}
-
-	domains := make(map[string]domainFlags, len(gen.Domains))
-	for k, v := range gen.Domains {
-		domains[k] = domainFlags(v)
 	}
 
 	prefixes := make([]netip.Prefix, 0, len(gen.CIDRs))
@@ -212,9 +194,8 @@ func GenerationToSnapshot(gen *Generation) (*Snapshot, error) {
 	idx := newIPv4Index(prefixes)
 
 	// A durable generation stores merged rules only, so it carries no per-rule
-	// source attribution. The prefixes are still retained individually: an
-	// explanation can then name the prefix that matched and state honestly that
-	// the source is unknown for a last-known-good snapshot.
+	// source attribution. The prefixes are still retained individually so an
+	// explanation can name the prefix that matched.
 	cidrRules := make([]cidrRule, len(prefixes))
 	for i := range prefixes {
 		cidrRules[i] = cidrRule{prefix: prefixes[i]}
@@ -230,10 +211,8 @@ func GenerationToSnapshot(gen *Generation) (*Snapshot, error) {
 		version:      gen.Version,
 		generationID: gen.GenerationID,
 		createdAt:    gen.CreatedAt,
-		domainCount:  len(domains),
 		cidrCount:    len(prefixes),
 		sourceIDs:    sourceIDs,
-		domains:      domains,
 		ipv4:         idx,
 		cidrRules:    cidrRules,
 	}, nil

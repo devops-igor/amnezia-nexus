@@ -9,21 +9,17 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
-// These tests exercise the production policy-source lifecycle of #678:
-// validated settings -> policy.Settings.SyncConfig -> policy.Syncer ->
-// fetch/parse/shrink guard -> durable commit -> atomic publish -> PBR activation.
+// These tests exercise the production policy lifecycle: validated record →
+// policy.Settings.SyncConfig → policy.Syncer → compile/commit/publish → PBR
+// activation.
 //
-// They deliberately do not stub the syncer. The real end-to-end fetch/parse/
-// last-known-good behaviour is proven in internal/policy (policy_source_678_test.go),
-// where the fetcher's test-injection seams live; these tests prove the *wiring*
-// and the fail-closed activation contract that #678 adds on top of it.
-//
-// A test that asserted "activation succeeded" against a mocked syncer would prove
-// nothing about product activation, which is the exact gap this round closes.
+// They deliberately do not stub the syncer. The activation contract that #678 adds
+// on top of it is what these prove: fail closed when nothing can be published, and
+// install the classifier when something can.
 
-// memoryStore is a policy.Store backed by memory. It proves the durable commit
-// path is really invoked and lets a test simulate a stored last-known-good
-// generation without touching the filesystem.
+// memoryStore is a policy.Store backed by memory. It proves the durable commit path
+// is really invoked and lets a test simulate a stored generation without touching
+// the filesystem.
 type memoryStore struct {
 	committed *policy.Generation
 	loadErr   error
@@ -32,7 +28,7 @@ type memoryStore struct {
 
 func (m *memoryStore) Commit(_ context.Context, gen *policy.Generation) error {
 	m.commits++
-	gen.ContentHash = policy.ComputeContentHash(gen.Domains, gen.CIDRs)
+	gen.ContentHash = policy.ComputeContentHash(gen.CIDRs)
 	m.committed = gen
 	return nil
 }
@@ -55,27 +51,30 @@ func serviceForActivation(t *testing.T) *Service {
 	return svc
 }
 
+// policyConfigHashFor reports the configuration hash the production syncer derives
+// for a record, so a fixture comparison uses the definition rather than a copy.
+func policyConfigHashFor(t *testing.T, settings policy.Settings) string {
+	t.Helper()
+	return lkgHashFor(t, settings)
+}
+
 // When no policy can be published, activation must fail with
-// ErrPolicyActivationNoRules and leave PBR disabled. The custom source here is a
-// syntactically valid HTTPS URL on a reserved .invalid host, which passes
-// ValidateFetchURL but can never resolve, so the sync fails and there is no
-// last-known-good to fall back to.
-func TestStartPolicyRoutingFailsClosedWithoutPolicySource(t *testing.T) {
+// ErrPolicyActivationNoRules and leave PBR disabled. The record here is enabled with
+// an empty exception list and no stored generation, so the cycle has nothing to
+// publish and there is no last-known-good to fall back to.
+func TestStartPolicyRoutingFailsClosedWithoutPolicyRules(t *testing.T) {
 	svc := serviceForActivation(t)
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://unreachable.example.invalid/list.lst"}
-
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("test fixture settings are invalid: %v", err)
 	}
 
 	store := &memoryStore{loadErr: errors.New("no cached generation")}
-	err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset))
+	err := svc.StartPolicyRouting(context.Background(), settings, store)
 	if err == nil {
-		t.Fatal("StartPolicyRouting succeeded with no usable policy source")
+		t.Fatal("StartPolicyRouting succeeded with no publishable policy")
 	}
 	if !errors.Is(err, ErrPolicyActivationNoRules) {
 		t.Fatalf("expected ErrPolicyActivationNoRules, got: %v", err)
@@ -88,64 +87,18 @@ func TestStartPolicyRoutingFailsClosedWithoutPolicySource(t *testing.T) {
 	}
 }
 
-// Acceptance A3: a healthy policy source but an unusable direct egress path must
-// still refuse enablement, with a useful operator-facing error, leaving PBR
-// disabled. This is the half that stops a valid policy from routing traffic
-// unproxied when the WAN path is not usable.
-//
-// In a unit-test process the host WAN prerequisites (TUN/AF_PACKET device, loose
-// rp_filter) are typically absent or unsafe, so this asserts the guard fires.
-// The assertion deliberately targets "refused + disabled + descriptive" rather
-// than a specific kernel error string, so it stays valid where kernel settings
-// differ.
-func TestStartPolicyRoutingFailsClosedWhenEgressUnavailable(t *testing.T) {
-	svc := serviceForActivation(t)
-
-	// A real built-in preset: the fetch may legitimately succeed here, which is
-	// exactly the case this test is about (valid policy, unusable egress).
-	settings := policy.DefaultSettings()
-	settings.Enabled = true
-	settings.Preset = policy.PresetGeoblock
-
-	store := &memoryStore{}
-	err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset))
-	if err == nil {
-		// The host satisfies every WAN prerequisite. Activation is then legitimate;
-		// clean up and record that this host cannot prove the negative.
-		t.Cleanup(func() { svc.StopPolicyRouting() })
-		t.Skip("host satisfies direct-egress prerequisites; cannot assert the refusal path here")
-	}
-
-	if len(err.Error()) < 20 {
-		t.Errorf("activation error %q is not descriptive enough for an operator", err)
-	}
-	if svc.PBREnabled() {
-		t.Fatal("PBR is enabled after a refused activation")
-	}
-	if svc.PolicyMatcher() != nil {
-		t.Fatal("matcher registered after a refused activation")
-	}
-	// A refused activation must not leave a sync runtime behind.
-	if _, syncErr := svc.SyncPolicyNow(context.Background()); syncErr == nil {
-		t.Fatal("refused activation left a sync runtime registered")
-	}
-	// Nor may it leave a half-registered PBR configuration behind.
-	if cfg := svc.getPBRConfig(); cfg != nil {
-		t.Fatalf("refused activation left PBR config registered: %+v", cfg)
-	}
-}
-
-// Invalid settings must be rejected before any network work or runtime change.
+// Invalid settings must be rejected before any runtime change, so a rejected record
+// can never start a data path.
 func TestStartPolicyRoutingRejectsInvalidSettings(t *testing.T) {
 	svc := serviceForActivation(t)
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = "not_a_preset"
+	settings.ProxyExceptions = []string{"not-a-prefix"}
 
-	err := svc.StartPolicyRouting(context.Background(), settings, &memoryStore{}, "not_a_preset")
+	err := svc.StartPolicyRouting(context.Background(), settings, &memoryStore{})
 	if err == nil {
-		t.Fatal("StartPolicyRouting accepted an unknown preset")
+		t.Fatal("StartPolicyRouting accepted an unparseable exception line")
 	}
 	if svc.PBREnabled() {
 		t.Fatal("PBR enabled for invalid settings")
@@ -159,9 +112,9 @@ func TestStartPolicyRoutingRequiresStore(t *testing.T) {
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetGeoblock
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 
-	if err := svc.StartPolicyRouting(context.Background(), settings, nil, string(settings.Preset)); err == nil {
+	if err := svc.StartPolicyRouting(context.Background(), settings, nil); err == nil {
 		t.Fatal("StartPolicyRouting accepted a nil store")
 	}
 	if svc.PBREnabled() {
@@ -171,7 +124,7 @@ func TestStartPolicyRoutingRequiresStore(t *testing.T) {
 
 // loadLastKnownGood must publish a usable stored generation into the matcher and
 // must reject useless ones. This is the concrete half of "preserve last-known-good
-// policy on transient sync failure".
+// policy".
 func TestLoadLastKnownGoodPublishesStoredGeneration(t *testing.T) {
 	matcher := policy.NewMatcher()
 	gen := &policy.Generation{
@@ -179,8 +132,6 @@ func TestLoadLastKnownGoodPublishesStoredGeneration(t *testing.T) {
 		GenerationID:  "gen-lkg-1",
 		Version:       7,
 		ConfigHash:    "seed",
-		SourcesMeta:   map[string]policy.SourceMeta{"geoblock": {ID: "geoblock"}},
-		Domains:       map[string]uint32{"example.com": 2},
 		CIDRs:         []string{"198.51.100.0/24"},
 	}
 	store := &memoryStore{committed: gen}
@@ -195,11 +146,11 @@ func TestLoadLastKnownGoodPublishesStoredGeneration(t *testing.T) {
 	if snap.Generation() != "gen-lkg-1" {
 		t.Errorf("published generation = %q, want %q", snap.Generation(), "gen-lkg-1")
 	}
-	if snap.DomainCount() == 0 {
-		t.Error("published last-known-good snapshot has no domain rules")
+	if snap.CIDRCount() == 0 {
+		t.Error("published last-known-good snapshot has no prefixes")
 	}
-	if !snap.MatchDomain("example.com") {
-		t.Error("published last-known-good snapshot does not match its stored rule")
+	if !snap.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Error("published last-known-good snapshot does not match its stored prefix")
 	}
 }
 
@@ -216,7 +167,6 @@ func TestLoadLastKnownGoodRejectsUnusableStores(t *testing.T) {
 				SchemaVersion: policy.SchemaVersion,
 				GenerationID:  "gen-empty",
 				Version:       1,
-				Domains:       map[string]uint32{},
 				CIDRs:         nil,
 			}},
 		},
@@ -246,14 +196,13 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 		SchemaVersion: policy.SchemaVersion,
 		GenerationID:  "gen-status-1",
 		Version:       3,
-		Domains:       map[string]uint32{"example.com": 2},
 		CIDRs:         []string{"198.51.100.0/24"},
 	}
 	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, matcher, ""); err != nil {
 		t.Fatalf("seed matcher: %v", err)
 	}
 	policyRuntimeMu.Lock()
-	policyRuntimes[svc] = &policyRuntime{matcher: matcher, presetID: "geoblock"}
+	policyRuntimes[svc] = &policyRuntime{matcher: matcher}
 	policyRuntimeMu.Unlock()
 	t.Cleanup(func() {
 		policyRuntimeMu.Lock()
@@ -271,9 +220,6 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 	if got.Version != 3 {
 		t.Errorf("Version = %d, want 3", got.Version)
 	}
-	if got.DomainCount != 1 {
-		t.Errorf("DomainCount = %d, want 1", got.DomainCount)
-	}
 	if got.CIDRCount != 1 {
 		t.Errorf("CIDRCount = %d, want 1", got.CIDRCount)
 	}
@@ -281,37 +227,32 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 		t.Errorf("SyncState = %q, want %q", got.SyncState, "synced")
 	}
 
-	// 2. Syncer-backed path with a recorded failure.
-	store := &memoryStore{}
+	// 2. Syncer-backed path with a recorded failure: a record with no rules cannot
+	// publish, which is the failure the status must surface.
 	failingSettings := policy.DefaultSettings()
-	failingSettings.Preset = policy.PresetCustom
-	failingSettings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
 	cfg, err := failingSettings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, store, cfg)
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), &memoryStore{}, cfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	// Force a recorded failure without network: an empty source list is rejected by
-	// the constructor, so drive a failure through SyncOnce on an unroutable host.
-	syncCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	_, _ = syncer.SyncOnce(syncCtx)
+	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, syncErr := syncer.SyncOnce(syncCtx)
 	cancel()
+	if syncErr == nil {
+		t.Fatal("a rule-less cycle reported success; the failure status below would be vacuous")
+	}
 
 	policyRuntimeMu.Lock()
 	policyRuntimes[svc] = &policyRuntime{
-		syncer:   syncer,
-		matcher:  matcher,
-		presetID: "custom",
+		syncer:  syncer,
+		matcher: matcher,
 	}
 	policyRuntimeMu.Unlock()
 
 	got2 := svc.PolicyStatusSnapshot()
-	if got2.Preset != "custom" {
-		t.Errorf("Preset = %q, want %q", got2.Preset, "custom")
-	}
 	if got2.SyncState != "error" {
 		t.Errorf("SyncState after a failed sync = %q, want %q", got2.SyncState, "error")
 	}
@@ -320,8 +261,8 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 	}
 }
 
-// applyMatcherStatus must be a no-op for a nil matcher or an unpublished one, so
-// the status cannot claim readiness without a snapshot.
+// applyMatcherStatus must be a no-op for a nil matcher or an unpublished one, so the
+// status cannot claim readiness without a snapshot.
 func TestApplyMatcherStatusNoOpWithoutSnapshot(t *testing.T) {
 	status := PolicyStatus{SyncState: "disabled"}
 	applyMatcherStatus(&status, nil)
@@ -338,7 +279,7 @@ func TestApplyMatcherStatusNoOpWithoutSnapshot(t *testing.T) {
 }
 
 // StopPolicyRouting must cancel a registered runtime and clear it, so a later
-// disable cannot leave a fetcher scheduling against a torn-down data path.
+// disable cannot leave a scheduler running against a torn-down data path.
 func TestStopPolicyRoutingCancelsRegisteredRuntime(t *testing.T) {
 	svc := serviceForActivation(t)
 
@@ -408,27 +349,28 @@ func TestPolicyDispatchCountersWithoutTraffic(t *testing.T) {
 	}
 }
 
-// The policy.SettingsType must remain the single source of truth for the sync
-// configuration the service builds; a regression that bypassed SyncConfig would
-// silently drop the operator's interval or force-shrink setting.
+// policy.Settings must remain the single source of truth for the sync configuration
+// the service builds; a regression that bypassed SyncConfig would silently drop the
+// operator's exceptions or force-shrink setting.
 func TestStartPolicyRoutingUsesSettingsDerivedConfig(t *testing.T) {
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetAntifilterDomains
+	settings.ProxyExceptions = []string{"203.0.113.0/24", "198.51.100.7"}
 	settings.SyncInterval = int64(policy.MinSyncInterval.Seconds())
 
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	if len(cfg.Sources) != 1 {
-		t.Fatalf("derived source count = %d, want 1", len(cfg.Sources))
+	if len(cfg.LocalRules.CIDRs) != 2 {
+		t.Fatalf("derived prefixes = %d, want the 2 operator entries", len(cfg.LocalRules.CIDRs))
 	}
-	if cfg.Sources[0].URL != "https://antifilter.download/list/domains.lst" {
-		t.Errorf("derived source URL = %q, want the documented Antifilter domains URL", cfg.Sources[0].URL)
+	// A bare address becomes a /32 so the packet path matches it exactly.
+	if got := cfg.LocalRules.CIDRs[1].String(); got != "198.51.100.7/32" {
+		t.Errorf("derived second prefix = %q, want 198.51.100.7/32", got)
 	}
 	if cfg.ForceShrink {
-		t.Error("derived config enables ForceShrink; a small download must fail")
+		t.Error("derived config enables ForceShrink; a shrunk set must fail")
 	}
 }
 
@@ -441,15 +383,11 @@ func TestPolicyActivationErrorIsDescriptive(t *testing.T) {
 	}
 }
 
-// ensureInitialSnapshot must accept a matcher that already holds rules, and must
-// refuse one that holds nothing, so activation cannot proceed on an empty policy.
+// ensureInitialSnapshot must accept a record that publishes its own rules, and must
+// refuse one that publishes nothing, so activation cannot proceed on an empty policy.
 func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
-	// A syncer that cannot publish (unroutable source) plus a store holding a
-	// usable generation for *this* configuration: the last-known-good fallback must
-	// supply the rules.
 	settings := policy.DefaultSettings()
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	settings.ProxyExceptions = []string{"198.51.100.0/24"}
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
@@ -460,44 +398,46 @@ func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
 		GenerationID:  "gen-ensure-1",
 		Version:       1,
 		ConfigHash:    policyConfigHashFor(t, settings),
-		Domains:       map[string]uint32{"example.com": 2},
+		CIDRs:         []string{"198.51.100.0/24"},
 	}
 	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, usable, gen.ConfigHash); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	syncer, err := policy.NewSyncer(usable, nil, &memoryStore{committed: gen}, cfg)
+	syncer, err := policy.NewSyncer(usable, &memoryStore{committed: gen}, cfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-
-	// The sync fails, but the seeded matcher already holds rules, so this must pass
-	// through the last-known-good branch.
 	if err := ensureInitialSnapshot(context.Background(), syncer, &memoryStore{committed: gen}, usable); err != nil {
-		t.Fatalf("ensureInitialSnapshot rejected a matcher holding rules: %v", err)
+		t.Fatalf("ensureInitialSnapshot rejected a record that publishes its own rules: %v", err)
 	}
 
-	// An empty matcher with no usable store must be refused.
+	// An empty record with no usable store must be refused.
+	emptySettings := policy.DefaultSettings()
+	emptyCfg, err := emptySettings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
 	empty := policy.NewMatcher()
-	emptySyncer, err := policy.NewSyncer(empty, nil, &memoryStore{loadErr: errors.New("no cache")}, cfg)
+	emptySyncer, err := policy.NewSyncer(empty, &memoryStore{loadErr: errors.New("no cache")}, emptyCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
 	if err := ensureInitialSnapshot(context.Background(), emptySyncer, &memoryStore{loadErr: errors.New("no cache")}, empty); err == nil {
-		t.Fatal("ensureInitialSnapshot accepted an empty matcher with no usable store")
+		t.Fatal("ensureInitialSnapshot accepted an empty record with no usable store")
 	} else if !errors.Is(err, ErrPolicyActivationNoRules) {
 		t.Fatalf("expected ErrPolicyActivationNoRules, got: %v", err)
 	}
 }
 
-// StartPolicyRouting must reject a nil syncer-store and a nil service safely, and
-// must not leave a runtime when the policy source cannot be built.
-func TestStartPolicyRoutingRejectsNilReceiverAndStore(t *testing.T) {
+// StartPolicyRouting must reject a nil receiver safely and must not leave a runtime
+// when no policy can be published.
+func TestStartPolicyRoutingRejectsNilReceiverAndUnusableStore(t *testing.T) {
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetGeoblock
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 
 	var nilSvc *Service
-	if err := nilSvc.StartPolicyRouting(context.Background(), settings, &memoryStore{}, "geoblock"); err == nil {
+	if err := nilSvc.StartPolicyRouting(context.Background(), settings, &memoryStore{}); err == nil {
 		t.Fatal("nil service accepted a policy activation")
 	}
 
@@ -505,7 +445,7 @@ func TestStartPolicyRoutingRejectsNilReceiverAndStore(t *testing.T) {
 	// not register a runtime on a real service.
 	svc := serviceForActivation(t)
 	store := &memoryStore{loadErr: errors.New("no cache")}
-	if err := svc.StartPolicyRouting(context.Background(), settings, store, "geoblock"); err == nil {
+	if err := svc.StartPolicyRouting(context.Background(), settings, store); err == nil {
 		t.Fatal("activation succeeded with an unusable store")
 	}
 	if svc.policyRuntime() != nil {
@@ -523,20 +463,18 @@ func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
 	svc := serviceForActivation(t)
 
 	settings := policy.DefaultSettings()
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	store := &memoryStore{}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, store, cfg)
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), &memoryStore{}, cfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	svc.startPolicyLoop(ctx, syncer, policy.NewMatcher(), settings, "custom")
+	svc.startPolicyLoop(ctx, syncer, policy.NewMatcher(), settings)
 	t.Cleanup(func() {
 		policyRuntimeMu.Lock()
 		delete(policyRuntimes, svc)
@@ -550,8 +488,8 @@ func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
 	if rt.syncer != syncer {
 		t.Error("registered runtime does not reference the supplied syncer")
 	}
-	if rt.presetID != "custom" {
-		t.Errorf("registered presetID = %q, want %q", rt.presetID, "custom")
+	if len(rt.settings.ProxyExceptions) != 1 {
+		t.Errorf("registered settings carry %v, want the record's exception", rt.settings.ProxyExceptions)
 	}
 	if rt.cancel == nil {
 		t.Fatal("registered runtime has no cancel function")
@@ -569,9 +507,9 @@ func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
 // The host WAN address the activation hands to initPBR must be the production
 // derivation, not a hardcoded or test address.
 //
-// initPBR derives HostWANIP only when no configuration is registered; this path
-// must register one to hand over the compiled matcher, so activation derives the
-// address itself. Previously that made activation fail every time with
+// initPBR derives HostWANIP only when no configuration is registered; this path must
+// register one to hand over the compiled matcher, so activation derives the address
+// itself. Previously that made activation fail every time with
 // ErrPBRMissingHostWAN, which left the positive enablement path unreachable by
 // construction.
 func TestStartPolicyRoutingRegistersDerivedHostWANIP(t *testing.T) {
@@ -581,7 +519,7 @@ func TestStartPolicyRoutingRegistersDerivedHostWANIP(t *testing.T) {
 	t.Cleanup(svc.StopPolicyRouting)
 
 	settings := repeatedEnableSettings(t)
-	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings), string(settings.Preset)); err != nil {
+	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings)); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
 
@@ -592,8 +530,8 @@ func TestStartPolicyRoutingRegistersDerivedHostWANIP(t *testing.T) {
 	if !cfg.HostWANIP.IsValid() || !cfg.HostWANIP.Is4() || cfg.HostWANIP.IsLoopback() || cfg.HostWANIP.IsUnspecified() {
 		t.Fatalf("activation registered an unusable host WAN IP: %v", cfg.HostWANIP)
 	}
-	// Same derivation production uses for the same purpose: if this host can
-	// derive an address, activation must have registered exactly that one.
+	// Same derivation production uses for the same purpose: if this host can derive
+	// an address, activation must have registered exactly that one.
 	if want, err := DeriveHostWANIP(); err == nil && cfg.HostWANIP != want {
 		t.Fatalf("registered host WAN IP = %v, want the production derivation %v", cfg.HostWANIP, want)
 	}

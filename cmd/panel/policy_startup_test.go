@@ -46,8 +46,7 @@ func newPolicyStartupFixture(t *testing.T) (*database.DB, *config.Config, policy
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://lists.example/policy.lst"}
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("fixture settings are invalid: %v", err)
 	}
@@ -72,8 +71,8 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	}
 	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
 
-	// No last-known-good generation is seeded and the source cannot be reached, so
-	// activation is refused by the existing guards. Nothing is weakened for this.
+	// No last-known-good generation is seeded, so activation has nothing to publish
+	// and is refused by the existing guards. Nothing is weakened for this.
 	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
 		t.Fatalf("startup refused to continue after a policy activation failure, so the panel would exit (P2-B): %v", err)
 	}
@@ -92,8 +91,8 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
 		t.Fatalf("re-read the persisted policy record: %v", err)
 	}
-	if !stored.Enabled || stored.Preset != settings.Preset ||
-		len(stored.CustomURLs) != len(settings.CustomURLs) || stored.CustomURLs[0] != settings.CustomURLs[0] {
+	if !stored.Enabled || len(stored.ProxyExceptions) != len(settings.ProxyExceptions) ||
+		stored.ProxyExceptions[0] != settings.ProxyExceptions[0] {
 		t.Fatalf("the persisted record changed during a refused activation: %+v", stored)
 	}
 
@@ -105,8 +104,15 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	if status.LastError == "" {
 		t.Fatal("status carries no reason after a refused startup activation, so the operator cannot diagnose it (P2-B)")
 	}
-	if !strings.Contains(status.LastError, "policy routing") || !strings.Contains(status.LastError, "activation") {
+	// The reason must name the activation and carry the producer's own detail, so
+	// the operator can act on it. Which prerequisite refused depends on the host, so
+	// the assertion is on the framing plus a non-empty cause rather than on one
+	// kernel message.
+	if !strings.Contains(status.LastError, "persisted policy routing could not be activated") {
 		t.Fatalf("status reason does not name the failed policy activation: %q", status.LastError)
+	}
+	if !strings.Contains(status.LastError, "activate policy routing") {
+		t.Fatalf("status reason does not carry the activation cause: %q", status.LastError)
 	}
 	if status.SyncState != "error" {
 		t.Fatalf("status sync_state = %q, want \"error\" for a refused activation", status.SyncState)
@@ -138,22 +144,21 @@ func TestPersistedPolicyActivationRecoversAfterRepair(t *testing.T) {
 		t.Fatalf("SyncConfig: %v", err)
 	}
 	store := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
-	probe, err := policy.NewSyncer(policy.NewMatcher(), nil, store, syncCfg)
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	meta := make(map[string]policy.SourceMeta, len(syncCfg.Sources))
-	for _, src := range syncCfg.Sources {
-		meta[src.ID] = policy.SourceMeta{ID: src.ID, URL: src.URL, RuleCount: 1}
+	prefixes := make([]string, 0, len(syncCfg.LocalRules.CIDRs))
+	for _, prefix := range syncCfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
 	}
 	gen := &policy.Generation{
 		SchemaVersion: policy.SchemaVersion,
 		GenerationID:  "gen-startup-repair",
 		Version:       1,
 		ConfigHash:    probe.ConfigHash(),
-		SourcesMeta:   meta,
-		Domains:       map[string]uint32{"seed.example.com": 1},
-		DomainCount:   1,
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
 	}
 	if err := store.Commit(context.Background(), gen); err != nil {
 		t.Fatalf("seed the repaired policy snapshot: %v", err)

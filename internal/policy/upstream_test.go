@@ -216,7 +216,7 @@ func TestDefaultUpstreamsAreValid(t *testing.T) {
 // nothing needs a migration: it stops being read, and it stops being written on
 // the next save.
 func TestStoredRecordWithRemovedUpstreamFieldStillLoads(t *testing.T) {
-	stored := []byte(`{"enabled":true,"preset":"geoblock","custom_urls":[],` +
+	stored := []byte(`{"enabled":true,"local_entries":["203.0.113.0/24"],` +
 		`"sync_interval_seconds":3600,` +
 		`"upstream_dns":[{"address":"9.9.9.9","port":853,"transport":"dot","spki_pin":"` + testSPKIPin() + `"}]}`)
 
@@ -227,14 +227,14 @@ func TestStoredRecordWithRemovedUpstreamFieldStillLoads(t *testing.T) {
 	if !decoded.Enabled {
 		t.Error("the record's enabled flag was lost")
 	}
-	if decoded.Preset != PresetGeoblock {
-		t.Errorf("preset = %q, want %q", decoded.Preset, PresetGeoblock)
+	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Errorf("proxy exceptions = %v, want the stored entry", decoded.ProxyExceptions)
 	}
 	if decoded.SyncInterval != 3600 {
 		t.Errorf("sync_interval_seconds = %d, want 3600", decoded.SyncInterval)
 	}
 	if decoded.IsZero() {
-		t.Error("a record with a preset and enabled decoded as the zero record")
+		t.Error("a record with exceptions and enabled decoded as the zero record")
 	}
 	if err := decoded.Normalize().Validate(); err != nil {
 		t.Errorf("a record carrying the removed field no longer validates: %v", err)

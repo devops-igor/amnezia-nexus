@@ -3,36 +3,46 @@ package policy
 import (
 	"errors"
 	"net/netip"
-	"strings"
 	"sync/atomic"
 	"time"
 )
 
 // Snapshot represents an immutable policy matching state published atomically.
-// It provides O(1) expected domain matching and O(log N) IPv4 CIDR matching
-// with zero reader lock contention.
+// It provides O(log N) IPv4 CIDR matching with zero reader lock contention.
+//
+// The snapshot holds IPv4 prefixes only. The routing authority for a destination
+// is its address, so there is no domain index: a name-based rule never decided a
+// packet's route.
 type Snapshot struct {
 	version      uint64
 	generationID string
 	createdAt    time.Time
-	domainCount  int
 	cidrCount    int
 	sourceIDs    []string
-	domains      map[string]domainFlags
 	ipv4         ipv4Index
 	// cidrRules keeps every distinct prefix with the sources that supplied it.
 	// The merged ipv4Index answers "does this address match"; it cannot answer
 	// "which prefix, from which source" because it merges adjacent ranges. This
-	// list is what a dry run reads (snapshot_explain.go). It costs one prefix
-	// plus one provenance byte per distinct prefix and changes no match result.
+	// list is what an explanation reads. It costs one prefix plus one provenance
+	// byte per distinct prefix and changes no match result.
 	cidrRules []cidrRule
 }
 
+const (
+	// maxSnapshotSources bounds the compiled provenance encoding: one bit per
+	// source, packed into the high bits of the per-prefix provenance word. A
+	// snapshot compiled from more sources records no provenance at all rather
+	// than a wrong one.
+	maxSnapshotSources = 25
+	// provenanceShift is the position of the first provenance bit.
+	provenanceShift = 0
+)
+
 // cidrRule is one compiled IPv4 prefix with the provenance bits of the sources
-// that supplied it, in the same encoding domain entries use.
+// that supplied it.
 type cidrRule struct {
 	prefix  netip.Prefix
-	sources domainFlags
+	sources uint32
 }
 
 // Version returns the sequential version number of this snapshot.
@@ -59,14 +69,6 @@ func (s *Snapshot) CreatedAt() time.Time {
 	return s.createdAt
 }
 
-// DomainCount returns the number of distinct domain rules in this snapshot.
-func (s *Snapshot) DomainCount() int {
-	if s == nil {
-		return 0
-	}
-	return s.domainCount
-}
-
 // CIDRCount returns the number of IPv4 prefixes/ranges in this snapshot.
 func (s *Snapshot) CIDRCount() int {
 	if s == nil {
@@ -83,44 +85,6 @@ func (s *Snapshot) SourceIDs() []string {
 	out := make([]string, len(s.sourceIDs))
 	copy(out, s.sourceIDs)
 	return out
-}
-
-// MatchCanonicalDomain checks if a canonical domain (ASCII lowercase, no trailing dot)
-// matches any exact, inclusive suffix, or descendant rule in the snapshot.
-// The search walks dot boundaries without string allocations.
-func (s *Snapshot) MatchCanonicalDomain(name string) bool {
-	if s == nil || len(s.domains) == 0 || name == "" {
-		return false
-	}
-
-	orig := true
-	q := name
-	for {
-		if f, ok := s.domains[q]; ok {
-			if f&domainInclusiveSuffix != 0 || (orig && f&domainExact != 0) || (!orig && f&domainDescendants != 0) {
-				return true
-			}
-		}
-		i := strings.IndexByte(q, '.')
-		if i < 0 {
-			return false
-		}
-		q = q[i+1:]
-		orig = false
-	}
-}
-
-// MatchDomain normalizes name and checks if it matches any rule in the snapshot.
-// If normalization fails, MatchDomain returns false (which downstream treats as UNKNOWN/PROXY).
-func (s *Snapshot) MatchDomain(name string) bool {
-	if s == nil {
-		return false
-	}
-	canon, err := NormalizeDomain(name)
-	if err != nil {
-		return false
-	}
-	return s.MatchCanonicalDomain(canon)
 }
 
 // MatchIPv4 checks whether addr falls within any IPv4 CIDR range in the snapshot.
@@ -148,9 +112,6 @@ func NewMemorySource(id string, rules ParsedRules) MemorySource {
 	if id == "" {
 		id = "memory-default"
 	}
-	if rules.Domains == nil {
-		rules.Domains = make(map[string]domainFlags)
-	}
 	return MemorySource{
 		SourceID: id,
 		Rules:    rules,
@@ -167,17 +128,14 @@ func (m MemorySource) ToSourceParsedRules() SourceParsedRules {
 
 // CompileSnapshot creates a new immutable Snapshot from source parsed rules.
 //
-// Provenance: each rule records which sources supplied it, packed into the bits
-// of domainFlags above domainMatchMask, so an explanation can name the rule AND
-// the list it came from without a second per-rule index in memory. The packed
-// bits are invisible to the matchers, which read only domainMatchMask; matching
-// therefore behaves exactly as before.
+// Provenance: each prefix records which sources supplied it, packed into the bits
+// of domainFlags above the match bits, so an explanation can name the prefix AND
+// the list it came from without a second per-rule index in memory.
 func CompileSnapshot(version uint64, generationID string, sources []SourceParsedRules) (*Snapshot, error) {
 	if len(sources) == 0 {
 		return nil, errors.New("cannot compile snapshot with zero sources")
 	}
 
-	mergedDomains := make(map[string]domainFlags)
 	cidrRules := make([]cidrRule, 0, len(sources))
 	cidrIndex := make(map[netip.Prefix]int)
 	sourceIDs := make([]string, 0, len(sources))
@@ -185,9 +143,6 @@ func CompileSnapshot(version uint64, generationID string, sources []SourceParsed
 	for i, src := range sources {
 		sourceIDs = append(sourceIDs, src.SourceID)
 		provenance := provenanceBit(i, len(sources))
-		for base, flags := range src.Rules.Domains {
-			mergedDomains[base] |= (flags & domainMatchMask) | provenance
-		}
 		for _, prefix := range src.Rules.CIDRs {
 			canon := prefix.Masked()
 			if at, exists := cidrIndex[canon]; exists {
@@ -208,10 +163,8 @@ func CompileSnapshot(version uint64, generationID string, sources []SourceParsed
 		version:      version,
 		generationID: generationID,
 		createdAt:    time.Now().UTC(),
-		domainCount:  len(mergedDomains),
 		cidrCount:    len(cidrRules),
 		sourceIDs:    sourceIDs,
-		domains:      mergedDomains,
 		ipv4:         newIPv4Index(prefixes),
 		cidrRules:    cidrRules,
 	}, nil
@@ -219,13 +172,13 @@ func CompileSnapshot(version uint64, generationID string, sources []SourceParsed
 
 // provenanceBit returns the provenance bit for the source at index i, or zero
 // when the snapshot has more sources than the encoding holds. Recording nothing
-// for such a snapshot is the honest answer: an explanation then names the rule
+// for such a snapshot is the honest answer: an explanation then names the prefix
 // without naming a source, instead of naming a partial or wrong set.
-func provenanceBit(i, total int) domainFlags {
+func provenanceBit(i, total int) uint32 {
 	if total > maxSnapshotSources || i < 0 || i >= maxSnapshotSources {
 		return 0
 	}
-	return domainFlags(1<<uint(i)) << domainSourceShift
+	return uint32(1<<uint(i)) << provenanceShift
 }
 
 // Matcher provides lock-free, concurrent-safe access to the current active policy Snapshot.
@@ -239,7 +192,7 @@ func NewMatcher() *Matcher {
 }
 
 // Current returns the currently active Snapshot, or nil if no snapshot has been published yet.
-// Callers can safely retain this pointer for the duration of a transaction (e.g. DNS observation).
+// Callers can safely retain this pointer for the duration of a transaction.
 func (m *Matcher) Current() *Snapshot {
 	return m.current.Load()
 }

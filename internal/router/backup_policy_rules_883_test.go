@@ -28,11 +28,10 @@ import (
 // middlewares and a real SQLite database: the fixture record is written by the
 // production admin API and read back by the production export handler.
 
-const backupFixturePolicyPreset = policy.PresetGeoblock
-
-// backupFixtureRules are the synthetic rules the fixture administrator saved.
-// They are distinct literals that must not appear anywhere in a Support export.
-var backupFixtureRules = []string{"ops-internal.example", "10.42.0.0/16"}
+// backupFixtureRules are the synthetic exception prefixes the fixture
+// administrator saved. They are distinct literals that must not appear anywhere in
+// a Support export.
+var backupFixtureRules = []string{"203.0.113.0/24", "198.51.100.0/24"}
 
 // backupFixtureAppearance is ordinary permitted metadata: it must survive in a
 // Support export, so the test can distinguish "policy record withheld" from
@@ -61,8 +60,7 @@ func newPolicyBackupRouter(t *testing.T) (*database.DB, http.Handler) {
 	// Save the policy record through the real admin endpoint, so the fixture is
 	// the record production actually persists (json tags, defaults and all).
 	record := policy.DefaultSettings()
-	record.Preset = backupFixturePolicyPreset
-	record.LocalEntries = append([]string(nil), backupFixtureRules...)
+	record.ProxyExceptions = append([]string(nil), backupFixtureRules...)
 	body, err := json.Marshal(record)
 	if err != nil {
 		t.Fatalf("marshal policy record: %v", err)
@@ -79,9 +77,9 @@ func newPolicyBackupRouter(t *testing.T) (*database.DB, http.Handler) {
 	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
 		t.Fatalf("read back seeded policy record: %v", err)
 	}
-	if len(stored.LocalEntries) != len(backupFixtureRules) {
+	if len(stored.ProxyExceptions) != len(backupFixtureRules) {
 		t.Fatalf("seeded policy record holds %d local entries, want %d: %+v",
-			len(stored.LocalEntries), len(backupFixtureRules), stored)
+			len(stored.ProxyExceptions), len(backupFixtureRules), stored)
 	}
 
 	return db, r
@@ -176,16 +174,16 @@ func TestAdminKeepsPolicyRecordReads(t *testing.T) {
 		t.Fatalf("Admin GET /api/vpn/policy = %d, want 200; body=%s", wPolicy.Code, wPolicy.Body.String())
 	}
 	record := decodeJSON(t, wPolicy)
-	entries, ok := record["local_entries"].([]any)
+	entries, ok := record["proxy_exceptions"].([]any)
 	if !ok {
-		t.Fatalf("Admin policy read carries no local_entries: %v", record)
+		t.Fatalf("Admin policy read carries no proxy_exceptions: %v", record)
 	}
 	if len(entries) != len(backupFixtureRules) {
-		t.Fatalf("Admin policy read returned %d local entries, want %d: %v", len(entries), len(backupFixtureRules), entries)
+		t.Fatalf("Admin policy read returned %d proxy exceptions, want %d: %v", len(entries), len(backupFixtureRules), entries)
 	}
 	for i, want := range backupFixtureRules {
 		if got, _ := entries[i].(string); got != want {
-			t.Errorf("Admin policy local_entries[%d] = %q, want %q", i, got, want)
+			t.Errorf("Admin policy proxy_exceptions[%d] = %q, want %q", i, got, want)
 		}
 	}
 

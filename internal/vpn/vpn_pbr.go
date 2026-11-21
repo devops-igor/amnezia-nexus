@@ -54,7 +54,7 @@ func ValidatePBRPrerequisites(cfg PBRConfig) error {
 		return ErrPBRMissingPolicy
 	}
 	snap := cfg.PolicyMatcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+	if snap == nil || snap.CIDRCount() == 0 {
 		return ErrPBREmptyPolicy
 	}
 	return nil
@@ -239,7 +239,7 @@ func initPBRPolicyMatcher(cfg *PBRConfig) error {
 			}
 			return fmt.Errorf("compile initial policy snapshot: %w", err)
 		}
-		if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+		if snap.CIDRCount() == 0 {
 			if cfg.WANDevice != nil {
 				_ = cfg.WANDevice.Close()
 			}
@@ -250,7 +250,7 @@ func initPBRPolicyMatcher(cfg *PBRConfig) error {
 		return nil
 	}
 	snap := cfg.PolicyMatcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+	if snap == nil || snap.CIDRCount() == 0 {
 		if cfg.WANDevice != nil {
 			_ = cfg.WANDevice.Close()
 		}
@@ -379,7 +379,7 @@ func (s *Service) UpdatePolicySnapshot(version uint64, genID string, sources []p
 	if err != nil {
 		return fmt.Errorf("compile policy snapshot: %w (retaining existing snapshot)", err)
 	}
-	if newSnap.DomainCount() == 0 && newSnap.CIDRCount() == 0 {
+	if newSnap.CIDRCount() == 0 {
 		return errors.New("vpn: compiled snapshot contains no rules (retaining existing snapshot)")
 	}
 	pbrCfg.PolicyMatcher.Publish(newSnap)

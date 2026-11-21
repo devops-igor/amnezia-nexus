@@ -244,8 +244,7 @@ func countCommittedDataFile(dir string) (int, error) {
 // file as it stands; it is not a candidate for acceptance, so the absolute floor
 // and the canonical-form and markup rules do not apply to it.
 func countInventoryPrefixes(body []byte) (int, error) {
-	src := Source{ID: "ru-inventory-baseline", Format: FormatIPv4, BareDomainMode: DomainModeExact}
-	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), src, DefaultParseLimits())
+	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), DefaultParseLimits())
 	if err != nil {
 		return 0, err
 	}

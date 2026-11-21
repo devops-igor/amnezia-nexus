@@ -165,8 +165,13 @@ func TestCommittedInventoryLoadsWholeSetBeyondLocalEntryCap(t *testing.T) {
 		}
 	}
 
-	if _, _, err := ParseLocalRules(dataLines(committedInventoryData(t))); err == nil {
-		t.Fatal("ParseLocalRules accepted the shipped inventory; the operator local-entry cap is not enforced")
+	// The operator exception path is capped, and the shipped set exceeds that cap.
+	// The cap is enforced by Settings.Validate, which is the boundary an operator
+	// body actually crosses.
+	settings := DefaultSettings()
+	settings.ProxyExceptions = dataLines(committedInventoryData(t))
+	if err := settings.Validate(); err == nil {
+		t.Fatal("Validate accepted the shipped inventory as an operator exception list; the 4096-line cap is not enforced")
 	}
 }
 

@@ -63,12 +63,12 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()
 
-	if err := settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), syncer.GenerationViolations, baseline, syncRes, syncErr); err != nil {
+	if err := settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), baseline, syncRes, syncErr); err != nil {
 		return err
 	}
 
 	snap := matcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+	if snap == nil || snap.CIDRCount() == 0 {
 		return ErrPolicyActivationNoRules
 	}
 	return nil
@@ -85,14 +85,11 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 // source-faithful (#678 F678-05): a durable generation that belongs to a
 // *different* source configuration must never be published as this one's rules,
 // however usable it looks, because the selected list has then never loaded.
-// violations is the selected guard validator (built-in plus operator exclusions),
-// so a retained generation is never published with a newly excluded name.
 func settleInitialSync(
 	ctx context.Context,
 	store policy.Store,
 	matcher *policy.Matcher,
 	configHash string,
-	violations func(*policy.Generation) []string,
 	baseline policy.BaselineStatus,
 	syncRes policy.SyncResult,
 	syncErr error,
@@ -114,7 +111,7 @@ func settleInitialSync(
 		slog.Warn("Policy sync failed at startup and the stored generation is not valid rules for this configuration; refusing activation", "err", syncErr)
 		return fmt.Errorf("%w: initial sync of the selected configuration failed (%v) and the stored last-known-good generation is not valid rules for it (different source configuration or never-proxy guarded domains)", ErrPolicyActivationNoRules, syncErr)
 	case syncErr != nil:
-		if loadErr := loadLastKnownGoodWithGuard(ctx, store, matcher, configHash, violations); loadErr != nil {
+		if loadErr := loadLastKnownGood(ctx, store, matcher, configHash); loadErr != nil {
 			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
 				ErrPolicyActivationNoRules, syncErr, loadErr)
 		}
@@ -133,18 +130,11 @@ func settleInitialSync(
 // guard PrimeBaseline applies must hold on this fallback path, otherwise a failed
 // first sync of a new source could still authorize traffic with unrelated rules.
 func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.Matcher, wantConfigHash string) error {
-	return loadLastKnownGoodWithGuard(ctx, store, matcher, wantConfigHash, nil)
-}
-
-// loadLastKnownGoodWithGuard is loadLastKnownGood with the selected guard
-// validator. A nil validator falls back to the built-in guard, which is what
-// direct callers and older tests expect.
-func loadLastKnownGoodWithGuard(ctx context.Context, store policy.Store, matcher *policy.Matcher, wantConfigHash string, violations func(*policy.Generation) []string) error {
 	gen, err := store.Load(ctx)
 	if err != nil {
 		return err
 	}
-	snap, err := validateLastKnownGood(gen, wantConfigHash, violations)
+	snap, err := validateLastKnownGood(gen, wantConfigHash)
 	if err != nil {
 		return err
 	}
@@ -155,27 +145,18 @@ func loadLastKnownGoodWithGuard(ctx context.Context, store policy.Store, matcher
 // validateLastKnownGood checks a durable generation against the selected
 // configuration and guard and compiles it. Keeping the decisions in one place
 // stops the fallback from drifting from PrimeBaseline.
-func validateLastKnownGood(gen *policy.Generation, wantConfigHash string, violations func(*policy.Generation) []string) (*policy.Snapshot, error) {
+func validateLastKnownGood(gen *policy.Generation, wantConfigHash string) (*policy.Snapshot, error) {
 	if gen == nil {
 		return nil, errors.New("no last-known-good policy generation stored")
 	}
 	if wantConfigHash != "" && gen.ConfigHash != wantConfigHash {
 		return nil, errors.New("stored last-known-good generation belongs to a different source configuration")
 	}
-	// Defense in depth: a generation is a record of what an older build and
-	// older settings published, and the guard or the operator exclusions may
-	// have gained patterns since. Never publish rules the current guard forbids.
-	if violations == nil {
-		violations = policy.GenerationNeverProxyViolations
-	}
-	if found := violations(gen); len(found) > 0 {
-		return nil, fmt.Errorf("stored last-known-good generation contains %d never-proxy guarded domain(s), including %q", len(found), found[0])
-	}
 	snap, err := policy.GenerationToSnapshot(gen)
 	if err != nil {
 		return nil, err
 	}
-	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+	if snap.CIDRCount() == 0 {
 		return nil, errors.New("stored policy generation contains no rules")
 	}
 	return snap, nil

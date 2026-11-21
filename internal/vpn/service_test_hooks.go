@@ -269,18 +269,12 @@ func (s *Service) DestinationClassifierForTest() forwarder.DestinationClassifier
 	return s.forwarder.DestinationClassifier()
 }
 
-// policyFetcherForTest lets tests drive the real fetch pipeline against a local
-// TLS fixture instead of a public CA. Production leaves it nil, so
-// newPolicySyncer passes a nil fetcher and policy.NewSyncer builds the hardened
-// production one from the configured limits.
-var policyFetcherForTest func(limits policy.FetchLimits) *policy.Fetcher
-
 // SetPolicySyncerForTest registers a policy syncer as the service's live policy
 // runtime, so handlers exercising the sync endpoint can drive the
 // already-running branch without a real fetch. It is test-only and exists because
 // the policy runtime registry is package-private.
-func (s *Service) SetPolicySyncerForTest(syncer *policy.Syncer, presetID string) {
+func (s *Service) SetPolicySyncerForTest(syncer *policy.Syncer) {
 	policyRuntimeMu.Lock()
 	defer policyRuntimeMu.Unlock()
-	policyRuntimes[s] = &policyRuntime{syncer: syncer, presetID: presetID}
+	policyRuntimes[s] = &policyRuntime{syncer: syncer}
 }

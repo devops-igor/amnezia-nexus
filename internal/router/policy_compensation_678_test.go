@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
-	"net"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -13,6 +13,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/handlers"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // This is the permanent regression oracle for issue #678 finding F678-02
@@ -20,28 +21,40 @@ import (
 // TestAuditCanceledPutLeavesRejectedSettingsPersisted.
 //
 // It runs the real router with the real auth/role/CSRF middleware, the real
-// handler, the real policy service and a real SQLite settings table. Only DNS is
-// stalled, and only so that activation is genuinely in flight and then
-// canceled at the decisive moment.
+// handler, the real policy service and a real SQLite settings table. Only the WAN
+// packet device is substituted, and only so that activation is genuinely in flight
+// and then canceled at the decisive moment.
+//
+// There is no fetched source any more, so the activation work that can be held is
+// the device acquisition: the production constructor is replaced by one that
+// signals when it is entered and then waits for the test. That keeps the window
+// between "the record is durable" and "activation finished" real.
 
-// stallPolicyDNS replaces the default resolver with one that signals when a
-// lookup starts and then blocks until the caller's context is canceled, so a
-// request can be canceled deterministically after its settings write committed.
-func stallPolicyDNS(t *testing.T) <-chan struct{} {
+// activationStall holds the production WAN device constructor open, so a request
+// can be canceled deterministically after its settings write committed and while
+// activation is still in flight. Releasing it makes activation fail at that
+// prerequisite, which is what puts the compensation path under a canceled request
+// context — the exact F678-02 condition.
+type activationStall struct {
+	started <-chan struct{}
+	release func()
+}
+
+func stallPolicyActivation(t *testing.T) activationStall {
 	t.Helper()
-	oldResolver := net.DefaultResolver
 	started := make(chan struct{})
+	release := make(chan struct{})
 	var once sync.Once
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			once.Do(func() { close(started) })
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
+	var releaseOnce sync.Once
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return nil, errors.New("activation refused: the data path is unavailable")
+	}))
+	return activationStall{
+		started: started,
+		release: func() { releaseOnce.Do(func() { close(release) }) },
 	}
-	t.Cleanup(func() { net.DefaultResolver = oldResolver })
-	return started
 }
 
 // TestCanceledPutDoesNotLeaveRejectedSettingsPersisted is the F678-02 regression.
@@ -56,13 +69,14 @@ func stallPolicyDNS(t *testing.T) <-chan struct{} {
 // it to be the rejected record BEFORE cancelling. Without that check the
 // cancellation could land before any write and the test would pass vacuously.
 func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
-	stalled := stallPolicyDNS(t)
+	stall := stallPolicyActivation(t)
+	t.Cleanup(stall.release)
 
 	db, cfg := setupTestRouterDB(t)
 	seedPolicySessions(t, db)
 
 	previous := policy.DefaultSettings()
-	previous.Preset = policy.PresetGeoblock
+	previous.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := db.SetSetting(context.Background(), policy.SettingsKey, previous); err != nil {
 		t.Fatalf("seed policy settings: %v", err)
 	}
@@ -76,8 +90,7 @@ func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
 
 	incoming := previous
 	incoming.Enabled = true
-	incoming.Preset = policy.PresetCustom
-	incoming.CustomURLs = []string{"https://audit-cancel.example.invalid/list.lst"}
+	incoming.ProxyExceptions = []string{"198.51.100.0/24"}
 	body, err := json.Marshal(incoming)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -96,9 +109,9 @@ func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
 	}()
 
 	select {
-	case <-stalled:
+	case <-stall.started:
 	case <-time.After(10 * time.Second):
-		t.Fatal("request never reached DNS; activation was never in flight")
+		t.Fatal("request never reached activation; it was never in flight")
 	}
 
 	// Post-commit barrier: the handler persists before activating, so the row
@@ -107,12 +120,15 @@ func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
 	if err := db.GetSetting(context.Background(), policy.SettingsKey, &mid); err != nil {
 		t.Fatalf("read back mid-flight settings: %v", err)
 	}
-	if !mid.Enabled || mid.Preset != policy.PresetCustom {
+	if !mid.Enabled || len(mid.ProxyExceptions) != 1 || mid.ProxyExceptions[0] != "198.51.100.0/24" {
 		t.Fatalf("cancellation would be vacuous: the request had not committed its record yet (got %+v)", mid)
 	}
 
-	// Cancel exactly like a client disconnect or the shipped request deadline.
+	// Cancel exactly like a client disconnect or the shipped request deadline,
+	// then let activation fail at its prerequisite. The compensation that follows
+	// runs with the request already canceled, which is the defect this pins.
 	cancel()
+	stall.release()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -129,9 +145,9 @@ func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
 	if err := db.GetSetting(context.Background(), policy.SettingsKey, &after); err != nil {
 		t.Fatalf("read back settings after cancellation: %v", err)
 	}
-	if after.Enabled || after.Preset != policy.PresetGeoblock {
-		t.Fatalf("rejected settings remained durable after a canceled request (F678-02): got enabled=%t preset=%q custom=%v; a restart would treat rejected intent as authoritative",
-			after.Enabled, after.Preset, after.CustomURLs)
+	if after.Enabled || len(after.ProxyExceptions) != 1 || after.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("rejected settings remained durable after a canceled request (F678-02): got enabled=%t exceptions=%v; a restart would treat rejected intent as authoritative",
+			after.Enabled, after.ProxyExceptions)
 	}
 	if svc.PBREnabled() {
 		t.Fatal("rejected activation still left PBR enabled")
@@ -143,7 +159,8 @@ func TestCanceledPutDoesNotLeaveRejectedSettingsPersisted(t *testing.T) {
 // must restore "absent" rather than materialize a default row. Otherwise the
 // fresh-install default would be persisted as if an operator had set it.
 func TestRejectedEnableWithAbsentPreviousRowRemovesTheRow(t *testing.T) {
-	stalled := stallPolicyDNS(t)
+	stall := stallPolicyActivation(t)
+	t.Cleanup(stall.release)
 
 	db, cfg := setupTestRouterDB(t)
 	seedPolicySessions(t, db)
@@ -157,8 +174,7 @@ func TestRejectedEnableWithAbsentPreviousRowRemovesTheRow(t *testing.T) {
 
 	enable := policy.DefaultSettings()
 	enable.Enabled = true
-	enable.Preset = policy.PresetCustom
-	enable.CustomURLs = []string{"https://audit-absent.example.invalid/list.lst"}
+	enable.ProxyExceptions = []string{"203.0.113.0/24"}
 	body, err := json.Marshal(enable)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -177,9 +193,9 @@ func TestRejectedEnableWithAbsentPreviousRowRemovesTheRow(t *testing.T) {
 	}()
 
 	select {
-	case <-stalled:
+	case <-stall.started:
 	case <-time.After(10 * time.Second):
-		t.Fatal("request never reached DNS; activation was never in flight")
+		t.Fatal("request never reached activation; it was never in flight")
 	}
 	_, found, err := db.GetSettingRaw(context.Background(), policy.SettingsKey)
 	if err != nil {
@@ -190,6 +206,7 @@ func TestRejectedEnableWithAbsentPreviousRowRemovesTheRow(t *testing.T) {
 	}
 
 	cancel()
+	stall.release()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):

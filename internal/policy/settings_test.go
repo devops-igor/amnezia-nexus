@@ -8,18 +8,18 @@ import (
 )
 
 // The default record must leave an existing install on the old all-proxy route:
-// acceptance bullet 1 of issue #678. Disabled, no invented preset, default
-// interval. No migration or default settings row is involved.
+// acceptance bullet 1 of issue #678. Disabled, no exceptions, default interval.
+// No migration or default settings row is involved.
 func TestDefaultSettingsIsDisabled(t *testing.T) {
 	got := DefaultSettings()
 	if got.Enabled {
 		t.Error("DefaultSettings().Enabled = true, want false (all-proxy default)")
 	}
-	if got.Preset != "" {
-		t.Errorf("DefaultSettings().Preset = %q, want empty (no implied source)", got.Preset)
+	if len(got.ProxyExceptions) != 0 {
+		t.Errorf("DefaultSettings().ProxyExceptions = %v, want none", got.ProxyExceptions)
 	}
-	if len(got.CustomURLs) != 0 {
-		t.Errorf("DefaultSettings().CustomURLs = %v, want none", got.CustomURLs)
+	if len(got.InventoryOverride) != 0 {
+		t.Errorf("DefaultSettings().InventoryOverride = %v, want none", got.InventoryOverride)
 	}
 	if got.Interval() != DefaultSyncInterval {
 		t.Errorf("DefaultSettings().Interval() = %v, want %v", got.Interval(), DefaultSyncInterval)
@@ -49,8 +49,8 @@ func TestNormalizeFillsDefaultIntervalOnly(t *testing.T) {
 	if got.Interval() != DefaultSyncInterval {
 		t.Errorf("Normalize() interval = %v, want %v", got.Interval(), DefaultSyncInterval)
 	}
-	if got.Preset != "" {
-		t.Errorf("Normalize() invented preset %q; selecting a source must stay an operator action", got.Preset)
+	if len(got.ProxyExceptions) != 0 {
+		t.Errorf("Normalize() invented exceptions %v; the list must stay an operator action", got.ProxyExceptions)
 	}
 
 	// An explicit interval must survive normalization untouched.
@@ -60,112 +60,83 @@ func TestNormalizeFillsDefaultIntervalOnly(t *testing.T) {
 	}
 }
 
-func TestNormalizeCopiesCustomURLs(t *testing.T) {
-	original := Settings{CustomURLs: []string{"https://lists.example/domains.lst"}}
+func TestNormalizeCopiesProxyExceptions(t *testing.T) {
+	original := Settings{ProxyExceptions: []string{"203.0.113.0/24"}}
 	normalized := original.Normalize()
 
-	normalized.CustomURLs[0] = "https://mutated.example/x.lst"
-	if original.CustomURLs[0] != "https://lists.example/domains.lst" {
-		t.Fatal("Normalize() shares the CustomURLs backing array with its input")
+	normalized.ProxyExceptions[0] = "192.0.2.0/24"
+	if original.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatal("Normalize() shares the ProxyExceptions backing array with its input")
 	}
 }
 
-func TestValidateAcceptsEachBuiltinPreset(t *testing.T) {
-	for _, p := range Presets() {
-		t.Run(string(p.ID), func(t *testing.T) {
-			s := DefaultSettings()
-			s.Preset = p.ID
-			if err := s.Validate(); err != nil {
-				t.Fatalf("Validate() for preset %q = %v, want nil", p.ID, err)
-			}
-			sources, err := s.Sources()
-			if err != nil {
-				t.Fatalf("Sources() for preset %q = %v", p.ID, err)
-			}
-			wantSources := 1
-			if p.ID == PresetAggregate {
-				wantSources = len(AggregateSources())
-			}
-			if len(sources) != wantSources {
-				t.Fatalf("Sources() for preset %q returned %d sources, want %d", p.ID, len(sources), wantSources)
-			}
-			if p.ID == PresetAggregate {
-				if !sources[0].IsPreset || sources[0].ID != AggregateSources()[0].ID {
-					t.Errorf("aggregate first source = %+v", sources[0])
-				}
-				return
-			}
-			if sources[0].URL != p.URL {
-				t.Errorf("source URL = %q, want %q", sources[0].URL, p.URL)
-			}
-			if !sources[0].IsPreset {
-				t.Error("built-in preset source not flagged IsPreset")
-			}
-			if sources[0].ID != string(p.ID) {
-				t.Errorf("source ID = %q, want %q", sources[0].ID, p.ID)
-			}
-		})
+// The exception list is the one operator control, so its accepted shape is
+// pinned directly: addresses, prefix lines, comments and blank lines.
+func TestValidateAcceptsProxyExceptionShapes(t *testing.T) {
+	s := DefaultSettings()
+	s.ProxyExceptions = []string{
+		"# operator PROXY exceptions",
+		"203.0.113.7",
+		"198.51.100.0/24",
+		"",
+		"! ignore me too",
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+	prefixes, err := s.ProxyExceptionPrefixes()
+	if err != nil {
+		t.Fatalf("ProxyExceptionPrefixes() = %v", err)
+	}
+	if len(prefixes) != 2 {
+		t.Fatalf("parsed %d prefixes, want 2", len(prefixes))
+	}
+	// A bare address becomes a /32 so the packet path matches it exactly.
+	if got := prefixes[0].String(); got != "203.0.113.7/32" {
+		t.Errorf("first prefix = %q, want 203.0.113.7/32", got)
+	}
+	if got := prefixes[1].String(); got != "198.51.100.0/24" {
+		t.Errorf("second prefix = %q, want 198.51.100.0/24", got)
 	}
 }
 
-// A record with no source selection is valid: the classifier is the policy
+// A source-less record is the shipped shape: the classifier is the policy
 // authority and the operator contributes address exceptions locally, so nothing
-// needs to be fetched. This is the shape the settings page offers, so it has to
-// be accepted rather than merely tolerated.
+// is fetched. This is what the settings page offers, so it must be accepted.
 func TestValidateAcceptsNoSourceSelection(t *testing.T) {
 	s := DefaultSettings()
 	s.Enabled = true
-	s.LocalEntries = []string{"203.0.113.0/24"}
+	s.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil for a local-only record", err)
-	}
-	sources, err := s.Sources()
-	if err != nil {
-		t.Fatalf("Sources() = %v", err)
-	}
-	if len(sources) != 0 {
-		t.Fatalf("len(Sources()) = %d, want 0", len(sources))
 	}
 	cfg, err := s.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig() = %v", err)
 	}
-	if len(cfg.Sources) != 0 {
-		t.Fatalf("SyncConfig sources = %d, want 0", len(cfg.Sources))
-	}
 	if len(cfg.LocalRules.CIDRs) != 1 {
 		t.Fatalf("SyncConfig local prefixes = %d, want 1", len(cfg.LocalRules.CIDRs))
 	}
+	if _, err := NewSyncer(NewMatcher(), NewFileStore(t.TempDir()), cfg); err != nil {
+		t.Fatalf("NewSyncer rejected the derived configuration: %v", err)
+	}
 }
 
-func TestValidateAcceptsCustomURLs(t *testing.T) {
+// An empty record is valid: enabling it is a runtime decision made by the VPN
+// layer, which refuses with the operator-facing empty-policy error. Validation
+// must not pretend to decide that.
+func TestValidateAcceptsEmptyRecord(t *testing.T) {
 	s := DefaultSettings()
-	s.Preset = PresetCustom
-	s.CustomURLs = []string{
-		"https://antifilter.download/list/subnet.lst",
-		"https://lists.example/extra.lst",
-	}
+	s.Enabled = true
 	if err := s.Validate(); err != nil {
-		t.Fatalf("Validate() = %v, want nil", err)
+		t.Fatalf("Validate() = %v; enablement is gated by the VPN layer", err)
 	}
-
-	sources, err := s.Sources()
+	cfg, err := s.SyncConfig()
 	if err != nil {
-		t.Fatalf("Sources() = %v", err)
+		t.Fatalf("SyncConfig() = %v", err)
 	}
-	if len(sources) != 2 {
-		t.Fatalf("len(Sources()) = %d, want 2", len(sources))
-	}
-	for i, src := range sources {
-		if src.IsPreset {
-			t.Errorf("custom source %d flagged IsPreset; a custom list is strictly parsed", i)
-		}
-		if src.Format != FormatMixed {
-			t.Errorf("custom source %d Format = %v, want %v", i, src.Format, FormatMixed)
-		}
-	}
-	if sources[0].URL != "https://antifilter.download/list/subnet.lst" {
-		t.Errorf("custom source order not preserved: first = %q", sources[0].URL)
+	if len(cfg.LocalRules.CIDRs) != 0 {
+		t.Fatalf("empty record derived %d prefixes", len(cfg.LocalRules.CIDRs))
 	}
 }
 
@@ -179,135 +150,50 @@ func TestValidateRejectsBadInput(t *testing.T) {
 		wantSub string
 	}{
 		{
-			// No preset is the shipped shape now: the classifier is the policy
-			// authority and the operator's IPv4 exceptions are local. What must
-			// still be refused is a record that names custom URLs without the
-			// source selection that would fetch them.
-			name: "custom URLs without the custom source selection",
-			mutate: func(s *Settings) {
-				s.Preset = ""
-				s.CustomURLs = []string{"https://lists.example/extra.lst"}
-			},
-			wantSub: "custom URLs require the",
+			// A domain line would be saved and never applied, because the packet
+			// path matches addresses only. It is refused by name.
+			name:    "domain line in the exception list",
+			mutate:  func(s *Settings) { s.ProxyExceptions = []string{"example.com"} },
+			wantSub: "proxy exception rejected",
 		},
 		{
-			name:    "unknown preset",
-			mutate:  func(s *Settings) { s.Preset = "russia_outside" },
-			wantSub: `unknown policy preset "russia_outside"`,
+			name:    "wildcard in the exception list",
+			mutate:  func(s *Settings) { s.ProxyExceptions = []string{"*.example.org"} },
+			wantSub: "proxy exception rejected",
 		},
 		{
-			name:    "custom preset without URLs",
-			mutate:  func(s *Settings) { s.Preset = PresetCustom },
-			wantSub: "requires at least one custom URL",
+			name:    "mistyped address in the exception list",
+			mutate:  func(s *Settings) { s.ProxyExceptions = []string{"203.0.113.999"} },
+			wantSub: "proxy exception rejected",
 		},
 		{
-			name: "builtin preset mixed with custom URLs",
-			mutate: func(s *Settings) {
-				s.Preset = PresetGeoblock
-				s.CustomURLs = []string{"https://lists.example/extra.lst"}
-			},
-			wantSub: "cannot be combined with custom URLs",
+			name:    "IPv6 in the exception list",
+			mutate:  func(s *Settings) { s.ProxyExceptions = []string{"2001:db8::/32"} },
+			wantSub: "proxy exception rejected",
 		},
 		{
-			name: "http custom URL",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"http://lists.example/plain.lst"}
-			},
-			wantSub: "only https scheme is permitted",
-		},
-		{
-			name: "private SSRF target",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://10.0.0.5/list.lst"}
-			},
-			wantSub: "prohibited network range",
-		},
-		{
-			name: "cloud metadata SSRF target",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://169.254.169.254/latest/meta-data/"}
-			},
-			wantSub: "special-use address",
-		},
-		{
-			name: "loopback SSRF target",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://127.0.0.1/list.lst"}
-			},
-			wantSub: "special-use address",
-		},
-		{
-			name: "nonstandard port",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://lists.example:8443/list.lst"}
-			},
-			wantSub: "only port 443 is permitted",
-		},
-		{
-			name: "URL with credentials",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://user:pass@lists.example/list.lst"}
-			},
-			wantSub: "userinfo in URL is not permitted",
-		},
-		{
-			name: "single-label host",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{"https://intranet/list.lst"}
-			},
-			wantSub: "single-label hostname",
-		},
-		{
-			name: "duplicate custom URL",
-			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				s.CustomURLs = []string{
-					"https://lists.example/a.lst",
-					"https://lists.example/a.lst",
-				}
-			},
-			wantSub: "duplicates an earlier entry",
-		},
-		{
-			name: "interval below minimum",
-			mutate: func(s *Settings) {
-				s.Preset = PresetGeoblock
-				s.SyncInterval = int64(MinSyncInterval/time.Second) - 1
-			},
+			name:    "interval below minimum",
+			mutate:  func(s *Settings) { s.SyncInterval = int64(MinSyncInterval/time.Second) - 1 },
 			wantSub: "shorter than the minimum",
 		},
 		{
-			name: "negative interval",
-			mutate: func(s *Settings) {
-				s.Preset = PresetGeoblock
-				s.SyncInterval = -1
-			},
+			name:    "negative interval",
+			mutate:  func(s *Settings) { s.SyncInterval = -1 },
 			wantSub: "shorter than the minimum",
 		},
 		{
-			name: "interval above maximum",
-			mutate: func(s *Settings) {
-				s.Preset = PresetGeoblock
-				s.SyncInterval = int64(MaxSyncInterval/time.Second) + 1
-			},
+			name:    "interval above maximum",
+			mutate:  func(s *Settings) { s.SyncInterval = int64(MaxSyncInterval/time.Second) + 1 },
 			wantSub: "longer than the maximum",
 		},
 		{
-			name: "too many custom URLs",
+			name: "too many exception lines",
 			mutate: func(s *Settings) {
-				s.Preset = PresetCustom
-				urls := make([]string, 0, MaxCustomURLs+1)
-				for i := 0; i <= MaxCustomURLs; i++ {
-					urls = append(urls, "https://lists.example/"+string(rune('a'+i))+".lst")
+				entries := make([]string, 0, MaxLocalExceptions+1)
+				for i := 0; i <= MaxLocalExceptions; i++ {
+					entries = append(entries, "203.0.113.0/24")
 				}
-				s.CustomURLs = urls
+				s.ProxyExceptions = entries
 			},
 			wantSub: "exceed the maximum",
 		},
@@ -326,12 +212,8 @@ func TestValidateRejectsBadInput(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want it to mention %q", err, tc.wantSub)
 			}
 
-			// A rejected record must also refuse to produce sources or a sync
-			// configuration, so a handler cannot persist-then-derive around the
-			// validation gate.
-			if sources, srcErr := s.Sources(); srcErr == nil {
-				t.Errorf("Sources() succeeded for invalid settings: %v", sources)
-			}
+			// A rejected record must also refuse to produce a sync configuration,
+			// so a handler cannot persist-then-derive around the validation gate.
 			if cfg, cfgErr := s.SyncConfig(); cfgErr == nil {
 				t.Errorf("SyncConfig() succeeded for invalid settings: %+v", cfg)
 			}
@@ -343,7 +225,7 @@ func TestValidateIntervalBoundariesAccepted(t *testing.T) {
 	for _, interval := range []time.Duration{MinSyncInterval, MaxSyncInterval} {
 		t.Run(interval.String(), func(t *testing.T) {
 			s := DefaultSettings()
-			s.Preset = PresetRussiaInside
+			s.ProxyExceptions = []string{"203.0.113.0/24"}
 			s.SyncInterval = int64(interval / time.Second)
 			if err := s.Validate(); err != nil {
 				t.Fatalf("Validate() = %v, want nil at boundary %v", err, interval)
@@ -352,33 +234,21 @@ func TestValidateIntervalBoundariesAccepted(t *testing.T) {
 	}
 }
 
-// Disabled with a valid source selection must be allowed: an operator has to be
-// able to configure and pre-sync before turning PBR on. Enablement itself is
-// gated at runtime by the VPN layer, not by this record.
-func TestValidateAllowsDisabledWithValidSelection(t *testing.T) {
+// Disabled with a configured exception list must be allowed: an operator has to
+// be able to prepare the list before turning PBR on. Enablement itself is gated
+// at runtime by the VPN layer, not by this record.
+func TestValidateAllowsDisabledWithConfiguredExceptions(t *testing.T) {
 	s := DefaultSettings()
 	s.Enabled = false
-	s.Preset = PresetAntifilterDomains
+	s.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil for disabled-but-configured", err)
 	}
 }
 
-// The record carries no snapshot or egress state, so its validation must not
-// pretend to decide enablement. That guard lives in vpn.ValidatePBRPrerequisites
-// / ErrPBREmptyPolicy, which policy cannot import (policy is the lower layer).
-func TestValidateDoesNotClaimRuntimePrerequisites(t *testing.T) {
-	s := DefaultSettings()
-	s.Enabled = true
-	s.Preset = PresetGeoblock
-	if err := s.Validate(); err != nil {
-		t.Fatalf("Validate() = %v; runtime prerequisite gating belongs to the VPN layer", err)
-	}
-}
-
 func TestSyncConfigUsesProductionBounds(t *testing.T) {
 	s := DefaultSettings()
-	s.Preset = PresetAntifilterIPv4
+	s.ProxyExceptions = []string{"203.0.113.0/24"}
 	s.SyncInterval = int64(3 * time.Hour / time.Second)
 
 	cfg, err := s.SyncConfig()
@@ -389,14 +259,7 @@ func TestSyncConfigUsesProductionBounds(t *testing.T) {
 		t.Errorf("RefreshInterval = %v, want 3h", cfg.RefreshInterval)
 	}
 	if cfg.ForceShrink {
-		t.Error("ForceShrink = true; a small download must fail rather than replace a valid policy")
-	}
-	if len(cfg.Sources) != 1 {
-		t.Fatalf("len(Sources) = %d, want 1", len(cfg.Sources))
-	}
-	wantLimits := DefaultFetchLimits()
-	if cfg.FetchLimits != wantLimits {
-		t.Errorf("FetchLimits = %+v, want production defaults %+v", cfg.FetchLimits, wantLimits)
+		t.Error("ForceShrink = true; a shrunk rule set must fail rather than replace a valid policy")
 	}
 	wantParse := DefaultParseLimits()
 	if cfg.ParseLimits != wantParse {
@@ -404,31 +267,25 @@ func TestSyncConfigUsesProductionBounds(t *testing.T) {
 	}
 }
 
-// The derived configuration must satisfy the Syncer's own constructor rules, so
-// a saved record can always build a live syncer without a surprise rejection.
-func TestSyncConfigSatisfiesSyncerConstructor(t *testing.T) {
-	for _, preset := range Presets() {
-		t.Run(string(preset.ID), func(t *testing.T) {
-			s := DefaultSettings()
-			s.Preset = preset.ID
-
-			cfg, err := s.SyncConfig()
-			if err != nil {
-				t.Fatalf("SyncConfig() = %v", err)
-			}
-			if _, err := NewSyncer(NewMatcher(), nil, NewFileStore(t.TempDir()), cfg); err != nil {
-				t.Fatalf("NewSyncer rejected a derived configuration: %v", err)
-			}
-		})
+// Duplicate and reordered declarations describe the same rule set, and the
+// derived configuration must say so: neither may look like a new policy.
+func TestSyncConfigCollapsesDuplicateExceptions(t *testing.T) {
+	s := DefaultSettings()
+	s.ProxyExceptions = []string{"203.0.113.0/24", "203.0.113.9/24", "198.51.100.0/24"}
+	cfg, err := s.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig() = %v", err)
+	}
+	if len(cfg.LocalRules.CIDRs) != 2 {
+		t.Fatalf("prefixes = %d, want 2 after collapsing the duplicate /24", len(cfg.LocalRules.CIDRs))
 	}
 }
 
 func TestSettingsJSONRoundTrip(t *testing.T) {
 	original := Settings{
-		Enabled:      true,
-		Preset:       PresetCustom,
-		CustomURLs:   []string{"https://lists.example/a.lst"},
-		SyncInterval: int64(90 * time.Minute / time.Second),
+		Enabled:         true,
+		ProxyExceptions: []string{"203.0.113.0/24"},
+		SyncInterval:    int64(90 * time.Minute / time.Second),
 	}
 
 	encoded, err := json.Marshal(original)
@@ -444,11 +301,8 @@ func TestSettingsJSONRoundTrip(t *testing.T) {
 	if decoded.Enabled != original.Enabled {
 		t.Errorf("Enabled = %v, want %v", decoded.Enabled, original.Enabled)
 	}
-	if decoded.Preset != original.Preset {
-		t.Errorf("Preset = %q, want %q", decoded.Preset, original.Preset)
-	}
-	if len(decoded.CustomURLs) != 1 || decoded.CustomURLs[0] != original.CustomURLs[0] {
-		t.Errorf("CustomURLs = %v, want %v", decoded.CustomURLs, original.CustomURLs)
+	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != original.ProxyExceptions[0] {
+		t.Errorf("ProxyExceptions = %v, want %v", decoded.ProxyExceptions, original.ProxyExceptions)
 	}
 	if decoded.SyncInterval != original.SyncInterval {
 		t.Errorf("SyncInterval = %d, want %d", decoded.SyncInterval, original.SyncInterval)
@@ -459,8 +313,11 @@ func TestSettingsJSONRoundTrip(t *testing.T) {
 }
 
 // Field names are the wire contract for both the settings row and the admin API.
+//
+// The exception list serializes under its current name. The load path accepts the
+// old "local_entries" key as well, which the migration case below asserts.
 func TestSettingsJSONFieldNames(t *testing.T) {
-	encoded, err := json.Marshal(DefaultSettings())
+	encoded, err := json.Marshal(Settings{ProxyExceptions: []string{"203.0.113.0/24"}})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -469,10 +326,39 @@ func TestSettingsJSONFieldNames(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	for _, field := range []string{"enabled", "preset", "custom_urls", "sync_interval_seconds"} {
+	for _, field := range []string{"enabled", "proxy_exceptions", "sync_interval_seconds"} {
 		if _, ok := asMap[field]; !ok {
 			t.Errorf("expected JSON field %q missing from %s", field, encoded)
 		}
+	}
+	for _, removed := range []string{"preset", "custom_urls", "excluded_domains", "local_entries"} {
+		if _, ok := asMap[removed]; ok {
+			t.Errorf("record still serializes %q: %s", removed, encoded)
+		}
+	}
+}
+
+// A record written by an earlier build carries the operator's addresses under
+// "local_entries". The rename must read them, or an upgrade would silently discard
+// a configuration the operator saved.
+func TestSettingsLoadsTheLegacyExceptionKey(t *testing.T) {
+	const stored = `{"enabled":true,"local_entries":["203.0.113.0/24"],"sync_interval_seconds":3600}`
+
+	var decoded Settings
+	if err := json.Unmarshal([]byte(stored), &decoded); err != nil {
+		t.Fatalf("a stored record from an earlier build must still load: %v", err)
+	}
+	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("loaded exceptions = %v, want the stored entry", decoded.ProxyExceptions)
+	}
+
+	// A record carrying both keys is read from the current one.
+	const both = `{"proxy_exceptions":["198.51.100.0/24"],"local_entries":["203.0.113.0/24"]}`
+	if err := json.Unmarshal([]byte(both), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != "198.51.100.0/24" {
+		t.Fatalf("a record carrying both keys read %v, want the current field", decoded.ProxyExceptions)
 	}
 }
 
@@ -484,35 +370,66 @@ func TestSettingsKeyValue(t *testing.T) {
 	}
 }
 
-func TestSettingsAggregateAndLocalEntries(t *testing.T) {
-	settings := DefaultSettings()
-	settings.Preset = PresetAggregate
-	settings.LocalEntries = []string{"local.example", "198.51.100.0/24"}
-	if err := settings.Validate(); err != nil {
-		t.Fatalf("aggregate/local settings rejected: %v", err)
+// A record written by an earlier build must still load, keep the operator's
+// address exceptions, and explain what it could not carry: the source selection
+// and the domain half are gone, and silence about that would read as a dropped
+// configuration that nobody was told about.
+func TestLegacyRecordKeepsExceptionsAndExplainsDroppedFields(t *testing.T) {
+	const legacy = `{
+		"enabled": true,
+		"preset": "aggregate",
+		"custom_urls": ["https://lists.example/a.lst"],
+		"local_entries": ["203.0.113.0/24", "198.51.100.7"],
+		"excluded_domains": ["bank.example"],
+		"sync_interval_seconds": 21600
+	}`
+
+	var decoded Settings
+	if err := json.Unmarshal([]byte(legacy), &decoded); err != nil {
+		t.Fatalf("a stored record from an earlier build must still load: %v", err)
 	}
-	cfg, err := settings.SyncConfig()
+	if !decoded.Enabled {
+		t.Error("the enabled flag from the stored record did not survive the load")
+	}
+	if len(decoded.ProxyExceptions) != 2 {
+		t.Fatalf("operator addresses = %v, want the 2 stored entries; a rename must not drop them", decoded.ProxyExceptions)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("the migrated record is not usable: %v", err)
+	}
+	prefixes, err := decoded.ProxyExceptionPrefixes()
 	if err != nil {
-		t.Fatalf("SyncConfig: %v", err)
+		t.Fatalf("ProxyExceptionPrefixes: %v", err)
 	}
-	if len(cfg.Sources) != len(AggregateSources()) {
-		t.Fatalf("sources = %d, want %d", len(cfg.Sources), len(AggregateSources()))
-	}
-	if len(cfg.LocalRules.Domains) != 1 || len(cfg.LocalRules.CIDRs) != 1 {
-		t.Fatalf("local rules = %+v", cfg.LocalRules)
+	if len(prefixes) != 2 {
+		t.Fatalf("parsed %d prefixes, want 2", len(prefixes))
 	}
 
-	settings.LocalEntries = []string{"ozon.ru"}
-	if err := settings.Validate(); err == nil || !strings.Contains(err.Error(), "never-proxy guard") {
-		t.Fatalf("guarded local entry error = %v", err)
+	// The dropped content is reported, not silently discarded.
+	var legacyRecord legacySettings
+	if err := json.Unmarshal([]byte(legacy), &legacyRecord); err != nil {
+		t.Fatalf("unmarshal legacy shape: %v", err)
+	}
+	dropped := migrateLegacyRecord(legacyRecord)
+	if len(dropped) != 3 {
+		t.Fatalf("migration report = %v, want 3 dropped items (selection, custom URLs, exclusions)", dropped)
+	}
+	joined := strings.Join(dropped, "; ")
+	for _, want := range []string{"aggregate", "custom list URL", "excluded domain"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("migration report %q does not mention %q", joined, want)
+		}
 	}
 }
 
-func TestSettingsAggregateCannotBeCombinedWithCustomURLs(t *testing.T) {
-	settings := DefaultSettings()
-	settings.Preset = PresetAggregate
-	settings.CustomURLs = []string{"https://lists.example/x.lst"}
-	if err := settings.Validate(); err == nil {
-		t.Fatal("aggregate + custom URLs was accepted")
+// A legacy record with nothing but operator addresses reports nothing dropped,
+// so the ordinary upgrade path carries no alarming notice.
+func TestLegacyRecordWithOnlyExceptionsReportsNoLoss(t *testing.T) {
+	legacyRecord := legacySettings{
+		Enabled:      true,
+		LocalEntries: []string{"203.0.113.0/24"},
+	}
+	if dropped := migrateLegacyRecord(legacyRecord); len(dropped) != 0 {
+		t.Fatalf("migration report = %v, want none", dropped)
 	}
 }

@@ -13,33 +13,33 @@ import (
 // unchanged. The decisive property is that adoption is a read: it records the
 // durable generation for comparison and publishes nothing, so it cannot take write
 // ownership from the runtime that is still serving.
+
+// adoptConfigFor builds the record-derived configuration for an exception set, so
+// the fixture cannot drift from what a saved record actually produces.
+func adoptConfigFor(t *testing.T, exceptions ...string) SyncConfig {
+	t.Helper()
+	settings := DefaultSettings()
+	settings.ProxyExceptions = exceptions
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	return cfg
+}
+
 func TestSyncer_AdoptBaseline(t *testing.T) {
 	newSyncer := func(t *testing.T, dir string, cfg SyncConfig) (*Syncer, *Matcher) {
 		t.Helper()
 		matcher := NewMatcher()
-		syncer, err := NewSyncer(matcher, nil, NewFileStore(dir), cfg)
+		syncer, err := NewSyncer(matcher, NewFileStore(dir), cfg)
 		if err != nil {
 			t.Fatalf("NewSyncer: %v", err)
 		}
 		return syncer, matcher
 	}
-	cfgFor := func(url string) SyncConfig {
-		return SyncConfig{
-			Sources: []Source{{
-				ID:             "source-1",
-				URL:            url,
-				Format:         FormatMixed,
-				BareDomainMode: DomainModeExact,
-				IsPreset:       true,
-			}},
-			RefreshInterval: time.Hour,
-			FetchLimits:     DefaultFetchLimits(),
-			ParseLimits:     DefaultParseLimits(),
-		}
-	}
 
 	t.Run("absent store records nothing", func(t *testing.T) {
-		syncer, matcher := newSyncer(t, t.TempDir(), cfgFor("https://rules.example.com/a.lst"))
+		syncer, matcher := newSyncer(t, t.TempDir(), adoptConfigFor(t, "198.51.100.0/24"))
 		status, err := syncer.AdoptBaseline(context.Background())
 		if err != nil {
 			t.Fatalf("AdoptBaseline on an empty store: %v", err)
@@ -60,7 +60,7 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, cacheFileName), []byte("{not json"), 0o600); err != nil {
 			t.Fatalf("write corrupt cache: %v", err)
 		}
-		syncer, matcher := newSyncer(t, dir, cfgFor("https://rules.example.com/a.lst"))
+		syncer, matcher := newSyncer(t, dir, adoptConfigFor(t, "198.51.100.0/24"))
 		status, err := syncer.AdoptBaseline(context.Background())
 		if err == nil {
 			t.Fatal("AdoptBaseline accepted an unreadable stored generation")
@@ -75,19 +75,21 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 
 	t.Run("foreign configuration is not adopted", func(t *testing.T) {
 		dir := t.TempDir()
-		seeder, _ := newSyncer(t, dir, cfgFor("https://rules.example.com/a.lst"))
+		seeder, _ := newSyncer(t, dir, adoptConfigFor(t, "203.0.113.0/24"))
 		if err := seeder.store.Commit(context.Background(), &Generation{
 			SchemaVersion: SchemaVersion,
 			GenerationID:  "gen-adopt-seed",
 			Version:       3,
 			CreatedAt:     time.Now().UTC(),
 			ConfigHash:    seeder.ConfigHash(),
-			Domains:       map[string]uint32{"listed.example.com": uint32(domainExact)},
+			CIDRs:         []string{"203.0.113.0/24"},
 		}); err != nil {
 			t.Fatalf("seed generation: %v", err)
 		}
 
-		other, matcher := newSyncer(t, dir, cfgFor("https://rules.example.com/b.lst"))
+		// A different exception set is a different configuration, which is what the
+		// config hash is derived from now that there is no fetched source list.
+		other, matcher := newSyncer(t, dir, adoptConfigFor(t, "192.0.2.0/24"))
 		status, err := other.AdoptBaseline(context.Background())
 		if err != nil {
 			t.Fatalf("AdoptBaseline for a different configuration: %v", err)
@@ -105,7 +107,7 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 
 	t.Run("matching configuration is recorded without publication", func(t *testing.T) {
 		dir := t.TempDir()
-		cfg := cfgFor("https://rules.example.com/a.lst")
+		cfg := adoptConfigFor(t, "198.51.100.0/24")
 		seeder, _ := newSyncer(t, dir, cfg)
 		seeded := &Generation{
 			SchemaVersion: SchemaVersion,
@@ -113,7 +115,6 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 			Version:       4,
 			CreatedAt:     time.Now().UTC(),
 			ConfigHash:    seeder.ConfigHash(),
-			Domains:       map[string]uint32{"listed.example.com": uint32(domainExact)},
 			CIDRs:         []string{"198.51.100.0/24"},
 		}
 		if err := seeder.store.Commit(context.Background(), seeded); err != nil {

@@ -43,17 +43,9 @@ var policySectionIDs = []string{
 	"policyAlert",
 	"policyStatusBadge",
 	"policy_enabled",
-	"policy_preset_aggregate",
-	"policy_preset_russia_inside",
-	"policy_preset_geoblock",
-	"policy_preset_antifilter_domains",
-	"policy_preset_antifilter_ipv4",
-	"policy_preset_custom",
-	"policyCustomUrlsGroup",
-	"policy_custom_urls",
+	"policy_proxy_exceptions",
 	"policySaveBtn",
 	"policySyncBtn",
-	"policyActivePreset",
 	"policyLastSuccess",
 	"policySyncState",
 	"policyRuleCount",
@@ -62,8 +54,6 @@ var policySectionIDs = []string{
 	"policyDirectBytes",
 	"policyProxyDrops",
 	"policyDirectDrops",
-	"policy_local_entries",
-	"policy_excluded_domains",
 	"policy_inventory_override",
 	"policyInventorySource",
 	"policyInventoryPrefixes",
@@ -75,7 +65,6 @@ var policySectionIDs = []string{
 	"policyCdnCount",
 	"policyCdnEntries",
 	"policyCdnNotice",
-	"policySourceStats",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -110,19 +99,30 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 			}
 		}
 		for _, token := range []string{
-			`name="policy_preset"`,
-			`value="aggregate"`,
-			`value="russia_inside"`,
-			`value="geoblock"`,
-			`value="antifilter_domains"`,
-			`value="antifilter_ipv4"`,
-			`value="custom"`,
+			`name="policy_enabled"`,
+			`name="policy_proxy_exceptions"`,
 			`type="submit"`,
 			`id="policySaveBtn"`,
 			`id="policySyncBtn"`,
 		} {
 			if !strings.Contains(adminBody, token) {
 				t.Errorf("admin settings page is missing %q", token)
+			}
+		}
+	})
+
+	// A visible control must do what it says, so the page offers exactly the two
+	// inputs that reach a packet decision and nothing that configures a source.
+	t.Run("NoSourceOrDomainControls", func(t *testing.T) {
+		for _, removed := range []string{
+			`name="policy_preset"`,
+			`name="policy_custom_urls"`,
+			`name="policy_excluded_domains"`,
+			`id="policyActivePreset"`,
+			`id="policySourceStats"`,
+		} {
+			if strings.Contains(adminBody, removed) {
+				t.Errorf("admin settings page still renders the removed control %q", removed)
 			}
 		}
 	})

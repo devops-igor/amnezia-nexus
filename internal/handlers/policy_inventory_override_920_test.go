@@ -53,7 +53,7 @@ func TestPolicyOverrideSavePersistsAndReportsStatus(t *testing.T) {
 
 	w := putPolicyForTest(t, h, map[string]any{
 		"enabled":               false,
-		"preset":                string(policy.PresetAggregate),
+		"proxy_exceptions":      []string{"203.0.113.0/24"},
 		"sync_interval_seconds": 3600,
 		"inventory_override":    []string{"203.0.113.0/24", "198.51.100.0/24"},
 	})
@@ -112,7 +112,7 @@ func TestPolicyOverrideRefusedAtTheBoundaryLeavesTheRecordUnchanged(t *testing.T
 
 	accepted := putPolicyForTest(t, h, map[string]any{
 		"enabled":               false,
-		"preset":                string(policy.PresetAggregate),
+		"proxy_exceptions":      []string{"203.0.113.0/24"},
 		"sync_interval_seconds": 3600,
 		"inventory_override":    []string{"203.0.113.0/24"},
 	})
@@ -129,7 +129,7 @@ func TestPolicyOverrideRefusedAtTheBoundaryLeavesTheRecordUnchanged(t *testing.T
 		t.Run(name, func(t *testing.T) {
 			w := putPolicyForTest(t, h, map[string]any{
 				"enabled":               false,
-				"preset":                string(policy.PresetAggregate),
+				"proxy_exceptions":      []string{"203.0.113.0/24"},
 				"sync_interval_seconds": 3600,
 				"inventory_override":    override,
 			})
@@ -153,12 +153,11 @@ func TestPolicyOverrideRefusedAtTheBoundaryLeavesTheRecordUnchanged(t *testing.T
 // client that predates the field, and an operator clearing the textarea.
 func TestPolicyOverrideMergePreservesAbsentAndClearsExplicitEmpty(t *testing.T) {
 	previous := previousPolicyRecord{present: true, settings: policy.Settings{
-		Preset:            policy.PresetAggregate,
 		SyncInterval:      3600,
 		InventoryOverride: []string{"203.0.113.0/24"},
 	}}
 
-	absent, err := mergeStoredInventoryOverride(policy.Settings{Preset: policy.PresetAggregate, SyncInterval: 3600}, previous)
+	absent, err := mergeStoredInventoryOverride(policy.Settings{SyncInterval: 3600}, previous)
 	if err != nil {
 		t.Fatalf("merge absent override: %v", err)
 	}
@@ -167,7 +166,7 @@ func TestPolicyOverrideMergePreservesAbsentAndClearsExplicitEmpty(t *testing.T) 
 	}
 
 	cleared, err := mergeStoredInventoryOverride(policy.Settings{
-		Preset: policy.PresetAggregate, SyncInterval: 3600, InventoryOverride: []string{},
+		SyncInterval: 3600, InventoryOverride: []string{},
 	}, previous)
 	if err != nil {
 		t.Fatalf("merge explicit empty override: %v", err)
@@ -178,8 +177,8 @@ func TestPolicyOverrideMergePreservesAbsentAndClearsExplicitEmpty(t *testing.T) 
 }
 
 func TestPolicySettingsEqualIncludesInventoryOverride(t *testing.T) {
-	base := policy.Settings{Preset: policy.PresetAggregate, InventoryOverride: []string{"203.0.113.0/24"}}
-	changed := policy.Settings{Preset: policy.PresetAggregate, InventoryOverride: []string{"198.51.100.0/24"}}
+	base := policy.Settings{InventoryOverride: []string{"203.0.113.0/24"}}
+	changed := policy.Settings{InventoryOverride: []string{"198.51.100.0/24"}}
 	if policySettingsEqual(base, changed) {
 		t.Fatal("override changes compared equal, so a compensating write could skip the rollback")
 	}

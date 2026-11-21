@@ -193,18 +193,18 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 	}
 
 	policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
-	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
+	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore); startErr != nil {
 		// Fail closed on the data plane, not on the management plane: never start
 		// serving with PBR reported as on but not actually activated, but keep the
 		// panel reachable. Nothing here rewrites the stored record; the operator's
 		// intent stays available to repair through the API.
 		vpnSvc.ReportPolicyActivationFailure(fmt.Errorf("persisted policy routing could not be activated: %w", startErr))
 		slog.Error("Policy routing could not be activated from persisted settings; the panel starts with policy routing disabled",
-			"preset", string(policySettings.Preset), "err", startErr)
+			"err", startErr)
 		return nil
 	}
 	slog.Info("Policy routing activated from persisted settings",
-		"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+		"interval_seconds", policySettings.SyncInterval)
 	return nil
 }
 

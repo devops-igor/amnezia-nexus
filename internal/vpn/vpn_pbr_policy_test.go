@@ -55,11 +55,7 @@ func TestPBR_UpdatePolicySnapshot_PreservesOnFailure(t *testing.T) {
 
 	validWAN := netip.MustParseAddr("198.51.200.1")
 	dev := &mockPBRDevice{}
-	rules1, _, _ := policy.Parse(context.Background(), strings.NewReader("protected.com\n"), policy.Source{
-		ID:             "list-v1",
-		Format:         policy.FormatDomains,
-		BareDomainMode: policy.DomainModeExact,
-	}, policy.DefaultParseLimits())
+	rules1, _, _ := policy.Parse(context.Background(), strings.NewReader("198.51.200.0/24\n"), policy.DefaultParseLimits())
 
 	src1 := policy.NewMemorySource("list-v1", rules1)
 	svc.SetPBRConfig(PBRConfig{
@@ -75,8 +71,8 @@ func TestPBR_UpdatePolicySnapshot_PreservesOnFailure(t *testing.T) {
 
 	pbrCfg := svc.getPBRConfig()
 	origSnap := pbrCfg.PolicyMatcher.Current()
-	if origSnap == nil || origSnap.DomainCount() != 1 {
-		t.Fatalf("expected original snapshot with 1 domain, got %v", origSnap)
+	if origSnap == nil || origSnap.CIDRCount() != 1 {
+		t.Fatalf("expected original snapshot with 1 prefix, got %v", origSnap)
 	}
 
 	// Attempt update with zero sources: must fail and retain origSnap

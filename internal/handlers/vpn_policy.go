@@ -121,11 +121,8 @@ func (h *Handlers) savePolicySettings(ctx context.Context, settings policy.Setti
 // configuration. Settings contains a slice, so == is unavailable.
 func policySettingsEqual(a, b policy.Settings) bool {
 	return a.Enabled == b.Enabled &&
-		a.Preset == b.Preset &&
 		a.SyncInterval == b.SyncInterval &&
-		slices.Equal(a.CustomURLs, b.CustomURLs) &&
-		slices.Equal(a.LocalEntries, b.LocalEntries) &&
-		slices.Equal(a.ExcludedDomains, b.ExcludedDomains) &&
+		slices.Equal(a.ProxyExceptions, b.ProxyExceptions) &&
 		slices.Equal(a.InventoryOverride, b.InventoryOverride)
 }
 
@@ -171,10 +168,7 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]any{
 		"enabled":               settings.Enabled,
-		"preset":                string(settings.Preset),
-		"custom_urls":           customURLsOrEmpty(settings.CustomURLs),
-		"local_entries":         localEntriesOrEmpty(settings.LocalEntries),
-		"excluded_domains":      excludedDomainsOrEmpty(settings.ExcludedDomains),
+		"proxy_exceptions":      stringsOrEmpty(settings.ProxyExceptions),
 		"inventory_override":    stringsOrEmpty(settings.InventoryOverride),
 		"sync_interval_seconds": settings.SyncInterval,
 	}
@@ -183,15 +177,6 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.JSON(w, http.StatusOK, response)
-}
-
-// customURLsOrEmpty reports an empty JSON array rather than null for a preset
-// selection that carries no custom URLs.
-func customURLsOrEmpty(urls []string) []string {
-	if urls == nil {
-		return []string{}
-	}
-	return urls
 }
 
 // stringsOrEmpty reports an empty JSON array rather than null for a list the
@@ -203,18 +188,6 @@ func stringsOrEmpty(entries []string) []string {
 		return []string{}
 	}
 	return entries
-}
-
-// localEntriesOrEmpty reports an empty JSON array rather than null for a record
-// whose local entry list is unset.
-func localEntriesOrEmpty(entries []string) []string {
-	return stringsOrEmpty(entries)
-}
-
-// excludedDomainsOrEmpty reports an empty JSON array rather than null for a
-// record whose exclusion list is unset.
-func excludedDomainsOrEmpty(entries []string) []string {
-	return stringsOrEmpty(entries)
 }
 
 // policySettingsMutation is the settings-mutation boundary: at most one complete
@@ -307,9 +280,8 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.audit(r, "policy.settings_save", map[string]any{
-		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
-		"custom_url_count": len(incoming.CustomURLs), "local_entry_count": len(incoming.LocalEntries),
-		"excluded_domain_count":    len(incoming.ExcludedDomains),
+		"result": "ok", "enabled": incoming.Enabled,
+		"proxy_exception_count":    len(incoming.ProxyExceptions),
 		"inventory_override_count": len(incoming.InventoryOverride),
 		"sync_interval_seconds":    incoming.SyncInterval,
 	})
@@ -333,7 +305,7 @@ func (h *Handlers) rollbackPolicySettings(w http.ResponseWriter, r *http.Request
 	rollbackErr := h.restorePolicySettings(r.Context(), previous, written)
 
 	details := map[string]any{
-		"result": "failed", "enabled": written.Enabled, "preset": string(written.Preset), "reason": activationErr.Error(),
+		"result": "failed", "enabled": written.Enabled, "reason": activationErr.Error(),
 	}
 	switch {
 	case rollbackErr == nil:
@@ -349,7 +321,7 @@ func (h *Handlers) rollbackPolicySettings(w http.ResponseWriter, r *http.Request
 	if rollbackErr != nil && !errors.Is(rollbackErr, errPolicySettingsSuperseded) {
 		slog.Error("Policy settings rollback failed after activation failure; durable settings and the running policy may disagree",
 			"rollback_err", rollbackErr, "activation_err", activationErr,
-			"enabled", written.Enabled, "preset", string(written.Preset))
+			"enabled", written.Enabled)
 		h.JSONError(w, http.StatusInternalServerError, "state_inconsistent",
 			"Policy activation failed and the rejected settings could not be rolled back: "+rollbackErr.Error()+"; activation error: "+activationErr.Error())
 		return
@@ -390,45 +362,25 @@ func (h *Handlers) decodePolicyPut(w http.ResponseWriter, r *http.Request) (poli
 }
 
 // mergeStoredPolicyFields fills every additive field a save omits from the stored
-// record and validates the result. The merge is one step because the fields
-// interact: a local entry may not overlap an exclusion.
+// record and validates the result. The merge is one step because a field can be
+// omitted independently and each omission means "keep the stored value".
 func mergeStoredPolicyFields(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
-	merged, err := mergeStoredLocalEntries(incoming, previous)
-	if err != nil {
-		return policy.Settings{}, err
-	}
-	merged, err = mergeStoredExcludedDomains(merged, previous)
+	merged, err := mergeStoredProxyExceptions(incoming, previous)
 	if err != nil {
 		return policy.Settings{}, err
 	}
 	return mergeStoredInventoryOverride(merged, previous)
 }
 
-// mergeStoredLocalEntries preserves the stored local entries when a save omits
-// the field. An explicitly empty slice is a deliberate removal.
-func mergeStoredLocalEntries(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
-	if incoming.LocalEntries != nil {
-		return incoming, nil
-	}
-	merged := incoming
-	if previous.present {
-		merged.LocalEntries = previous.settings.LocalEntries
-	}
-	if err := merged.Validate(); err != nil {
-		return policy.Settings{}, err
-	}
-	return merged, nil
-}
-
-// mergeStoredExcludedDomains preserves the stored exclusion list when a save
+// mergeStoredProxyExceptions preserves the stored exception list when a save
 // omits the field. An explicitly empty slice is a deliberate removal.
-func mergeStoredExcludedDomains(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
-	if incoming.ExcludedDomains != nil {
+func mergeStoredProxyExceptions(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	if incoming.ProxyExceptions != nil {
 		return incoming, nil
 	}
 	merged := incoming
 	if previous.present {
-		merged.ExcludedDomains = previous.settings.ExcludedDomains
+		merged.ProxyExceptions = previous.settings.ProxyExceptions
 	}
 	if err := merged.Validate(); err != nil {
 		return policy.Settings{}, err
@@ -459,10 +411,7 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
 		"status":                "ok",
 		"enabled":               saved.Enabled,
-		"preset":                string(saved.Preset),
-		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
-		"local_entries":         localEntriesOrEmpty(saved.LocalEntries),
-		"excluded_domains":      excludedDomainsOrEmpty(saved.ExcludedDomains),
+		"proxy_exceptions":      stringsOrEmpty(saved.ProxyExceptions),
 		"inventory_override":    stringsOrEmpty(saved.InventoryOverride),
 		"sync_interval_seconds": saved.SyncInterval,
 	}
@@ -506,7 +455,7 @@ func (h *Handlers) applyPolicySettings(ctx context.Context, settings policy.Sett
 	}
 
 	store := policy.NewFileStore(h.policyStoreDir())
-	return h.vpnSvc.StartPolicyRouting(ctx, settings, store, string(settings.Preset))
+	return h.vpnSvc.StartPolicyRouting(ctx, settings, store)
 }
 
 // SyncPolicyHandler serves POST /api/vpn/policy/sync.
@@ -579,7 +528,7 @@ func (h *Handlers) GetPolicyStatsHandler(w http.ResponseWriter, r *http.Request)
 
 		status := h.vpnSvc.PolicyStatusSnapshot()
 		stats["enabled"] = status.Enabled
-		stats["active_rules"] = status.DomainCount + status.CIDRCount
+		stats["active_rules"] = status.CIDRCount
 		stats["sync_state"] = status.SyncState
 	}
 

@@ -3,11 +3,8 @@ package vpn
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"net/netip"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,177 +12,167 @@ import (
 )
 
 // These are the permanent regression oracles for issue #678 finding F678-04: a
-// manual sync that is still in flight when the operator saves a different source
+// sync that is still in flight when the operator saves a different configuration
 // used to commit and publish its old generation after the replacement had already
-// been accepted. Settings and runtime status then named the new source while both
-// the live matcher and the durable generation held the old one's rules.
+// been accepted. Settings and runtime status then named the new configuration
+// while both the live matcher and the durable generation held the old one's rules.
 //
-// The decisive condition is a *held* HTTPS response, not a timing window: the
-// fixture blocks the old source's fetch until the test releases it, so the stale
-// commit is attempted strictly after the replacement published. Everything else —
-// the service entry points, the write-ownership boundary, the real syncer, parser,
-// FileStore and matcher — is production code. Only TLS trust and the dial target
-// are substituted, both fixture-scoped.
+// The policy content a save changes is the operator's IPv4 exception list, so the
+// two configurations below differ in exactly that. The decisive condition is a
+// durable write held open across a replacement, not a timing window: the fixture
+// store blocks the incumbent's next commit until the test releases it, so the stale
+// commit is attempted strictly after the replacement published.
+//
+// Everything in the path — the service entry points, the write-ownership boundary,
+// the real syncer, the file store beneath the fixture wrapper and the matcher — is
+// production code. Only the packet device is substituted, so no /dev/net/tun is
+// required.
 
-// policyGate is a per-path request gate for the fixture list server.
-type policyGate struct {
-	mu       sync.Mutex
-	counts   map[string]int
-	blockAt  int
-	blocked  chan struct{} // closed when a request reaches the gate
-	release  chan struct{} // closed by the test to let the held request finish
-	released bool
+func mustAddr(t *testing.T, raw string) netip.Addr {
+	t.Helper()
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	return addr
 }
 
-func newPolicyGate() *policyGate {
-	return &policyGate{
-		counts:  make(map[string]int),
-		blocked: make(chan struct{}),
+// ownershipConfigs returns two records that differ only in their exception
+// prefixes, so replacing one with the other is a genuine configuration change with
+// distinguishable content.
+func ownershipConfigs() (policy.Settings, policy.Settings) {
+	a := policy.DefaultSettings()
+	a.Enabled = true
+	a.ProxyExceptions = []string{"203.0.113.0/24"}
+
+	b := policy.DefaultSettings()
+	b.Enabled = true
+	b.ProxyExceptions = []string{"198.51.100.0/24", "192.0.2.0/24"}
+	return a, b
+}
+
+// lkgStoreFor writes a configuration-matching durable generation so activation can
+// publish real rules without any network access, and so the shrink-guard baseline
+// is genuine rather than absent.
+//
+// The config hash comes from a throwaway syncer, so the fixture cannot drift from
+// the production hash definition.
+func lkgStoreFor(t *testing.T, settings policy.Settings) *policy.FileStore {
+	t.Helper()
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	probe, err := policy.NewSyncer(policy.NewMatcher(), policy.NewFileStore(t.TempDir()), cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer for the config hash: %v", err)
+	}
+	prefixes := make([]string, 0, len(cfg.LocalRules.CIDRs))
+	for _, prefix := range cfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-audit-seed",
+		Version:       1,
+		CreatedAt:     time.Now().UTC(),
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
+	}
+	store := policy.NewFileStore(t.TempDir())
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed durable generation: %v", err)
+	}
+	return store
+}
+
+// holdNthCommitStore forwards to a production FileStore but holds the commit
+// numbered `hold` open until the test releases it. Every other commit passes
+// straight through.
+//
+// It exists because the durable commit and the live publication are one critical
+// section inside the write-ownership boundary: holding the commit open is the only
+// way to create "the incumbent has prepared a candidate but has not written it yet"
+// without touching production code.
+type holdNthCommitStore struct {
+	inner policy.Store
+	hold  int
+
+	mu       sync.Mutex
+	commits  int
+	reached  chan struct{}
+	release  chan struct{}
+	reachedN int
+}
+
+func newHoldNthCommitStore(inner policy.Store, hold int) *holdNthCommitStore {
+	return &holdNthCommitStore{
+		inner:   inner,
+		hold:    hold,
+		reached: make(chan struct{}, 1),
 		release: make(chan struct{}),
 	}
 }
 
-// holdFrom makes the next request for path block until release is closed.
-func (g *policyGate) holdFrom(path string) {
-	g.mu.Lock()
-	g.blockAt = g.counts[path] + 1
-	g.mu.Unlock()
-}
+// waitForHold reports the channel that fires when the held commit has arrived.
+func (s *holdNthCommitStore) waitForHold() <-chan struct{} { return s.reached }
 
-func (g *policyGate) count(path string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.counts[path]
-}
-
-// admit records a request and reports whether it must wait for the release.
-func (g *policyGate) admit(path string) bool {
-	g.mu.Lock()
-	g.counts[path]++
-	hold := g.blockAt > 0 && g.counts[path] >= g.blockAt
-	alreadyReleased := g.released
-	g.mu.Unlock()
-	if !hold || alreadyReleased {
-		return false
+// releaseHold lets the held commit proceed.
+func (s *holdNthCommitStore) releaseHold() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reachedN != 0 {
+		return
 	}
-	select {
-	case <-g.blocked:
-	default:
-		close(g.blocked)
-	}
-	<-g.release
-	return true
+	s.reachedN = 1
+	close(s.release)
 }
 
-func (g *policyGate) releaseAll() {
-	g.mu.Lock()
-	if !g.released {
-		g.released = true
-		close(g.release)
-	}
-	g.mu.Unlock()
-}
+func (s *holdNthCommitStore) Commit(ctx context.Context, gen *policy.Generation) error {
+	s.mu.Lock()
+	s.commits++
+	mine := s.commits
+	s.mu.Unlock()
 
-// newGatedPolicyServer serves one list per path with an optional block.
-func newGatedPolicyServer(gate *policyGate, lists map[string][]string) *httptest.Server {
-	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		list, ok := lists[r.URL.Path]
-		if !ok {
-			http.Error(w, "no such list", http.StatusNotFound)
-			return
+	if mine == s.hold {
+		select {
+		case s.reached <- struct{}{}:
+		default:
 		}
-		// admit blocks this request until the test releases the gate, which is what
-		// keeps the retired source's response in flight; the list is served once the
-		// replacement has been accepted.
-		gate.admit(r.URL.Path)
-		w.Header().Set("Content-Type", "text/plain")
-		for _, domain := range list {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-}
-
-// policySettingsForURL returns enabled custom-URL settings for one fixture list.
-func policySettingsForURL(t *testing.T, url string) policy.Settings {
-	t.Helper()
-	s := policy.DefaultSettings()
-	s.Enabled = true
-	s.Preset = policy.PresetCustom
-	s.CustomURLs = []string{url}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("fixture settings for %s are invalid: %v", url, err)
+		<-s.release
 	}
-	return s
+	return s.inner.Commit(ctx, gen)
 }
 
-// fixtureFetcherFor builds the real production Fetcher for one fixture server and
-// sync configuration.
-func fixtureFetcherFor(t *testing.T, server *httptest.Server, cfg policy.SyncConfig) *policy.Fetcher {
-	t.Helper()
-	fetch, _ := fixtureFetcherAndStore(t, server, cfg)
-	return fetch
-}
-
-// domainList returns n synthetic domains with the given prefix.
-func domainList(prefix string, n int) []string {
-	out := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		out = append(out, fmt.Sprintf("%s%d.example.com", prefix, i))
-	}
-	return out
+func (s *holdNthCommitStore) Load(ctx context.Context) (*policy.Generation, error) {
+	return s.inner.Load(ctx)
 }
 
 // TestReplacedRuntimeCannotOverwriteAcceptedPolicy is the core F678-04 regression.
+//
+// Configuration A becomes the live runtime. A manual sync on it is started and the
+// fixture holds its durable commit open. The operator then saves configuration B,
+// which publishes and takes write ownership. Releasing A's commit must be refused
+// inside the boundary.
 func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
-	const (
-		pathA = "/policy-a.lst"
-		pathB = "/policy-b.lst"
-	)
-	// A serves 20 rules and includes a domain that only A's list knows about.
-	listA := append(domainList("a", 19), "stale-a-only.example.com")
-	// B serves 12 rules (>= 50% of A, so the shrink guard is not what refuses
-	// anything here) and includes the domain that must stay protected.
-	listB := append(domainList("b", 11), "new-protected.example.com")
-
-	gate := newPolicyGate()
-	server := newGatedPolicyServer(gate, map[string][]string{pathA: listA, pathB: listB})
-	defer server.Close()
-	t.Cleanup(gate.releaseAll)
-
-	settingsA := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	settingsB := policySettingsForURL(t, "https://audit-b.example"+pathB)
-
-	// The service builds its syncers through this seam, so its activation and its
-	// manual sync reach the fixture through the real fetch pipeline.
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
-	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
+	settingsA, settingsB := ownershipConfigs()
 
 	withNameOwnedWANDevice(t, newNameRegistry())
 	svc := serviceForActivation(t)
 	t.Cleanup(svc.StopPolicyRouting)
 
-	// A becomes the live runtime, seeded from a durable last-known-good generation
-	// for A's exact configuration so activation needs no network round trip first.
-	store := auditedLKGStore(t, settingsA)
-	if err := svc.StartPolicyRouting(context.Background(), settingsA, store, string(settingsA.Preset)); err != nil {
-		t.Fatalf("activation of source A failed: %v", err)
+	inner := lkgStoreFor(t, settingsA)
+	// Commit 1 is the seeded generation above; commit 2 is activation's own sync;
+	// commit 3 is the manual sync under test.
+	store := newHoldNthCommitStore(inner, 3)
+	t.Cleanup(store.releaseHold)
+
+	if err := svc.StartPolicyRouting(context.Background(), settingsA, store); err != nil {
+		t.Fatalf("activation of configuration A failed: %v", err)
 	}
 	hashA := svc.policyRuntime().syncer.ConfigHash()
 
-	// Wait until A's own immediate refresh has run, so the gate below can be aimed
-	// at exactly the manual request instead of catching the loop's update.
-	deadline := time.Now().Add(15 * time.Second)
-	for gate.count(pathA) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("source A's activation and immediate refresh never completed (requests=%d)", gate.count(pathA))
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Hold A's next fetch, then start the manual sync that will be left in flight.
-	gate.holdFrom(pathA)
 	type syncOutcome struct {
 		res policy.SyncResult
 		err error
@@ -194,9 +181,9 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 	manualCtx, cancelManual := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelManual()
 	go func() {
-		// The loop may still be finishing its own immediate update when this starts,
-		// in which case the single-flight guard answers ErrSyncInProgress. That is
-		// not the scenario under test, so retry until an attempt is accepted.
+		// The activation handshake may still be finishing its own update, in which
+		// case the single-flight guard answers ErrSyncInProgress. That is not the
+		// scenario under test, so retry until an attempt is accepted.
 		for {
 			res, err := svc.SyncPolicyNow(manualCtx)
 			if errors.Is(err, policy.ErrSyncInProgress) && manualCtx.Err() == nil {
@@ -207,33 +194,28 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 			return
 		}
 	}()
+
 	select {
-	case <-gate.blocked:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the manual sync never reached the fixture server; the held-response scenario did not run")
+	case <-store.waitForHold():
+	case outcome := <-manual:
+		t.Fatalf("the manual sync finished before its commit was held (err=%v); the scenario did not run", outcome.err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the manual sync never reached its durable commit; the held-write scenario did not run")
 	}
 
-	// The operator now saves a different source. This publishes B and registers it.
-	if err := svc.StartPolicyRouting(context.Background(), settingsB, store, string(settingsB.Preset)); err != nil {
-		t.Fatalf("replacement with source B failed: %v", err)
-	}
-	// Wait for B's own immediate refresh inside the new scheduling loop, so the
-	// release below happens strictly after B is both accepted and refreshed.
-	deadline = time.Now().Add(15 * time.Second)
-	for gate.count(pathB) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("B's immediate refresh never ran (requests=%d)", gate.count(pathB))
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The operator now saves a different configuration. This publishes B and takes
+	// write ownership.
+	if err := svc.StartPolicyRouting(context.Background(), settingsB, store); err != nil {
+		t.Fatalf("replacement with configuration B failed: %v", err)
 	}
 
-	// Release A's held response: its stale generation must not be written.
-	gate.releaseAll()
+	// Release A's held commit: its stale generation must not land.
+	store.releaseHold()
 	var outcome syncOutcome
 	select {
 	case outcome = <-manual:
-	case <-time.After(20 * time.Second):
-		t.Fatal("the manual sync never returned after its response was released")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the manual sync never returned after its commit was released")
 	}
 	if outcome.err == nil {
 		t.Fatal("the superseded manual sync reported success (F678-04: a retired runtime published its stale generation)")
@@ -242,8 +224,7 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 		t.Fatalf("the superseded manual sync failed for an unrelated reason: %v", outcome.err)
 	}
 
-	// Live policy: B's protected rule is present and A's stale-only rule never came
-	// back.
+	// Live policy: B's prefixes are present and A's is gone.
 	live := svc.PolicyMatcher()
 	if live == nil {
 		t.Fatal("no live matcher after the replacement")
@@ -252,18 +233,18 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 	if snap == nil {
 		t.Fatal("no live snapshot after the replacement")
 	}
-	if !snap.MatchDomain("new-protected.example.com") {
-		t.Fatalf("the accepted source's protected rule is gone from the live policy after the stale sync (F678-04): %d rules", snap.DomainCount())
+	if !snap.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Fatal("the accepted configuration's prefix is gone from the live policy after the stale sync (F678-04)")
 	}
-	if snap.MatchDomain("stale-a-only.example.com") {
-		t.Fatal("the retired source's rule is live again: the superseded sync published its generation (F678-04)")
+	if !snap.MatchIPv4(mustAddr(t, "192.0.2.7")) {
+		t.Fatal("the accepted configuration's second prefix is missing from the live policy")
 	}
-	if got := snap.DomainCount(); got != len(listB) {
-		t.Fatalf("live policy has %d rules, want the accepted source's %d (F678-04)", got, len(listB))
+	if snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the retired configuration's prefix is live again: the superseded sync published its generation (F678-04)")
 	}
 
 	// Durable policy: reload from the store, not from memory.
-	gen, err := store.Load(context.Background())
+	gen, err := inner.Load(context.Background())
 	if err != nil {
 		t.Fatalf("reload the durable generation: %v", err)
 	}
@@ -272,26 +253,27 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 	}
 	hashB := svc.policyRuntime().syncer.ConfigHash()
 	if hashA == hashB {
-		t.Fatal("fixture is invalid: the two sources share a configuration hash")
+		t.Fatal("fixture is invalid: the two configurations share a configuration hash")
 	}
 	if gen.ConfigHash != hashB {
-		t.Fatalf("durable generation belongs to %s, want the accepted source %s (F678-04: the stale sync committed)", gen.ConfigHash, hashB)
+		t.Fatalf("durable generation belongs to %s, want the accepted configuration %s (F678-04: the stale sync committed)", gen.ConfigHash, hashB)
 	}
-	if _, ok := gen.Domains["stale-a-only.example.com"]; ok {
-		t.Fatal("the durable generation contains the retired source's rule (F678-04)")
-	}
-	if _, ok := gen.Domains["new-protected.example.com"]; !ok {
-		t.Fatal("the durable generation lost the accepted source's protected rule (F678-04)")
+	for _, prefix := range gen.CIDRs {
+		if prefix == "203.0.113.0/24" {
+			t.Fatal("the durable generation contains the retired configuration's prefix (F678-04)")
+		}
 	}
 
-	// Settings and runtime status still identify the accepted source.
+	// Runtime settings and status still identify the accepted configuration.
 	runtimeSettings := svc.policyRuntime().settings
-	if len(runtimeSettings.CustomURLs) != 1 || runtimeSettings.CustomURLs[0] != settingsB.CustomURLs[0] {
-		t.Fatalf("runtime settings identify %v, want the accepted source %v", runtimeSettings.CustomURLs, settingsB.CustomURLs)
+	if len(runtimeSettings.ProxyExceptions) != len(settingsB.ProxyExceptions) {
+		t.Fatalf("runtime settings identify %v, want the accepted configuration %v",
+			runtimeSettings.ProxyExceptions, settingsB.ProxyExceptions)
 	}
 	status := svc.PolicyStatusSnapshot()
-	if status.DomainCount != len(listB) {
-		t.Fatalf("runtime status reports %d rules, want the accepted source's %d (F678-04)", status.DomainCount, len(listB))
+	if status.CIDRCount != len(settingsB.ProxyExceptions) {
+		t.Fatalf("runtime status reports %d prefixes, want the accepted configuration's %d (F678-04)",
+			status.CIDRCount, len(settingsB.ProxyExceptions))
 	}
 	if status.LastError != "" {
 		t.Fatalf("runtime status reports an error after a successful replacement: %q", status.LastError)
@@ -303,111 +285,102 @@ func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
 
 // TestSuccessfulManualSyncStillPublishesOnCurrentSource keeps the F678-04 boundary
 // from turning every manual sync into a refusal: the current runtime must still be
-// able to sync and publish on demand.
+// able to publish on demand.
 func TestSuccessfulManualSyncStillPublishesOnCurrentSource(t *testing.T) {
-	const pathA = "/policy-a.lst"
-	var grown atomic.Bool
-	gate := newPolicyGate()
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gate.admit(r.URL.Path)
-		w.Header().Set("Content-Type", "text/plain")
-		list := domainList("a", 20)
-		if grown.Load() {
-			list = append(list, "manual-sync.example.com")
-		}
-		for _, domain := range list {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-	defer server.Close()
-
-	settings := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
-	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
-
 	withNameOwnedWANDevice(t, newNameRegistry())
 	svc := serviceForActivation(t)
 	t.Cleanup(svc.StopPolicyRouting)
 
-	store := auditedLKGStore(t, settings)
-	if err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset)); err != nil {
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
+
+	store := lkgStoreFor(t, settings)
+	if err := svc.StartPolicyRouting(context.Background(), settings, store); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
 
-	grown.Store(true)
 	res, err := svc.SyncPolicyNow(context.Background())
 	if err != nil {
-		t.Fatalf("manual sync on the current source failed: %v", err)
+		t.Fatalf("manual sync on the current configuration failed: %v", err)
 	}
-	if !res.Published {
-		t.Fatal("manual sync on the current source did not publish")
+	if res.GenerationID == "" {
+		t.Fatal("the manual sync published no generation identity")
 	}
 	snap := svc.PolicyMatcher().Current()
-	if snap == nil || !snap.MatchDomain("manual-sync.example.com") {
-		t.Fatal("the manual sync's new rule is not live: a working manual sync was refused")
+	if snap == nil || !snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the manual sync left no rule-bearing snapshot live: a working manual sync was refused")
 	}
 	gen, err := store.Load(context.Background())
 	if err != nil || gen == nil {
-		t.Fatalf("reload durable generation: %v", err)
+		t.Fatalf("the durable generation is unreadable after a successful manual sync: %v", err)
 	}
-	if _, ok := gen.Domains["manual-sync.example.com"]; !ok {
-		t.Fatal("the manual sync's new rule was not committed durably")
+	if gen.GenerationID != res.GenerationID {
+		t.Fatalf("durable generation = %s, want the published %s", gen.GenerationID, res.GenerationID)
 	}
 }
 
-// TestFailedManualSyncKeepsCurrentPolicy is the refused-update control: a manual
-// sync whose source is unavailable reports the failure and changes nothing live or
-// durable, which is the last-known-good behavior the boundary must not disturb.
-func TestFailedManualSyncKeepsCurrentPolicy(t *testing.T) {
-	const pathA = "/policy-a.lst"
-	var fail atomic.Bool
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fail.Load() {
-			http.Error(w, "upstream maintenance", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		for _, domain := range domainList("a", 20) {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-	defer server.Close()
-
-	settings := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
-	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
-
+// TestRetiredRuntimeCannotPublishAfterDisable is the disable half of the same
+// boundary: once the operator turns policy routing off, a sync that was already
+// prepared must be refused rather than resurrect the retired policy.
+func TestRetiredRuntimeCannotPublishAfterDisable(t *testing.T) {
 	withNameOwnedWANDevice(t, newNameRegistry())
 	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
 
-	store := auditedLKGStore(t, settings)
-	if err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset)); err != nil {
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
+
+	inner := lkgStoreFor(t, settings)
+	store := newHoldNthCommitStore(inner, 2)
+	t.Cleanup(store.releaseHold)
+
+	if err := svc.StartPolicyRouting(context.Background(), settings, store); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
-	before, err := store.Load(context.Background())
-	if err != nil || before == nil {
-		t.Fatalf("reload durable generation before the failed sync: %v", err)
+
+	type syncOutcome struct {
+		err error
+	}
+	manual := make(chan syncOutcome, 1)
+	manualCtx, cancelManual := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelManual()
+	go func() {
+		_, err := svc.SyncPolicyNow(manualCtx)
+		manual <- syncOutcome{err: err}
+	}()
+
+	select {
+	case <-store.waitForHold():
+	case <-time.After(30 * time.Second):
+		t.Fatal("the manual sync never reached its durable commit")
 	}
 
-	fail.Store(true)
-	if _, err := svc.SyncPolicyNow(context.Background()); err == nil {
-		t.Fatal("a manual sync against an unavailable source reported success")
+	// The operator disables policy routing: the data path goes away and the write
+	// boundary is retired.
+	svc.StopPolicyRouting()
+	if svc.PBREnabled() {
+		t.Fatal("PBR is still enabled after disable")
 	}
 
-	snap := svc.PolicyMatcher().Current()
-	if snap == nil || snap.DomainCount() != 20 {
-		t.Fatalf("the live policy changed after a failed manual sync: %+v", snap)
+	store.releaseHold()
+	select {
+	case outcome := <-manual:
+		if outcome.err == nil {
+			t.Fatal("a sync prepared before the disable published afterwards (F678-04: retired runtime resurrected the policy)")
+		}
+		if !errors.Is(outcome.err, policy.ErrSyncSuperseded) {
+			t.Fatalf("the retired sync failed for an unrelated reason: %v", outcome.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the manual sync never returned after its commit was released")
 	}
-	after, err := store.Load(context.Background())
-	if err != nil || after == nil {
-		t.Fatalf("reload durable generation after the failed sync: %v", err)
+
+	// The live policy must be the disabled one: no matcher, nothing published.
+	if svc.PolicyMatcher() != nil {
+		t.Fatal("a policy runtime is still registered after disable")
 	}
-	if after.GenerationID != before.GenerationID {
-		t.Fatalf("the durable generation changed after a failed manual sync: %s -> %s", before.GenerationID, after.GenerationID)
+	if svc.DestinationClassifierForTest() != nil {
+		t.Fatal("a destination classifier is still installed after disable")
 	}
 }

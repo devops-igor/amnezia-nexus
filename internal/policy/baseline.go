@@ -75,14 +75,6 @@ func (s *Syncer) AdoptBaseline(ctx context.Context) (BaselineStatus, error) {
 	if gen.ConfigHash != s.computeConfigHash() {
 		return BaselineForeign, nil
 	}
-	// A durable generation records what an older build published, not what the
-	// current guard permits. Adopting one that contains a guarded name would let
-	// the replacement syncer treat those rules as the live baseline; the guard
-	// version is part of neither the generative identity nor the config hash, so
-	// the content itself has to be checked.
-	if violations := generationNeverProxyViolations(gen, s.guardPatterns); len(violations) > 0 {
-		return BaselineForeign, nil
-	}
 	s.cachedGen = gen
 	return BaselinePrimed, nil
 }
@@ -139,7 +131,6 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 		s.status.Version = gen.Version
 		s.status.GenerationID = gen.GenerationID
 		s.status.LastSuccess = gen.CreatedAt
-		s.status.DomainCount = snap.DomainCount()
 		s.status.CIDRCount = snap.CIDRCount()
 		s.statusMu.Unlock()
 		return nil
@@ -150,38 +141,21 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 }
 
 // prepareBaselineSnapshot validates a durable generation against this syncer's
-// configuration and the current never-proxy guard, then compiles it.
+// configuration, then compiles it.
 //
-// BaselineForeign means the generation is not rules for this configuration; the
-// caller may fetch a fresh baseline. An error is reserved for a generation that
-// matches the configuration but cannot be used.
+// BaselineForeign means the generation is not rules for this configuration, so
+// the cycle publishes fresh content instead. An error is reserved for a
+// generation that matches the configuration but cannot be used.
 func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineStatus, error) {
 	if gen.ConfigHash != s.computeConfigHash() {
-		return nil, BaselineForeign, nil
-	}
-	// A durable generation records what an older build published, not what the
-	// current guard permits. Publishing a snapshot with a guarded name would
-	// proxy protected infrastructure exactly when the upstream fetch also fails.
-	if violations := generationNeverProxyViolations(gen, s.guardPatterns); len(violations) > 0 {
 		return nil, BaselineForeign, nil
 	}
 	snap, err := GenerationToSnapshot(gen)
 	if err != nil {
 		return nil, BaselineAbsent, fmt.Errorf("stored policy generation cannot be compiled: %w", err)
 	}
-	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+	if snap.CIDRCount() == 0 {
 		return nil, BaselineAbsent, errors.New("stored policy generation contains no rules")
 	}
 	return snap, BaselinePrimed, nil
-}
-
-// GenerationViolations returns the stored domain rules that this syncer's
-// current guard (built-in patterns plus operator exclusions) forbids. It is the
-// validator the vpn last-known-good fallback uses, so a generation written
-// before an operator exclusion is never published after a restart.
-func (s *Syncer) GenerationViolations(gen *Generation) []string {
-	if s == nil {
-		return GenerationNeverProxyViolations(gen)
-	}
-	return generationNeverProxyViolations(gen, s.guardPatterns)
 }

@@ -26,7 +26,7 @@ import (
 func localOnlySettings(entries []string) policy.Settings {
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.LocalEntries = entries
+	settings.ProxyExceptions = entries
 	return settings
 }
 
@@ -40,11 +40,10 @@ func (noopWANDevice) Write([]byte) (int, error) { return 0, errors.New("no traff
 func (noopWANDevice) Close() error              { return nil }
 
 type localActivationOutcome struct {
-	err             error
-	pbrEnabled      bool
-	classifierSet   bool
-	snapshotCIDRs   int
-	snapshotDomains int
+	err           error
+	pbrEnabled    bool
+	classifierSet bool
+	snapshotCIDRs int
 }
 
 func runLocalOnlyActivation(t *testing.T, settings policy.Settings) localActivationOutcome {
@@ -61,13 +60,12 @@ func runLocalOnlyActivation(t *testing.T, settings policy.Settings) localActivat
 	// install's FileStore returns; any other error would be an unusable store,
 	// which the activation handshake is right to refuse.
 	store := &memoryStore{loadErr: fs.ErrNotExist}
-	err := svc.StartPolicyRouting(context.Background(), settings, store, "")
+	err := svc.StartPolicyRouting(context.Background(), settings, store)
 
 	out := localActivationOutcome{err: err, pbrEnabled: svc.PBREnabled()}
 	if matcher := svc.PolicyMatcher(); matcher != nil {
 		if snap := matcher.Current(); snap != nil {
 			out.snapshotCIDRs = snap.CIDRCount()
-			out.snapshotDomains = snap.DomainCount()
 		}
 	}
 	out.classifierSet = svc.DestinationClassifierForTest() != nil
@@ -85,12 +83,12 @@ func TestLocalOnlyPolicyActivatesWithoutAnySource(t *testing.T) {
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("a local-only record must be valid: %v", err)
 	}
-	sources, err := settings.Sources()
+	cfg, err := settings.SyncConfig()
 	if err != nil {
-		t.Fatalf("Sources() = %v; a local-only record derives no sources rather than an error", err)
+		t.Fatalf("SyncConfig() = %v", err)
 	}
-	if len(sources) != 0 {
-		t.Fatalf("Sources() = %d sources, want 0 for a local-only record", len(sources))
+	if len(cfg.LocalRules.CIDRs) != 2 {
+		t.Fatalf("derived rules = %d prefixes, want the 2 operator entries", len(cfg.LocalRules.CIDRs))
 	}
 
 	out := runLocalOnlyActivation(t, settings)
@@ -105,9 +103,6 @@ func TestLocalOnlyPolicyActivatesWithoutAnySource(t *testing.T) {
 	}
 	if out.snapshotCIDRs != 2 {
 		t.Fatalf("snapshot prefixes = %d, want the 2 operator entries", out.snapshotCIDRs)
-	}
-	if out.snapshotDomains != 0 {
-		t.Fatalf("snapshot domains = %d, want 0: the exception list is addresses only", out.snapshotDomains)
 	}
 }
 
@@ -139,10 +134,7 @@ func TestSyncerAcceptsLocalOnlyConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncConfig() = %v", err)
 	}
-	if len(cfg.Sources) != 0 {
-		t.Fatalf("sources = %d, want 0", len(cfg.Sources))
-	}
-	if _, err := policy.NewSyncer(policy.NewMatcher(), nil, policy.NewFileStore(t.TempDir()), cfg); err != nil {
+	if _, err := policy.NewSyncer(policy.NewMatcher(), policy.NewFileStore(t.TempDir()), cfg); err != nil {
 		t.Fatalf("NewSyncer refused a local-only configuration: %v", err)
 	}
 
@@ -153,7 +145,7 @@ func TestSyncerAcceptsLocalOnlyConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncConfig() = %v", err)
 	}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, policy.NewFileStore(t.TempDir()), emptyCfg)
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), policy.NewFileStore(t.TempDir()), emptyCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer refused an empty configuration instead of leaving the refusal to the publication guard: %v", err)
 	}

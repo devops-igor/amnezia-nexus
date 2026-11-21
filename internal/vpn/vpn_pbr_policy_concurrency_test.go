@@ -169,7 +169,7 @@ func TestDisableDuringActivationIsSerialized(t *testing.T) {
 
 	activateDone := make(chan error, 1)
 	go func() {
-		err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset))
+		err := svc.StartPolicyRouting(context.Background(), settings, store)
 		log.add("activation-returned")
 		activateDone <- err
 	}()
@@ -266,7 +266,7 @@ func TestRepeatedUpdateAndDisableEndsConsistent(t *testing.T) {
 			defer wg.Done()
 			// Offline this returns ErrPolicyActivationNoRules rather than publishing;
 			// what matters is that it cannot corrupt the disable's outcome.
-			_ = svc.StartPolicyRouting(context.Background(), settings, seededStore(t), string(settings.Preset))
+			_ = svc.StartPolicyRouting(context.Background(), settings, seededStore(t))
 		}()
 		go func() {
 			defer wg.Done()
@@ -302,7 +302,10 @@ func TestColdActivationRefusedLeavesNothingOwned(t *testing.T) {
 	svc := serviceForActivation(t)
 	t.Cleanup(func() { svc.StopPolicyRouting() })
 
-	settings := repeatedEnableSettings(t)
+	// A record with no rules and an empty store cannot publish anything, which is
+	// the cold-activation negative: nothing may be owned afterwards.
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
 	err := activateOnce(svc, settings, emptyStore{})
 	if err == nil {
 		t.Fatal("activation with no publishable snapshot must fail closed")
