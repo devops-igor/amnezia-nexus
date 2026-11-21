@@ -97,7 +97,6 @@ const w = dom.window;
 // substituted values) and the runtime sync-state tokens (a token must be looked
 // up in the dictionary, not printed raw).
 w._ = key => {
-  if (key === 'policy_rule_count_value') return '{domains} domains / {cidrs} prefixes';
   if (key.indexOf('policy_sync_state_') === 0) return 'sync:' + key.slice('policy_sync_state_'.length);
   // The two inventory templates whose substitution is under test: everything else
   // resolves to its own key, so an assertion can name the exact key a branch chose.
@@ -161,10 +160,6 @@ const badge = () => {
   return {text: el.textContent, enabled: el.getAttribute('data-enabled')};
 };
 const text = id => w.document.getElementById(id).textContent;
-const selectedPreset = () => {
-  const checked = w.document.querySelector('input[name="policy_preset"]:checked');
-  return checked ? checked.value : '';
-};
 
 // Evaluate the module before the section exists: the auto-init entry point must
 // be inert without a form, and the test then installs the real markup.
@@ -225,15 +220,16 @@ func policyCDNPayloadForTest(t *testing.T) string {
 	return string(encoded)
 }
 
-// policyRecordScript is the API double's default answer: a disabled record with
-// a chosen preset, plus the runtime snapshot and counters the status block reads.
-func policyRecordScript(t *testing.T, enabled bool, preset string) string {
+// policyRecordScript is the API double's default answer: a record carrying an
+// operator exception list, plus the runtime snapshot and counters the status block
+// reads.
+func policyRecordScript(t *testing.T, enabled bool, exceptions string) string {
 	t.Helper()
 	return fmt.Sprintf(`
 const cdn = %s;
-const record = () => ({enabled: %t, preset: '%s', custom_urls: [], sync_interval_seconds: 21600,
+const record = () => ({enabled: %t, proxy_exceptions: %s, sync_interval_seconds: 21600,
   inventory_override: [],
-  status: {enabled: %t, preset: '%s', domain_count: 1234, cidr_count: 56, sync_state: 'synced',
+  status: {enabled: %t, cidr_count: 56, sync_state: 'synced',
            last_success: '2026-11-14T10:00:00Z', last_error: '',
            cdn: cdn,
            inventory: {source: 'ipdeny', source_url: 'https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone',
@@ -244,27 +240,28 @@ responder = async (url, opts) => {
   if (url.endsWith('/stats')) return stats();
   if (url.endsWith('/api/vpn/policy')) return record();
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
-};`, policyCDNPayloadForTest(t), enabled, preset, enabled, preset)
+};`, policyCDNPayloadForTest(t), enabled, exceptions, enabled)
 }
 
 func TestPolicyRoutingControllerInitialRender(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24", "198.51.100.7/32"]`), `
 assert.equal(toggle(), false, 'the saved record is disabled, so the toggle must be off');
-assert.equal(selectedPreset(), 'geoblock', 'the saved preset must be selected');
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value,
+  '203.0.113.0/24\n198.51.100.7/32',
+  'the saved exception list must be shown as stored, one entry per line');
 assert.equal(badge().enabled, 'false', 'a disabled record must not render an enabled badge');
 assert.equal(badge().text, 'policy_status_disabled');
-assert.equal(text('policyActivePreset'), 'policy_preset_geoblock');
 assert.match(text('policyLastSuccess'), /\d{4}|\d{1,2}:\d{2}/, 'the last success must be a timestamp, not "never"');
 assert.equal(text('policyLastError'), 'policy_none');
-assert.equal(text('policyRuleCount'), '1234 domains / 56 prefixes');
+assert.equal(text('policyRuleCount'), '56', 'the rule count is the published prefix count');
 assert.equal(text('policySyncState'), 'sync:synced',
   'the runtime sync-state token must be looked up in the dictionary, not printed raw');
 assert.equal(text('policyProxyBytes'), '2.00 KiB');
 assert.equal(text('policyDirectBytes'), '1.00 MiB');
 assert.equal(text('policyProxyDrops'), '3');
 assert.equal(text('policyDirectDrops'), '0');
-assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, 'none',
-  'the custom URL box must stay hidden for a preset that carries no URLs');
+assert.equal(w.document.getElementById('policyCustomUrlsGroup'), null,
+  'the removed custom-URL group must not be rendered');
 // The inventory block reports the shipped set's own provenance and says plainly
 // that no operator override is in force.
 assert.equal(text('policyInventorySource'), 'ipdeny');
@@ -280,44 +277,43 @@ assert.equal(requestsTo('/api/vpn/policy/stats', 'GET').length, 1, 'counters com
 }
 
 func TestPolicyRoutingControllerSaveAccepted(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, ""), `
-// The operator picks a preset and toggles the master switch on; the server
-// accepts both.
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `[]`), `
+// The operator types an exception list and toggles the master switch on; the
+// server accepts both.
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 1};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
-    return {status: 'ok', enabled: true, preset: 'russia_inside', custom_urls: [],
+    return {status: 'ok', enabled: true, proxy_exceptions: ['203.0.113.0/24'],
             sync_interval_seconds: 21600,
-            policy_status: {enabled: true, preset: 'russia_inside', domain_count: 7, cidr_count: 0,
+            policy_status: {enabled: true, cidr_count: 1,
                             sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}};
   }
-  if (url.endsWith('/api/vpn/policy')) return {enabled: false, preset: '', custom_urls: [],
+  if (url.endsWith('/api/vpn/policy')) return {enabled: false, proxy_exceptions: [],
     sync_interval_seconds: 21600,
-    status: {enabled: false, preset: '', domain_count: 0, cidr_count: 0, sync_state: 'disabled'}};
+    status: {enabled: false, cidr_count: 0, sync_state: 'disabled'}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
-w.document.getElementById('policy_preset_russia_inside').checked = true;
+editField('policy_proxy_exceptions', ' 203.0.113.0/24 ');
 w.document.getElementById('policy_enabled').checked = true;
 await w.savePolicySettings();
 await settle();
 
 const puts = requestsTo('/api/vpn/policy', 'PUT');
 assert.equal(puts.length, 1, 'one save is exactly one PUT');
-assert.deepEqual(puts[0].body, {enabled: true, preset: 'russia_inside', custom_urls: [],
-                                local_entries: [], excluded_domains: [], inventory_override: [],
-                                sync_interval_seconds: 21600},
-  'the save payload carries the operator intent and the preserved interval');
+assert.deepEqual(puts[0].body, {enabled: true, proxy_exceptions: ['203.0.113.0/24'],
+                                inventory_override: [], sync_interval_seconds: 21600},
+  'the save payload carries the operator intent and the preserved interval, and no source field');
 assert.equal(alertText().state, 'success', 'an accepted save is reported as success');
 assert.equal(alertText().text, 'policy_saved');
 assert.equal(toggle(), true, 'the accepted record is reflected in the form');
 assert.equal(badge().enabled, 'true', 'the runtime snapshot the server returned is enabled');
-assert.equal(text('policyRuleCount'), '7 domains / 0 prefixes');
+assert.equal(text('policyRuleCount'), '1', 'the rule count is the published prefix count');
 assert.equal(text('policyDirectDrops'), '1', 'counters are refreshed from the stats endpoint');
 `)
 }
 
 func TestPolicyRoutingControllerRefusedEnableIsNotShownEnabled(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), `
 // The operator asks for enablement; activation is refused (missing direct
 // egress). What the server is running is refreshed by a separate read; the
 // operator's edit stays in the form, marked unsaved.
@@ -332,8 +328,8 @@ responder = async (url, opts) => {
     throw err;
   }
   if (url.endsWith('/api/vpn/policy')) {
-    return {enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 21600,
-            status: {enabled: false, preset: 'geoblock', domain_count: 5, cidr_count: 0,
+    return {enabled: false, sync_interval_seconds: 21600,
+            status: {enabled: false, cidr_count: 0,
                      sync_state: 'error', last_success: '', last_error: 'direct egress is unavailable'}};
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
@@ -362,14 +358,14 @@ assert.equal(text('policyLastError'), 'direct egress is unavailable',
 }
 
 func TestPolicyRoutingControllerRefusedSaveRestoresLastKnownRecord(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "antifilter_domains"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["198.51.100.0/24"]`), `
 // The refusal happens and the follow-up status read fails too. The edit stays in
 // the form, marked unsaved, and the last runtime observation stays on screen.
 responder = async (url, opts) => {
   if (opts.method === 'PUT' || opts.method === 'POST') {
-    const err = new Error('policy preset must be selected');
+    const err = new Error('proxy exception rejected: proxy exception must be an IPv4 address or prefix');
     err.status = 400;
-    err.data = {error: 'validation_failed', detail: 'policy preset must be selected'};
+    err.data = {error: 'validation_failed', detail: 'proxy exception rejected: proxy exception must be an IPv4 address or prefix'};
     throw err;
   }
   throw new Error('backend unavailable');
@@ -378,17 +374,18 @@ editToggle(true);
 await w.savePolicySettings();
 await settle();
 
-assert.ok(alertText().text.indexOf('policy preset must be selected') !== -1,
+assert.ok(alertText().text.indexOf('proxy exception rejected') !== -1,
   'the validation detail must be surfaced, got: ' + alertText().text);
 assert.equal(toggle(), true, 'the refused edit must stay in the form');
-assert.equal(selectedPreset(), 'antifilter_domains', 'a field the operator did not touch is unchanged');
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value, '198.51.100.0/24',
+  'a field the operator did not touch is unchanged');
 assert.equal(unsavedBadge().text, 'settings_unsaved', 'a failed status read must not clear the unsaved mark');
 assert.equal(badge().enabled, 'false', 'a failed status read keeps the last runtime observation');
 `)
 }
 
 func TestPolicyRoutingControllerSyncFailureAndSuccess(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, true, "russia_inside"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, true, `["203.0.113.0/24"]`), `
 // 1. The sync fails: the server says why, and the button becomes usable again.
 responder = async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/sync')) {
@@ -399,8 +396,8 @@ responder = async (url, opts) => {
   }
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy')) {
-    return {enabled: true, preset: 'russia_inside', custom_urls: [], sync_interval_seconds: 21600,
-            status: {enabled: true, preset: 'russia_inside', domain_count: 5, cidr_count: 0,
+    return {enabled: true, sync_interval_seconds: 21600,
+            status: {enabled: true, cidr_count: 0,
                      sync_state: 'error', last_success: '', last_error: 'VPN data plane is not available'}};
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
@@ -424,12 +421,12 @@ assert.ok(requestsTo('/api/vpn/policy/sync', 'POST').length === 1, 'exactly one 
 responder = async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/sync')) {
     return {status: 'ok', published: true, version: 2, generation_id: 'gen-2',
-            policy_status: {enabled: true, preset: 'russia_inside', domain_count: 10, cidr_count: 4,
+            policy_status: {enabled: true, cidr_count: 4,
                             sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   }
   if (url.endsWith('/stats')) return {proxy_bytes: 4096, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
-  if (url.endsWith('/api/vpn/policy')) return {enabled: true, preset: 'russia_inside', custom_urls: [],
-    sync_interval_seconds: 21600, status: {enabled: true, preset: 'russia_inside', domain_count: 10,
+  if (url.endsWith('/api/vpn/policy')) return {enabled: true,
+    sync_interval_seconds: 21600, status: {enabled: true, 
     cidr_count: 4, sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
@@ -438,33 +435,29 @@ await settle();
 
 assert.equal(alertText().state, 'success', 'a completed sync is reported as success');
 assert.equal(alertText().text, 'policy_sync_ok');
-assert.equal(text('policyRuleCount'), '10 domains / 4 prefixes', 'the status block adopts the new snapshot');
+assert.equal(text('policyRuleCount'), '4', 'the status block adopts the new snapshot');
 assert.equal(text('policyLastError'), 'policy_none', 'a recovered sync clears the reported error');
 assert.equal(text('policyProxyBytes'), '4.00 KiB', 'counters are re-read after a successful sync');
 `)
 }
 
-func TestPolicyRoutingControllerCustomURLPayload(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "custom"), `
-// The custom preset is the only one that sends URLs; the list is trimmed and
-// blank lines are dropped. Validation itself stays server-side.
-assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, 'block',
-  'the custom URL box is shown for the custom preset');
-editField('policy_custom_urls',
-  '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n');
-editField('policy_local_entries', ' local.example \n\n 198.51.100.0/24 ');
-editField('policy_excluded_domains', ' internal.api.example.com \n\n *.corp.example ');
+func TestPolicyRoutingControllerExceptionListPayload(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `[]`), `
+// The exception list is the section's one input. It is trimmed, blank lines are
+// dropped, and validation itself stays server-side.
+editField('policy_proxy_exceptions',
+  '  203.0.113.0/24  \n\n 198.51.100.7 \n');
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
-    const err = new Error('custom URL 1 rejected: scheme must be https');
+    const err = new Error('proxy exception rejected: proxy exception must be an IPv4 address or prefix');
     err.status = 400;
-    err.data = {error: 'validation_failed', detail: 'custom URL 1 rejected: scheme must be https'};
+    err.data = {error: 'validation_failed', detail: 'proxy exception rejected: proxy exception must be an IPv4 address or prefix'};
     throw err;
   }
   if (url.endsWith('/api/vpn/policy')) {
-    return {enabled: false, preset: 'custom', custom_urls: ['https://lists.example.com/a.lst'],
-            sync_interval_seconds: 21600, status: {enabled: false, sync_state: 'disabled'}};
+    return {enabled: false, proxy_exceptions: [], sync_interval_seconds: 21600,
+            status: {enabled: false, sync_state: 'disabled'}};
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
@@ -473,21 +466,18 @@ await settle();
 
 const puts = requestsTo('/api/vpn/policy', 'PUT');
 assert.equal(puts.length, 1, 'one save is exactly one PUT');
-assert.deepEqual(puts[0].body.custom_urls,
-  ['https://lists.example.com/a.lst', 'https://lists.example.com/b.lst'],
-  'the payload carries the operator URLs, trimmed, in order');
-assert.deepEqual(puts[0].body.local_entries,
-  ['local.example', '198.51.100.0/24'],
-  'the payload carries local entries in order; blank/comment handling stays server-side');
-assert.deepEqual(puts[0].body.excluded_domains,
-  ['internal.api.example.com', '*.corp.example'],
-  'the payload carries excluded domains, trimmed and without blank lines');
-assert.ok(alertText().text.indexOf('scheme must be https') !== -1,
+assert.deepEqual(puts[0].body.proxy_exceptions,
+  ['203.0.113.0/24', '198.51.100.7'],
+  'the payload carries the operator entries, trimmed and without blank lines');
+assert.ok(!('custom_urls' in puts[0].body), 'the payload carries no source URL field');
+assert.ok(!('preset' in puts[0].body), 'the payload carries no source selection');
+assert.ok(!('excluded_domains' in puts[0].body), 'the payload carries no domain exclusion field');
+assert.ok(alertText().text.indexOf('proxy exception rejected') !== -1,
   'the server validation detail is surfaced, got: ' + alertText().text);
 // A rejected entry is not stored, and it is not discarded either: the operator's
-// text is still in the box so the URL can be corrected.
-assert.equal(w.document.getElementById('policy_custom_urls').value,
-  '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n',
+// text is still in the box so it can be corrected.
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value,
+  '  203.0.113.0/24  \n\n 198.51.100.7 \n',
   'the refused input stays in the editor');
 assert.equal(unsavedBadge().text, 'settings_unsaved');
 `)
@@ -497,12 +487,12 @@ assert.equal(unsavedBadge().text, 'settings_unsaved');
 // and one sync in flight. Disabling the button is not enough on its own: pressing
 // Enter in the form reaches the submit handler while the button is already done.
 func TestPolicyRoutingControllerSingleFlight(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), `
 let putCalls = 0;
 let syncCalls = 0;
-const accepted = () => ({status: 'ok', enabled: true, preset: 'geoblock', custom_urls: [],
+const accepted = () => ({status: 'ok', enabled: true,
   sync_interval_seconds: 21600,
-  policy_status: {enabled: true, preset: 'geoblock', domain_count: 1, cidr_count: 0,
+  policy_status: {enabled: true, cidr_count: 0,
                   sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}});
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
@@ -510,7 +500,7 @@ responder = async (url, opts) => {
     syncCalls++;
     await new Promise(resolve => setTimeout(resolve, 10));
     return {status: 'ok', published: true,
-            policy_status: {enabled: true, preset: 'geoblock', sync_state: 'synced'}};
+            policy_status: {enabled: true, sync_state: 'synced'}};
   }
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     putCalls++;
@@ -546,16 +536,17 @@ func TestPolicyRoutingControllerSaveBlockedUntilRecordLoads(t *testing.T) {
 	runPolicyControllerScenario(t, `
 let releaseInitial = null;
 const initialGate = new Promise(resolve => { releaseInitial = resolve; });
-// The stored record is enabled and carries a non-default refresh interval.
-let stored = {enabled: true, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200,
-  status: {enabled: true, preset: 'geoblock', sync_state: 'synced', domain_count: 9, cidr_count: 1,
+// The stored record is enabled, carries a non-default refresh interval and an
+// operator exception list, so the load has something to reveal.
+let stored = {enabled: true, proxy_exceptions: ['203.0.113.0/24'], sync_interval_seconds: 7200,
+  status: {enabled: true, sync_state: 'synced', cidr_count: 1,
            last_success: '2026-11-15T00:00:00Z', last_error: ''}};
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (opts.method === 'PUT') {
     const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
     stored = Object.assign({}, body,
-      {status: {enabled: body.enabled, preset: body.preset, sync_state: 'disabled'}});
+      {status: {enabled: body.enabled, sync_state: 'disabled'}});
     return Object.assign({}, stored, {status: 'ok', policy_status: stored.status});
   }
   // The first read is held: the record has not reached the form yet.
@@ -570,8 +561,8 @@ assert.equal(w.document.getElementById('policySaveBtn').disabled, true,
 assert.equal(w.document.getElementById('policyRoutingForm').getAttribute('data-policy-ready'), 'false',
   'the section must advertise that it is not ready');
 
-// The operator picks a preset and clicks the real control.
-w.document.getElementById('policy_preset_geoblock').checked = true;
+// The operator edits the exception list and clicks the real control.
+editField('policy_proxy_exceptions', '203.0.113.0/24');
 w.document.getElementById('policySaveBtn').click();
 await settle();
 assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
@@ -591,13 +582,13 @@ assert.ok(alertText().text.indexOf('policy_not_ready') !== -1,
 releaseInitial();
 await settle();
 assert.equal(toggle(), true, 'the loaded record is the stored enabled one');
-assert.equal(selectedPreset(), 'geoblock');
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value, '203.0.113.0/24');
 assert.equal(badge().enabled, 'true', 'the runtime snapshot arrived with the record');
 assert.equal(w.document.getElementById('policyRoutingForm').getAttribute('data-policy-ready'), 'true');
 // A loaded record is the saved state, so nothing is staged and Save stays
 // disabled until the operator changes something (SET2-12).
 assert.equal(w.document.getElementById('policySaveBtn').disabled, true, 'a clean card does not commit');
-editField('policy_local_entries', 'local.example');
+editField('policy_proxy_exceptions', '198.51.100.0/24');
 assert.equal(w.document.getElementById('policySaveBtn').disabled, false, 'an edited, loaded card can commit');
 
 // Ordinary post-load control: the accepted save still works, and it carries the
@@ -607,7 +598,7 @@ await settle();
 const puts = requestsTo('/api/vpn/policy', 'PUT');
 assert.equal(puts.length, 1, 'one post-load save is exactly one PUT');
 assert.equal(puts[0].body.enabled, true);
-assert.equal(puts[0].body.preset, 'geoblock');
+assert.deepEqual(puts[0].body.proxy_exceptions, ['198.51.100.0/24']);
 assert.equal(puts[0].body.sync_interval_seconds, 7200,
   'the loaded non-default interval must be preserved, not reset to 0');
 assert.equal(alertText().state, 'success');
@@ -621,9 +612,9 @@ assert.equal(alertText().state, 'success');
 func TestPolicyRoutingControllerFailedRecoveryKeepsRuntimeState(t *testing.T) {
 	runPolicyControllerScenario(t, `
 let offline = false;
-const stored = () => ({enabled: true, preset: 'geoblock', custom_urls: [],
+const stored = () => ({enabled: true,
   sync_interval_seconds: 7200,
-  status: {enabled: false, preset: 'geoblock', sync_state: 'error', domain_count: 0, cidr_count: 0,
+  status: {enabled: false, sync_state: 'error', cidr_count: 0,
            last_success: '', last_error: 'activation failed: list source unavailable'}});
 responder = async (url) => {
   if (offline) throw new TypeError('Failed to fetch');
@@ -656,8 +647,8 @@ assert.equal(text('policySyncState'), 'sync:error');
 // Ordinary control: a fresh observation that reports an active runtime.
 responder = async (url) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
-  return {enabled: true, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200,
-          status: {enabled: true, preset: 'geoblock', sync_state: 'synced', domain_count: 5,
+  return {enabled: true, sync_interval_seconds: 7200,
+          status: {enabled: true, sync_state: 'synced',
                    cidr_count: 0, last_success: '2026-11-15T02:00:00Z', last_error: ''}};
 };
 await w.loadPolicySettings();
@@ -678,10 +669,10 @@ responder = async (url, opts) => {
   if (opts.method === 'PUT') {
     // Management-only deployment: the record saves, but there is no runtime to
     // observe, so the only status field in the answer is the result code.
-    return {status: 'ok', enabled: true, preset: 'geoblock', custom_urls: [],
+    return {status: 'ok', enabled: true,
             sync_interval_seconds: 7200};
   }
-  return {enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200};
+  return {enabled: false, sync_interval_seconds: 7200};
 };
 `, `
 assert.equal(badge().enabled, 'unknown',
@@ -705,9 +696,9 @@ assert.equal(badge().enabled, 'unknown',
 func TestPolicyRoutingControllerInventoryOverride(t *testing.T) {
 	runPolicyControllerScenario(t, `
 const recordWith = (inventory) => ({
-  enabled: false, preset: 'aggregate', custom_urls: [], sync_interval_seconds: 21600,
+  enabled: false, sync_interval_seconds: 21600,
   inventory_override: ['203.0.113.0/24'],
-  status: {enabled: false, preset: 'aggregate', domain_count: 0, cidr_count: 0,
+  status: {enabled: false, cidr_count: 0,
            sync_state: 'disabled', last_success: '', last_error: '', inventory: inventory}
 });
 const shipped = {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: 8664,
@@ -716,7 +707,7 @@ const shipped = {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: 866
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
-    return {status: 'ok', enabled: false, preset: 'aggregate', custom_urls: [],
+    return {status: 'ok', enabled: false,
             inventory_override: ['198.51.100.0/24', '203.0.113.0/24'],
             sync_interval_seconds: 21600,
             policy_status: recordWith(Object.assign({}, shipped, {
@@ -760,8 +751,8 @@ func TestPolicyRoutingControllerInventoryUnusable(t *testing.T) {
 	runPolicyControllerScenario(t, `
 responder = async (url) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
-  return {enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 21600,
-          status: {enabled: false, preset: 'geoblock', domain_count: 0, cidr_count: 0,
+  return {enabled: false, sync_interval_seconds: 21600,
+          status: {enabled: false, cidr_count: 0,
                    sync_state: 'disabled', last_error: '',
                    inventory: {error: 'inventory provenance does not match the committed data',
                                prefix_count: 0, max_age_days: 180}}};
@@ -779,7 +770,7 @@ assert.equal(text('policyInventoryNotice'), 'policy_inventory_unusable inventory
 // entry, with the source it was read from. The fixture payload is the real table,
 // so an entry the surface drops is an entry an operator would not see.
 func TestPolicyRoutingControllerCDNExclusions(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, "russia_inside"), fmt.Sprintf(`
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), fmt.Sprintf(`
 const expected = %s;
 const rows = w.document.querySelectorAll('#policyCdnEntries li');
 assert.equal(text('policyCdnSource'), expected.source,
@@ -805,9 +796,9 @@ assert.equal(text('policyCdnNotice'), '', 'a usable set carries no warning');
 // round. Neither may be rendered as an invented count.
 func TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable(t *testing.T) {
 	runPolicyControllerScenario(t, `
-const recordWith = (cdn) => ({enabled: false, preset: 'geoblock', custom_urls: [],
+const recordWith = (cdn) => ({enabled: false,
   sync_interval_seconds: 21600,
-  status: {enabled: false, preset: 'geoblock', domain_count: 0, cidr_count: 0,
+  status: {enabled: false, cidr_count: 0,
            sync_state: 'disabled', cdn: cdn}});
 let answer = () => recordWith({source: 'geodb.KnownCDNASNs', entries: []});
 responder = async (url) => {
