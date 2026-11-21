@@ -628,11 +628,13 @@ The table below maps tests in `web/*_test.go` that inspect frontend templates an
 
 The repository contains Playwright integration suites in `tests/e2e/*.py` that execute in real browsers against a live server:
 
-1. **`tests/e2e/test_vpn_diagnostics.py`**:
-   - `test_vpn_dashboard_navigation_and_banner`: Navigates to `/vpn`, validates live banner, public endpoint auto-detection.
-   - `test_vpn_kpi_summary_bar`: Validates all 8 KPI tiles and live metric updates.
-   - `test_vpn_diagnostic_panels`: Validates Data Plane, Traffic Drops, Route Integrity, and Fleet Resources panels.
-   - `test_vpn_sparklines_window_toggle`: Interacts with window chips (1m, 5m, 15m, 1h, 6h, 24h) and checks active classes.
+1. **`tests/e2e/test_vpn_health_surface.py`** (health surface and Advanced Diagnostics disclosure):
+   - `test_vpn_dashboard_navigation_and_banner`: Navigates to `/vpn`, validates the health banner and the absence of the retired KPI tiles.
+   - `test_vpn_overview_signals`: Asserts exactly four overview signals in order, and that an unmeasured value reads as text rather than a numeric zero.
+   - `test_vpn_diagnostic_panels`: Validates the single Advanced Diagnostics disclosure, its three ordered sections and the telemetry fields it surfaces.
+
+2. **`tests/e2e/test_vpn_diagnostics.py`** (lifecycle, historical charts and API contracts):
+   - `test_vpn_sparklines_window_toggle`: Interacts with window chips (15m, 1h, 24h) and checks active classes.
    - `test_vpn_historical_charts_interaction_and_kpis`: Tests chart hover tooltips and dynamic KPI value updates.
    - `test_vpn_historical_charts_hover_preserved_across_live_polling`: Verifies hover state survives 5s polling updates without jitter.
    - `test_vpn_problem_routes_toggle`: Toggles `#vpn-routes-toggle-all-btn` and checks table row count transitions.
@@ -640,7 +642,7 @@ The repository contains Playwright integration suites in `tests/e2e/*.py` that e
    - `test_vpn_routes_table_mobile_containment_and_scrolling`: Asserts table responsiveness under mobile viewports.
    - `test_vpn_dashboard_sections_visual_order_and_vertical_layout`: Validates strict visual vertical ordering of sections (stats -> backends -> sessions -> forwarder).
 
-2. **`tests/e2e/test_servers.py`**:
+3. **`tests/e2e/test_servers.py`**:
    - `test_server_list_loads`: Validates server grid rendering.
    - `test_server_detail_page`: Loads `/server/{id}`, validates stats, reachability badges, protocol cards.
    - `test_server_check`: Clicks check button, validates live spinner and status badge update.
@@ -649,7 +651,7 @@ The repository contains Playwright integration suites in `tests/e2e/*.py` that e
    - `test_server_edit_host_ui_validation`: Tests client-side validation on host edit input (RFC 1123 / IP regex).
    - `test_server_edit_host_ui_lifecycle`: Full lifecycle: open modal -> enter host -> submit -> verify displayed host updates.
 
-3. **`tests/e2e/test_users.py`**:
+4. **`tests/e2e/test_users.py`**:
    - `test_user_list_loads`: Validates user card grid and filter chips.
    - `test_add_user`: Adds a user via modal, asserts grid refresh and notification toast.
    - `test_edit_user`: Edits user limits/roles, asserts persistence.
