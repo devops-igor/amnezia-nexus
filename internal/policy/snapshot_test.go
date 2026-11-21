@@ -117,8 +117,12 @@ func TestSyncer_Status(t *testing.T) {
 	if _, err := NewSyncer(matcher, nil, nil, cfg); err == nil {
 		t.Error("expected error for nil store")
 	}
-	if _, err := NewSyncer(matcher, nil, store, SyncConfig{}); err == nil {
-		t.Error("expected error for empty sources")
+	// A configuration with neither source nor local rules is a valid
+	// configuration shape now (the classifier is the policy authority), and the
+	// refusal it must receive is the publication guard's, not a constructor
+	// error. That refusal is asserted directly instead of by constructor here.
+	if _, err := NewSyncer(matcher, nil, store, SyncConfig{}); err != nil {
+		t.Errorf("NewSyncer rejected a source-less configuration: %v", err)
 	}
 	if _, err := NewSyncer(matcher, nil, store, SyncConfig{
 		Sources: make([]Source, MaxSyncSources+1),

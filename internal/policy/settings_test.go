@@ -108,6 +108,36 @@ func TestValidateAcceptsEachBuiltinPreset(t *testing.T) {
 	}
 }
 
+// A record with no source selection is valid: the classifier is the policy
+// authority and the operator contributes address exceptions locally, so nothing
+// needs to be fetched. This is the shape the settings page offers, so it has to
+// be accepted rather than merely tolerated.
+func TestValidateAcceptsNoSourceSelection(t *testing.T) {
+	s := DefaultSettings()
+	s.Enabled = true
+	s.LocalEntries = []string{"203.0.113.0/24"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a local-only record", err)
+	}
+	sources, err := s.Sources()
+	if err != nil {
+		t.Fatalf("Sources() = %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("len(Sources()) = %d, want 0", len(sources))
+	}
+	cfg, err := s.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig() = %v", err)
+	}
+	if len(cfg.Sources) != 0 {
+		t.Fatalf("SyncConfig sources = %d, want 0", len(cfg.Sources))
+	}
+	if len(cfg.LocalRules.CIDRs) != 1 {
+		t.Fatalf("SyncConfig local prefixes = %d, want 1", len(cfg.LocalRules.CIDRs))
+	}
+}
+
 func TestValidateAcceptsCustomURLs(t *testing.T) {
 	s := DefaultSettings()
 	s.Preset = PresetCustom
@@ -149,9 +179,16 @@ func TestValidateRejectsBadInput(t *testing.T) {
 		wantSub string
 	}{
 		{
-			name:    "no preset selected",
-			mutate:  func(s *Settings) { s.Preset = "" },
-			wantSub: "preset must be selected",
+			// No preset is the shipped shape now: the classifier is the policy
+			// authority and the operator's IPv4 exceptions are local. What must
+			// still be refused is a record that names custom URLs without the
+			// source selection that would fetch them.
+			name: "custom URLs without the custom source selection",
+			mutate: func(s *Settings) {
+				s.Preset = ""
+				s.CustomURLs = []string{"https://lists.example/extra.lst"}
+			},
+			wantSub: "custom URLs require the",
 		},
 		{
 			name:    "unknown preset",

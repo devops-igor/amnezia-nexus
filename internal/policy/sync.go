@@ -140,9 +140,13 @@ func NewSyncer(m *Matcher, fetcher *Fetcher, store Store, cfg SyncConfig) (*Sync
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
-	if len(cfg.Sources) == 0 {
-		return nil, errors.New("at least one source must be configured")
-	}
+	// A configuration with no source is valid: the classifier is the policy
+	// authority and the operator's local exception list is supplied locally.
+	// A configuration that can never publish anything is NOT rejected here —
+	// the empty-rule refusal belongs to the publication guard
+	// (validateCandidateRules / ErrPBREmptyPolicy), which stays the single owner
+	// of fail-closed enablement. Restating it here would replace that operator-
+	// facing reason with a constructor error.
 	if len(cfg.Sources) > MaxSyncSources {
 		return nil, fmt.Errorf("maximum %d sources may be configured", MaxSyncSources)
 	}

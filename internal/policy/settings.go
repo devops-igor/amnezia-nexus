@@ -16,12 +16,13 @@ import (
 //     correct state for existing and fresh installs: no migration and no
 //     default row are required, because an absent settings row deserializes to
 //     a zero value whose Enabled is false.
-//   - A preset is a list SOURCE, never a routing mode. Presets still mean
-//     PROXY on match.
+//   - The policy authority is the destination classifier (committed Russian
+//     allocation plus the CDN exclusion set). This record adds one operator
+//     input on top: an IPv4 PROXY exception list whose prefixes are forced to
+//     PROXY ahead of the classifier. It never selects a source and never
+//     fetches a list, so an activated policy needs no external availability.
 //   - Invalid settings are rejected; they never overwrite a last working
 //     configuration. Validation is pure so a handler can reject before writing.
-//   - One source selection at a time. A built-in preset and custom URLs are not
-//     silently merged; choosing both is an operator error.
 //
 // Runtime prerequisite gating (a published non-empty snapshot plus working
 // direct egress) is deliberately NOT re-implemented here. That contract lives in
@@ -162,12 +163,6 @@ func (s Settings) Validate() error {
 	if err := s.validateInterval(); err != nil {
 		return err
 	}
-	if !s.Preset.Valid() {
-		if s.Preset == "" {
-			return errors.New("policy preset must be selected")
-		}
-		return fmt.Errorf("unknown policy preset %q", s.Preset)
-	}
 	if err := s.validateSourceSelection(); err != nil {
 		return err
 	}
@@ -192,6 +187,20 @@ func (s Settings) validateInterval() error {
 }
 
 func (s Settings) validateSourceSelection() error {
+	// No source selection is the shipped shape. The destination classifier is
+	// the policy authority, and the operator contributes address exceptions
+	// locally, so a record with no preset and no external source is complete.
+	// An external source is still available as an optional extra, and the rules
+	// below keep the one-selection-at-a-time contract for records that use one.
+	if s.Preset == "" {
+		if len(s.CustomURLs) > 0 {
+			return fmt.Errorf("custom URLs require the %q source selection; a record with no selection fetches nothing", PresetCustom)
+		}
+		return nil
+	}
+	if !s.Preset.Valid() {
+		return fmt.Errorf("unknown policy preset %q", s.Preset)
+	}
 	if s.Preset == PresetCustom {
 		return s.validateCustomURLs()
 	}
@@ -326,11 +335,18 @@ func (s Settings) validateCustomURLs() error {
 // order is deterministic so the Syncer's config hash, conditional validators and
 // per-source statistics stay stable across restarts.
 //
+// No selection yields NO sources, and that is a complete configuration rather
+// than an error: the classifier is the policy authority and the operator's IPv4
+// exception list is supplied locally, so an activated policy fetches nothing.
+//
 // A built-in preset yields exactly one preset source. The custom preset yields
 // one strictly parsed source per URL, in the operator's order.
 func (s Settings) Sources() ([]Source, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
+	}
+	if s.Preset == "" {
+		return nil, nil
 	}
 	if s.Preset == PresetAggregate {
 		return AggregateSources(), nil
