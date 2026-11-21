@@ -36,11 +36,11 @@
             <p class="form-hint" id="policyDirectEgressNotice">{{ _ "policy_direct_egress_notice" }}</p>
         </div>
 
-        <div class="form-group">
-            <label class="form-label" for="policy_proxy_exceptions">{{ _ "policy_proxy_exceptions_label" }}</label>
+        <fieldset class="form-group settings-fieldset">
+            <legend class="form-label settings-flush">{{ _ "policy_proxy_exceptions_label" }}</legend>
             <textarea class="form-input font-mono" id="policy_proxy_exceptions" name="policy_proxy_exceptions" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_proxy_exceptions_placeholder" }}" aria-describedby="policyProxyExceptionsHint"></textarea>
             <p class="form-hint" id="policyProxyExceptionsHint">{{ _ "policy_proxy_exceptions_hint" }}</p>
-        </div>
+        </fieldset>
 
         <div class="form-group">
             <label class="form-label" for="policy_inventory_override">{{ _ "policy_inventory_override_label" }}</label>
