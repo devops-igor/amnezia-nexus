@@ -603,8 +603,8 @@ def test_actions_merge_checkout_gives_the_same_answer_as_the_pr_head(tmp_path: P
 
     That equivalence is a property of disjoint edits, not of the merge ref. When
     both sides edit the same file it breaks in both directions; see
-    `test_same_file_divergent_merge_false_rejection_is_rejected` and
-    `test_same_file_divergent_merge_false_acceptance_is_rejected`, which is why
+    `test_same_file_divergent_merge_does_not_falsely_reject_the_pr` and
+    `test_same_file_divergent_merge_does_not_falsely_accept_the_pr`, which is why
     the workflow now passes the event's own head SHA through --head-ref instead
     of letting the CLI default to the checkout.
     """
