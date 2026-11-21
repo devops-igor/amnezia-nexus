@@ -276,7 +276,7 @@ vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
 // have nothing to resurrect and the cache-clearing guard would go untested.
 assert(vpnLastStatus&&vpnLastStatus.historical_series,'available poll must cache its series');
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent,_('vpn_forwarder_healthy'),'available poll must render Healthy');
-assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent,'1.00 Mbps / 50.0 pps','available poll must render throughput');
+assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(),'1.00 Mbps','available poll must render the current throughput rate');
 for (const id of SVG_CHARTS) {
  assert(document.getElementById(id).innerHTML.includes('<svg'),'seed must render SVG in '+id);
 }
@@ -313,15 +313,15 @@ for (const id of SVG_CHARTS.concat(SERIES_CHARTS).concat(['vpn-diag-be-traffic',
  assert(!el.innerHTML.includes('<path'),'unavailable state must not invent curves in '+id);
  assert(!el.innerHTML.includes('<circle'),'unavailable state must not invent points in '+id);
 }
-const ALL_KPIS = [
- 'vpn-kpi-throughput', 'vpn-kpi-routes-sessions', 'vpn-kpi-queue-pressure',
- 'vpn-kpi-packet-loss', 'vpn-kpi-client-engine', 'vpn-kpi-peer-sync',
- 'vpn-kpi-backends', 'vpn-kpi-slow-writes'
+// #955 replaced the eight KPI tiles with four overview signals.
+const ALL_SIGNALS = [
+ 'vpn-signal-backends-value', 'vpn-sessions',
+ 'vpn-signal-throughput-value', 'vpn-signal-drops-value'
 ];
 const DETAIL_PANEL_IDS = [
  'vpn-diag-throughput', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h',
  'vpn-diag-queue-occ', 'vpn-diag-queue-peak',
- 'vpn-diag-lat-percentiles', 'vpn-diag-lat-max',
+ 'vpn-diag-lat-percentiles',
  'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total',
  'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-hs-freshness',
  'vpn-diag-routing-counts', 'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-fd'
@@ -333,13 +333,14 @@ function assertAllSurfacesCleared(context) {
  assert.strictEqual(document.getElementById('vpn-fwd-headline-summary').textContent, _('vpn_forwarder_unavailable'), context + ': headline');
  const problemList = document.getElementById('vpn-fwd-problem-list');
  assert.strictEqual(problemList.textContent, '', context + ': problem list text');
- assert.strictEqual(problemList.style.display, 'none', context + ': problem list display');
+ assert.strictEqual(problemList.hidden, true, context + ': problem list hidden');
 
- for (const id of ALL_KPIS) {
-  assert.strictEqual(document.getElementById(id).textContent, '-', context + ': KPI ' + id);
+ for (const id of ALL_SIGNALS) {
+  assert.strictEqual(document.getElementById(id).textContent, _('vpn_diag_not_measured'), context + ': signal ' + id);
  }
  for (const id of DETAIL_PANEL_IDS) {
-  assert.strictEqual(document.getElementById(id).textContent, '-', context + ': detail elem ' + id);
+  const expected = id === 'vpn-diag-lat-percentiles' ? _('vpn_diag_not_measured') : '-';
+  assert.strictEqual(document.getElementById(id).textContent, expected, context + ': detail elem ' + id);
  }
 
  const routBadge = document.getElementById('vpn-diag-routing-badge');
@@ -347,7 +348,7 @@ function assertAllSurfacesCleared(context) {
  assert.strictEqual(routBadge.textContent, '-', context + ': routing badge text');
  const routAlerts = document.getElementById('vpn-diag-routing-alerts');
  assert.strictEqual(routAlerts.textContent, '', context + ': routing alerts text');
- assert.strictEqual(routAlerts.style.display, 'none', context + ': routing alerts display');
+ assert.strictEqual(routAlerts.hidden, true, context + ': routing alerts hidden');
 
  assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 0, context + ': backend traffic rows');
  assert.strictEqual(document.getElementById('vpn-history-fleet-note').textContent, '', context + ': fleet note text');
@@ -407,7 +408,7 @@ const freshAvailableStatus = {
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert(vpnLastStatus && vpnLastStatus.historical_series, 'fresh poll must cache status');
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'fresh poll restores Healthy');
-assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'fresh poll restores throughput');
+assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(), '2.00 Mbps', 'fresh poll restores throughput');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'fresh poll restores backend rows');
 for (const id of SVG_CHARTS) assert(document.getElementById(id).innerHTML.includes('<svg'), 'fresh poll restores SVG in ' + id);
 for (const id of SERIES_CHARTS) assert(document.getElementById(id).children.length > 0, 'fresh poll restores series in ' + id);
@@ -429,7 +430,7 @@ assertAllSurfacesCleared('after null window 15m');
 // Recovery from null status when live poll succeeds
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'recovery after null poll');
-assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, '2.00 Mbps / 100.0 pps', 'recovery throughput after null poll');
+assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(), '2.00 Mbps', 'recovery throughput after null poll');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
 
 `
@@ -454,12 +455,13 @@ vpnRenderForwarderHealth({
 	drop_categories: { rates_available: false, client_drop_rate_pps: 0, client_total_drops: 12, return_drop_rate_pps: 0, return_total_drops: 34, total_drop_rate_pps: 0, total_drops: 46 }
 });
 
-assert.strictEqual(document.getElementById('vpn-kpi-throughput').textContent, 'Traffic unavailable', 'KPI throughput must be unavailable');
+assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent, 'Not measured', 'unmeasured throughput is text, not a numeric zero');
 assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Traffic unavailable', 'detail throughput must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Traffic unavailable', 'detail ewma5m must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Traffic unavailable', 'detail ewma1h must be unavailable');
 
-assert.strictEqual(document.getElementById('vpn-kpi-packet-loss').textContent, 'Loss rate unavailable (46 cumulative)', 'KPI loss must be unavailable');
+assert.strictEqual(document.getElementById('vpn-signal-drops-value').textContent, 'Not measured', 'unmeasured drop rate is text, not a numeric zero');
+assert(document.getElementById('vpn-signal-drops-sub').textContent.includes('46 drops since reset'), 'the cumulative total is still reported');
 assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, 'Loss rate unavailable (12 cumulative)', 'detail client drops must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, 'Loss rate unavailable (34 cumulative)', 'detail return drops must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 'Loss rate unavailable (46 cumulative)', 'detail total drops must be unavailable');
@@ -478,7 +480,8 @@ assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, '
 assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, '0.00 pps (5 cumulative)', 'available zero client loss must show measured rate');
 assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, '0.00 pps (2 cumulative)', 'available zero return loss must show measured rate');
 assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, '0.00 pps (7 cumulative)', 'available zero total loss must show measured rate');
-assert.strictEqual(document.getElementById('vpn-kpi-packet-loss').textContent, '0.00 pps (7 cumulative)');
+assert.strictEqual(document.getElementById('vpn-signal-drops-value').textContent.replace(/\s+/g,' ').trim(), '0.00 drops/s', 'a sampled zero rate stays numeric');
+assert(document.getElementById('vpn-signal-drops-sub').textContent.includes('7 drops since reset'));
 
 // 3. Independent flags: Traffic available (legitimate idle zero), Loss unavailable.
 vpnRenderForwarderHealth({
@@ -537,28 +540,32 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color,
 	}
 }
 
-func TestVPNHorizonWindowToggles1mAnd5m(t *testing.T) {
+func TestVPNHorizonWindowToggles(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
 
 	for _, expectedBtn := range []string{
-		`data-action="vpn-set-history-window" data-window="1m"`,
-		`data-action="vpn-set-history-window" data-window="5m"`,
 		`data-action="vpn-set-history-window" data-window="15m"`,
 		`data-action="vpn-set-history-window" data-window="1h"`,
-		`data-action="vpn-set-history-window" data-window="6h"`,
 		`data-action="vpn-set-history-window" data-window="24h"`,
 	} {
 		if !strings.Contains(tmplStr, expectedBtn) {
 			t.Fatalf("vpn.html missing toggle button %s", expectedBtn)
 		}
 	}
+	// The visible control offers the three practical ranges; nothing in the other
+	// API windows was deleted from the payload.
+	for _, absent := range []string{`data-window="1m"`, `data-window="6h"`} {
+		if strings.Contains(tmplStr, absent) {
+			t.Errorf("vpn.html must not expose retired range %s", absent)
+		}
+	}
 
 	assertions := `
 const toggles = document.getElementById('vpn-history-window-toggles');
 assert(toggles, 'toggles container must exist');
-toggles.children = ['1m', '5m', '15m', '1h', '6h', '24h'].map(w => {
+toggles.children = ['15m', '1h', '24h'].map(w => {
     const btn = document.createElement('button');
     btn.textContent = w;
     btn.className = w === '15m' ? 'btn btn-sm btn-primary active' : 'btn btn-sm btn-secondary';
@@ -566,13 +573,13 @@ toggles.children = ['1m', '5m', '15m', '1h', '6h', '24h'].map(w => {
 });
 toggles.querySelectorAll = (sel) => sel === 'button' ? toggles.children : [];
 const buttons = Array.from(toggles.querySelectorAll('button'));
-const btn1m = buttons.find(b => b.textContent.trim() === '1m');
-const btn5m = buttons.find(b => b.textContent.trim() === '5m');
 const btn15m = buttons.find(b => b.textContent.trim() === '15m');
+const btn1h = buttons.find(b => b.textContent.trim() === '1h');
+const btn24h = buttons.find(b => b.textContent.trim() === '24h');
 
-assert(btn1m, '1m button must exist');
-assert(btn5m, '5m button must exist');
 assert(btn15m, '15m button must exist');
+assert(btn1h, '1h button must exist');
+assert(btn24h, '24h button must exist');
 
 const mockSeries = {
     window_1m: [
@@ -600,27 +607,36 @@ vpnGenerateSparklineSVG = (values, ...args) => {
     return originalSparkline(values, ...args);
 };
 
-// 1. Click 1m horizon button
+// 1. Select the 15m default explicitly.
 seen.length = 0;
-vpnSetHistoryWindow('1m');
-assert(btn1m.className.includes('btn-primary'), '1m button must be primary when active');
-assert(btn1m.className.includes('active'), '1m button must have active class');
-assert(!btn5m.className.includes('btn-primary'), '5m button must not be primary');
-assert(!btn15m.className.includes('btn-primary'), '15m button must not be primary');
-assert.strictEqual(vpnHistoryWindow, '1m', 'vpnHistoryWindow must be 1m');
-// Verify points loaded from window_1m: throughput is (1000+2000) = 3000, (1100+2200) = 3300
-assert.deepStrictEqual(seen[0], [3000, 3300], 'throughput chart must load window_1m points');
+vpnSetHistoryWindow('15m');
+assert(btn15m.className.includes('btn-primary'), '15m button must be primary when active');
+assert(btn15m.className.includes('active'), '15m button must have active class');
+assert.strictEqual(btn15m.getAttribute('aria-pressed'), 'true', 'the active range exposes aria-pressed');
+assert.strictEqual(btn1h.getAttribute('aria-pressed'), 'false', 'an inactive range is aria-pressed=false');
+assert(!btn1h.className.includes('btn-primary'), '1h button must not be primary');
+assert.strictEqual(vpnHistoryWindow, '15m', 'vpnHistoryWindow must be 15m');
+// window_15m throughput is (15000+16000) = 31000.
+assert.deepStrictEqual(seen[0], [31000], 'throughput chart must load window_15m points');
 
-// 2. Click 5m horizon button
+// 2. Switch to 1h. window_1h is absent from the mock, so the chart must show the
+// empty state instead of interpolating the 15m series as 1h data.
+seen.length = 0;
+vpnSetHistoryWindow('1h');
+assert(btn1h.className.includes('btn-primary'), '1h button must be primary when active');
+assert.strictEqual(btn1h.getAttribute('aria-pressed'), 'true');
+assert.strictEqual(btn15m.getAttribute('aria-pressed'), 'false');
+assert.strictEqual(vpnHistoryWindow, '1h', 'vpnHistoryWindow must be 1h');
+assert.strictEqual(seen[0].length, 0, 'an unsampled window is empty, not the previous window');
+
+// 3. The payload windows outside the visible control keep working when requested.
+// The throughput chart is drawn first in each render, so index 0 is its series.
 seen.length = 0;
 vpnSetHistoryWindow('5m');
-assert(btn5m.className.includes('btn-primary'), '5m button must be primary when active');
-assert(btn5m.className.includes('active'), '5m button must have active class');
-assert(!btn1m.className.includes('btn-primary'), '1m button must not be primary');
-assert(!btn15m.className.includes('btn-primary'), '15m button must not be primary');
-assert.strictEqual(vpnHistoryWindow, '5m', 'vpnHistoryWindow must be 5m');
-// Verify points loaded from window_5m: throughput is (5000+6000) = 11000, (5500+6500) = 12000
-assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load window_5m points');
+assert.deepStrictEqual(seen[0], [11000, 12000], '5m remains reachable through the API history');
+seen.length = 0;
+vpnSetHistoryWindow('15m');
+assert.deepStrictEqual(seen[0], [31000], 'restoring 15m restores its own series');
 `
 
 	script, err := fixture.AssembleHealthScript("en", assertions)
@@ -629,7 +645,7 @@ assert.deepStrictEqual(seen[0], [11000, 12000], 'throughput chart must load wind
 	}
 
 	if out, err := execNodeScript(node, script); err != nil {
-		t.Fatalf("1m and 5m horizon window toggles test failed: %v\n%s", err, out)
+		t.Fatalf("horizon window toggles test failed: %v\n%s", err, out)
 	}
 }
 

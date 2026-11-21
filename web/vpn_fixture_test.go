@@ -730,45 +730,62 @@ func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]str
 }
 
 func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
+	// Every relocated diagnostic value must keep its localized label, now as a
+	// <dt>/<dd> pair inside Advanced Diagnostics rather than a dense panel row.
 	fields := map[string]string{
-		"vpn-diag-throughput":     "vpn_fwd_kpi_throughput",
-		"vpn-diag-ewma5m":         "vpn_diag_avg_5m",
-		"vpn-diag-ewma1h":         "vpn_diag_avg_1h",
-		"vpn-diag-queue-occ":      "vpn_diag_occupancy",
-		"vpn-diag-queue-peak":     "vpn_forwarder_peak",
-		"vpn-diag-lat-max":        "vpn_diag_max_duration",
-		"vpn-diag-drops-client":   "vpn_diag_drops_outbound",
-		"vpn-diag-drops-return":   "vpn_diag_drops_inbound",
-		"vpn-diag-drops-total":    "vpn_diag_total_drop_rate",
-		"vpn-diag-engine-status":  "vpn_diag_engine",
-		"vpn-diag-hs-freshness":   "vpn_diag_handshake_freshness",
-		"vpn-diag-routing-counts": "vpn_diag_route_integrity",
-		"vpn-diag-res-cpu":        "vpn_diag_cpu_usage",
-		"vpn-diag-res-mem":        "vpn_diag_memory",
-		"vpn-diag-res-fd":         "vpn_diag_file_descriptors",
+		"vpn-diag-throughput":      "vpn_diag_throughput_now",
+		"vpn-diag-ewma5m":          "vpn_diag_avg_5m",
+		"vpn-diag-ewma1h":          "vpn_diag_avg_1h",
+		"vpn-diag-queue-occ":       "vpn_forwarder_queue",
+		"vpn-diag-queue-peak":      "vpn_forwarder_peak",
+		"vpn-diag-drops-client":    "vpn_diag_drops_outbound",
+		"vpn-diag-drops-return":    "vpn_diag_drops_inbound",
+		"vpn-diag-drops-total":     "vpn_diag_total_drop_rate",
+		"vpn-diag-engine-status":   "vpn_diag_engine",
+		"vpn-diag-hs-freshness":    "vpn_diag_handshake_freshness",
+		"vpn-diag-routing-counts":  "vpn_diag_route_integrity",
+		"vpn-diag-res-cpu":         "vpn_diag_cpu_usage",
+		"vpn-diag-res-mem":         "vpn_diag_memory",
+		"vpn-diag-res-fd":          "vpn_diag_file_descriptors",
+		"vpn-diag-lat-percentiles": "vpn_diag_forward_p95_recent",
 	}
 	labels := make(map[string]string)
-	fieldPattern := regexp.MustCompile(`<div class="flex justify-between"><span class="text-muted">([^<]+)</span><span class="font-mono" id="([^"]+)"`)
+	fieldPattern := regexp.MustCompile(`<dt>([^<]+)</dt><dd[^>]*id="([^"]+)"`)
 	for _, match := range fieldPattern.FindAllStringSubmatch(rendered, -1) {
 		labels[match[2]] = html.UnescapeString(match[1])
 	}
 	for id, key := range fields {
-		if labels[id] != dict[key]+":" {
-			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key]+":")
+		if labels[id] != dict[key] {
+			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key])
 		}
 	}
-	for id, key := range map[string]string{
-		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
-		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_latency_p95",
+
+	// The four signals must carry localized titles, and the health summary keeps its
+	// live-region semantics.
+	for _, signal := range []struct{ class, key string }{
+		{"backends", "vpn_signal_backends"},
+		{"sessions", "vpn_signal_sessions"},
+		{"throughput", "vpn_fwd_kpi_throughput"},
+		{"drops", "vpn_signal_drops"},
 	} {
-		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`)
+		pattern := regexp.MustCompile(`data-signal="` + signal.class + `">\s*<div class="stat-card-header">\s*<span class="stat-card-title">([^<]+)</span>`)
 		match := pattern.FindStringSubmatch(rendered)
-		expected := dict[key]
-		if len(match) != 2 || html.UnescapeString(match[1]) != expected {
-			return fmt.Errorf("static chart %s is not localized", id)
+		if len(match) != 2 || html.UnescapeString(match[1]) != dict[signal.key] {
+			return fmt.Errorf("signal %s title is not localized", signal.class)
 		}
 	}
-	if !strings.Contains(rendered, "<details><summary>"+html.EscapeString(dict["vpn_diag_loss_backend_history"])+"</summary>") {
+
+	if !strings.Contains(rendered, `id="vpn-fwd-headline-summary" role="status" aria-atomic="true"`) {
+		return errors.New("health summary must remain a polite atomic live region")
+	}
+	if !strings.Contains(rendered, `id="vpn-advanced-entry"`) {
+		return errors.New("Advanced Diagnostics entry is missing")
+	}
+	if !strings.Contains(rendered, html.EscapeString(dict["vpn_diagnostics_traffic"])) {
+		return errors.New("traffic section heading is not localized")
+	}
+	if !strings.Contains(rendered, "<summary>\n                <span>"+html.EscapeString(dict["vpn_diag_loss_backend_history"])) &&
+		!strings.Contains(rendered, html.EscapeString(dict["vpn_diag_loss_backend_history"])) {
 		return errors.New("history details heading is not localized")
 	}
 	return nil

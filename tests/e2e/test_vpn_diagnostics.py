@@ -9,10 +9,18 @@ from playwright.sync_api import Page, expect
 from tests.e2e.conftest import api_get, assert_response_shape
 
 
-def _ensure_tech_details_open(page: Page) -> None:
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+def _ensure_diagnostics_open(page: Page) -> None:
+    """Open Advanced Diagnostics through its own entry, only when closed.
+
+    #955 replaced the old #vpn-fwd-tech-details fold with a single
+    #vpn-advanced-entry / #vpn-diagnostics disclosure. The panel is never
+    auto-opened, so a check that needs it open must do so explicitly without
+    toggling an already-open panel shut.
+    """
+    entry = page.locator("#vpn-advanced-entry")
+    if entry.get_attribute("aria-expanded") != "true":
+        entry.click()
+    expect(page.locator("#vpn-diagnostics")).to_be_visible()
 
 
 def _assert_tooltip_hidden(tooltip) -> None:
@@ -72,41 +80,57 @@ def test_vpn_dashboard_navigation_and_banner(authenticated_page: Page, base_url:
     assert "/login" not in page.url
     assert "/vpn" in page.url
 
-    # Headline status banner elements
-    for loc in (
-        "#vpn-fwd-status-badge",
-        "#vpn-fwd-status-text",
-        "#vpn-fwd-headline-summary",
-    ):
+    # One visible health status plus the four essential signals.
+    for loc in ("#vpn-fwd-status-badge", "#vpn-fwd-status-text", "#vpn-fwd-headline-summary"):
         expect(page.locator(loc)).to_be_visible()
+    expect(page.locator("#vpn-forwarder-card #vpn-kpi-throughput")).to_have_count(0)
+    expect(page.locator("#vpn-fwd-tech-details")).to_have_count(0)
+    expect(page.locator("#vpn-fwd-summary-header")).to_have_count(0)
+    expect(page.locator("#vpn-active-tunnels")).to_have_count(0)
 
 
 @pytest.mark.e2e
-def test_vpn_kpi_summary_bar(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> verifies 8 KPI summary cards are rendered."""
+def test_vpn_overview_signals(authenticated_page: Page, base_url: str) -> None:
+    """Navigate to /vpn -> exactly four overview signals, no duplicated KPI tiles."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    kpi_keys = (
+    signals = page.locator("[data-signal]")
+    expect(signals).to_have_count(4)
+    assert ["backends", "sessions", "throughput", "drops"] == [
+        signals.nth(i).get_attribute("data-signal") for i in range(4)
+    ]
+
+    # No retired KPI tile survives.
+    for key in (
         "throughput routes-sessions queue-pressure packet-loss "
         "client-engine peer-sync backends slow-writes"
-    ).split()
-    for loc in [f"#vpn-kpi-{k}" for k in kpi_keys]:
-        expect(page.locator(loc)).to_be_visible()
+    ).split():
+        expect(page.locator(f"#vpn-kpi-{key}")).to_have_count(0)
 
-    # The Peer Sync tile reports SYNCHRONIZATION (desired vs actual peers from
-    # status.peer_sync), not the handshake peer count it used to render
-    # (issue #424 round 4, item H). peer_sync is omitempty, so an absent payload
-    # must render an explicit unavailable state, never a misleading '0 / 0'.
-    peer_sync_kpi = page.locator("#vpn-kpi-peer-sync")
+    # The Sessions signal is the LIVE count; configured/synchronized peers are a
+    # different population and must never be substituted for it.
     status_data = api_get(page, "/api/vpn/status")
-    peer_sync = status_data.get("peer_sync")
-    if isinstance(peer_sync, dict):
-        expected = f"{peer_sync['actual_peers']} / {peer_sync['desired_peers']}"
-        expect(peer_sync_kpi).to_have_text(expected)
+    live = status_data.get("connected_sessions")
+    sessions_value = page.locator("#vpn-sessions")
+    if isinstance(live, int):
+        expect(sessions_value).to_have_text(str(live))
     else:
-        assert peer_sync_kpi.inner_text().strip() not in ("", "0 / 0")
+        expect(sessions_value).to_have_text("Not measured")
+
+    # An unmeasured value reads as text, never a numeric zero or a healthy badge.
+    throughput_text = page.locator("#vpn-signal-throughput-value").inner_text().strip()
+    rates = status_data.get("rates") or {}
+    if rates.get("available") is not True:
+        assert throughput_text == "Not measured"
+    drops_text = page.locator("#vpn-signal-drops-value").inner_text().strip()
+    drops = status_data.get("drop_categories") or {}
+    if drops.get("rates_available") is not True:
+        assert drops_text == "Not measured"
+
+    # The dataplane scope is stated so the number cannot read as end-to-end loss.
+    assert "not end-to-end" in page.locator("#vpn-signal-drops-sub").inner_text()
 
 
 @pytest.mark.e2e
@@ -116,20 +140,36 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    _ensure_tech_details_open(page)
+    # Closed by default: nothing opens it for the operator.
+    expect(page.locator("#vpn-diagnostics")).to_be_hidden()
+    expect(page.locator("#vpn-advanced-entry")).to_have_attribute("aria-expanded", "false")
+    _ensure_diagnostics_open(page)
 
-    cards = page.locator(
-        "#vpn-fwd-tech-details > div > div > div.card, #vpn-fwd-tech-details > div > div.card"
-    )
-    expect(cards).to_have_count(4)
+    # One disclosure with three ordered sections.
+    for section in ("#vpn-traffic-performance", "#vpn-routing-drops", "#vpn-runtime-details"):
+        expect(page.locator(section)).to_be_visible()
+    boxes = [page.locator(s).bounding_box() for s in (
+        "#vpn-traffic-performance", "#vpn-routing-drops", "#vpn-runtime-details")]
+    assert all(b is not None for b in boxes)
+    assert boxes[0]["y"] < boxes[1]["y"] < boxes[2]["y"]
+
+    # #vpn-diag-lat-max is retired: the default percentile is the recent
+    # forward-write reservoir, not the unprovable historical one.
+    expect(page.locator("#vpn-diag-lat-max")).to_have_count(0)
 
     diag_fields = (
-        "throughput ewma5m ewma1h lat-percentiles lat-max queue-occ queue-peak "
+        "throughput ewma5m ewma1h lat-percentiles queue-occ queue-peak "
         "drops-client drops-return drops-total engine-status peers-status "
         "hs-freshness routing-counts res-cpu res-mem res-fd"
     ).split()
     for f in diag_fields:
         expect(page.locator(f"#vpn-diag-{f}")).to_be_visible()
+
+    # An unsampled percentile must read as not measured, never 0.0 ms.
+    lat_text = page.locator("#vpn-diag-lat-percentiles").inner_text().strip()
+    p95_samples = (api_get(page, "/api/vpn/status").get("forward_latency") or {}).get("p95_health_samples")
+    if not isinstance(p95_samples, int) or p95_samples <= 0:
+        assert lat_text == "Not measured"
 
     for obsolete in (
         "#vpn-diag-packets",
@@ -141,22 +181,20 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
 
 @pytest.mark.e2e
 def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> interactive time window toggle (15m, 1h, 6h, 24h)."""
+    """Navigate to /vpn -> interactive time window toggle (15m, 1h, 24h)."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Ensure technical details disclosure is open
-    _ensure_tech_details_open(page)
+    # Advanced Diagnostics is closed by default; open it explicitly.
+    _ensure_diagnostics_open(page)
 
     for chart in _HISTORICAL_CHARTS:
         expect(page.locator(chart)).to_be_visible()
     for obsolete in _OBSOLETE_CHARTS:
         expect(page.locator(obsolete)).to_have_count(0)
 
-    breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
-        has=page.locator("#vpn-chart-reasons")
-    )
+    breakdown = page.locator("details").filter(has=page.locator("#vpn-chart-reasons"))
     breakdown.locator("summary").click()
     for chart in ("#vpn-chart-reasons", "#vpn-chart-backends"):
         expect(page.locator(chart)).to_be_visible()
@@ -165,7 +203,7 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
 
-    for win in ("1h", "6h", "24h", "15m"):
+    for win in ("1h", "24h", "15m"):
         btn = toggles.locator(f"button:has-text('{win}')")
         expect(btn).to_be_visible()
         btn.click()
@@ -183,8 +221,8 @@ def test_vpn_historical_charts_interaction_and_kpis(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Ensure technical details disclosure is open
-    _ensure_tech_details_open(page)
+    # Advanced Diagnostics is closed by default; open it explicitly.
+    _ensure_diagnostics_open(page)
 
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
@@ -230,7 +268,7 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
     page.wait_for_load_state("networkidle")
 
     # Open technical details disclosure if collapsed
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     # Inject an unavailable history series with unavailable flags and zero sample count
     page.evaluate("""() => {
@@ -280,7 +318,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     page.evaluate("""() => {
         const pt = { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
@@ -317,7 +355,7 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     details = page.locator("#vpn-fwd-routes-details")
     expect(details).to_be_visible()
@@ -364,11 +402,10 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Production JS auto-expands both disclosures conditionally: the outer one on
-    # new health problems and the inner one on route pressure. Open each only
-    # when closed so this check stays independent of dashboard health state and
-    # never toggles an already-open disclosure shut.
-    _ensure_tech_details_open(page)
+    # #955 removed every auto-expand: neither Advanced Diagnostics nor the route
+    # fold opens itself. Open both explicitly, and only when closed, so this check
+    # stays independent of dashboard health state.
+    _ensure_diagnostics_open(page)
     routes_details = page.locator("#vpn-fwd-routes-details")
     if not routes_details.evaluate("el => el.open"):
         page.locator("#vpn-fwd-routes-details > summary").click()
@@ -445,7 +482,9 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
 
     assert result["wrapper_client_width"] <= 375
     assert result["table_scroll_width"] >= 540
-    assert result["table_min_width_style"] == "540px"
+    # The 540px minimum is stylesheet-owned now, so assert the real containment
+    # rather than an inline style value.
+    assert result["table_min_width_style"] == ""
     assert result["wrapper_scroll_width"] > result["wrapper_client_width"]
     assert result["wrapper_overflow_x"] == "auto"
     assert result["scroll_left_ltr"] > 0

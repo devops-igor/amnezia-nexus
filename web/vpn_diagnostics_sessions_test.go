@@ -68,26 +68,41 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 			t.Errorf("#vpn-fwd-routes-table has obsolete class table, got classes: %q", tableClass)
 		}
 
-		// 3. Minimum width rule
-		tableStyle := getHTMLNodeAttr(table, "style")
-		if !strings.Contains(tableStyle, "min-width: 540px") {
-			t.Errorf("#vpn-fwd-routes-table style missing min-width: 540px, got: %q", tableStyle)
+		// 3. The 540px minimum width is declared by the scoped stylesheet on the
+		// table's named scroll region rather than as an inline style (#955 removes
+		// large inline styling from the template).
+		if tableStyle := getHTMLNodeAttr(table, "style"); tableStyle != "" {
+			t.Errorf("#vpn-fwd-routes-table must not carry an inline style, got %q", tableStyle)
+		}
+		region := table.Parent
+		if region == nil {
+			t.Fatal("route table has no parent region")
+		}
+		if cls := getHTMLNodeAttr(region, "class"); !strings.Contains(cls, "vpn-route-table-region") {
+			t.Errorf("route table wrapper class = %q, want the .vpn-route-table-region scroll region", cls)
+		}
+		if !strings.Contains(cssStr, ".vpn-route-table-region .data-table") ||
+			!strings.Contains(cssStr, "min-inline-size: 540px") {
+			t.Error("vpn.css must declare the 540px minimum on .vpn-route-table-region .data-table")
+		}
+		if !strings.Contains(cssStr, ".vpn-route-table-region") || !strings.Contains(cssStr, "overflow: auto") {
+			t.Error("vpn.css must make the route region scroll inside itself")
 		}
 
-		// 4. Headers: Peer has white-space: nowrap, Queue, Peak, Drops, Writes have text-align: right
+		// 4. Headers: numeric columns are right-aligned and the peer column does not
+		// wrap, expressed as classes so RTL logical properties apply.
 		thNodes := findHTMLNodesByTag(table, "th")
 		if len(thNodes) != 5 {
 			t.Fatalf("expected 5 <th> elements in #vpn-fwd-routes-table, found %d", len(thNodes))
 		}
-		thPeerStyle := getHTMLNodeAttr(thNodes[0], "style")
-		if !strings.Contains(thPeerStyle, "white-space: nowrap") {
-			t.Errorf("peer header style = %q, want containing 'white-space: nowrap'", thPeerStyle)
-		}
-		for i, name := range []string{"queue", "peak", "drops", "writes"} {
-			thStyle := getHTMLNodeAttr(thNodes[i+1], "style")
-			if !strings.Contains(thStyle, "text-align: right") {
-				t.Errorf("%s header style = %q, want containing 'text-align: right'", name, thStyle)
+		for i := 1; i < len(thNodes); i++ {
+			cls := getHTMLNodeAttr(thNodes[i], "class")
+			if !strings.Contains(cls, "vpn-numeric") {
+				t.Errorf("numeric header %d class = %q, want .vpn-numeric", i, cls)
 			}
+		}
+		if !strings.Contains(cssStr, ".vpn-numeric") || !strings.Contains(cssStr, "text-align: right") {
+			t.Error("vpn.css must right-align .vpn-numeric cells")
 		}
 	})
 
@@ -185,12 +200,16 @@ console.log('TABLE_FORMATTING_PASS');
 			if gotText != wantText {
 				t.Errorf("Persian header %d (%s) = %q, want %q", i, exp.key, gotText, wantText)
 			}
+			// Alignment is expressed by class so logical properties hold in RTL.
 			style := getHTMLNodeAttr(thNodes[i], "style")
-			if exp.nowrap && !strings.Contains(style, "white-space: nowrap") {
-				t.Errorf("Persian header %d missing 'white-space: nowrap', style=%q", i, style)
+			if style != "" {
+				t.Errorf("Persian header %d must not carry an inline style, style=%q", i, style)
 			}
-			if exp.alignment != "" && !strings.Contains(style, exp.alignment) {
-				t.Errorf("Persian header %d missing %q, style=%q", i, exp.alignment, style)
+			if exp.alignment != "" && !strings.Contains(cssStr, ".vpn-numeric") {
+				t.Errorf("Persian header %d: .vpn-numeric rule missing", i)
+			}
+			if exp.nowrap && !strings.Contains(cssStr, "white-space: nowrap") {
+				t.Errorf("Persian header %d: stylesheet must keep the peer column unwrapped", i)
 			}
 		}
 
@@ -220,11 +239,12 @@ assert.strictEqual(thElements[2].textContent.trim(), w.translations['vpn_forward
 assert.strictEqual(thElements[3].textContent.trim(), w.translations['vpn_forwarder_route_drops'], 'localized drops header');
 assert.strictEqual(thElements[4].textContent.trim(), w.translations['vpn_forwarder_route_writes'], 'localized writes header');
 
-assert.strictEqual(thElements[0].style.whiteSpace, 'nowrap', 'peer header white-space nowrap under RTL');
-assert.strictEqual(thElements[1].style.textAlign, 'right', 'queue header text-align right under RTL');
-assert.strictEqual(thElements[2].style.textAlign, 'right', 'peak header text-align right under RTL');
-assert.strictEqual(thElements[3].style.textAlign, 'right', 'drops header text-align right under RTL');
-assert.strictEqual(thElements[4].style.textAlign, 'right', 'writes header text-align right under RTL');
+// Header alignment is stylesheet-owned now (logical properties), so assert the
+// class contract instead of an inline style.
+assert(thElements[1].className.includes('vpn-numeric'), 'queue header uses the numeric class under RTL');
+assert(thElements[2].className.includes('vpn-numeric'), 'peak header uses the numeric class under RTL');
+assert(thElements[3].className.includes('vpn-numeric'), 'drops header uses the numeric class under RTL');
+assert(thElements[4].className.includes('vpn-numeric'), 'writes header uses the numeric class under RTL');
 
 const sampleRoutes = [
     { peer_key: 'fa_peer_1', occupancy: 10, capacity: 100, high_water: 20, drops: 0, write_count: 50 },
@@ -274,6 +294,7 @@ console.log('PERSIAN_RTL_PASS');
 		translationsJS := vpnDiagnosticsTranslationsJS(t, "en")
 
 		testScript := jsdomBootstrapSnippet + fmt.Sprintf(`
+const CSS_TEXT = %q;
 const dom = new JSDOM('<!DOCTYPE html><html><head><style>' + %q + '</style></head><body>' + %q + '</body></html>', {
     pretendToBeVisual: true,
     runScripts: 'outside-only'
@@ -295,15 +316,17 @@ assert(container, 'parent .table-container must exist');
 const containerStyle = w.getComputedStyle(container);
 assert.strictEqual(containerStyle.overflowX, 'auto', 'container must have overflow-x: auto');
 
-// 2. Verify #vpn-fwd-routes-table style has min-width: 540px
-const tableComputed = w.getComputedStyle(table);
-assert.strictEqual(tableComputed.minWidth, '540px', 'table computed min-width must be 540px');
-assert.strictEqual(table.style.minWidth, '540px', 'table inline style min-width must be 540px');
-
-// 3. Verify min-width exceeds mobile viewport (~375px), preventing columns from collapsing
-const minWidthPx = parseInt(tableComputed.minWidth, 10);
-assert.strictEqual(minWidthPx, 540, 'min-width must be 540px');
-assert(minWidthPx > w.innerWidth, 'table min-width (' + minWidthPx + 'px) exceeds narrow viewport (' + w.innerWidth + 'px), preserving columns and enabling horizontal scroll');
+// 2. The 540px minimum is declared by the scoped stylesheet on the named scroll
+// region, not as an inline style; the region scrolls instead of the document.
+assert.strictEqual(table.style.minWidth, '', 'table must not carry an inline min-width');
+const region = table.closest('.vpn-route-table-region');
+assert(region, 'table must sit inside the .vpn-route-table-region scroll region');
+assert.strictEqual(region.getAttribute('tabindex'), '0', 'the scroll region is keyboard reachable');
+assert.strictEqual(region.getAttribute('role'), 'region', 'the scroll region is a named region');
+assert(region.getAttribute('aria-label'), 'the scroll region has an accessible name');
+assert(CSS_TEXT.includes('.vpn-route-table-region .data-table'), 'stylesheet declares the route table minimum width');
+assert(CSS_TEXT.includes('min-inline-size: 540px'), 'stylesheet minimum width is 540px');
+assert(CSS_TEXT.includes('overflow: auto'), 'stylesheet makes the region scroll inside itself');
 
 // 4. Render sample routes and verify table renders without collapsing columns
 const sampleRoutes = [
@@ -334,7 +357,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('NARROW_VIEWPORT_PASS');
-`, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
+`, cssStr, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
 
 		out := runJSDOMTestScript(t, nodePath, testScript)
 		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
