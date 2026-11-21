@@ -78,15 +78,6 @@ type Settings struct {
 	ExcludedDomains []string `json:"excluded_domains,omitempty"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`
-	// UpstreamDNS is the operator-configured upstream resolver list. It is
-	// empty by default, which means "use the effective defaults" rather than
-	// "no resolver": an existing record written before this field existed
-	// therefore keeps resolving exactly as it did.
-	//
-	// The list is validated by Validate before it is persisted (see
-	// upstream.go), and the policy resolver and the DNS servers a generated
-	// client configuration pushes both derive from it.
-	UpstreamDNS []Upstream `json:"upstream_dns,omitempty"`
 	// InventoryOverride holds operator-supplied IPv4 prefixes that take
 	// precedence over the committed Russian allocation inventory for every
 	// address they contain, so a deployment can correct the shipped set without
@@ -99,8 +90,7 @@ type Settings struct {
 }
 
 // DefaultSettings returns the fresh-install configuration: policy routing
-// disabled, no preset selected, no custom URLs, default refresh interval and
-// the default upstream resolvers (represented by the empty list).
+// disabled, no preset selected, no custom URLs and the default refresh interval.
 func DefaultSettings() Settings {
 	return Settings{
 		Enabled:      false,
@@ -111,9 +101,8 @@ func DefaultSettings() Settings {
 }
 
 // Normalize fills in a valid default refresh interval when the field is absent
-// (zero), applies each upstream entry's transport default port, and returns a
-// copy with an owned CustomURLs and UpstreamDNS slice so a caller cannot mutate
-// shared state through the returned value.
+// (zero), and returns a copy with owned slices so a caller cannot mutate shared
+// state through the returned value.
 //
 // Normalize deliberately does NOT invent a preset. Selecting a source is an
 // operator action, and a synthesized default would be the "dummy policy" the
@@ -134,12 +123,6 @@ func (s Settings) Normalize() Settings {
 	if s.ExcludedDomains != nil {
 		out.ExcludedDomains = make([]string, len(s.ExcludedDomains))
 		copy(out.ExcludedDomains, s.ExcludedDomains)
-	}
-	if s.UpstreamDNS != nil {
-		out.UpstreamDNS = make([]Upstream, len(s.UpstreamDNS))
-		for i, upstream := range s.UpstreamDNS {
-			out.UpstreamDNS[i] = upstream.WithDefaultPort()
-		}
 	}
 	if s.InventoryOverride != nil {
 		out.InventoryOverride = make([]string, len(s.InventoryOverride))
@@ -165,13 +148,12 @@ func (s Settings) Interval() time.Duration {
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.UpstreamDNS) == 0 && len(s.InventoryOverride) == 0
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.InventoryOverride) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
-// means the record is internally coherent, every URL is fetchable under the
-// same SSRF rules the fetcher enforces, and every upstream entry is a usable
-// resolver whose selected transport may dial it.
+// means the record is internally coherent and every URL is fetchable under the
+// same SSRF rules the fetcher enforces.
 //
 // Validate intentionally does not consult live runtime state: whether enablement
 // is currently possible depends on a published snapshot and direct egress, which
@@ -195,10 +177,7 @@ func (s Settings) Validate() error {
 	if err := s.validateLocalEntries(); err != nil {
 		return err
 	}
-	if err := s.validateInventoryOverride(); err != nil {
-		return err
-	}
-	return s.validateUpstreams()
+	return s.validateInventoryOverride()
 }
 
 func (s Settings) validateInterval() error {

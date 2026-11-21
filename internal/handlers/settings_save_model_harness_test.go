@@ -83,7 +83,6 @@ const policyDouble = {
   puts: [],
   record: {enabled: false, preset: 'geoblock', custom_urls: [], local_entries: [], excluded_domains: [],
     sync_interval_seconds: 21600,
-    upstream_dns: [{address: '9.9.9.9', port: 53, transport: 'plain'}],
     status: {enabled: false, preset: 'geoblock', sync_state: 'disabled'}}
 };
 const jsonResponse = (body, status) => new Response(JSON.stringify(body), {status: status || 200, headers: {'content-type': 'application/json'}});

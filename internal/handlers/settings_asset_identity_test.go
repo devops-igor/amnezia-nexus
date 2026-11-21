@@ -51,7 +51,6 @@ var settingsSurfaceControllers = []string{
 	"/static/js/notifications_settings.js",
 	"/static/js/settings.js",
 	"/static/js/policy_routing.js",
-	"/static/js/policy_upstream.js",
 	"/static/js/policy_client_diag_filter.js",
 	"/static/js/policy_client_diag.js",
 	"/static/js/gigahost_catalog_status.js",
@@ -258,7 +257,7 @@ func TestSettingsTemplatesVersionEveryAsset(t *testing.T) {
 	// in it: the shell and the three policy sub-pages that hold the controllers.
 	for _, required := range []string{
 		"settings.html", "settings_policy.html",
-		"settings_policy_client.html", "settings_policy_upstream.html",
+		"settings_policy_client.html",
 	} {
 		if !slices.Contains(scan.templates, required) {
 			t.Fatalf("the scan did not reach %s (scanned %v); an unversioned asset there would pass", required, scan.templates)
@@ -290,12 +289,6 @@ func TestSettingsTemplatesVersionEveryAsset(t *testing.T) {
 // instead.
 func versionedAssetURL(path string) string {
 	return path + "?v=" + config.AppVersion
-}
-
-// versionedSrcAttr is the rendered src attribute for a settings controller,
-// spelled the way a template that carries {{ .app_version }} renders it.
-func versionedSrcAttr(path string) string {
-	return `src="` + versionedAssetURL(path) + `"`
 }
 
 // deliveredAssetDigest is the reference computation for a content-derived URL:
@@ -450,30 +443,5 @@ func TestSettingsAssetVersionMovesWithTheAssetBytes(t *testing.T) {
 	}
 	if _, err := web.AssetVersion(current, "js/absent.js"); err == nil {
 		t.Fatal("an asset this build does not ship produced an identity instead of an error")
-	}
-}
-
-// TestCachedResolverControllerURLDiffersFromTheLiveBaseURL states the cache
-// identity contract for the controller the earlier build made incompatible. The
-// previous release served it at the bare path with a one-day lifetime, so the
-// two URLs must differ: equal URLs mean a cached copy satisfies the new markup.
-func TestCachedResolverControllerURLDiffersFromTheLiveBaseURL(t *testing.T) {
-	const liveBaseResolverURL = "/static/js/policy_upstream.js"
-	if config.AppVersion == "" {
-		t.Fatal("config.AppVersion is empty, so an unchanged URL could not be detected")
-	}
-	body := renderSettingsPage(t, models.RoleAdmin)
-
-	current := versionedAssetURL(liveBaseResolverURL)
-	if !strings.Contains(body, `src="`+current+`"`) {
-		t.Fatalf("the current page does not load the resolver controller at %q", current)
-	}
-	if strings.Contains(body, `src="`+liveBaseResolverURL+`"`) {
-		t.Fatalf("the current page still loads %q; a browser holding that cached copy keeps "+
-			"the previous controller, which discards a conflicted draft and removes both "+
-			"fixed result regions", liveBaseResolverURL)
-	}
-	if current == liveBaseResolverURL {
-		t.Fatal("the version query produced the live-base URL, so it carries no cache identity")
 	}
 }

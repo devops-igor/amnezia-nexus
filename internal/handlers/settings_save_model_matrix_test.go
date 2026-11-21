@@ -1,6 +1,6 @@
 package handlers
 
-// One oracle over the nine settings cards crossed with every way a save can end
+// One oracle over the eight settings cards crossed with every way a save can end
 // (#888). Earlier rounds each fixed the case a review named and left its class.
 // This file states the contract once and checks every cell.
 //
@@ -34,7 +34,7 @@ var settingsMatrixOutcomes = []string{
 
 var settingsMatrixCards = []string{
 	"appearanceCard", "captchaCard", "sslCard", "limitsCard", "telegramCard",
-	"gigahostCard", "notificationsCard", "policyRoutingCard", "policyUpstreamCard",
+	"gigahostCard", "notificationsCard", "policyRoutingCard",
 }
 
 // matrixCell is one result row the scenario prints.
@@ -56,8 +56,7 @@ const MX_CARDS = {
   telegramCard:      {id: 'telegram_chat_id', mk: n => '-100cell' + n, stored: s => s.telegram.chat_id, other: 'app_title'},
   gigahostCard:      {id: 'gigahost_api_key', secret: true, mk: n => 'flux_live_cell_' + n + '_0123456789', stored: s => s.gigahost.api_key, other: 'app_title'},
   notificationsCard: {id: 'notifications_cooldown', mk: n => String(100 + n), other: 'app_title', own: true},
-  policyRoutingCard: {id: 'policy_local_entries', mk: n => 'cell' + n + '.example', other: 'app_title', own: true},
-  policyUpstreamCard:{upstream: true, mk: n => String(5300 + n), other: 'app_title', own: true}
+  policyRoutingCard: {id: 'policy_local_entries', mk: n => 'cell' + n + '.example', other: 'app_title', own: true}
 };
 let mxN = 0;
 const mxText = el => el.textContent.replace(/\s+/g, ' ').trim();
@@ -121,7 +120,7 @@ async function mxStored(cfg) {
     return String((await (await realFetch(CFG.base + '/api/notifications/settings')).json()).cooldown_seconds);
   }
   if (cfg.id === 'policy_local_entries') return policyDouble.record.local_entries.join('\n');
-  return String(policyDouble.record.upstream_dns[0].port);
+  throw new Error('no stored fact is defined for card ' + cfg.id);
 }
 
 // mxRegions checks the card's two result regions: exactly one of each, fixed
@@ -186,22 +185,13 @@ async function mxCell(cardId, outcome) {
       ok(await mxStored(cfg) === before, 'nothing was stored');
 
     } else if (outcome === 'conflict') {
-      if (!cfg.upstream) {
-        status = 'na';
-        reason = 'a conflict needs a read-before-write against a record another tab can change. Only the resolver list replaces a whole record; every other card writes its own section or fields, and two tabs cannot make one overwrite the other (covered by the two-client interleaving tests).';
-      } else {
-        policyDouble.record = Object.assign({}, policyDouble.record, {upstream_dns: [{address: '8.8.8.8', port: 53, transport: 'plain'}]});
-        commit.focus();
-        commit.click();
-        await until(() => p.card.getAttribute('aria-busy') === 'false' && mxText(p.card.querySelector('[data-error]')) !== '', 'the conflict to settle');
-        await settled();
-        ok(policyDouble.puts.length === 0, 'no write is sent on a conflict');
-        ok(mxValue(p, cfg) === draft, 'the draft is still in the editor and the newer list is not adopted');
-        ok(mxDirty(p) !== '', 'a conflict does not mark the card clean');
-        mxRegions(p, ok, 'alert', 'conflict');
-        mxIdle(p, ok);
-        ok(policyDouble.record.upstream_dns[0].address === '8.8.8.8', 'the concurrent writer record is intact');
-      }
+      // No card has a read-before-write over a whole record any more: the
+      // resolver list that did was removed with the encrypted upstream editor.
+      // Every remaining card writes its own section or fields, so two tabs
+      // cannot make one overwrite the other (covered by the two-client
+      // interleaving tests).
+      status = 'na';
+      reason = 'a conflict needs a read-before-write against a record another tab can change. No surviving card replaces a whole record: every one writes its own section or fields, and two tabs cannot make one overwrite the other (covered by the two-client interleaving tests).';
 
     } else if (outcome === 'success') {
       commit.focus();

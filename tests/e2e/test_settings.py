@@ -615,7 +615,7 @@ def test_settings_every_staged_card_commits_from_inside_itself(
     assert page.locator(".settings-actions").count() == 0
     cards = [
         "appearanceCard", "sslCard", "captchaCard", "limitsCard", "telegramCard",
-        "notificationsCard", "policyRoutingCard", "policyUpstreamCard", "gigahostCard",
+        "notificationsCard", "policyRoutingCard", "gigahostCard",
     ]
     labels = set()
     for card in cards:

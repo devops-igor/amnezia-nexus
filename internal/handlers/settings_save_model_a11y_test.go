@@ -1,6 +1,6 @@
 package handlers
 
-// Busy and live-announcement contract on all nine settings cards (#888).
+// Busy and live-announcement contract on all eight settings cards (#888).
 //
 // A role attribute on a node that is hidden is not an announcement: browsers
 // register a live region reliably only when it is already in the accessibility
@@ -16,12 +16,12 @@ import (
 	"testing"
 )
 
-// settingsA11yHelpers is shared scenario code: the nine cards, a test of whether
+// settingsA11yHelpers is shared scenario code: the eight cards, a test of whether
 // a node is exposed, and an observer that records every text change of the three
 // live nodes of a card.
 const settingsA11yHelpers = `
 const CARDS = ['appearanceCard', 'captchaCard', 'sslCard', 'limitsCard', 'telegramCard', 'gigahostCard',
-  'notificationsCard', 'policyRoutingCard', 'policyUpstreamCard'];
+  'notificationsCard', 'policyRoutingCard'];
 function exposed(el) {
   for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
     if (n.hidden || n.getAttribute('aria-hidden') === 'true') return false;
@@ -126,7 +126,7 @@ func TestSettingsA11y_PolicyCardsUseFixedStatusAndAlertRegions(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	runSettingsScenario(t, h, settingsA11yHelpers+`
 await sleep(400);
-for (const [cardId, wrapperId] of [['policyRoutingCard', 'policyAlert'], ['policyUpstreamCard', 'policyUpstreamAlert']]) {
+for (const [cardId, wrapperId] of [['policyRoutingCard', 'policyAlert']]) {
   const wrapper = doc.getElementById(wrapperId);
   assert.ok(wrapper.contains(liveNodes(cardId).status) && wrapper.contains(liveNodes(cardId).error), cardId + ' regions sit in the result wrapper');
   assert.equal(wrapper.getAttribute('role'), null, wrapperId + ' is a plain wrapper, not a live region of its own');
@@ -157,15 +157,14 @@ function wrapperState() { return doc.getElementById('policyAlert').getAttribute(
 `)
 }
 
-// TestSettingsA11y_BusyAndFocusHoldOnAllNineCards: committing any card marks that
+// TestSettingsA11y_BusyAndFocusHoldOnAllEightCards: committing any card marks that
 // card aria-busy, disables its commit and shows its spinner, clears all three when
 // the operation ends, puts keyboard focus back, and leaves every other card's
 // state alone. The save is held at the network so the busy interval is observable.
-func TestSettingsA11y_BusyAndFocusHoldOnAllNineCards(t *testing.T) {
+func TestSettingsA11y_BusyAndFocusHoldOnAllEightCards(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	runSettingsScenarioWith(t, h, settingsHarnessOptions{liveNotifications: true}, settingsA11yHelpers+`
 await until(() => !card('notificationsCard').querySelector('#notificationHistory .text-muted').textContent.startsWith('Loading'), 'notifications to load');
-await until(() => card('policyUpstreamCard').querySelectorAll('[data-upstream-role="row"]').length > 0, 'upstream rows to load');
 await sleep(300);
 
 const edits = {
@@ -176,17 +175,12 @@ const edits = {
   telegramCard: () => type('telegram_chat_id', '-100busy'),
   gigahostCard: () => type('gigahost_api_key', 'flux_live_busy_key_0123456789'),
   notificationsCard: () => type('notifications_cooldown', '45'),
-  policyRoutingCard: () => type('policy_local_entries', 'busy.example'),
-  policyUpstreamCard: () => {
-    const a = card('policyUpstreamCard').querySelector('[data-upstream-field="port"]');
-    a.value = '5353'; a.dispatchEvent(new w.Event('input', {bubbles: true})); a.dispatchEvent(new w.Event('change', {bubbles: true}));
-  }
+  policyRoutingCard: () => type('policy_local_entries', 'busy.example')
 };
 const holds = {
   default: u => String(u).indexOf('/api/settings/save') === 0,
   notificationsCard: u => String(u).indexOf('/api/notifications/settings') === 0,
-  policyRoutingCard: u => String(u) === '/api/vpn/policy',
-  policyUpstreamCard: u => String(u) === '/api/vpn/policy'
+  policyRoutingCard: u => String(u) === '/api/vpn/policy'
 };
 
 for (const id of CARDS) {

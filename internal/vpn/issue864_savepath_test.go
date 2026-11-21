@@ -23,10 +23,9 @@ import (
 // decided there and not by the scheduled loop.
 //
 // The save that exposes this is the ordinary settings edit whose effective rules
-// are unchanged — the upstream resolver list, the refresh interval — because the
-// policy snapshot does not carry those fields. A save whose fetch is refused must
-// leave the authoritative record, the live policy and the write ownership exactly
-// as they were.
+// are unchanged — the refresh interval — because the policy snapshot does not
+// carry it. A save whose fetch is refused must leave the authoritative record,
+// the live policy and the write ownership exactly as they were.
 //
 // Everything below is production code except the two fixture-scoped seams the
 // other policy oracles already use: TLS trust (and the approved-IP/dial pair) for
@@ -103,8 +102,8 @@ func newSavePathScenario(t *testing.T, fixture *savePathFixture, server *httptes
 	if !reflect.DeepEqual(cfgActive.Sources, cfgSaved.Sources) {
 		t.Fatalf("fixture precondition: the save changed the policy sources (%+v -> %+v)", cfgActive.Sources, cfgSaved.Sources)
 	}
-	if reflect.DeepEqual(active.EffectiveUpstreams(), saved.EffectiveUpstreams()) {
-		t.Fatal("fixture precondition: the save does not change the upstream list")
+	if active.SyncInterval == saved.SyncInterval {
+		t.Fatal("fixture precondition: the save changes no setting outside the compiled snapshot")
 	}
 
 	return activateSavePathScenario(t, fixture, server, active, saved)
@@ -135,12 +134,17 @@ func activateSavePathScenario(t *testing.T, fixture *savePathFixture, server *ht
 	return &savePathScenario{svc: svc, store: store, ctx: ctx, active: active, saved: saved}
 }
 
-// effectiveUpstreams returns the upstream list the live resolver was last given.
-func (sc *savePathScenario) effectiveUpstreams(t *testing.T) []policy.Upstream {
+// liveRefreshInterval returns the refresh interval the live runtime was last
+// given. It is the setting the save-path cases change: the policy snapshot does
+// not carry it, so a save that changes only this must keep the published
+// generation.
+func (sc *savePathScenario) liveRefreshInterval(t *testing.T) time.Duration {
 	t.Helper()
-	sc.svc.mu.Lock()
-	defer sc.svc.mu.Unlock()
-	return append([]policy.Upstream(nil), sc.svc.dnsUpstreams...)
+	runtime := sc.svc.policyRuntime()
+	if runtime == nil {
+		t.Fatal("no live policy runtime")
+	}
+	return runtime.settings.Interval()
 }
 
 // TestSaveWithUnchangedRulesPreservesGeneration is the required oracle for the
@@ -158,7 +162,7 @@ func TestSaveWithUnchangedRulesPreservesGeneration(t *testing.T) {
 
 	active := policySettingsForURL(t, "https://save-path.example"+pathA)
 	saved := active
-	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	saved.SyncInterval = active.SyncInterval + 600
 	if err := saved.Validate(); err != nil {
 		t.Fatalf("saved fixture settings are invalid: %v", err)
 	}
@@ -205,11 +209,11 @@ func TestSaveWithUnchangedRulesPreservesGeneration(t *testing.T) {
 	}
 
 	// The requested setting must still be applied, and recorded as the runtime's.
-	if got, want := sc.effectiveUpstreams(t), saved.EffectiveUpstreams(); !reflect.DeepEqual(got, want) {
-		t.Errorf("live upstream list = %+v, want the saved %+v", got, want)
+	if got, want := sc.liveRefreshInterval(t), saved.Interval(); got != want {
+		t.Errorf("live refresh interval = %s, want the saved %s", got, want)
 	}
-	if got := sc.svc.policyRuntime().settings.UpstreamDNS; !reflect.DeepEqual(got, saved.UpstreamDNS) {
-		t.Errorf("runtime settings upstreams = %+v, want the saved %+v", got, saved.UpstreamDNS)
+	if got := sc.svc.policyRuntime().settings.SyncInterval; got != saved.SyncInterval {
+		t.Errorf("runtime settings sync interval = %d, want the saved %d", got, saved.SyncInterval)
 	}
 }
 
@@ -231,7 +235,7 @@ func TestSaveWithChangedSourcePublishesNewGeneration(t *testing.T) {
 
 	active := policySettingsForURL(t, "https://save-path.example"+pathA)
 	saved := policySettingsForURL(t, "https://save-path.example"+pathB)
-	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	saved.SyncInterval = active.SyncInterval + 600
 	if err := saved.Validate(); err != nil {
 		t.Fatalf("saved fixture settings are invalid: %v", err)
 	}
@@ -273,8 +277,8 @@ func TestSaveWithChangedSourcePublishesNewGeneration(t *testing.T) {
 	if durableAfter.ContentHash == durableBefore.ContentHash {
 		t.Errorf("changed-source save left the durable content hash at %q", durableBefore.ContentHash)
 	}
-	if got, want := sc.effectiveUpstreams(t), saved.EffectiveUpstreams(); !reflect.DeepEqual(got, want) {
-		t.Errorf("live upstream list = %+v, want the saved %+v", got, want)
+	if got, want := sc.liveRefreshInterval(t), saved.Interval(); got != want {
+		t.Errorf("live refresh interval = %s, want the saved %s", got, want)
 	}
 }
 
@@ -291,7 +295,7 @@ func TestFailedSaveWithUnchangedSourcesKeepsWriteOwnership(t *testing.T) {
 
 	active := policySettingsForURL(t, "https://save-path.example"+pathA)
 	saved := active
-	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	saved.SyncInterval = active.SyncInterval + 600
 	if err := saved.Validate(); err != nil {
 		t.Fatalf("saved fixture settings are invalid: %v", err)
 	}
@@ -301,19 +305,19 @@ func TestFailedSaveWithUnchangedSourcesKeepsWriteOwnership(t *testing.T) {
 	if liveBefore == nil {
 		t.Fatal("no live snapshot after activation")
 	}
-	upstreamsBefore := sc.effectiveUpstreams(t)
+	intervalBefore := sc.liveRefreshInterval(t)
 
-	// The list host fails exactly while the operator saves the new upstream list.
+	// The list host fails exactly while the operator saves the new settings.
 	fixture.refuse(pathA)
 	if err := sc.svc.StartPolicyRouting(sc.ctx, saved, sc.store, string(saved.Preset)); err == nil {
-		t.Fatal("an upstream-only save whose source fetch failed reported success")
+		t.Fatal("a settings-only save whose source fetch failed reported success")
 	}
 
 	if live := sc.svc.PolicyMatcher().Current(); live == nil || live.Generation() != liveBefore.Generation() {
 		t.Fatalf("a failed save replaced the live generation (%q)", liveBefore.Generation())
 	}
-	if got := sc.effectiveUpstreams(t); !reflect.DeepEqual(got, upstreamsBefore) {
-		t.Errorf("a failed save applied its upstream list anyway: %+v -> %+v", upstreamsBefore, got)
+	if got := sc.liveRefreshInterval(t); got != intervalBefore {
+		t.Errorf("a failed save applied its refresh interval anyway: %s -> %s", intervalBefore, got)
 	}
 
 	// The surviving runtime must still own its writes. Its periodic update may be

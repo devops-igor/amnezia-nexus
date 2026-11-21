@@ -176,7 +176,6 @@ func settingsTemplateSource(t *testing.T) string {
 		"templates/settings_notifications.html",
 		"templates/settings_save_controls.html",
 		"templates/settings_policy.html",
-		"templates/settings_policy_upstream.html",
 		"templates/settings_policy_client.html",
 	}
 	entries, err := web.TemplatesFS.ReadDir("templates/settings")

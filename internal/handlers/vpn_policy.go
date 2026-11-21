@@ -120,15 +120,12 @@ func (h *Handlers) savePolicySettings(ctx context.Context, settings policy.Setti
 // policySettingsEqual reports whether two records describe the same
 // configuration. Settings contains a slice, so == is unavailable.
 func policySettingsEqual(a, b policy.Settings) bool {
-	// The upstream list is part of the record: a compensating write must not
-	// mistake a record whose only change was the resolver list for its own.
 	return a.Enabled == b.Enabled &&
 		a.Preset == b.Preset &&
 		a.SyncInterval == b.SyncInterval &&
 		slices.Equal(a.CustomURLs, b.CustomURLs) &&
 		slices.Equal(a.LocalEntries, b.LocalEntries) &&
 		slices.Equal(a.ExcludedDomains, b.ExcludedDomains) &&
-		slices.Equal(a.UpstreamDNS, b.UpstreamDNS) &&
 		slices.Equal(a.InventoryOverride, b.InventoryOverride)
 }
 
@@ -180,7 +177,6 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"excluded_domains":      excludedDomainsOrEmpty(settings.ExcludedDomains),
 		"inventory_override":    stringsOrEmpty(settings.InventoryOverride),
 		"sync_interval_seconds": settings.SyncInterval,
-		"upstream_dns":          upstreamDNSOrEmpty(settings.UpstreamDNS),
 	}
 	if h.vpnSvc != nil {
 		response["status"] = h.vpnSvc.PolicyStatusSnapshot()
@@ -219,16 +215,6 @@ func localEntriesOrEmpty(entries []string) []string {
 // record whose exclusion list is unset.
 func excludedDomainsOrEmpty(entries []string) []string {
 	return stringsOrEmpty(entries)
-}
-
-// upstreamDNSOrEmpty reports an empty JSON array rather than null for a record
-// that uses the effective default upstream list. An empty array therefore reads
-// as "no explicit list", which is exactly what the setting means.
-func upstreamDNSOrEmpty(list []policy.Upstream) []policy.Upstream {
-	if list == nil {
-		return []policy.Upstream{}
-	}
-	return list
 }
 
 // policySettingsMutation is the settings-mutation boundary: at most one complete
@@ -325,7 +311,7 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"custom_url_count": len(incoming.CustomURLs), "local_entry_count": len(incoming.LocalEntries),
 		"excluded_domain_count":    len(incoming.ExcludedDomains),
 		"inventory_override_count": len(incoming.InventoryOverride),
-		"sync_interval_seconds":    incoming.SyncInterval, "upstream_dns_count": len(incoming.UpstreamDNS),
+		"sync_interval_seconds":    incoming.SyncInterval,
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
 }
@@ -403,38 +389,11 @@ func (h *Handlers) decodePolicyPut(w http.ResponseWriter, r *http.Request) (poli
 	return incoming, true
 }
 
-// mergeStoredUpstreams preserves the stored upstream list for a save that omits
-// the field, while an explicitly empty list stays a deliberate reset.
-//
-// The existing policy form sends only enabled, preset, custom_urls and
-// sync_interval_seconds, so an absent field would otherwise decode to nil and
-// erase an API-configured resolver list on an ordinary settings save. An absent
-// field and an explicit null both decode to nil and both mean "keep what is
-// stored"; only a non-nil slice replaces the record. The merged record is
-// validated before it can be written.
-func mergeStoredUpstreams(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
-	if incoming.UpstreamDNS != nil {
-		return incoming, nil
-	}
-	merged := incoming
-	if previous.present {
-		merged.UpstreamDNS = previous.settings.UpstreamDNS
-	}
-	if err := merged.Validate(); err != nil {
-		return policy.Settings{}, err
-	}
-	return merged, nil
-}
-
 // mergeStoredPolicyFields fills every additive field a save omits from the stored
 // record and validates the result. The merge is one step because the fields
 // interact: a local entry may not overlap an exclusion.
 func mergeStoredPolicyFields(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
-	merged, err := mergeStoredUpstreams(incoming, previous)
-	if err != nil {
-		return policy.Settings{}, err
-	}
-	merged, err = mergeStoredLocalEntries(merged, previous)
+	merged, err := mergeStoredLocalEntries(incoming, previous)
 	if err != nil {
 		return policy.Settings{}, err
 	}
@@ -506,7 +465,6 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 		"excluded_domains":      excludedDomainsOrEmpty(saved.ExcludedDomains),
 		"inventory_override":    stringsOrEmpty(saved.InventoryOverride),
 		"sync_interval_seconds": saved.SyncInterval,
-		"upstream_dns":          upstreamDNSOrEmpty(saved.UpstreamDNS),
 	}
 	if h.vpnSvc != nil {
 		response["policy_status"] = h.vpnSvc.PolicyStatusSnapshot()
@@ -536,12 +494,6 @@ func (h *Handlers) applyPolicySettings(ctx context.Context, settings policy.Sett
 		override, err := settings.ParsedInventoryOverride()
 		if err != nil {
 			return fmt.Errorf("inventory override: %w", err)
-		}
-		// An accepted disable still owns the resolver that issued gateway-DNS
-		// profiles use, so its list is published before the data path is torn
-		// down; teardown then builds the continuity responder from that list.
-		if err := h.vpnSvc.ApplyEffectiveUpstreams(settings.EffectiveUpstreams()); err != nil {
-			return fmt.Errorf("apply upstream dns configuration: %w", err)
 		}
 		h.vpnSvc.StopPolicyRouting()
 		// The override is part of the stored record, not of the data path: with
