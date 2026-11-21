@@ -44,8 +44,8 @@ func TestDirectAllocationAttributionSeparatesWorkedFromFailed(t *testing.T) {
 	failed.ForwardFailed = 1
 	failed.ForwardFailure = forwarder.FlowFailureEgressUnavailable
 
-	workedWire := clientDiagnosisFlow(worked, nil, false, nil, now)
-	failedWire := clientDiagnosisFlow(failed, nil, false, nil, now)
+	workedWire := clientDiagnosisFlow(worked, now)
+	failedWire := clientDiagnosisFlow(failed, now)
 
 	// The deciding rule is the allocation token on both, so an operator reads
 	// "allocation matched" rather than a claim about where the service runs.
@@ -102,7 +102,7 @@ func TestAllocationCDNExclusionIsVisiblePerFlow(t *testing.T) {
 		ForwardPackets:   1,
 	}
 
-	got := clientDiagnosisFlow(flow, nil, false, nil, now)
+	got := clientDiagnosisFlow(flow, now)
 	if got.DecisionReason != string(forwarder.EgressReasonAllocationCDNExcluded) {
 		t.Fatalf("decision reason = %q, want %q", got.DecisionReason, forwarder.EgressReasonAllocationCDNExcluded)
 	}

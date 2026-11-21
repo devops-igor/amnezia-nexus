@@ -10,10 +10,15 @@ package vpn
 //     of being omitted. A missing key would let a later slice change the shape,
 //     and a client could not tell "the panel does not know" from "the panel's
 //     build is older than the server's".
-//   - Nothing here is inferred. A retained cache entry says which decision was
-//     stored for an address; it does not say which query produced it, when the
-//     routing decision was taken, why, or whether the application ever
-//     succeeded. Each of those is its own field with an explicit unknown token.
+//   - Nothing here is inferred. A recorded flow says which route it was given
+//     and why, but not whether the application succeeded. Each unobservable fact
+//     is its own field with an explicit unknown token.
+//
+// There is no DNS section. The panel records no DNS evidence: the producer, the
+// route cache and the history store that fed one are deleted, so a member shaped
+// like a permanently empty history would describe something this build cannot
+// ever report. The section is absent from the answer rather than present and
+// empty.
 
 const (
 	// ClientDiagnosisStateLive means the selected session and route generation
@@ -48,14 +53,6 @@ const (
 	// ClientDiagnosisTokenNotObservable marks a fact the panel can never state
 	// from router-side evidence, whatever slice is built.
 	ClientDiagnosisTokenNotObservable = "not_observable"
-	// ClientDiagnosisNamesNotRecorded is the names-match token for this slice:
-	// the route cache is keyed by address, so no name is retained anywhere.
-	ClientDiagnosisNamesNotRecorded = "not_recorded"
-	// ClientDiagnosisNamesReasonNotRetained is the reason token of the retained
-	// address-evidence names block: that evidence is keyed by address, so the block
-	// states no name. It is not a panel limitation — names are recorded by the DNS
-	// answer and query history beside it.
-	ClientDiagnosisNamesReasonNotRetained = "dns_names_not_retained"
 )
 
 // Limitation tokens an answer carries. They are fixed identifiers so the UI can
@@ -74,14 +71,11 @@ const (
 	// reply from a replaced incarnation on the same tuple is not distinguishable from a
 	// current one by routing state alone.
 	ClientDiagnosisLimitReturnTupleAssociation = "return_current_tuple_association"
-	ClientDiagnosisLimitEvidenceScope          = "route_cache_evidence_only"
 	ClientDiagnosisLimitSessionEnd             = "session_end_not_distinguishable"
 	ClientDiagnosisLimitIPv6                   = "ipv6_not_supported"
-	ClientDiagnosisLimitEncryptedDNS           = "encrypted_dns_not_observed"
 	ClientDiagnosisLimitSingleSnapshot         = "not_an_atomic_cross_subsystem_snapshot"
 	ClientDiagnosisLimitSelectionChanged       = "selection_changed_during_read"
 	ClientDiagnosisLimitFlowScanPartial        = "flow_scan_window_partial"
-	ClientDiagnosisLimitDNSNoIncarnation       = "records_without_route_generation"
 	// The counter-sampling caveat: the counters are read live, not as a settled total.
 	ClientDiagnosisLimitFlowCountersSampled = "flow_counters_are_live_samples"
 	ClientDiagnosisLimitIdentitySource      = "session_registry_unavailable"
@@ -145,165 +139,9 @@ type ClientDiagnosisCoverage struct {
 	EvidenceSource string `json:"evidence_source"`
 	// NotCovered lists facts no router-side store retains today.
 	NotCovered []string `json:"not_covered"`
-	// NotRecorded lists facts this slice does not read from a store that will
-	// carry them in a later slice.
+	// NotRecorded lists the facts the stores this answer reads cannot state, so a
+	// reader can tell "the panel does not record it" from "nothing happened".
 	NotRecorded []string `json:"not_recorded"`
-}
-
-// ClientDiagnosisNamesMatch states whether the retained evidence names the
-// destination. Slice 1 always answers ClientDiagnosisNamesNotRecorded: the cache
-// keeps addresses, never names.
-type ClientDiagnosisNamesMatch struct {
-	Match  string `json:"match"`
-	Reason string `json:"reason,omitempty"`
-}
-
-// ClientDiagnosisDNSAddress is one address an observed answer wrote into the
-// route cache, with the decision it wrote.
-type ClientDiagnosisDNSAddress struct {
-	Address  string `json:"address"`
-	Decision string `json:"decision"`
-}
-
-// ClientDiagnosisDNSRecord is one client DNS answer the router actually observed.
-//
-// It is history, not the active route cache: the record survives its evidence
-// expiring and is dropped only by age, capacity or session retirement. Fields this
-// build's observation boundary cannot see are present with explicit tokens
-// (transport, received_at) instead of being guessed.
-type ClientDiagnosisDNSRecord struct {
-	Seq                  uint64                      `json:"seq"`
-	Name                 string                      `json:"name"`
-	QType                string                      `json:"qtype"`
-	RCode                string                      `json:"rcode"`
-	Aliases              []string                    `json:"aliases"`
-	Addresses            []ClientDiagnosisDNSAddress `json:"addresses"`
-	ResolvedAddresses    int                         `json:"resolved_addresses"`
-	ObservedAt           string                      `json:"observed_at"`
-	ReceivedAt           string                      `json:"received_at"`
-	Transport            string                      `json:"transport"`
-	ExpiresAt            string                      `json:"expires_at"`
-	ExpiresInSeconds     int64                       `json:"expires_in_seconds"`
-	State                string                      `json:"state"`
-	PolicyGeneration     string                      `json:"policy_generation,omitempty"`
-	RouteGeneration      *uint64                     `json:"route_generation,omitempty"`
-	IncarnationKnown     bool                        `json:"route_generation_established"`
-	Classification       string                      `json:"classification"`
-	ClassificationReason string                      `json:"classification_reason,omitempty"`
-	CacheWrite           string                      `json:"cache_write"`
-	Count                int                         `json:"count"`
-	FirstSeen            string                      `json:"first_seen"`
-	LastSeen             string                      `json:"last_seen"`
-}
-
-// ClientDiagnosisRecordLimits states the collector's bounds in force.
-type ClientDiagnosisRecordLimits struct {
-	RecordsPerSession  int   `json:"records_per_session"`
-	RecordsTotal       int   `json:"records_total"`
-	MaxAgeSeconds      int64 `json:"max_age_seconds"`
-	BytesTotal         int   `json:"bytes_total"`
-	NamesPerRecord     int   `json:"names_per_record"`
-	AddressesPerRecord int   `json:"addresses_per_record"`
-}
-
-// ClientDiagnosisDNSRecordCoverage reports what the collector holds and what it
-// could not observe.
-type ClientDiagnosisDNSRecordCoverage struct {
-	StartedAt          string                      `json:"started_at"`
-	RecordsStored      int                         `json:"records_stored"`
-	EstimatedBytes     int                         `json:"estimated_bytes"`
-	Sessions           int                         `json:"sessions"`
-	Written            int64                       `json:"written"`
-	Collapsed          int64                       `json:"collapsed"`
-	EvictedPerSession  int64                       `json:"evicted_per_session"`
-	EvictedGlobal      int64                       `json:"evicted_global"`
-	AgedOut            int64                       `json:"aged_out"`
-	RejectedNoRoom     int64                       `json:"rejected_no_room"`
-	WithoutIncarnation int64                       `json:"without_route_generation"`
-	Limits             ClientDiagnosisRecordLimits `json:"limits"`
-	// NotRecorded lists the observation gaps of this build, so a missing query
-	// type or failure is stated instead of read as "nothing happened".
-	NotRecorded []string `json:"not_recorded"`
-}
-
-// ClientDiagnosisDNSQueryEvent is one terminal client DNS query: an answer, a
-// no-answer response, an error, a refusal, a truncated reply or a reply the client
-// never received. It is diagnostic history and is never route evidence.
-type ClientDiagnosisDNSQueryEvent struct {
-	Seq           uint64 `json:"seq"`
-	Name          string `json:"name"`
-	QType         string `json:"qtype"`
-	RCode         string `json:"rcode"`
-	Kind          string `json:"kind"`
-	Transport     string `json:"transport"`
-	Delivered     bool   `json:"delivered"`
-	Truncated     bool   `json:"truncated"`
-	UpstreamError string `json:"upstream_error,omitempty"`
-	ReceivedAt    string `json:"received_at"`
-	AnsweredAt    string `json:"answered_at"`
-	// RouteGeneration is the registered incarnation when the query arrived, when it
-	// could be established.
-	RouteGeneration  *uint64 `json:"route_generation,omitempty"`
-	IncarnationKnown bool    `json:"route_generation_established"`
-	PolicyGeneration string  `json:"policy_generation,omitempty"`
-	Count            int     `json:"count"`
-	FirstSeen        string  `json:"first_seen"`
-	LastSeen         string  `json:"last_seen"`
-}
-
-// ClientDiagnosisDNSQueryEventCoverage reports the terminal-event store's counters.
-type ClientDiagnosisDNSQueryEventCoverage struct {
-	StartedAt         string                     `json:"started_at"`
-	EventsStored      int                        `json:"events_stored"`
-	EstimatedBytes    int                        `json:"estimated_bytes"`
-	Written           int64                      `json:"written"`
-	Collapsed         int64                      `json:"collapsed"`
-	EvictedPerSession int64                      `json:"evicted_per_session"`
-	EvictedGlobal     int64                      `json:"evicted_global"`
-	AgedOut           int64                      `json:"aged_out"`
-	RejectedNoRoom    int64                      `json:"rejected_no_room"`
-	Limits            ClientDiagnosisEventLimits `json:"limits"`
-	NotRecorded       []string                   `json:"not_recorded"`
-}
-
-// ClientDiagnosisEventLimits states the event store's bounds in force.
-type ClientDiagnosisEventLimits struct {
-	EventsPerSession int   `json:"events_per_session"`
-	EventsTotal      int   `json:"events_total"`
-	MaxAgeSeconds    int64 `json:"max_age_seconds"`
-}
-
-// ClientDiagnosisDNS is the DNS section. It used to carry two halves: the
-// retained address evidence (what the route cache held for this session) and the
-// observed-answer history (what the router actually saw).
-//
-// This build retains neither. The route cache and its evidence are deleted, and
-// the producer that wrote the answer and query history was deleted with the DNS
-// gateway, so the section states not_recorded and keeps only the history members
-// — they are removed together with the history store, not here. The entries half
-// is gone because nothing can fill it and its table is gone from the page.
-type ClientDiagnosisDNS struct {
-	// Available is false and State is not_recorded: no address evidence is
-	// retained, so the section has no view to describe.
-	Available bool   `json:"available"`
-	State     string `json:"state"`
-	// Names is this section's answer to "which name produced these addresses?".
-	Names ClientDiagnosisNamesMatch `json:"names"`
-	// Records are the observed answers, newest first. RecordsAvailable reports
-	// whether a collector was consulted at all.
-	RecordsAvailable bool                             `json:"records_available"`
-	Records          []ClientDiagnosisDNSRecord       `json:"records"`
-	RecordsTotal     int                              `json:"records_total"`
-	RecordsTruncated bool                             `json:"records_truncated"`
-	RecordCoverage   ClientDiagnosisDNSRecordCoverage `json:"record_coverage"`
-	// Events are the terminal client queries, newest first. They are a separate
-	// store from the answers: a query that produced no usable answer still appears
-	// here.
-	EventsAvailable bool                                 `json:"events_available"`
-	Events          []ClientDiagnosisDNSQueryEvent       `json:"events"`
-	EventsTotal     int                                  `json:"events_total"`
-	EventsTruncated bool                                 `json:"events_truncated"`
-	EventCoverage   ClientDiagnosisDNSQueryEventCoverage `json:"event_coverage"`
 }
 
 // ClientDiagnosisFlowDispatch is what the dispatch path did with the flow's
@@ -355,25 +193,6 @@ type ClientDiagnosisFlowReturn struct {
 	Failure   string `json:"failure,omitempty"`
 }
 
-// ClientDiagnosisFlowNameCandidate is one retained answer that named the flow's
-// destination at the instant the flow was decided.
-type ClientDiagnosisFlowNameCandidate struct {
-	Name       string `json:"name"`
-	Seq        uint64 `json:"dns_seq"`
-	ObservedAt string `json:"observed_at"`
-	ExpiresAt  string `json:"expires_at"`
-}
-
-// ClientDiagnosisFlowNameAttempt is one unresolved query the client tried shortly
-// before the flow was decided. It is not the flow's name: a failed query has no
-// answer to attribute to the destination IP.
-type ClientDiagnosisFlowNameAttempt struct {
-	Name       string `json:"name"`
-	QType      string `json:"qtype"`
-	Kind       string `json:"kind"`
-	ReceivedAt string `json:"received_at"`
-}
-
 // ClientDiagnosisFlow is one live flow record.
 type ClientDiagnosisFlow struct {
 	Protocol        string `json:"protocol"`
@@ -403,18 +222,6 @@ type ClientDiagnosisFlow struct {
 	Dispatch ClientDiagnosisFlowDispatch `json:"dispatch"`
 	Forward  ClientDiagnosisFlowForward  `json:"forward"`
 	Return   ClientDiagnosisFlowReturn   `json:"return"`
-
-	// Names is the correlated-name verdict for this destination. A matching
-	// address alone is not a unique domain, so ambiguous and none are first-class
-	// outcomes.
-	Names           []string                           `json:"names"`
-	NamesMatch      string                             `json:"names_match"`
-	NamesReason     string                             `json:"names_reason,omitempty"`
-	NamesConsidered int                                `json:"names_considered"`
-	NameCandidates  []ClientDiagnosisFlowNameCandidate `json:"name_candidates"`
-	// NameAttempts are the unresolved queries tried shortly before the decision.
-	// They are populated only when NamesMatch is none.
-	NameAttempts []ClientDiagnosisFlowNameAttempt `json:"name_attempts"`
 }
 
 // ClientDiagnosisFlows is the live-flow section.
@@ -480,13 +287,15 @@ type ClientDiagnosisDropCoverage struct {
 
 // ClientDiagnosisResponse is the operator-facing answer.
 //
-// The observed sections (DNS, Flows, Drops) carry router-recorded facts only.
+// The observed sections (Flows, Drops) carry router-recorded facts only.
 // No policy evaluation is merged into them: a policy verdict for a destination is
 // a prospective classification and belongs to the separate dry-run endpoint.
+//
+// There is no dns member: this build records no DNS answer, query event or name
+// correlation, so the key is absent rather than present with an empty history.
 type ClientDiagnosisResponse struct {
 	Selection   ClientDiagnosisSelection `json:"selection"`
 	Coverage    ClientDiagnosisCoverage  `json:"coverage"`
-	DNS         ClientDiagnosisDNS       `json:"dns"`
 	Flows       ClientDiagnosisFlows     `json:"flows"`
 	Drops       ClientDiagnosisDrops     `json:"drops"`
 	Limitations []string                 `json:"limitations"`

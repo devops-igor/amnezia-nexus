@@ -173,7 +173,7 @@ await w.diagnoseSelectedClient();
 await settle();
 assert.equal(resultHidden(), false);
 const filter = w.document.getElementById('policyClientDestinationFilter');
-filter.value = 'plain.example';
+filter.value = '93.184.216.34';
 filter.dispatchEvent(new w.Event('input'));
 await settle();
 assert.equal(rowCount('policyClientFlowRows'), 1, 'the filter narrows the result');
@@ -182,7 +182,7 @@ await w.refreshPolicyClients();
 await settle();
 assert.equal(resultHidden(), false, 'an unchanged incarnation retains its valid result');
 assert.equal(text('policyClientGenerationValue'), '3', 'and its generation');
-assert.equal(w.document.getElementById('policyClientDestinationFilter').value, 'plain.example',
+assert.equal(w.document.getElementById('policyClientDestinationFilter').value, '93.184.216.34',
   'and the operator filter');
 assert.equal(rowCount('policyClientFlowRows'), 1, 'the filter still applies to the retained rows');
 assert.equal(requestsTo('/api/vpn/policy/client-diagnosis', 'POST').length, 1,

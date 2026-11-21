@@ -69,14 +69,17 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 	if readOnly, _ := out["read_only"].(bool); !readOnly {
 		t.Error("the answer must declare that it is read-only")
 	}
-	for _, section := range []string{"coverage", "dns", "flows", "drops"} {
+	for _, section := range []string{"coverage", "flows", "drops"} {
 		if _, ok := out[section].(map[string]any); !ok {
 			t.Errorf("section %q is missing from the answer", section)
 		}
 	}
-	// Every list is an array, never null: the UI iterates unconditionally. The DNS
-	// section no longer carries an entries list: the retained-evidence table was
-	// deleted with the route cache it read.
+	// The removed section is an absent key, not an empty object: this build records no
+	// DNS answer, query event or correlated name, so it ships no member for them.
+	if _, ok := out["dns"]; ok {
+		t.Errorf("the answer carries a dns member, which this build cannot produce: %s", w.Body.String())
+	}
+	// Every list is an array, never null: the UI iterates unconditionally.
 	for _, section := range []string{"flows", "drops"} {
 		block := out[section].(map[string]any)
 		if _, ok := block["entries"].([]any); !ok {
@@ -85,22 +88,6 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 	}
 	if limitations, ok := out["limitations"].([]any); !ok || len(limitations) == 0 {
 		t.Errorf("limitations = %v, want a non-empty list", out["limitations"])
-	}
-	// The DNS section carries the answer and query history with final shapes.
-	dns, ok := out["dns"].(map[string]any)
-	if !ok {
-		t.Fatalf("dns section missing: %s", w.Body.String())
-	}
-	for _, key := range []string{"records", "events"} {
-		if _, ok := dns[key].([]any); !ok {
-			t.Errorf("dns.%s is %T, want an array", key, dns[key])
-		}
-	}
-	if _, ok := dns["entries"]; ok {
-		t.Error("dns.entries is present: the retained-evidence table has no producer and no reader")
-	}
-	if available, _ := dns["records_available"].(bool); available {
-		t.Error("a service without a policy runtime cannot report an available DNS collector")
 	}
 	flows, ok := out["flows"].(map[string]any)
 	if !ok {
@@ -114,26 +101,8 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 			t.Errorf("flows is missing %q", key)
 		}
 	}
-
-	recordCoverage, ok := dns["record_coverage"].(map[string]any)
-	if !ok {
-		t.Fatalf("dns.record_coverage missing: %s", w.Body.String())
-	}
-	// The per-store gap list is an array and it is empty. The facts that used to be listed
-	// here — a failed answer, a non-answer query, the transport, the query receipt instant —
-	// are recorded by the query history of the same panel, so claiming them as gaps of this
-	// store would be a claim the answer cannot keep.
-	if gaps, ok := recordCoverage["not_recorded"].([]any); !ok {
-		t.Errorf("record coverage not_recorded is %T, want an array", recordCoverage["not_recorded"])
-	} else if len(gaps) != 0 {
-		t.Errorf("record coverage claims gaps the query history records: %v", gaps)
-	}
-	// The unavailable half is stated explicitly, not only by an empty list.
-	if state, _ := dns["state"].(string); state != "not_recorded" {
-		t.Errorf("dns.state = %v, want the explicit not_recorded token", dns["state"])
-	}
 	// The global coverage still discloses what this build genuinely cannot state, so an
-	// empty history is never read as "this client asked nothing".
+	// empty flow list is never read as "this client sent nothing".
 	globalCoverage, ok := out["coverage"].(map[string]any)
 	if !ok {
 		t.Fatalf("coverage section missing: %s", w.Body.String())

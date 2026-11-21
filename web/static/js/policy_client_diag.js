@@ -12,7 +12,10 @@
  *   - refuses to render an answer that does not echo the session it asked for;
  *   - renders only what the answer says, with every unknown token shown as the
  *     server named it. It never infers a name, a cause, a decision time or a
- *     success from a route, an address or a timestamp.
+ *     success from a route, an address or a timestamp. The sections it renders
+ *     are the ones the answer carries — the live flows and the drop ledger. There
+ *     is no DNS table: this build records no answer, query event or correlated
+ *     name, so the controller looks none up.
  *
  * There is no polling: the list and the answer refresh only when the operator
  * asks. Query names are browsing metadata, so a background refresh would read it
@@ -218,22 +221,6 @@
                 rows.removeChild(rows.firstChild);
             }
         }
-        rows = clientElement('policyClientDNSRows');
-        if (rows) {
-            while (rows.firstChild) {
-                rows.removeChild(rows.firstChild);
-            }
-        }
-        rows = clientElement('policyClientEventRows');
-        if (rows) {
-            while (rows.firstChild) {
-                rows.removeChild(rows.firstChild);
-            }
-        }
-        var eventCoverage = clientElement('policyClientEventCoverage');
-        if (eventCoverage) {
-            eventCoverage.textContent = '';
-        }
         rows = clientElement('policyClientDropRows');
         if (rows) {
             while (rows.firstChild) {
@@ -243,16 +230,6 @@
         var dropCoverage = clientElement('policyClientDropCoverage');
         if (dropCoverage) {
             dropCoverage.textContent = '';
-        }
-        var gaps = clientElement('policyClientDNSGaps');
-        if (gaps) {
-            while (gaps.firstChild) {
-                gaps.removeChild(gaps.firstChild);
-            }
-        }
-        var coverage = clientElement('policyClientDNSCoverage');
-        if (coverage) {
-            coverage.textContent = '';
         }
         var limits = clientElement('policyClientLimitations');
         if (limits) {
@@ -266,13 +243,11 @@
                 el.textContent = '-';
             }
         });
-        ['policyClientFlowFoot', 'policyClientDNSFoot'].forEach(function (id) {
-            var el = clientElement(id);
-            if (el) {
-                el.hidden = true;
-                el.textContent = '';
-            }
-        });
+        var flowFoot = clientElement('policyClientFlowFoot');
+        if (flowFoot) {
+            flowFoot.hidden = true;
+            flowFoot.textContent = '';
+        }
     }
 
     // selectedOption returns the chosen incarnation, or null. The route
@@ -567,29 +542,12 @@
         });
     }
 
-    // appendFlowDestination states the recorded tuple, followed by the matched DNS
-    // names only when stored answers name this address: the one name when there is
-    // one, and the first name plus how many others also match when there are
-    // several. The first name is shown because the row must stay readable, and the
-    // count is shown with it so the address never looks like it has that one name.
-    // The complete list stays in the cell tooltip, and the names a client tried
-    // without an answer are never shown: an unanswered query says nothing about
-    // where this flow went.
+    // appendFlowDestination states the recorded tuple. The row no longer carries a
+    // correlated name: the DNS history that could name an address is gone, so the
+    // cell states what the flow record itself carries and nothing is inferred from
+    // a query the client may have made.
     function appendFlowDestination(row, flow) {
-        var address = flow.destination_ip + ':' + String(flow.destination_port);
-        var names = flow.names || [];
-        if (names.length === 1) {
-            appendCell(row, address + ' (' + names[0] + ')');
-            return;
-        }
-        if (names.length > 1) {
-            var several = clientText('policy_client_flow_names_multiple')
-                .replace('{name}', String(names[0]))
-                .replace('{count}', String(names.length - 1));
-            appendCell(row, address + ' (' + several + ')', names.join(', '));
-            return;
-        }
-        appendCell(row, address);
+        appendCell(row, flow.destination_ip + ':' + String(flow.destination_port));
     }
 
     // appendFlowRoute states the route the flow was given and marks every producer
@@ -763,100 +721,6 @@
         return parts.join(' · ');
     }
 
-    // renderDNSRecords renders the observed answers. The name, its validated
-    // aliases and the addresses with their decisions are the record's own facts;
-    // nothing here re-derives a decision or a name.
-    function renderDNSRecords(records) {
-        var body = clientElement('policyClientDNSRows');
-        if (!body) {
-            return;
-        }
-        records.forEach(function (record) {
-            var row = root.document.createElement('tr');
-            var name = record.name || '';
-            if (record.aliases && record.aliases.length) {
-                name = name + ' → ' + record.aliases.join(' → ');
-            }
-            appendCell(row, name);
-            appendCell(row, record.qtype);
-            var addresses = (record.addresses || []).map(function (entry) {
-                return entry.address + ' (' + clientTokenLabel('decision', entry.decision) + ')';
-            }).join(', ');
-            appendCell(row, addresses);
-            appendCell(row, record.observed_at);
-            appendCell(row, record.expires_at);
-            appendCell(row, String(record.count || 1));
-            // The policy generation the answer was evaluated against, as recorded.
-            appendCell(row, record.policy_generation);
-            appendCell(row, clientTokenLabel('state', record.state));
-            body.appendChild(row);
-        });
-    }
-
-    function renderDNSCoverage(coverage) {
-        var el = clientElement('policyClientDNSCoverage');
-        if (el) {
-            if (!coverage) {
-                el.textContent = '';
-            } else {
-                el.textContent = clientText('policy_client_dns_coverage')
-                    .replace('{stored}', String(coverage.records_stored || 0))
-                    .replace('{collapsed}', String(coverage.collapsed || 0))
-                    .replace('{evicted}', String((coverage.evicted_per_session || 0) + (coverage.evicted_global || 0)))
-                    .replace('{aged}', String(coverage.aged_out || 0));
-            }
-        }
-        var gaps = clientElement('policyClientDNSGaps');
-        clearChildren('policyClientDNSGaps');
-        if (gaps && coverage && coverage.not_recorded) {
-            coverage.not_recorded.forEach(function (token) {
-                var item = root.document.createElement('li');
-                item.textContent = clientTokenLabel('limit', token);
-                gaps.appendChild(item);
-            });
-        }
-    }
-
-    // renderDNSEvents renders the terminal client queries: including the ones that
-    // produced no usable answer, which is why the table exists next to the answers.
-    function renderDNSEvents(events) {
-        var body = clientElement('policyClientEventRows');
-        if (!body) {
-            return;
-        }
-        (events || []).forEach(function (event) {
-            var row = root.document.createElement('tr');
-            appendCell(row, event.name);
-            appendCell(row, event.qtype);
-            var result = clientTokenLabel('dns_event', event.kind);
-            if (event.upstream_error) {
-                result = result + ' (' + clientTokenLabel('upstream', event.upstream_error) + ')';
-            }
-            appendCell(row, result);
-            appendCell(row, String(event.transport || '').toUpperCase());
-            appendCell(row, event.received_at);
-            appendCell(row, event.answered_at);
-            appendCell(row, event.delivered ? clientText('policy_client_delivered_yes') : clientText('policy_client_delivered_no'));
-            body.appendChild(row);
-        });
-    }
-
-    function renderEventCoverage(coverage) {
-        var el = clientElement('policyClientEventCoverage');
-        if (!el) {
-            return;
-        }
-        if (!coverage) {
-            el.textContent = '';
-            return;
-        }
-        el.textContent = clientText('policy_client_dns_events_coverage')
-            .replace('{stored}', String(coverage.events_stored || 0))
-            .replace('{collapsed}', String(coverage.collapsed || 0))
-            .replace('{evicted}', String((coverage.evicted_per_session || 0) + (coverage.evicted_global || 0)))
-            .replace('{aged}', String(coverage.aged_out || 0));
-    }
-
     function renderDrops(drops) {
         var body = clientElement('policyClientDropRows');
         if (!body) {
@@ -977,7 +841,6 @@
 
     function renderClientDiagnosis(answer) {
         var selection = (answer && answer.selection) || {};
-        var dns = (answer && answer.dns) || {};
         var flows = (answer && answer.flows) || {};
 
         var session = clientElement('policyClientSessionValue');
@@ -1001,25 +864,15 @@
         // The destination filter re-renders this same answer, so every appending
         // renderer starts from an empty body and the panels never accumulate rows.
         clearChildren('policyClientFlowRows');
-        clearChildren('policyClientDNSRows');
-        clearChildren('policyClientEventRows');
         clearChildren('policyClientDropRows');
         clearChildren('policyClientLimitations');
 
-        var recordsAll = dns.records || [];
-        var eventsAll = dns.events || [];
         var flowsAll = flows.entries || [];
         var dropView = (answer && answer.drops) || {};
         var dropsAll = dropView.entries || [];
-        var records = destinationRows('records', recordsAll);
-        var events = destinationRows('events', eventsAll);
         var flowEntries = destinationRows('flows', flowsAll);
         var dropEntries = destinationRows('drops', dropsAll);
 
-        renderDNSRecords(records);
-        renderDNSCoverage(dns.record_coverage);
-        renderDNSEvents(events);
-        renderEventCoverage(dns.event_coverage);
         renderFlows(flowEntries);
         renderDrops({
             state: dropView.state,
@@ -1030,32 +883,12 @@
         });
         renderLimitations((answer && answer.limitations) || []);
         renderNotCovered((answer && answer.coverage && answer.coverage.not_covered) || []);
-        // Recorded rows the filter leaves, against all recorded rows. The section foots
-        // above keep describing what was recorded, so an empty table under a filter is
+        // Recorded rows the filter leaves, against all recorded rows. The section foot
+        // below keeps describing what was recorded, so an empty table under a filter is
         // never read as an empty history.
         renderFilterFoot(
-            records.length + events.length + flowEntries.length + dropEntries.length,
-            recordsAll.length + eventsAll.length + flowsAll.length + dropsAll.length);
-
-        var dnsFoot = '';
-        if (!(dns.records || []).length) {
-            dnsFoot = dns.records_available ? clientText('policy_client_dns_empty') : clientText('policy_client_dns_not_recorded');
-        } else if (dns.records_truncated) {
-            dnsFoot = clientText('policy_client_dns_truncated')
-                .replace('{shown}', String((dns.records || []).length))
-                .replace('{total}', String(dns.records_total || 0));
-        }
-        renderFoot('policyClientDNSFoot', dnsFoot);
-
-        var eventFoot = '';
-        if (!(dns.events || []).length) {
-            eventFoot = dns.events_available ? clientText('policy_client_dns_events_empty') : clientText('policy_client_dns_events_not_recorded');
-        } else if (dns.events_truncated) {
-            eventFoot = clientText('policy_client_dns_events_truncated')
-                .replace('{shown}', String((dns.events || []).length))
-                .replace('{total}', String(dns.events_total || 0));
-        }
-        renderFoot('policyClientEventFoot', eventFoot);
+            flowEntries.length + dropEntries.length,
+            flowsAll.length + dropsAll.length);
 
         var flowFoot = '';
         if (!(flows.entries || []).length) {
