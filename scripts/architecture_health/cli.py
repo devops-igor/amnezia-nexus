@@ -46,11 +46,24 @@ def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
         )
         return 0
 
+    head_ref = args.head_ref or ""
+    if not head_ref:
+        if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+            logger.error(
+                "SG1 pull request gate FAILED: no head reference was supplied, and on a "
+                "pull request checkout HEAD is the synthetic merge of the base tip and the "
+                "pull request head, so it cannot stand in for the pull request. Judging it "
+                "would compare the base tip with the merge instead of the branch point with "
+                "the head. Failing rather than reporting a verdict from the merge checkout."
+            )
+            return 1
+        head_ref = "HEAD"
+
     try:
         result = evaluate_pull_request(
             repo_root=repo_root,
             base_ref=base_ref,
-            head_ref=args.head_ref,
+            head_ref=head_ref,
             ceiling_lines=args.ceiling,
         )
     except PrSizeGateError as exc:
@@ -63,11 +76,20 @@ def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
         return 1
 
     logger.info(
-        "SG1 pull request gate: compared %d changed path(s) against merge base %s of %s.",
+        "SG1 pull request gate: comparing %d changed path(s) between merge base %s of %s "
+        "and head %s.",
         result["checked_count"],
         result["merge_base"][:10],
         base_ref,
+        result["head_ref"],
     )
+    for entry in result["checked"]:
+        logger.info(
+            "SG1 pull request gate: %s is %d line(s) at the merge base and %d line(s) at the head.",
+            entry["path"],
+            entry["base_lines"],
+            entry["head_lines"],
+        )
     for entry in result["skipped"]:
         logger.info("SG1 pull request gate: skipped %s (%s).", entry["path"], entry["reason"])
 
@@ -142,8 +164,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--head-ref",
-        default="HEAD",
-        help="Head ref for --check-pr-size.",
+        default=None,
+        help=(
+            "Head ref for --check-pr-size. Required in a pull request context, where the "
+            "checked-out HEAD is the synthetic Actions merge and cannot stand in for the "
+            "pull request head; defaults to HEAD only outside a pull request."
+        ),
     )
     parser.add_argument(
         "--report-json",

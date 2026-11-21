@@ -47,8 +47,9 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 scripts/architecture_health.py --check-pr-size
+          python3 scripts/architecture_health.py --check-pr-size --head-ref "${PR_HEAD_SHA}"
 
       - name: Upload Architecture Health Report
         uses: actions/upload-artifact@v7

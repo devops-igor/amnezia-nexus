@@ -151,6 +151,7 @@ def evaluate_pull_request(
     merge_base = find_merge_base(repo_root, base_ref, head_ref)
     changes = _changed_paths(repo_root, merge_base, head_ref)
 
+    checked: List[Dict[str, Any]] = []
     violations: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -168,6 +169,7 @@ def evaluate_pull_request(
             skipped.append({"path": path, "reason": "not measurable as text"})
             continue
 
+        checked.append({"path": path, "base_lines": base_lines, "head_lines": head_lines})
         transition = size_transition(base_lines, head_lines, ceiling_lines)
         if transition:
             violations.append(
@@ -180,6 +182,7 @@ def evaluate_pull_request(
                 }
             )
 
+    checked.sort(key=lambda c: c["path"])
     violations.sort(key=lambda v: (v["transition"], v["path"]))
     skipped.sort(key=lambda s: s["path"])
     return {
@@ -187,7 +190,8 @@ def evaluate_pull_request(
         "head_ref": head_ref,
         "merge_base": merge_base,
         "ceiling_lines": ceiling_lines,
-        "checked_count": len(changes) - len(skipped),
+        "checked_count": len(checked),
+        "checked": checked,
         "violations": violations,
         "skipped": skipped,
     }

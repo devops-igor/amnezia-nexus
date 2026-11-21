@@ -6,10 +6,13 @@ is the most likely defect in this comparison and a fixture that is "about a
 thousand lines" cannot detect one.
 """
 
+import os
+import shutil
 import sys
+import textwrap
 from pathlib import Path
 import subprocess
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -22,6 +25,23 @@ from scripts.architecture_health import (
 from scripts.architecture_health.pull_request import CROSSED_TRANSITION, GREW_TRANSITION
 
 CEILING = 1000
+
+WORKFLOW_REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW_PATH = WORKFLOW_REPO_ROOT / ".github" / "workflows" / "architecture-health.yml"
+GATE_STEP_NAME = "Enforce SG1 size rule for this pull request"
+
+BRANCH_POINT = "5b1e0c0ffee0deadbeef0123456789abcdef0123"
+
+
+@pytest.fixture(autouse=True)
+def isolate_github_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test independent of the ambient Actions environment.
+
+    This module runs inside the pull-request workflow itself, so GITHUB_* is
+    normally populated. Each test sets only the variables it is about.
+    """
+    for name in ("GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_STEP_SUMMARY", "GITHUB_HEAD_REF"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _lines(count: int, tag: str = "line") -> str:
@@ -403,9 +423,13 @@ def test_non_pull_request_invocation_does_not_block(
 
 
 def test_pull_request_event_reads_base_ref_from_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """In CI the base comes from GITHUB_BASE_REF, so the workflow step stays thin."""
+    """In CI the base comes from GITHUB_BASE_REF, so the workflow step stays thin.
+
+    The head is supplied the way the workflow now supplies it: the event's own
+    pull request head, passed through --head-ref.
+    """
     repo = _build_pr(
         tmp_path,
         base_files={"grow.go": _lines(999, "func")},
@@ -413,8 +437,38 @@ def test_pull_request_event_reads_base_ref_from_environment(
     )
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    pr_head = _git(repo, "rev-parse", "HEAD").strip()
+    caplog.set_level("INFO")
+
+    assert main(["--repo-root", str(repo), "--check-pr-size", "--head-ref", pr_head]) == 1
+    # Exit 1 must come from the crossing, not from the missing-head guard.
+    assert "no head reference was supplied" not in caplog.text
+    assert "grow.go is 999 line(s) at the merge base and 1000 line(s) at the head" in caplog.text
+
+
+def test_pull_request_without_head_ref_fails_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pull request run with no head reference is an error, never a merge-head verdict.
+
+    Defaulting to HEAD here is exactly defect F952-01: on a pull_request checkout
+    HEAD is the synthetic merge, whose merge base with the base branch is the base
+    tip. The gate must refuse to judge instead of judging the wrong commit.
+    """
+    repo = _build_pr(
+        tmp_path,
+        base_files={"grow.go": _lines(999, "func")},
+        head_files={"grow.go": _lines(1000, "func")},
+    )
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    caplog.set_level("INFO")
 
     assert main(["--repo-root", str(repo), "--check-pr-size"]) == 1
+    assert "no head reference was supplied" in caplog.text
+    assert "synthetic merge" in caplog.text
+    assert "FAILED" in caplog.text
+    assert "PASSED" not in caplog.text
 
 
 def test_merge_base_not_base_tip_is_used(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -539,14 +593,20 @@ def test_missing_base_ref_still_fails_closed(tmp_path: Path) -> None:
 
 
 def test_actions_merge_checkout_gives_the_same_answer_as_the_pr_head(tmp_path: Path) -> None:
-    """The workflow's default HEAD is the Actions merge commit, not the PR head.
+    """Disjoint-file case: main and the PR touch different files, so both refs agree.
 
     actions/checkout on pull_request builds a synthetic two-parent merge of the
-    base tip and the PR head. That is safe here only because the gate diffs from
-    the merge base, and merge-base(base, merge-commit) is the base tip, so the
-    merge commit contributes no base-branch work of its own. This test builds
-    that exact shape and asserts both refs agree, so a future change to the
-    comparison cannot silently start reading the merge commit.
+    base tip and the PR head. Here main adds `other.go` while the PR changes
+    `grow.go`, so merging main's work in adds no line to any path the PR
+    touched, and merge-base(main, merge) is the base tip. Both comparisons
+    therefore agree, and the merge checkout contributes no base-branch work.
+
+    That equivalence is a property of disjoint edits, not of the merge ref. When
+    both sides edit the same file it breaks in both directions; see
+    `test_same_file_divergent_merge_false_rejection_is_rejected` and
+    `test_same_file_divergent_merge_false_acceptance_is_rejected`, which is why
+    the workflow now passes the event's own head SHA through --head-ref instead
+    of letting the CLI default to the checkout.
     """
     repo = _pr_with_remote_only_base(tmp_path)
     head_sha = _git(repo, "rev-parse", "pr").strip()
@@ -669,3 +729,232 @@ def test_mutation_control_leaves_source_intact() -> None:
     assert "base_lines < ceiling_lines <= head_lines" in source_path.read_text(encoding="utf-8")
     assert size_transition(999, 1000, CEILING) == CROSSED_TRANSITION
     assert size_transition(1000, 1000, CEILING) is None
+
+
+# --------------------------------------------------------------------------- #
+# F952-01: same-file contention, and the invocation the workflow actually runs.
+#
+# Round 1 established that the Actions merge checkout agrees with the PR head
+# only for edits to DIFFERENT files. When main and the PR both edit the same
+# file, merge-base(main, merge) is main's tip rather than the branch point, and
+# because the threshold predicate is not linear that substitution inverts the
+# verdict in both directions. These two tests build real two-parent merges with
+# contention on one file, and drive the workflow's own shell body against them.
+# --------------------------------------------------------------------------- #
+
+
+def _gate_step_block() -> str:
+    """The workflow text of the SG1 gate step, isolated from its neighbours."""
+    lines = WORKFLOW_PATH.read_text(encoding="utf-8").splitlines()
+    marker = f"- name: {GATE_STEP_NAME}"
+    start = next((i for i, line in enumerate(lines) if line.strip() == marker), None)
+    assert start is not None, f"workflow no longer defines the step {GATE_STEP_NAME!r}"
+
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    block: List[str] = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.lstrip().startswith("- ") and len(line) - len(line.lstrip()) <= step_indent:
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+def _gate_run_body() -> str:
+    """The shell body of the gate step, dedented to a standalone script."""
+    block = _gate_step_block()
+    head, _, body = block.partition("run: |\n")
+    assert body, "gate step no longer has a run block"
+
+    # The workflow must take the head from the event, not from the checkout: the
+    # checkout on pull_request is the synthetic merge, which is the defect.
+    assert "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in head
+    assert '--head-ref "${PR_HEAD_SHA}"' in body
+    return textwrap.dedent(body)
+
+
+def _run_gate_via_workflow(repo: Path, pr_head_sha: Optional[str]) -> subprocess.CompletedProcess:
+    """Execute the workflow's gate body in the fixture repo, as the runner does.
+
+    Actions runs a `run` block with the default shell `bash -e {0}`, which is
+    what this reproduces: an unset PR_HEAD_SHA expands to an empty string and
+    reaches the gate as an empty --head-ref, so the gate itself is the thing that
+    must refuse to judge.
+    """
+    body = _gate_run_body()
+    assert "python3 scripts/architecture_health.py" in body
+    body = body.replace(
+        "python3 scripts/architecture_health.py", f"{sys.executable} scripts/architecture_health.py"
+    )
+
+    # The runner checks out the repository, so the gate's own entrypoint is
+    # present in the working tree next to the code under measurement. Bytecode
+    # is excluded so the fixture cannot execute a stale cache of the gate.
+    shutil.copytree(
+        WORKFLOW_REPO_ROOT / "scripts",
+        repo / "scripts",
+        dirs_exist_ok=True,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+    env = dict(os.environ)
+    env["GITHUB_EVENT_NAME"] = "pull_request"
+    env["GITHUB_BASE_REF"] = "main"
+    env.pop("GITHUB_HEAD_REF", None)
+    env.pop("PR_HEAD_SHA", None)
+    if pr_head_sha is not None:
+        env["PR_HEAD_SHA"] = pr_head_sha
+    return subprocess.run(
+        ["bash", "-e", "-c", body], cwd=repo, capture_output=True, text=True, env=env
+    )
+
+
+def _same_file_contention_checkout(
+    tmp_path: Path, branch_point_lines: str, main_side: str, pr_side: str
+) -> Dict[str, Any]:
+    """A pull_request checkout where main and the PR both edit the same file.
+
+    Reproduces the runner's shape: `main` exists only as `origin/main` at its own
+    advanced tip, HEAD is detached at a synthetic two-parent merge of that tip
+    and the PR head, and one file carries an edit from each side.
+    """
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _write(repo, "hot.go", branch_point_lines)
+    _commit_all(repo, "branch point")
+    base_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    _git(repo, "checkout", "-q", "-b", "pr")
+    _write(repo, "hot.go", pr_side)
+    _commit_all(repo, "pr edits the file")
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "hot.go", main_side)
+    _commit_all(repo, "main edits the same file")
+    main_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "main")
+
+    _git(repo, "checkout", "-q", "-b", "merge-sim", main_sha)
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", head_sha)
+    merge_sha = _git(repo, "rev-parse", "HEAD").strip()
+    parents = _git(repo, "rev-list", "--parents", "-n1", merge_sha).split()
+    assert parents[1:] == [main_sha, head_sha], "fixture must be a two-parent merge"
+    assert _git(repo, "diff", "--name-only", base_sha, merge_sha).split().count("hot.go") == 1
+
+    _git(repo, "checkout", "-q", "--detach", merge_sha)
+    _git(repo, "branch", "-q", "-D", "main", "merge-sim")
+    assert "main" not in _git(repo, "branch", "--format=%(refname:short)").split()
+
+    return {
+        "repo": repo,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "main_sha": main_sha,
+        "merge_sha": merge_sha,
+    }
+
+
+def test_same_file_divergent_merge_does_not_falsely_reject_the_pr(tmp_path: Path) -> None:
+    """998 at the branch point, main and PR add a line each: the PR must pass.
+
+    The PR's own transition is 998 -> 999, which is below the ceiling. Judging
+    the synthetic merge instead reports 999 -> 1000 and reddens a compliant pull
+    request. The workflow invocation is the assertion: it exits 0.
+    """
+    fixture = _same_file_contention_checkout(
+        tmp_path,
+        branch_point_lines=_lines(998, "func"),
+        main_side="main was here\n" + _lines(998, "func"),
+        pr_side=_lines(998, "func") + "pr was here\n",
+    )
+    repo = fixture["repo"]
+    assert _physical_line_count(repo / "hot.go") == 1000, "the merge itself is at 1000 lines"
+
+    # The checkout's HEAD is the merge, so its merge base is main's tip: this is
+    # the wrong input, and it is what the round 1 workflow actually fed the gate.
+    via_merge = evaluate_pull_request(repo, "main", head_ref="HEAD")
+    assert via_merge["merge_base"] == fixture["main_sha"]
+    assert [(v["path"], v["base_lines"], v["head_lines"]) for v in via_merge["violations"]] == [
+        ("hot.go", 999, 1000)
+    ], "the merge checkout inverts this case into a violation"
+
+    # With the event's head SHA the same comparison is branch point -> PR head.
+    via_head = evaluate_pull_request(repo, "main", head_ref=fixture["head_sha"])
+    assert via_head["merge_base"] == fixture["base_sha"]
+    assert via_head["checked"] == [{"path": "hot.go", "base_lines": 998, "head_lines": 999}]
+    assert via_head["violations"] == []
+
+    run = _run_gate_via_workflow(repo, fixture["head_sha"])
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert (
+        f"comparing 1 changed path(s) between merge base {fixture['base_sha'][:10]} of main "
+        f"and head {fixture['head_sha']}"
+    ) in run.stdout
+    assert "hot.go is 998 line(s) at the merge base and 999 line(s) at the head." in run.stdout
+    assert "PASSED" in run.stdout
+
+
+def test_same_file_divergent_merge_does_not_falsely_accept_the_pr(tmp_path: Path) -> None:
+    """999 at the branch point, PR appends to 1000, main removes a line: must fail.
+
+    The PR crosses the ceiling, so the gate has to fail. Judging the synthetic
+    merge instead sees 998 -> 999, which passes silently. The workflow
+    invocation exits 1 and names both counts.
+    """
+    fixture = _same_file_contention_checkout(
+        tmp_path,
+        branch_point_lines=_lines(999, "func"),
+        main_side=_lines(999, "func").replace("func 0\n", ""),
+        pr_side=_lines(999, "func") + "pr was here\n",
+    )
+    repo = fixture["repo"]
+    assert _physical_line_count(repo / "hot.go") == 999, "the merge itself is at 999 lines"
+
+    via_merge = evaluate_pull_request(repo, "main", head_ref="HEAD")
+    assert via_merge["merge_base"] == fixture["main_sha"]
+    assert via_merge["violations"] == [], "the merge checkout hides a real crossing"
+
+    via_head = evaluate_pull_request(repo, "main", head_ref=fixture["head_sha"])
+    assert via_head["merge_base"] == fixture["base_sha"]
+    assert [
+        (v["path"], v["base_lines"], v["head_lines"], v["transition"])
+        for v in via_head["violations"]
+    ] == [("hot.go", 999, 1000, CROSSED_TRANSITION)]
+
+    run = _run_gate_via_workflow(repo, fixture["head_sha"])
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "hot.go is 999 line(s) at the merge base and 1000 line(s) at the head." in run.stdout
+    assert (
+        "::error file=hot.go::SG1 size rule violated (crossed ceiling at 1000 lines)" in run.stdout
+    )
+    assert "FAILED with 1 size violation(s)" in run.stdout
+
+
+def test_workflow_gate_without_the_head_sha_fails_instead_of_judging_the_merge(
+    tmp_path: Path,
+) -> None:
+    """The fail-loud half: no event head means no verdict, because the fallback is the bug.
+
+    On the false-acceptance fixture the merge checkout passes. If the head SHA
+    were missing and the gate silently fell back to HEAD, this PR would ship a
+    crossing. It must exit 1 and say why.
+    """
+    fixture = _same_file_contention_checkout(
+        tmp_path,
+        branch_point_lines=_lines(999, "func"),
+        main_side=_lines(999, "func").replace("func 0\n", ""),
+        pr_side=_lines(999, "func") + "pr was here\n",
+    )
+
+    run = _run_gate_via_workflow(fixture["repo"], None)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "no head reference was supplied" in run.stdout
+    assert "synthetic merge" in run.stdout
+    assert "PASSED" not in run.stdout
