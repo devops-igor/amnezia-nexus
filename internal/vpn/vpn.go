@@ -193,13 +193,6 @@ type Service struct {
 	portalPrivKey    string
 	awgProvider      AWGStatusProvider
 	ingressEngine    *IngressEngine
-	// dnsUpstreams is THE current effective upstream list every DNS consumer
-	// reads: the live policy resolver sets it on activation and on an accepted
-	// live change, and a disabled or refused activation records the operator's
-	// accepted list here for the next activation. It is never derived from
-	// activation metadata, so a list the operator replaced cannot come back.
-	// Guarded by mu; always a private copy.
-	dnsUpstreams []policy.Upstream
 	// inventoryOverride is the accepted operator override for the committed
 	// Russian allocation inventory, or nil when the shipped set alone answers.
 	// It is the record's own value, not a classification result: activation and

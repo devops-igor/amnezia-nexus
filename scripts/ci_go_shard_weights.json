@@ -34,7 +34,6 @@
   "internal/vpn": 430.6,
   "internal/vpn/auth": 1.1,
   "internal/vpn/clientawg": 2.8,
-  "internal/vpn/dns": 1.6,
   "internal/vpn/forwarder": 79.6,
   "internal/vpn/identity": 2.2,
   "internal/vpn/ingress": 13.8,

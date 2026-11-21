@@ -271,8 +271,11 @@ func TestService_StartWithPBR_DefaultDependencies(t *testing.T) {
 		t.Fatal("expected PBR to be enabled on service")
 	}
 
-	if cfg := svc.getPBRConfig(); cfg != nil && cfg.DNSResolver == nil {
-		t.Error("startup did not build the configured upstream resolver")
+	// The classifier is the data-path dependency this startup must have built
+	// from the configured sources: without it nothing routes DIRECT and every
+	// destination keeps the fail-safe proxy default.
+	if svc.forwarder.DestinationClassifier() == nil {
+		t.Error("startup installed no destination classifier")
 	}
 }
 

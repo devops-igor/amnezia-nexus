@@ -5,48 +5,44 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
-	"strconv"
 	"strings"
 )
 
-// This file defines the operator-facing upstream DNS configuration that the
-// policy resolver feeds on (issue #824) and the pure validation the admin API
-// applies before anything is persisted.
+// This file defines the upstream DNS entry type and the default resolver pair
+// that every generated client configuration renders its DNS servers from.
 //
 // Design constraints:
-//   - A configuration entry is explicit: address, port and transport. The only
-//     port default is the transport's own well-known one (853 for DoT), applied
-//     before the record is written, so a stored entry always states the port it
-//     dials and can never look like it targets one transport while it actually
-//     targets another.
-//   - Every transport the contract names is implemented: plain DNS, DoT and DoH.
-//     An entry never changes transport at dial time. A transport value this
-//     package does not know is rejected here rather than accepted and quietly
-//     carried in another transport, because a silent downgrade would be worse
-//     than an unimplemented option.
+//   - An entry is explicit: address, port and transport. The only port default is
+//     the transport's own well-known one (853 for DoT, 443 for DoH), applied where
+//     a record states none, so an entry always states the port it dials and can
+//     never look like it targets one transport while it actually targets another.
+//   - Every transport the contract names is a known value: plain DNS, DoT and DoH.
+//     A transport value this package does not know is rejected by Validate rather
+//     than accepted and quietly carried in another transport, because a silent
+//     downgrade would be worse than an unimplemented option.
 //   - A DoH entry is addressed like every other entry (address, port,
-//     transport). The resolver always requests https://<address>:<port>/dns-query,
-//     the well-known RFC 8484 path, so there is no scheme or path to configure and
-//     no way to express a plaintext HTTP endpoint.
-//   - The default pair lives in exactly one place (DefaultUpstreams). The
-//     resolver's fallback and the DNS servers a generated client configuration
-//     pushes both derive from it, so the two cannot drift apart again.
-//   - Validation rejects loopback, multicast, unspecified and malformed input
-//     before a record is written, so a rejected save cannot leave a partial
-//     configuration behind.
+//     transport). A DoH client requests https://<address>:<port>/dns-query, the
+//     well-known RFC 8484 path, so there is no scheme or path to configure and no
+//     way to express a plaintext HTTP endpoint.
+//   - The default pair lives in exactly one place (DefaultUpstreams), and the DNS
+//     servers a generated client configuration pushes derive from it, so the
+//     renderer cannot drift from the definition it is meant to describe.
+//   - Validation rejects loopback, multicast, unspecified and malformed input, so
+//     the default pair this file ships is always an addressable, usable resolver.
+//   - There is no operator-editable upstream list. The panel does not run a
+//     resolver of its own and does not steer client DNS, so the only upstream
+//     configuration this package carries is the built-in default.
 
-// UpstreamTransport selects how the policy resolver carries a query to one
-// upstream entry.
+// UpstreamTransport selects how a consumer carries a query to one upstream entry.
 type UpstreamTransport string
 
 const (
 	// TransportPlain is DNS over UDP with TCP fallback on truncation.
 	TransportPlain UpstreamTransport = "plain"
-	// TransportDoT is DNS over TLS (RFC 7858). The resolver implements it with
-	// the system trust store, chain and name verification, and an optional SPKI
-	// pin; it never carries the query in plaintext.
+	// TransportDoT is DNS over TLS (RFC 7858): the system trust store, chain and
+	// name verification, and an optional SPKI pin; it never carries the query in
+	// plaintext.
 	TransportDoT UpstreamTransport = "dot"
 	// TransportDoH is DNS over HTTPS (RFC 8484), carried over HTTP/2 with the
 	// system trust store, chain and name verification, and an optional SPKI pin.
@@ -55,9 +51,6 @@ const (
 )
 
 const (
-	// MaxUpstreams bounds the persisted list. The resolver contacts at most one
-	// alternate, so a longer list would be stored and never used.
-	MaxUpstreams = 3
 	// DefaultUpstreamPort is the port the default plain-DNS entries use.
 	DefaultUpstreamPort = 53
 	// DefaultDoTPort is the port a DoT entry uses when it states none.
@@ -70,16 +63,16 @@ const (
 	maxUpstreamLabelLen = 63
 )
 
-// ErrUpstreamLoopback marks a loopback entry. The policy resolver allows
-// loopback only through an explicit test-only seam, so the sentinel lets that
-// seam distinguish "loopback" from "genuinely unusable".
+// ErrUpstreamLoopback marks a loopback entry. Validation and any future consumer
+// that deliberately admits a local resolver need the same distinction, so the
+// sentinel stays separate from the message rather than only appearing in its text.
 var ErrUpstreamLoopback = errors.New("upstream is loopback")
 
-// Upstream is one persisted recursive-resolver entry.
+// Upstream is one recursive-resolver entry.
 //
 // Address is an IPv4 literal, an IPv6 literal or a hostname. A hostname is
-// resolved at dial time by the selected transport, so it stays a plain
-// configuration string.
+// resolved at dial time by whichever consumer dials the entry, so it stays a
+// plain configuration string.
 type Upstream struct {
 	// Address is the IPv4/IPv6 literal or hostname of the resolver.
 	Address string `json:"address"`
@@ -106,16 +99,6 @@ func (u Upstream) EffectiveTransport() UpstreamTransport {
 	return u.Transport
 }
 
-// EffectivePort reports the port the entry dials, applying the transport's own
-// default when the entry leaves it unset. It returns 0 for an entry that has no
-// port and no default, which Validate rejects.
-func (u Upstream) EffectivePort() int {
-	if u.Port != 0 {
-		return u.Port
-	}
-	return u.EffectiveTransport().defaultPort()
-}
-
 // defaultPort is the well-known port a transport uses when an entry states
 // none, or 0 for a transport that has no default and so requires an explicit one.
 func (t UpstreamTransport) defaultPort() int {
@@ -127,15 +110,6 @@ func (t UpstreamTransport) defaultPort() int {
 	default:
 		return 0
 	}
-}
-
-// WithDefaultPort returns the entry with its transport default applied when the
-// port is unset, so a persisted record states the port it actually dials.
-func (u Upstream) WithDefaultPort() Upstream {
-	if u.Port == 0 {
-		u.Port = u.EffectivePort()
-	}
-	return u
 }
 
 // SPKIPinDigest decodes the configured pin. Validate guarantees that a non-empty
@@ -155,21 +129,9 @@ func (u Upstream) SPKIPinDigest() ([]byte, error) {
 	return digest, nil
 }
 
-// HostPort renders the entry as a dial target ("host:port" / "[v6]:port").
-func (u Upstream) HostPort() string {
-	return net.JoinHostPort(u.Address, strconv.Itoa(u.EffectivePort()))
-}
-
-// String renders the entry for errors and operator-facing status.
-func (u Upstream) String() string {
-	if u.Transport == "" || u.Transport == TransportPlain {
-		return u.HostPort()
-	}
-	return string(u.Transport) + "://" + u.HostPort()
-}
-
-// Validate reports whether one entry may be persisted or dialed. Errors are
-// specific so the admin API can tell an operator exactly which rule failed.
+// Validate reports whether one entry is an addressable, usable resolver. Errors
+// are specific rather than a single "invalid entry", so a caller (a test or a
+// future reader of this package) can tell exactly which rule failed.
 func (u Upstream) Validate() error {
 	transport := u.EffectiveTransport()
 	if transport == TransportDoH {
@@ -340,53 +302,17 @@ func isNumericDotted(s string) bool {
 // DefaultUpstreams is the single definition of the default plain-DNS pair.
 //
 // AdGuard's public resolvers are the default because they answer from networks
-// that block 1.1.1.1 and 8.8.8.8; a default that cannot resolve is indistinguishable
-// from "no evidence" and silently disables policy routing.
+// that block 1.1.1.1 and 8.8.8.8; a default that cannot resolve leaves a client
+// with no DNS at all, which is worse than a slower one.
 //
-// Both the policy resolver fallback and the DNS servers a generated client
-// configuration pushes derive from this function, so an operator never sees the
-// two disagree.
+// The DNS servers a generated client configuration pushes are rendered from this
+// function, so the definition and the profiles it produces cannot drift apart.
+// Only plain-transport entries are suitable for that rendering: a DoT or DoH
+// entry here would be written into a profile as a plain DNS directive, which is a
+// silent downgrade for the client.
 func DefaultUpstreams() []Upstream {
 	return []Upstream{
 		{Address: "94.140.14.14", Port: DefaultUpstreamPort, Transport: TransportPlain},
 		{Address: "94.140.15.15", Port: DefaultUpstreamPort, Transport: TransportPlain},
 	}
-}
-
-// EffectiveUpstreams returns the upstream list the resolver must use: the
-// operator's validated list when one is configured, otherwise the defaults.
-// Every entry carries its effective port, so a consumer never has to guess a
-// transport default.
-// The returned slice is owned by the caller.
-func (s Settings) EffectiveUpstreams() []Upstream {
-	if len(s.UpstreamDNS) == 0 {
-		return DefaultUpstreams()
-	}
-	out := make([]Upstream, len(s.UpstreamDNS))
-	for i, upstream := range s.UpstreamDNS {
-		out[i] = upstream.WithDefaultPort()
-	}
-	return out
-}
-
-// validateUpstreams enforces the persisted-list contract.
-func (s Settings) validateUpstreams() error {
-	if len(s.UpstreamDNS) == 0 {
-		return nil
-	}
-	if len(s.UpstreamDNS) > MaxUpstreams {
-		return fmt.Errorf("%d upstream DNS entries exceed the maximum of %d", len(s.UpstreamDNS), MaxUpstreams)
-	}
-	seen := make(map[string]struct{}, len(s.UpstreamDNS))
-	for i, u := range s.UpstreamDNS {
-		if err := u.Validate(); err != nil {
-			return fmt.Errorf("upstream DNS entry %d rejected: %w", i+1, err)
-		}
-		key := string(u.EffectiveTransport()) + "|" + strings.ToLower(u.HostPort())
-		if _, dup := seen[key]; dup {
-			return fmt.Errorf("upstream DNS entry %d duplicates an earlier entry", i+1)
-		}
-		seen[key] = struct{}{}
-	}
-	return nil
 }

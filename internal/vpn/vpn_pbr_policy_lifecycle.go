@@ -10,7 +10,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 )
 
 // This file owns the production policy-source lifecycle for issue #678: turning
@@ -91,19 +90,6 @@ type PolicyStatus struct {
 	// excluded by the never-proxy guard, duplicates, conditional status and any
 	// failure. It is aggregate metadata, never a client observation.
 	SourceStats map[string]policy.SourceSyncStats `json:"source_stats,omitempty"`
-
-	// Upstream DNS health (issue #824). Without these an operator cannot tell a
-	// blocked upstream provider, which produces no evidence at all, from a policy
-	// that simply has not matched anything yet.
-	//
-	// LastUpstream is the upstream that served the most recent accepted answer.
-	// LastUpstreamFailure and LastUpstreamFailureKind describe the most recent
-	// failed attempt and are cleared by a later successful exchange. All three
-	// are empty while policy routing is not running or no exchange has happened.
-	// They carry resolver addresses only: no queried names and no client data.
-	LastUpstream            string `json:"last_upstream,omitempty"`
-	LastUpstreamFailure     string `json:"last_upstream_failure,omitempty"`
-	LastUpstreamFailureKind string `json:"last_upstream_failure_kind,omitempty"`
 
 	// Inventory is the committed Russian address inventory (issue #919): the
 	// source and retrieval date recorded beside the data, its age against the
@@ -255,7 +241,6 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		Enabled:           true,
 		HostWANIP:         hostWAN,
 		PolicyMatcher:     matcher,
-		UpstreamDNS:       settings.EffectiveUpstreams(),
 		InventoryOverride: override,
 	})
 
@@ -325,18 +310,10 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	if !syncRes.Published {
 		return fmt.Errorf("%w: policy update sync did not publish a snapshot", ErrPolicyActivationNoRules)
 	}
-	// The upstream list is not part of the compiled snapshot, so it is applied to
-	// the live resolver instead of rebuilding the data path. It is applied only
-	// after the sync succeeded: a refused update must leave the previous working
-	// configuration, upstreams included, exactly as it was.
-	if err := s.applyLiveUpstreams(settings); err != nil {
-		return err
-	}
-	// The inventory override is not part of the compiled snapshot either: it is
-	// applied to the installed classifier, which is replaced rather than rebuilt.
-	// It is applied only after the sync succeeded, for the same reason as the
-	// upstream list: a refused update must leave the previous configuration,
-	// override included, in effect.
+	// The inventory override is not part of the compiled snapshot: it is applied
+	// to the installed classifier, which is replaced rather than rebuilt. It is
+	// applied only after the sync succeeded: a refused update must leave the
+	// previous configuration, override included, in effect.
 	override, err := settings.ParsedInventoryOverride()
 	if err != nil {
 		return fmt.Errorf("inventory override: %w", err)
@@ -346,67 +323,6 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	// update leaves the previous loop running on the previous rules.
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
 	return nil
-}
-
-// applyLiveUpstreams applies an accepted settings change to the DNS consumers of
-// this service. It is a no-op when nothing consumes DNS yet, and a rejected list
-// leaves the installed list in effect.
-func (s *Service) applyLiveUpstreams(settings policy.Settings) error {
-	if s == nil {
-		return nil
-	}
-	return s.ApplyEffectiveUpstreams(settings.EffectiveUpstreams())
-}
-
-// ApplyEffectiveUpstreams publishes an accepted upstream list to the DNS
-// consumer that owns answers right now and records it as the service's current
-// effective list.
-//
-// The list is validated before anything is published, and the owned field is
-// written in the same critical section as the consumer update, so a later
-// activation reads the list the operator most recently had accepted - never the
-// value captured at activation. With policy routing inactive there is no
-// resolver in this build, so recording the list is the whole effect: it is the
-// list the next activation dials and the one the operator surface reports.
-func (s *Service) ApplyEffectiveUpstreams(upstreams []policy.Upstream) error {
-	if s == nil {
-		return nil
-	}
-	effective := policy.DefaultUpstreams()
-	if len(upstreams) > 0 {
-		effective = make([]policy.Upstream, len(upstreams))
-		copy(effective, upstreams)
-	}
-	if err := gatewaydns.ValidateUpstreams(effective, false); err != nil {
-		return fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// The list is validated above, so it is the accepted configuration: recording
-	// it first means a consumer that cannot be rebuilt never hides it from the
-	// next rebuild.
-	s.dnsUpstreams = effective
-
-	_, err := s.applyToLiveResolverLocked(effective)
-	return err
-}
-
-// applyToLiveResolverLocked publishes upstreams to the resolver registered with
-// the policy gateway and keeps the registered activation metadata in step with
-// it. It returns the configuration it updated (nil when none is registered) so
-// the caller can reuse its gateway address. The caller holds s.mu.
-func (s *Service) applyToLiveResolverLocked(upstreams []policy.Upstream) (*PBRConfig, error) {
-	pbrCfg := s.getPBRConfig()
-	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
-		return pbrCfg, nil
-	}
-	if err := pbrCfg.DNSResolver.SetUpstreams(upstreams); err != nil {
-		return nil, fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
-	}
-	s.publishPBRUpstreamsLocked(upstreams)
-	return pbrCfg, nil
 }
 
 // newPolicySyncer builds the syncer one activation/replacement uses.
@@ -660,7 +576,6 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 		status.SyncState = "error"
 	}
 
-	applyUpstreamStatus(&status, s.getPBRConfig())
 	applyInventoryStatus(&status, s.effectiveInventoryOverride())
 	applyCDNExclusionStatus(&status)
 	return status
@@ -716,19 +631,6 @@ func applyCDNExclusionStatus(status *PolicyStatus) {
 		live.Entries = entries
 	}
 	status.CDN = &live
-}
-
-// applyUpstreamStatus copies the upstream health of the resolver the policy
-// gateway actually dials, so a blocked provider surfaces as a failure kind
-// instead of presenting as "no evidence".
-func applyUpstreamStatus(status *PolicyStatus, pbrCfg *PBRConfig) {
-	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
-		return
-	}
-	live := pbrCfg.DNSResolver.Status()
-	status.LastUpstream = live.LastUpstream
-	status.LastUpstreamFailure = live.LastFailure
-	status.LastUpstreamFailureKind = string(live.LastFailureKind)
 }
 
 // applySyncerStatus copies the live syncer's counters and sync outcome into status.

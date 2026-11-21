@@ -11,7 +11,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -33,14 +32,6 @@ type PBRConfig struct {
 	WANDevice     forwarder.PacketDevice
 	PolicyMatcher *policy.Matcher
 	PolicySources []policy.SourceParsedRules
-	// UpstreamDNS is the validated upstream list the resolver is dialed with.
-	// Empty means the effective defaults (policy.DefaultUpstreams()).
-	UpstreamDNS []policy.Upstream
-	// DNSResolver holds the configured upstream resolver. It is kept here so the
-	// policy status can report the last upstream outcome, and so a live settings
-	// change can swap the upstream list. The panel serves no client DNS, so the
-	// resolver answers no query of its own; it carries the configured list.
-	DNSResolver *gatewaydns.UpstreamResolver
 	// InventoryOverride is the accepted operator override the classifier applies
 	// on top of the committed allocation inventory. Nil keeps the shipped set as
 	// the only authority, which is the behavior when no override is configured.
@@ -169,51 +160,8 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	servicePBRConfigs[s] = &cfg
 	servicePBRConfigsMu.Unlock()
 
-	// The resolver built for this activation is the authority for what is
-	// configured, so the owned list is taken from it rather than from the
-	// activation input: every later consumer (live change, a later activation)
-	// reads this one field.
-	if cfg.DNSResolver != nil {
-		s.dnsUpstreams = cfg.DNSResolver.Upstreams()
-	}
-
 	s.forwarder.SetPBREnabled(true)
 	return nil
-}
-
-// publishPBRUpstreamsLocked records upstreams as the registered activation input
-// and on the service, replacing the previous value rather than mutating it, so a
-// concurrent reader of either sees one coherent list and never the value the
-// activation started with. The caller holds s.mu.
-func (s *Service) publishPBRUpstreamsLocked(upstreams []policy.Upstream) {
-	s.dnsUpstreams = upstreams
-	servicePBRConfigsMu.Lock()
-	defer servicePBRConfigsMu.Unlock()
-	cfg := servicePBRConfigs[s]
-	if cfg == nil {
-		return
-	}
-	next := *cfg
-	next.UpstreamDNS = upstreams
-	servicePBRConfigs[s] = &next
-}
-
-// EffectiveDNSUpstreams returns the effective upstream list this service has
-// accepted for its policy resolver. An empty result means nothing has been
-// accepted yet, which the consumers treat as the effective defaults. The
-// slice is a copy.
-func (s *Service) EffectiveDNSUpstreams() []policy.Upstream {
-	if s == nil {
-		return policy.DefaultUpstreams()
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.dnsUpstreams) == 0 {
-		return policy.DefaultUpstreams()
-	}
-	out := make([]policy.Upstream, len(s.dnsUpstreams))
-	copy(out, s.dnsUpstreams)
-	return out
 }
 
 // PBREnabled reports whether policy-based routing is active on the service.
@@ -249,30 +197,6 @@ func (s *Service) getPBRConfig() *PBRConfig {
 	servicePBRConfigsMu.RLock()
 	defer servicePBRConfigsMu.RUnlock()
 	return servicePBRConfigs[s]
-}
-
-// newPolicyUpstreamResolver builds the upstream resolver from the configured
-// list, falling back to the effective defaults when no list is configured.
-// A list that cannot be dialed safely is returned as an error rather than
-// silently leaving the resolver unset: policy routing without a working
-// resolver produces no evidence at all, which is the failure this configuration
-// exists to remove.
-//
-// It is a package-level variable so a test can substitute a constructor for the
-// same reason newDNSContinuityResolver is one: the production resolver validates
-// loopback upstreams away, and an encrypted local fixture can only be reached
-// through a wrapper that calls NewUpstreamResolver on the configuration this
-// function actually receives. Production always runs the value below.
-var newPolicyUpstreamResolver = func(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
-	upstreams := configured
-	if len(upstreams) == 0 {
-		upstreams = policy.DefaultUpstreams()
-	}
-	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{Upstreams: upstreams})
-	if err != nil {
-		return nil, fmt.Errorf("upstream dns configuration: %w", err)
-	}
-	return resolver, nil
 }
 
 // newProductionWANDevice is the substitution point for the production WAN device
@@ -365,23 +289,7 @@ func (s *Service) initPBR(ctx context.Context) error {
 		return err
 	}
 
-	// 4. Upstream resolver: build it from the configured upstream list (the
-	// persisted policy settings, when this activation came from them) so a
-	// blocked provider is a settings change rather than a code change. The panel
-	// serves no client DNS, so this resolver answers no query of its own; it
-	// carries the configured list and its last outcome for the operator surface.
-	if cfg.DNSResolver == nil {
-		resolver, err := newPolicyUpstreamResolver(cfg.UpstreamDNS)
-		if err != nil {
-			if cfg.WANDevice != nil {
-				_ = cfg.WANDevice.Close()
-			}
-			return err
-		}
-		cfg.DNSResolver = resolver
-	}
-
-	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)
+	// 4. Configure PBR on Service (fails closed if prerequisite validation fails)
 	if err := s.ConfigurePBR(cfg); err != nil {
 		if cfg.WANDevice != nil {
 			_ = cfg.WANDevice.Close()

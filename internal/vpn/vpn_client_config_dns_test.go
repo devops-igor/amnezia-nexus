@@ -28,9 +28,14 @@ func parseClientConfigDNS(t *testing.T, config string) string {
 }
 
 // renderedProfileDNS is the resolver pair a generated profile must carry: the
-// plain-transport entries of the same DefaultUpstreams the policy resolver falls
-// back to. Deriving the expectation from that one definition keeps the profile and
-// its test from pinning two copies of the same literals.
+// plain-transport entries of policy.DefaultUpstreams, the single definition the
+// renderer reads. Deriving the expectation from that one definition keeps the
+// profile and its test from pinning two copies of the same literals.
+//
+// The pair is also compared with the AWG defaults below. That comparison is a
+// second, independent witness: the two are the same addresses today because the
+// shipped profile has always carried them, and a change to either must be a
+// deliberate edit in both places rather than a silent drift.
 func renderedProfileDNS() string {
 	first, second := "", ""
 	for _, upstream := range policy.DefaultUpstreams() {
@@ -84,6 +89,12 @@ func newActivePBRConfig(t *testing.T) PBRConfig {
 // a generated client configuration always carries the external resolver pair and
 // never a panel address, whatever state policy routing is in. A profile that
 // named the panel would depend on a resolver this build does not run.
+//
+// The panel runs no resolver of its own and steers no client DNS, so this pair is
+// the whole of what a client learns about DNS from its profile. The values are
+// pinned here rather than in the renderer's own code so a change to
+// DefaultUpstreams cannot pass silently: this test fails unless the change was
+// deliberate.
 func TestGenerateClientConfigCarriesExternalResolversOnly(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

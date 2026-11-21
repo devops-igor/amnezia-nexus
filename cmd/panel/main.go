@@ -177,14 +177,7 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 		return nil
 	}
 	if !policySettings.Enabled || !cfg.VPNEnabled {
-		// Policy routing stays off. The operator's saved upstream list is still
-		// recorded so a later activation dials it rather than the built-in
-		// defaults. Without a data plane there is nothing to record it on.
-		if cfg.VPNEnabled {
-			if applyErr := vpnSvc.ApplyEffectiveUpstreams(policySettings.EffectiveUpstreams()); applyErr != nil {
-				slog.Warn("Could not apply the persisted upstream DNS list; the policy resolver keeps its previous list", "err", applyErr)
-			}
-		}
+		// Policy routing stays off.
 		// The stored inventory override is reported even while policy routing is
 		// off: the status describes what the record configures, and an operator
 		// reading it must not see the shipped set alone when an override is stored.
@@ -205,14 +198,6 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 		// serving with PBR reported as on but not actually activated, but keep the
 		// panel reachable. Nothing here rewrites the stored record; the operator's
 		// intent stays available to repair through the API.
-		//
-		// The refused activation installed no resolver, so the saved list is
-		// recorded for a later activation rather than for a responder that would
-		// answer issued profiles.
-		if applyErr := vpnSvc.ApplyEffectiveUpstreams(policySettings.EffectiveUpstreams()); applyErr != nil {
-			slog.Warn("Could not apply the persisted upstream DNS list after a refused activation; the policy resolver keeps its previous list",
-				"err", applyErr)
-		}
 		vpnSvc.ReportPolicyActivationFailure(fmt.Errorf("persisted policy routing could not be activated: %w", startErr))
 		slog.Error("Policy routing could not be activated from persisted settings; the panel starts with policy routing disabled",
 			"preset", string(policySettings.Preset), "err", startErr)

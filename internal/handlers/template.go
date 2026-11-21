@@ -118,7 +118,6 @@ func (te *TemplateEngine) ReloadTemplates() error {
 	layoutPartials := []string{
 		"settings_policy.html",
 		"settings_policy_client.html",
-		"settings_policy_upstream.html",
 		"settings_notifications.html",
 		"settings_save_controls.html",
 		"settings/appearance.html",

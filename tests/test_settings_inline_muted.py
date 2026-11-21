@@ -64,7 +64,6 @@ REQUIRED_SCRIPTS = (
     "gigahost_order_status.js",
     "gigahost_setup_intents.js",  # templates/settings/ and the shell
     "policy_routing.js",  # a settings_*.html partial
-    "policy_upstream.js",
     "policy_client_diag.js",  # requested through asset_url
     "ui.js",  # the layout
 )

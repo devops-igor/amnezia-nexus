@@ -25,8 +25,9 @@ func TestLiveSaveAppliesTheInventoryOverride(t *testing.T) {
 	active := policySettingsForURL(t, "https://override-live.example"+pathA)
 	saved := active
 	// The scenario's own precondition requires the save to change a setting the
-	// compiled snapshot does not carry; both changes are of that kind.
-	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	// compiled snapshot does not carry; the refresh interval and the inventory
+	// override are both of that kind.
+	saved.SyncInterval = active.SyncInterval + 600
 	saved.InventoryOverride = []string{"198.51.100.0/24"}
 	if err := saved.Validate(); err != nil {
 		t.Fatalf("saved fixture settings are invalid: %v", err)
