@@ -538,6 +538,54 @@ def test_missing_base_ref_still_fails_closed(tmp_path: Path) -> None:
     assert main(["--repo-root", str(repo), "--check-pr-size", "--base-ref", "nope"]) == 1
 
 
+def test_actions_merge_checkout_gives_the_same_answer_as_the_pr_head(tmp_path: Path) -> None:
+    """The workflow's default HEAD is the Actions merge commit, not the PR head.
+
+    actions/checkout on pull_request builds a synthetic two-parent merge of the
+    base tip and the PR head. That is safe here only because the gate diffs from
+    the merge base, and merge-base(base, merge-commit) is the base tip, so the
+    merge commit contributes no base-branch work of its own. This test builds
+    that exact shape and asserts both refs agree, so a future change to the
+    comparison cannot silently start reading the merge commit.
+    """
+    repo = _pr_with_remote_only_base(tmp_path)
+    head_sha = _git(repo, "rev-parse", "pr").strip()
+
+    # The base branch moves after the PR branched, and violates SG1 itself.
+    _git(repo, "checkout", "-q", "-b", "advanced", "origin/main")
+    _write(repo, "other.go", _lines(1200, "func"))
+    _commit_all(repo, "main advances and overshoots separately")
+    advanced_sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "branch", "-q", "-f", "main", advanced_sha)
+
+    _git(repo, "checkout", "-q", "-b", "merge-sim", advanced_sha)
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", head_sha)
+    merge_sha = _git(repo, "rev-parse", "HEAD").strip()
+    parents = _git(repo, "rev-list", "--parents", "-n1", merge_sha).split()
+    assert parents[1:] == [advanced_sha, head_sha], "fixture must be a two-parent merge"
+
+    via_merge = evaluate_pull_request(repo, "main", head_ref="HEAD")
+    via_head = evaluate_pull_request(repo, "main", head_ref=head_sha)
+
+    # main's own 1200-line file is not blamed on the PR, and the PR's own
+    # crossing is reported identically either way.
+    assert "other.go" not in {v["path"] for v in via_merge["violations"]}
+    assert [(v["path"], v["base_lines"], v["head_lines"]) for v in via_merge["violations"]] == [
+        ("grow.go", 999, 1000)
+    ]
+    assert via_merge["violations"] == via_head["violations"]
+
+    # With the PR's own crossing reverted, the merge-commit shape reports clean
+    # even though main still carries a 1200-line file.
+    _git(repo, "checkout", "-q", "pr")
+    _write(repo, "grow.go", _lines(999, "func"))
+    _commit_all(repo, "drop the crossing")
+    clean_head = _git(repo, "rev-parse", "pr").strip()
+    _git(repo, "checkout", "-q", "merge-sim")
+    _git(repo, "merge", "-q", "--no-ff", "--no-edit", clean_head)
+    assert evaluate_pull_request(repo, "main", head_ref="HEAD")["violations"] == []
+
+
 # --------------------------------------------------------------------------- #
 # Mutation control: `size_transition` is mutated in the live module and the two
 # boundary tests are re-run against it. A mutant that no boundary test kills
