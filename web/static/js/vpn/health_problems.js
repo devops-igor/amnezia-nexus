@@ -202,362 +202,356 @@ function extractConditionEntities(item) {
     return parts.join(';');
 }
 
-function vpnRenderActiveProblemsCards(status, context) {
-    const ctx = context || {};
-    const allRouteList = ctx.allRouteList || [];
-    const routeHasPressure = !!ctx.routeHasPressure;
-
+// vpnIssueRows normalises actionable problems and qualifying conditions into one
+// ordered, deduplicated list of rows. Sorting is critical -> degraded -> warning;
+// identity reuses the existing condition/actionable keys so a fluctuated counter
+// never becomes a "new" problem.
+function vpnIssueRows(status) {
     const ha = (status && status.health_assessment) || {};
-    const s = ha.status ? String(ha.status).toUpperCase() : '';
+    const assessment = ha.status ? String(ha.status).toUpperCase() : '';
     const actionableProblems = Array.isArray(ha.actionable_problems) ? ha.actionable_problems : [];
-    const hasActionableProblems = actionableProblems.length > 0;
     const rawConditions = Array.isArray(ha.conditions) ? ha.conditions : [];
-    const hasExplicitConditions = rawConditions.length > 0;
 
-    const qualifyingConditions = [];
-    const seenCondKeys = new Set();
-    for (let i = 0; i < rawConditions.length; i++) {
-        const c = rawConditions[i];
-        if (!c) continue;
-        const sev = (c && c.severity) ? String(c.severity).toUpperCase() : '';
-        const isQualifyingSev = sev === 'DEGRADED' || sev === 'CRITICAL' || sev === 'WARNING' || sev === 'WARN';
-        if (!isQualifyingSev) continue;
+    const rows = [];
+    const seen = new Set();
 
-        const isDuplicateOfActionable = actionableProblems.some(function(p) {
-            if (p.message && c.message && p.message.trim() === c.message.trim()) return true;
+    function severityRank(sev) {
+        const s = String(sev || '').toUpperCase();
+        if (s === 'CRITICAL' || s === 'DOWN') return 0;
+        if (s === 'DEGRADED') return 1;
+        if (s === 'WARNING' || s === 'WARN') return 2;
+        return 3;
+    }
+
+    function push(row) {
+        if (seen.has(row.key)) return;
+        seen.add(row.key);
+        rows.push(row);
+    }
+
+    for (let i = 0; i < actionableProblems.length; i++) {
+        const p = actionableProblems[i];
+        if (!p) continue;
+        const stableMessage = p.message_key || deriveStableConditionCode(p.message);
+        const entityId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || p.entity_id || extractConditionEntities(p) || '';
+        const backendId = p.backend_id ? (':' + p.backend_id) : '';
+        push({
+            key: 'act:' + (p.category || '') + ':' + stableMessage + ':' + entityId + backendId + ':' + (p.severity || ''),
+            severity: p.severity,
+            title: p.message_key && _(p.message_key) !== p.message_key ? _(p.message_key) : (p.message || ''),
+            category: p.category || '',
+            user: p.username || p.user_id || '',
+            connectionName: p.connection_name || '',
+            assignedIP: p.assigned_ip || '',
+            sessionId: p.session_id || '',
+            connectionId: p.connection_id || '',
+            backendId: (p.backend_id !== undefined && p.backend_id !== null && p.backend_id !== '') ? String(p.backend_id) : '',
+            observedRate: p.observed_rate || '',
+            firstObserved: p.first_observed || ''
+        });
+    }
+
+    const isDuplicateOfActionable = function(c) {
+        return actionableProblems.some(function(p) {
+            if (p.message && c.message && String(p.message).trim() === String(c.message).trim()) return true;
             if (p.message_key && c.message_key && p.message_key === c.message_key) return true;
             return false;
         });
-        if (isDuplicateOfActionable) continue;
+    };
 
-        const condKey = (c.message_key || '') + '::' + (c.message || '') + '::' + (c.category || '') + '::' + sev;
-        if (seenCondKeys.has(condKey)) continue;
-        seenCondKeys.add(condKey);
-
-        qualifyingConditions.push(c);
-    }
-
-    let activeProblemsCount = actionableProblems.length + qualifyingConditions.length;
-    let affectedUsersCount = 0;
-    let affectedConfigsCount = 0;
-
-    if (hasActionableProblems) {
-        affectedUsersCount = new Set(actionableProblems.map(function(p) { return p.user_id || p.username; }).filter(Boolean)).size;
-        affectedConfigsCount = new Set(actionableProblems.map(function(p) {
-            return p.connection_id || (p.user_id ? p.user_id + ':' + (p.connection_name || '') : p.connection_name);
-        }).filter(Boolean)).size;
-    }
-
-    const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');
-    if (summaryHeaderElem) {
-        if (activeProblemsCount > 0) {
-            const problemsFmt = _('vpn_fwd_active_problems_count') || '%d active problems';
-            const usersFmt = _('vpn_fwd_affected_users_count') || '%d affected users';
-            const configsFmt = _('vpn_fwd_affected_configs_count') || '%d client configs';
-            const problemsText = problemsFmt.replace('%d', activeProblemsCount);
-            const usersText = usersFmt.replace('%d', affectedUsersCount);
-            const configsText = configsFmt.replace('%d', affectedConfigsCount);
-            summaryHeaderElem.innerHTML = `<span class="badge badge-warn" style="font-size: 0.8rem; padding: 2px 8px;">${problemsText} • ${usersText} • ${configsText}</span>`;
-            summaryHeaderElem.style.display = 'block';
-        } else {
-            summaryHeaderElem.textContent = '';
-            summaryHeaderElem.style.display = 'none';
-        }
-    }
-
-    const isDegradedOrDown = s === 'DEGRADED' || s === 'DOWN' || s === 'CRITICAL';
-    const hasActiveProblems = hasActionableProblems || hasExplicitConditions || isDegradedOrDown || routeHasPressure;
-    const isHealthy = s === 'HEALTHY' && !hasActiveProblems;
-
-    const problemListElem = document.getElementById('vpn-fwd-problem-list');
-    if (problemListElem) {
-        if (hasActiveProblems) {
-            problemListElem.textContent = '';
-            problemListElem.style.display = 'flex';
-            problemListElem.style.flexDirection = 'column';
-            problemListElem.style.gap = '6px';
-
-            for (let i = 0; i < actionableProblems.length; i++) {
-                const p = actionableProblems[i];
-                const row = document.createElement('div');
-                row.className = 'card problem-card';
-                row.style.display = 'flex';
-                row.style.alignItems = 'center';
-                row.style.gap = '8px';
-                row.style.fontSize = '0.825rem';
-                row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
-                row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
-                row.style.border = '1px solid var(--border-color)';
-                row.style.borderRadius = 'var(--radius-sm, 4px)';
-
-                const { badge: sevBadge, upperSev } = createSeverityBadge(p.severity);
-                if (upperSev === 'CRITICAL' || upperSev === 'DOWN') {
-                    row.style.borderLeft = '3px solid var(--danger)';
-                } else if (upperSev === 'DEGRADED') {
-                    row.style.borderLeft = '3px solid var(--warning)';
-                } else {
-                    row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
-                }
-                row.appendChild(sevBadge);
-
-                const msgSpan = document.createElement('span');
-                msgSpan.style.flex = '1';
-                msgSpan.textContent = p.message_key && _(p.message_key) !== p.message_key
-                    ? _(p.message_key) : (p.message || '');
-                row.appendChild(msgSpan);
-
-                const detailsParts = [];
-                if (p.category) {
-                    detailsParts.push(p.category);
-                }
-                const user = p.username || p.user_id;
-                if (user) {
-                    const userPrefix = (_('vpn_fwd_user_prefix') && _('vpn_fwd_user_prefix') !== 'vpn_fwd_user_prefix') ? _('vpn_fwd_user_prefix') : (_('vpn_fwd_user_prefix') || 'User: ');
-                    detailsParts.push(userPrefix + user);
-                }
-                if (p.connection_name) {
-                    const configPrefix = (_('vpn_fwd_config_prefix') && _('vpn_fwd_config_prefix') !== 'vpn_fwd_config_prefix') ? _('vpn_fwd_config_prefix') : (_('vpn_fwd_config_prefix') || 'Config: ');
-                    detailsParts.push(configPrefix + p.connection_name);
-                }
-                if (p.assigned_ip) {
-                    const ipPrefix = (_('vpn_fwd_ip_prefix') && _('vpn_fwd_ip_prefix') !== 'vpn_fwd_ip_prefix') ? _('vpn_fwd_ip_prefix') : (_('vpn_fwd_ip_prefix') || 'IP: ');
-                    detailsParts.push(ipPrefix + p.assigned_ip);
-                }
-                if (p.backend_id !== undefined && p.backend_id !== null && p.backend_id !== '') {
-                    const backendPrefix = (_('vpn_fwd_backend_prefix') && _('vpn_fwd_backend_prefix') !== 'vpn_fwd_backend_prefix') ? _('vpn_fwd_backend_prefix') : (_('vpn_fwd_backend_prefix') || 'Backend ');
-                    detailsParts.push(backendPrefix + p.backend_id);
-                }
-                if (p.observed_rate) {
-                    detailsParts.push(p.observed_rate);
-                }
-
-                if (detailsParts.length > 0) {
-                    const detailsBadge = document.createElement('span');
-                    detailsBadge.className = 'badge text-muted font-mono';
-                    detailsBadge.style.fontSize = '0.7rem';
-                    detailsBadge.style.padding = '1px 6px';
-                    detailsBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
-                    detailsBadge.style.border = '1px solid var(--border-color)';
-                    detailsBadge.style.borderRadius = 'var(--radius-sm, 4px)';
-                    detailsBadge.textContent = detailsParts.join(' • ');
-                    row.appendChild(detailsBadge);
-                }
-
-                if (p.first_observed) {
-                    const onsetSpan = document.createElement('span');
-                    onsetSpan.className = 'text-muted font-mono';
-                    onsetSpan.style.fontSize = '0.75rem';
-                    const onsetFmt = _('vpn_fwd_onset') || 'Onset: %s';
-                    onsetSpan.textContent = onsetFmt.replace('%s', vpnFormatTime(p.first_observed));
-                    row.appendChild(onsetSpan);
-                }
-
-                problemListElem.appendChild(row);
-            }
-
-            let conditionsToRender = qualifyingConditions;
-            if (!hasActionableProblems && qualifyingConditions.length === 0) {
-                if (hasExplicitConditions) {
-                    conditionsToRender = rawConditions;
-                } else if (isDegradedOrDown || routeHasPressure) {
-                    conditionsToRender = [
-                        {
-                            severity: isDegradedOrDown ? s : 'WARNING',
-                            message: (ha && ha.summary) ? ha.summary : (s === 'DOWN' ? (_('vpn_forwarder_down') || 'Down') : (_('vpn_forwarder_degraded') || 'Degraded')),
-                            category: routeHasPressure ? 'routing' : 'forwarder'
-                        }
-                    ];
-                }
-            }
-
-            for (let i = 0; i < conditionsToRender.length; i++) {
-                const cond = conditionsToRender[i];
-                const row = document.createElement('div');
-                row.className = 'card problem-card';
-                row.style.display = 'flex';
-                row.style.alignItems = 'center';
-                row.style.gap = '8px';
-                row.style.fontSize = '0.825rem';
-                row.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
-                row.style.background = 'var(--bg-surface, rgba(0,0,0,0.2))';
-                row.style.border = '1px solid var(--border-color)';
-                row.style.borderRadius = 'var(--radius-sm, 4px)';
-
-                const { badge: sevBadge, upperSev } = createSeverityBadge(cond.severity);
-                if (upperSev === 'CRITICAL' || upperSev === 'DOWN') {
-                    row.style.borderLeft = '3px solid var(--danger)';
-                } else if (upperSev === 'DEGRADED') {
-                    row.style.borderLeft = '3px solid var(--warning)';
-                } else {
-                    row.style.borderLeft = '3px solid var(--primary, #3b82f6)';
-                }
-                row.appendChild(sevBadge);
-
-                const msgSpan = document.createElement('span');
-                msgSpan.style.flex = '1';
-                msgSpan.textContent = cond.message_key && _(cond.message_key) !== cond.message_key
-                    ? _(cond.message_key) : (cond.message || '');
-                row.appendChild(msgSpan);
-
-                if (cond.category) {
-                    const compBadge = document.createElement('span');
-                    compBadge.className = 'badge text-muted font-mono';
-                    compBadge.style.fontSize = '0.7rem';
-                    compBadge.style.padding = '1px 6px';
-                    compBadge.style.background = 'var(--bg-muted, rgba(255, 255, 255, 0.05))';
-                    compBadge.style.border = '1px solid var(--border-color)';
-                    compBadge.style.borderRadius = 'var(--radius-sm, 4px)';
-                    compBadge.textContent = cond.category;
-                    row.appendChild(compBadge);
-                }
-
-                problemListElem.appendChild(row);
-            }
-        } else if (isHealthy) {
-            // NOMINAL (0 active problems): render reassuring green badge
-            problemListElem.textContent = '';
-            problemListElem.style.display = 'flex';
-            problemListElem.style.flexDirection = 'column';
-            problemListElem.style.gap = '6px';
-
-            const nominalBadge = document.createElement('div');
-            nominalBadge.className = 'badge badge-success';
-            nominalBadge.style.display = 'inline-flex';
-            nominalBadge.style.alignItems = 'center';
-            nominalBadge.style.gap = '6px';
-            nominalBadge.style.padding = 'var(--space-xs, 6px) var(--space-sm, 10px)';
-            nominalBadge.style.fontSize = '0.825rem';
-            nominalBadge.style.fontWeight = '500';
-            nominalBadge.style.borderRadius = 'var(--radius-sm, 4px)';
-            nominalBadge.style.width = 'fit-content';
-
-            const psKpi = status.peer_sync;
-            let actualPeers = 0;
-            let desiredPeers = 0;
-            if (psKpi && typeof psKpi === 'object') {
-                actualPeers = Number(psKpi.actual_peers !== undefined ? psKpi.actual_peers : (psKpi.synced || 0));
-                desiredPeers = Number(psKpi.desired_peers !== undefined ? psKpi.desired_peers : (psKpi.total || actualPeers));
-            } else if (status.connected_sessions !== undefined) {
-                actualPeers = Number(status.connected_sessions || 0);
-                desiredPeers = actualPeers;
-            } else if (status.routing_consistency && status.routing_consistency.active_sessions_count !== undefined) {
-                actualPeers = Number(status.routing_consistency.active_sessions_count || 0);
-                desiredPeers = actualPeers;
-            } else if (allRouteList && allRouteList.length > 0) {
-                actualPeers = allRouteList.length;
-                desiredPeers = allRouteList.length;
-            }
-
-            const be = status.backends || {};
-            let healthyBackends = 0;
-            let totalBackends = 0;
-            if (be.total_count !== undefined) {
-                totalBackends = Number(be.total_count || 0);
-                healthyBackends = Number(be.healthy_count !== undefined ? be.healthy_count : 0);
-            } else if (be.total !== undefined) {
-                totalBackends = Number(be.total || 0);
-                healthyBackends = Number(be.healthy !== undefined ? be.healthy : 0);
-            } else if (status.active_tunnels !== undefined) {
-                healthyBackends = Number(status.active_tunnels || 0);
-                totalBackends = healthyBackends;
-            }
-
-            let noProblemsText = _('vpn_fwd_no_active_problems');
-            if (!noProblemsText || noProblemsText === 'vpn_fwd_no_active_problems') {
-                noProblemsText = 'No active problems detected';
-            }
-
-            let peersText = vpnDiagText('vpn_fwd_nominal_peers', {
-                actual: actualPeers,
-                desired: desiredPeers,
-                synced: actualPeers,
-                total: desiredPeers
-            });
-            if (!peersText || peersText === 'vpn_fwd_nominal_peers') {
-                peersText = actualPeers + '/' + desiredPeers + ' peers synced';
-            }
-
-            let routesText = _('vpn_fwd_nominal_routes');
-            if (!routesText || routesText === 'vpn_fwd_nominal_routes') {
-                routesText = 'All routes consistent';
-            }
-
-            let backendsText = vpnDiagText('vpn_fwd_nominal_backends', {
-                healthy: healthyBackends,
-                total: totalBackends
-            });
-            if (!backendsText || backendsText === 'vpn_fwd_nominal_backends') {
-                backendsText = healthyBackends + '/' + totalBackends + ' backends healthy';
-            }
-
-            nominalBadge.textContent = '✓ ' + noProblemsText + ' • ' + peersText + ' • ' + routesText + ' • ' + backendsText;
-            problemListElem.appendChild(nominalBadge);
-        } else {
-            problemListElem.textContent = '';
-            problemListElem.style.display = 'none';
-        }
-    }
-
-    const currentProblemKeys = new Set();
-    if (isDegradedOrDown) {
-        currentProblemKeys.add('status:' + s);
-    }
-    actionableProblems.forEach(function(p) {
-        const pMsgKey = p.message_key || deriveStableConditionCode(p.message);
-        const pDurableId = p.connection_id || p.session_id || p.user_id || p.assigned_ip || p.peer_key || p.entity_id || extractConditionEntities(p) || '';
-        const pBackendId = p.backend_id ? (':' + p.backend_id) : '';
-        const k = 'act:' + (p.category || '') + ':' + pMsgKey + ':' + pDurableId + pBackendId + ':' + (p.severity || '');
-        currentProblemKeys.add(k);
-    });
-    qualifyingConditions.forEach(function(c) {
-        const cKey = c.message_key || deriveStableConditionCode(c.message);
-        const cEntityId = extractConditionEntities(c);
-        const k = 'cond:' + (c.category || '') + ':' + cKey + ':' + cEntityId + ':' + (c.severity || '');
-        currentProblemKeys.add(k);
-    });
-    if (routeHasPressure) {
-        currentProblemKeys.add('route_pressure');
-        allRouteList.forEach(function(r) {
-            if (r && (r.has_pressure || (Number(r.queue_full_drops_recent || 0) > 0) || (Number(r.write_errors_recent || 0) > 0) || (Number(r.write_stalls_recent || 0) > 0))) {
-                currentProblemKeys.add('route_pressure:' + (r.session_id || r.connection_id || r.assigned_ip || r.peer_key || 'unknown'));
-            }
+    for (let i = 0; i < rawConditions.length; i++) {
+        const c = rawConditions[i];
+        if (!c) continue;
+        const sev = c.severity ? String(c.severity).toUpperCase() : '';
+        if (!(sev === 'DEGRADED' || sev === 'CRITICAL' || sev === 'WARNING' || sev === 'WARN')) continue;
+        if (isDuplicateOfActionable(c)) continue;
+        const stableMessage = c.message_key || deriveStableConditionCode(c.message);
+        push({
+            key: 'cond:' + (c.category || '') + ':' + stableMessage + ':' + extractConditionEntities(c) + ':' + (c.severity || ''),
+            severity: c.severity,
+            title: c.message_key && _(c.message_key) !== c.message_key ? _(c.message_key) : (c.message || ''),
+            category: c.category || '',
+            user: c.username || c.user_id || '',
+            connectionName: c.connection_name || '',
+            assignedIP: c.assigned_ip || '',
+            sessionId: c.session_id || '',
+            connectionId: c.connection_id || '',
+            backendId: (c.backend_id !== undefined && c.backend_id !== null && c.backend_id !== '') ? String(c.backend_id) : '',
+            observedRate: '',
+            firstObserved: c.first_observed || ''
         });
     }
-    if (hasActiveProblems && currentProblemKeys.size === 0) {
-        currentProblemKeys.add('active_problem_generic');
+
+    // An assessment with no explicit row still needs one honest row: a degraded,
+    // down or critical verdict is itself the problem.
+    if (rows.length === 0 && (assessment === 'DEGRADED' || assessment === 'DOWN' || assessment === 'CRITICAL')) {
+        push({
+            key: 'status:' + assessment,
+            severity: assessment,
+            title: (ha && ha.summary) ? ha.summary
+                : (assessment === 'DOWN' ? (_('vpn_forwarder_down') || 'Down')
+                    : assessment === 'CRITICAL' ? _('vpn_forwarder_critical') : _('vpn_forwarder_degraded')),
+            category: '', user: '', connectionName: '', assignedIP: '', sessionId: '',
+            connectionId: '', backendId: '', observedRate: '', firstObserved: ''
+        });
     }
 
-    const prevKeys = typeof vpnLastActiveProblemKeys !== 'undefined' ? vpnLastActiveProblemKeys : null;
-    const prevCount = typeof vpnLastActiveProblemCount !== 'undefined' ? vpnLastActiveProblemCount : 0;
+    rows.sort(function(a, b) { return severityRank(a.severity) - severityRank(b.severity); });
+    return rows;
+}
 
-    let shouldAutoExpand = false;
-    if (hasActiveProblems) {
-        if (!prevKeys || prevKeys.size === 0) {
-            shouldAutoExpand = true;
-        } else {
-            for (const k of currentProblemKeys) {
-                if (!prevKeys.has(k)) {
-                    shouldAutoExpand = true;
-                    break;
-                }
-            }
-            if (activeProblemsCount > prevCount) {
-                shouldAutoExpand = true;
-            }
+// vpnIssueEntityLabel renders the known affected entity for one row. Identifiers
+// and addresses are isolated with <bdi> in the DOM so a mixed-direction value
+// cannot reorder the surrounding sentence.
+function vpnIssueEntityLabel(row) {
+    const parts = [];
+    if (row.user) parts.push(_('vpn_fwd_user_prefix') + row.user);
+    if (row.connectionName) parts.push(_('vpn_fwd_config_prefix') + row.connectionName);
+    if (row.assignedIP) parts.push(_('vpn_fwd_ip_prefix') + row.assignedIP);
+    if (row.backendId) parts.push(_('vpn_fwd_backend_prefix') + row.backendId);
+    if (row.sessionId && !row.connectionName) parts.push(vpnDiagText('vpn_issue_session_id', {id:row.sessionId}));
+    if (row.observedRate) parts.push(row.observedRate);
+    return parts.join(' \u00b7 ');
+}
+
+// vpnFindSessionRow returns the session table row for one identifier. It walks the
+// tbody's rows rather than relying on a selector engine, so the same lookup works
+// in every environment and never depends on CSS.escape for an id.
+function vpnFindSessionRow(sessionId) {
+    const tbody = document.getElementById('vpn-sessions-tbody');
+    if (!tbody || !tbody.children) return null;
+    const wanted = String(sessionId);
+    for (let i = 0; i < tbody.children.length; i++) {
+        const candidate = tbody.children[i];
+        if (!candidate || typeof candidate.getAttribute !== 'function') continue;
+        if (candidate.getAttribute('data-session-id') === wanted) {
+            return candidate;
         }
     }
+    return null;
+}
 
-    const techDetails = document.getElementById('vpn-fwd-tech-details');
-    if (techDetails && shouldAutoExpand) {
-        techDetails.open = true;
+// vpnFocusHeading moves the caller's focus to a table heading that already exists
+// in the template with tabindex="-1", so it is genuinely focusable.
+function vpnFocusHeading(id, explanationKey) {
+    const heading = document.getElementById(id);
+    if (heading && typeof heading.focus === 'function') heading.focus();
+    const summaryEl = document.getElementById('vpn-fwd-headline-summary');
+    if (summaryEl && explanationKey) summaryEl.textContent = _(explanationKey);
+}
+
+// vpnBackendFocusCell returns the focusable cell for one backend row. Row cells are
+// matched by kind, never by element name: a plain <td> always satisfies
+// typeof node.focus === 'function', so checking the function alone would claim a
+// non-focusable cell can take focus. The search is restricted to the row's own cells
+// so a nested control's tabindex cannot stand in for the cell's.
+function vpnBackendFocusCell(row) {
+    const cells = row.children || [];
+    for (let i = 0; i < cells.length; i++) {
+        const cell = cells[i];
+        if (cell && cell.getAttribute && cell.getAttribute('tabindex') !== null) return cell;
+    }
+    return null;
+}
+
+// vpnFocusFirstFocusable focuses the first candidate that carries an explicit
+// tabindex. A plain element satisfies typeof node.focus === 'function' even when
+// the browser refuses to focus it, so focusability is read from the attribute that
+// actually grants it.
+function vpnFocusFirstFocusable(candidates) {
+    for (let i = 0; i < candidates.length; i++) {
+        const node = candidates[i];
+        if (node && typeof node.focus === 'function' && node.getAttribute && node.getAttribute('tabindex') !== null) {
+            node.focus();
+            return true;
+        }
+    }
+    return false;
+}
+
+// vpnFocusSessionIssue reveals one session's drill-down and moves focus to the
+// affected session row's action cell. Diagnostics is never touched.
+function vpnFocusSessionIssue(row) {
+    const wanted = String(row.sessionId || row.connectionId);
+    const tr = vpnFindSessionRow(wanted);
+    if (!tr) {
+        vpnFocusHeading('vpn-troubleshooting-title', 'vpn_issue_entity_missing_session');
+        return;
+    }
+    // Reveal, never toggle: the action means "show me this", so it must not close a
+    // fold the operator is already reading.
+    if (typeof vpnSetSessionDrilldownOpen === 'function') {
+        vpnSetSessionDrilldownOpen(wanted, tr, true);
+    }
+    const cell = (typeof tr.querySelector === 'function') ? tr.querySelector('[data-action="vpn-toggle-session"]') : null;
+    if (!vpnFocusFirstFocusable([cell, tr])) {
+        // No focusable target on the row means focus would silently stay put.
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+    }
+}
+
+// vpnFocusBackendIssue moves focus to the affected backend's name cell, or to the
+// backend table heading when that backend is no longer listed.
+function vpnFocusBackendIssue(row) {
+    const tbody = document.getElementById('vpn-backends-tbody');
+    const rows = (tbody && tbody.children) ? tbody.children : [];
+    for (let i = 0; i < rows.length; i++) {
+        const actionBtn = (typeof rows[i].querySelector === 'function')
+            ? rows[i].querySelector('[data-action="vpn-toggle-backend"]')
+            : null;
+        if (!actionBtn || actionBtn.getAttribute('data-server-id') !== String(row.backendId)) continue;
+        const nameCell = vpnBackendFocusCell(rows[i]);
+        if (nameCell && vpnFocusFirstFocusable([nameCell])) return;
+        vpnFocusHeading('vpn-backends-title', null);
+        return;
+    }
+    vpnFocusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
+}
+
+// vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
+// opening Advanced Diagnostics. The destination must be a node that can actually
+// take focus, and the reveal is idempotent: a second Inspect on an already-open
+// detail keeps it open instead of toggling it shut.
+function vpnFocusIssueTarget(row) {
+    if (row.sessionId || row.connectionId) {
+        vpnFocusSessionIssue(row);
+    } else if (row.backendId) {
+        vpnFocusBackendIssue(row);
+    } else {
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+    }
+}
+
+// vpnIssueSeverityLabel returns the localized severity word for one row.
+function vpnIssueSeverityLabel(upperSev) {
+    return (upperSev === 'CRITICAL' || upperSev === 'DOWN') ? _('vpn_forwarder_critical')
+        : upperSev === 'DEGRADED' ? _('vpn_forwarder_degraded')
+        : _('vpn_forwarder_warning');
+}
+
+// vpnAnnounceProblems publishes the current problem set into the polite live region.
+// Only the headline used to be inside it, so a NEW affected entity at an unchanged
+// severity changed visible text with no announcement. This writes severity, title
+// and the known entity for every row; identical text is suppressed by vpnAssignText,
+// so an unchanged poll stays silent while a genuinely new entity is announced.
+function vpnAnnounceProblems(rows) {
+    const sink = document.getElementById('vpn-fwd-problem-announcement');
+    if (!sink) return;
+    if (!rows || rows.length === 0) {
+        vpnAssignText(sink, '');
+        return;
+    }
+    const parts = rows.map(function(row) {
+        const severity = vpnIssueSeverityLabel(String(row.severity || '').toUpperCase());
+        const entity = vpnIssueEntityLabel(row);
+        return entity ? severity + ': ' + row.title + ' (' + entity + ')' : severity + ': ' + row.title;
+    });
+    vpnAssignText(sink, parts.join(' \u00b7 '));
+}
+
+// vpnRenderActiveProblemsCards renders the problem rows and returns the number of
+// rows. It never changes the Advanced Diagnostics open state: a new problem is
+// surfaced here, not by expanding technical telemetry.
+function vpnRenderActiveProblemsCards(status, context) {
+    const ctx = context || {};
+    const problemListElem = document.getElementById('vpn-fwd-problem-list');
+    const rows = (status && status.forwarder_available === true) ? vpnIssueRows(status) : [];
+
+    if (!problemListElem) return rows.length;
+
+    if (rows.length === 0) {
+        problemListElem.textContent = '';
+        problemListElem.hidden = true;
+        vpnLastActiveProblemKeys = new Set();
+        if (typeof window !== 'undefined') window.vpnLastActiveProblemKeys = vpnLastActiveProblemKeys;
+        vpnAnnounceProblems([]);
+        return 0;
     }
 
-    vpnLastActiveProblemKeys = currentProblemKeys;
-    vpnLastActiveProblemCount = activeProblemsCount;
+    problemListElem.textContent = '';
+    problemListElem.hidden = false;
+
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const upperSev = String(row.severity || '').toUpperCase();
+        const severity = (upperSev === 'CRITICAL' || upperSev === 'DOWN') ? 'critical'
+            : upperSev === 'DEGRADED' ? 'degraded' : 'warning';
+
+        const li = document.createElement('li');
+        li.className = 'vpn-issue';
+        li.setAttribute('data-severity', severity);
+        li.setAttribute('data-issue-key', row.key);
+
+        const copy = document.createElement('div');
+        copy.className = 'vpn-issue-copy';
+
+        const severityEl = document.createElement('span');
+        severityEl.className = 'vpn-issue-severity';
+        const severityIcon = document.createElement('span');
+        severityIcon.setAttribute('aria-hidden', 'true');
+        severityIcon.textContent = severity === 'critical' ? '\u2297' : '\u26a0';
+        severityEl.appendChild(severityIcon);
+        const severityLabel = document.createElement('span');
+        severityLabel.textContent = vpnIssueSeverityLabel(upperSev);
+        severityEl.appendChild(severityLabel);
+        copy.appendChild(severityEl);
+
+        const title = document.createElement('h3');
+        title.className = 'vpn-issue-title';
+        title.textContent = row.title;
+        copy.appendChild(title);
+
+        const entityText = vpnIssueEntityLabel(row);
+        if (entityText) {
+            const entity = document.createElement('p');
+            entity.className = 'vpn-issue-entity';
+            const bdi = document.createElement('bdi');
+            bdi.textContent = entityText;
+            entity.appendChild(bdi);
+            copy.appendChild(entity);
+        }
+
+        // The onset is a separate line so the explanation and the known entity stay
+        // readable on their own. vpn_fwd_onset is printf-style, so format it directly.
+        if (row.firstObserved) {
+            const onset = document.createElement('p');
+            onset.className = 'vpn-issue-entity';
+            const onsetFmt = _('vpn_fwd_onset') || 'Onset: %s';
+            onset.textContent = onsetFmt.replace('%s', vpnFormatTime(row.firstObserved));
+            copy.appendChild(onset);
+        }
+        li.appendChild(copy);
+
+        const action = document.createElement('button');
+        action.type = 'button';
+        action.className = 'btn btn-secondary btn-sm vpn-issue-action';
+        action.textContent = (row.sessionId || row.connectionId) ? _('vpn_issue_inspect_session') : _('vpn_issue_inspect');
+        action.setAttribute('data-action', 'vpn-issue-inspect');
+        action.setAttribute('data-issue-key', row.key);
+        // The handler is also stored on the node so a test harness without a real
+        // event dispatcher can invoke exactly the code a click runs.
+        const inspectHandler = (function(captured) {
+            return function(event) {
+                if (event && typeof event.preventDefault === 'function') event.preventDefault();
+                vpnFocusIssueTarget(captured);
+            };
+        })(row);
+        action._vpnIssueAction = inspectHandler;
+        action.addEventListener('click', inspectHandler);
+        li.appendChild(action);
+
+        problemListElem.appendChild(li);
+    }
+
+    const keys = new Set(rows.map(function(r) { return r.key; }));
+    vpnLastActiveProblemKeys = keys;
+    vpnLastActiveProblemCount = rows.length;
     if (typeof window !== 'undefined') {
-        window.vpnLastActiveProblemKeys = currentProblemKeys;
-        window.vpnLastActiveProblemCount = activeProblemsCount;
+        window.vpnLastActiveProblemKeys = keys;
+        window.vpnLastActiveProblemCount = rows.length;
     }
+    vpnAnnounceProblems(rows);
+    return rows.length;
 }
 
 function vpnRenderTechDiagnosticCards(status, context) {
@@ -569,8 +563,9 @@ function vpnRenderTechDiagnosticCards(status, context) {
     const dropsNoRoute = Number(ctx.dropsNoRoute || 0);
     const dropsOversize = Number(ctx.dropsOversize || 0);
     const fmtBps = typeof ctx.fmtBps === 'function' ? ctx.fmtBps : function(b) { return String(b || 0) + ' bps'; };
+    const notMeasured = _('vpn_diag_not_measured');
 
-    // Card 1: Data Plane Performance
+    // Data Plane Performance
     const dThroughput = document.getElementById('vpn-diag-throughput');
     if (dThroughput) {
         const r = status.rates || {};
@@ -589,16 +584,30 @@ function vpnRenderTechDiagnosticCards(status, context) {
         dEwma1h.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :
             'Rx: ' + fmtBps(r.rx_bps_avg_1h || 0) + ' | Tx: ' + fmtBps(r.tx_bps_avg_1h || 0);
     }
+
+    // Recent forward-write p95. The gate is the SAMPLE COUNT of the recent
+    // reservoir plus a finite value: p95_health_samples == 0 means no recent write
+    // was observed, so the percentile is not measured and must never print a
+    // numeric zero. write_total cannot prove a sample (client_write.go increments
+    // it before completion), and the historical global reservoir is deliberately
+    // not surfaced here because its sample presence cannot be proven.
     const dLatPct = document.getElementById('vpn-diag-lat-percentiles');
     if (dLatPct) {
         const fl = status.forward_latency || {};
-        dLatPct.textContent = vpnDiagText('vpn_diag_historical_percentiles', {p50:(fl.p50_ms || 0).toFixed(1), p95:(fl.p95_ms || 0).toFixed(1), p99:(fl.p99_ms || 0).toFixed(1)});
+        const samples = Number(fl.p95_health_samples || 0);
+        const p95 = Number(fl.p95_health_ms);
+        if (samples > 0 && Number.isFinite(p95)) {
+            const windowSec = Number(fl.p95_health_window_sec || 0);
+            dLatPct.textContent = windowSec > 0
+                ? vpnDiagText('vpn_diag_forward_p95_window', {value:p95.toFixed(1), window:vpnFormatHealthWindow(windowSec)})
+                : vpnDiagText('vpn_diag_forward_p95_value', {value:p95.toFixed(1)});
+            dLatPct.classList.remove('vpn-not-measured');
+        } else {
+            dLatPct.textContent = notMeasured;
+            dLatPct.classList.add('vpn-not-measured');
+        }
     }
-    const dLatMax = document.getElementById('vpn-diag-lat-max');
-    if (dLatMax) {
-        const fl = status.forward_latency || {};
-        dLatMax.textContent = vpnDiagText('vpn_diag_historical_ms', {value:fl.max_ms || 0});
-    }
+
     const dQueueOcc = document.getElementById('vpn-diag-queue-occ');
     if (dQueueOcc) {
         const qp = status.queue_pressure || {};
@@ -613,7 +622,7 @@ function vpnRenderTechDiagnosticCards(status, context) {
         dQueuePeak.textContent = peak + ' (' + hwPct + '%)';
     }
 
-    // Card 2: Traffic Drops & Loss Diagnostics
+    // Traffic Drops
     const liveHorizon = _('vpn_fwd_horizon_current') || 'Current / Live';
     const resetHorizon = _('vpn_fwd_horizon_since_reset') || 'Since Startup / Reset';
     const dDropsClient = document.getElementById('vpn-diag-drops-client');
@@ -680,7 +689,7 @@ function vpnRenderTechDiagnosticCards(status, context) {
         }
     }
 
-    // Card 3: Engine & Route Integrity
+    // Engine & Route Integrity
     const dEngine = document.getElementById('vpn-diag-engine-status');
     if (dEngine) {
         const awgState = status.listener_running ? (_('vpn_diag_state_active') || 'active') : (_('vpn_diag_state_stopped') || 'stopped');
@@ -711,7 +720,7 @@ function vpnRenderTechDiagnosticCards(status, context) {
             vtStatus = _('vpn_fwd_warning') || 'Warning';
         }
 
-        dEngine.textContent = 'amneziawg-go (' + awgState + ') • VirtualTUN: ' + vtStatus;
+        dEngine.textContent = 'amneziawg-go (' + awgState + ') \u2022 VirtualTUN: ' + vtStatus;
         if (!status.listener_running || isVtDegraded) {
             dEngine.style.color = 'var(--danger)';
         } else if (isVtWarning) {
@@ -739,6 +748,28 @@ function vpnRenderTechDiagnosticCards(status, context) {
     if (dHsFresh) {
         const hsf = status.handshake_freshness || {};
         dHsFresh.textContent = '<2m: ' + (hsf.under_2m_count || 0) + ' | 2-5m: ' + (hsf.between_2m_5m_count || 0) + ' | >5m: ' + (hsf.over_5m_count || 0) + ' | ' + _('vpn_diag_peer_sync_never') + ': ' + (hsf.never_count || 0);
+    }
+
+    // Aggregate recent write stalls. Issue #955 retires the slow-write summary tile
+    // but requires its raw value to stay reachable here. stalls_recent is the count
+    // over stalls_window_sec; the horizon is printed with it so the number cannot be
+    // read as a since-reset total. A window of 0 means the producer reported no
+    // horizon, so the count is not measured rather than silently timeless.
+    const dStallsRecent = document.getElementById('vpn-diag-write-stalls-recent');
+    if (dStallsRecent) {
+        const fl = status.forward_latency || {};
+        const recentStalls = fl.stalls_recent;
+        const windowSec = Number(fl.stalls_window_sec || 0);
+        if (typeof recentStalls === 'number' && Number.isFinite(recentStalls) && windowSec > 0) {
+            dStallsRecent.textContent = vpnDiagText('vpn_diag_write_stalls_window', {
+                count: recentStalls,
+                window: vpnFormatHealthWindow(windowSec)
+            });
+            dStallsRecent.classList.remove('vpn-not-measured');
+        } else {
+            dStallsRecent.textContent = _('vpn_diag_not_measured');
+            dStallsRecent.classList.add('vpn-not-measured');
+        }
     }
     const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
     const dRoutCounts = document.getElementById('vpn-diag-routing-counts');
@@ -776,21 +807,21 @@ function vpnRenderTechDiagnosticCards(status, context) {
             const sLabel = _('vpn_diag_sessions') || 'sessions';
             const rLabel = _('vpn_diag_routes') || 'routes';
             const retLabel = _('vpn_diag_returns') || 'returns';
-            dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' ' + sLabel + ' • ' + (rc.active_routes_count || 0) + ' ' + rLabel + ' • ' + (rc.return_owners_count || 0) + ' ' + retLabel + ' (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
+            dRoutCounts.textContent = (rc.active_sessions_count || 0) + ' ' + sLabel + ' \u2022 ' + (rc.active_routes_count || 0) + ' ' + rLabel + ' \u2022 ' + (rc.return_owners_count || 0) + ' ' + retLabel + ' (' + vpnDiagText('vpn_diag_mismatch_drops', {count:rc.ownership_mismatch_drops || 0}) + ')';
         }
         if (dRoutAlerts) {
             if (Array.isArray(rc.inconsistency_details) && rc.inconsistency_details.length > 0) {
                 dRoutAlerts.textContent = rc.inconsistency_details.join('; ');
-                dRoutAlerts.style.display = 'block';
+                dRoutAlerts.hidden = false;
                 dRoutAlerts.style.color = routAlertColor;
             } else {
                 dRoutAlerts.textContent = '';
-                dRoutAlerts.style.display = 'none';
+                dRoutAlerts.hidden = true;
             }
         }
     }
 
-    // Card 4: System & Fleet Resources
+    // System & Fleet Resources
     const dResCpu = document.getElementById('vpn-diag-res-cpu');
     if (dResCpu) {
         const rr = status.runtime_resources || {};
@@ -833,27 +864,32 @@ function vpnRenderTechDiagnosticCards(status, context) {
                 return name + ' (' + pct + '%)';
             });
             const row = document.createElement('div');
-            row.textContent = parts.join(' • ');
+            row.textContent = parts.join(' \u2022 ');
             backendTraffic.appendChild(row);
         }
     }
 }
 
+// vpnFormatHealthWindow renders a diagnostic window length for the sample horizon.
+function vpnFormatHealthWindow(sec) {
+    const s = Math.max(0, Number(sec) || 0);
+    if (s >= 3600 && s % 3600 === 0) return (s / 3600) + 'h';
+    if (s >= 60) return Math.floor(s / 60) + 'm';
+    return s + 's';
+}
+
 function vpnResetHealthProblems() {
-    const summaryHeaderElem = document.getElementById('vpn-fwd-summary-header');
-    if (summaryHeaderElem) {
-        summaryHeaderElem.textContent = '';
-        summaryHeaderElem.style.display = 'none';
-    }
     const problemListElem = document.getElementById('vpn-fwd-problem-list');
     if (problemListElem) {
         problemListElem.textContent = '';
-        problemListElem.style.display = 'none';
+        problemListElem.hidden = true;
     }
-    const techDetails = document.getElementById('vpn-fwd-tech-details');
-    if (techDetails) {
-        techDetails.open = false;
-    }
+    // The announcement sink belongs to the live region, so a failed poll clears it
+    // together with the rows it described.
+    vpnAnnounceProblems([]);
+    // Note: the Advanced Diagnostics open state belongs to the operator and is
+    // deliberately NOT reset here, so a failed poll does not close a panel the
+    // operator opened.
     vpnLastActiveProblemKeys = null;
     vpnLastActiveProblemCount = 0;
     if (typeof window !== 'undefined') {
@@ -865,11 +901,13 @@ function vpnResetHealthProblems() {
 function vpnResetTechDiagnosticCards() {
     const diagIds = [
         'vpn-diag-throughput', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h',
-        'vpn-diag-lat-percentiles', 'vpn-diag-lat-max',
+        'vpn-diag-lat-percentiles',
         'vpn-diag-queue-occ', 'vpn-diag-queue-peak',
         'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-drop-reasons',
         'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts',
-        'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-fd'
+        'vpn-diag-write-stalls-recent',
+        'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-fd',
+        'vpn-fwd-counters-since'
     ];
     for (let i = 0; i < diagIds.length; i++) {
         const el = document.getElementById(diagIds[i]);
@@ -877,6 +915,20 @@ function vpnResetTechDiagnosticCards() {
             el.textContent = '-';
             el.style.color = '';
         }
+    }
+    // The recent-percentile row has no sample after a failed poll: it reads as
+    // not measured rather than a numeric zero.
+    const dLatPct = document.getElementById('vpn-diag-lat-percentiles');
+    if (dLatPct) {
+        dLatPct.textContent = _('vpn_diag_not_measured');
+        dLatPct.classList.add('vpn-not-measured');
+    }
+    // Same rule for the aggregate recent-stall count: no trustworthy window after a
+    // failed poll, so it is not measured rather than a number.
+    const dStallsReset = document.getElementById('vpn-diag-write-stalls-recent');
+    if (dStallsReset) {
+        dStallsReset.textContent = _('vpn_diag_not_measured');
+        dStallsReset.classList.add('vpn-not-measured');
     }
     const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
     if (dRoutBadge) {
@@ -886,7 +938,7 @@ function vpnResetTechDiagnosticCards() {
     const dRoutAlerts = document.getElementById('vpn-diag-routing-alerts');
     if (dRoutAlerts) {
         dRoutAlerts.textContent = '';
-        dRoutAlerts.style.display = 'none';
+        dRoutAlerts.hidden = true;
     }
     const beTraffic = document.getElementById('vpn-diag-be-traffic');
     if (beTraffic) {
@@ -905,9 +957,13 @@ if (typeof window !== 'undefined') {
     window.parseConditionMessage = parseConditionMessage;
     window.deriveStableConditionCode = deriveStableConditionCode;
     window.extractConditionEntities = extractConditionEntities;
-    window.createSeverityBadge = createSeverityBadge;
     window.vpnRenderActiveProblemsCards = vpnRenderActiveProblemsCards;
     window.vpnRenderTechDiagnosticCards = vpnRenderTechDiagnosticCards;
+    window.vpnIssueRows = vpnIssueRows;
+    window.vpnIssueSeverityLabel = vpnIssueSeverityLabel;
+    window.vpnAnnounceProblems = vpnAnnounceProblems;
+    window.vpnFocusIssueTarget = vpnFocusIssueTarget;
+    window.vpnFormatHealthWindow = vpnFormatHealthWindow;
     window.vpnResetHealthProblems = vpnResetHealthProblems;
     window.vpnResetTechDiagnosticCards = vpnResetTechDiagnosticCards;
 }

@@ -317,7 +317,10 @@ func TestIssue101VPNModernization(t *testing.T) {
 		t.Fatalf("GetTranslationsSubFS failed: %v", err)
 	}
 
-	// 1. Assert vpn.html contains all 36 required DOM element IDs
+	// 1. Assert vpn.html contains the required DOM element IDs. The #955 redesign
+	// replaced the old four-card block: #vpn-active-tunnels no longer exists (a route
+	// mismatch replaces it, and only when one is reported), while the cumulative Rx/Tx
+	// totals moved into Advanced Diagnostics.
 	requiredDOMIDs := []string{
 		"vpn-listener-badge",
 		"vpn-listen-port",
@@ -325,7 +328,6 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"vpn-public-endpoint",
 		"vpn-edit-endpoint-btn",
 		"vpn-sessions",
-		"vpn-active-tunnels",
 		"vpn-rx",
 		"vpn-tx",
 		"vpnTableContainer",
@@ -648,8 +650,18 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	vpnStr := string(vpnData)
-	if !strings.Contains(vpnStr, `style="gap: var(--space-sm);"`) {
-		t.Errorf("vpn.html missing style=\"gap: var(--space-sm);\" for live telemetry dot spacing")
+	// The inline "live telemetry" dot row is gone with the old bandwidth card; the
+	// redesigned surfaces express spacing through the scoped stylesheet instead, so
+	// an inline style must NOT remain in the template.
+	if strings.Contains(vpnStr, `style="gap: var(--space-sm);"`) {
+		t.Errorf("vpn.html must not carry the retired inline telemetry-dot spacing style")
+	}
+	cssGapData, err := fs.ReadFile(staticFS, "css/vpn.css")
+	if err != nil {
+		t.Fatalf("failed to read css/vpn.css: %v", err)
+	}
+	if !strings.Contains(string(cssGapData), "gap: var(--space-sm)") {
+		t.Errorf("vpn.css missing gap: var(--space-sm) used by the redesigned surfaces")
 	}
 
 	cssData, err := fs.ReadFile(staticFS, "css/style.css")
@@ -743,8 +755,13 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	vpnStr := string(vpnData)
-	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable" style="width: 100%; min-width: 100%;">`) {
-		t.Errorf("vpn.html missing table#vpnBackendsTable with style=\"width: 100%%; min-width: 100%%;\"")
+	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable">`) {
+		t.Errorf("vpn.html missing table#vpnBackendsTable with the interactive-table contract")
+	}
+	// Full width is carried by .interactive-table in the stylesheet rather than an
+	// inline style, which #955 removed along with the rest of the large inline styling.
+	if strings.Contains(vpnStr, `style="width: 100%; min-width: 100%;"`) {
+		t.Errorf("vpn.html must not carry inline full-width table styling")
 	}
 	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
 		t.Errorf("vpn.html missing #vpnTableContainer")

@@ -101,6 +101,11 @@ function vpnRenderBackendRow(b) {
     tr.setAttribute('data-status', displayStatus);
 
     const tdServer = document.createElement('td');
+    // Programmatic focus needs a focusable target: an "Inspect" action that names a
+    // backend moves focus here, so the cell carries tabindex="-1" (focusable, not
+    // in the tab order) as well as a stable attribute the focus helper can find.
+    tdServer.setAttribute('data-backend-name', String(srvId));
+    tdServer.setAttribute('tabindex', '-1');
     const srvMatch = vpnCachedServers.find(function (s) { return String(s.id) === String(srvId); });
     const srvName = srvMatch ? srvMatch.name : ('Server #' + srvId);
     tdServer.innerHTML = `
