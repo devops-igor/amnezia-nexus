@@ -19,13 +19,15 @@ import (
 func TestLiveSaveAppliesTheInventoryOverride(t *testing.T) {
 	withNameOwnedWANDevice(t, newNameRegistry())
 	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
 
 	active := policy.DefaultSettings()
 	active.Enabled = true
 	active.ProxyExceptions = []string{"203.0.113.0/24"}
 
 	store := lkgStoreFor(t, active)
+	// Registered after the store: cleanup runs LIFO, so the loop must stop before
+	// the directory it may still write to is removed.
+	t.Cleanup(svc.StopPolicyRouting)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := svc.StartPolicyRouting(ctx, active, store); err != nil {

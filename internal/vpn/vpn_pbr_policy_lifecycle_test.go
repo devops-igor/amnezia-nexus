@@ -516,10 +516,13 @@ func TestStartPolicyRoutingRegistersDerivedHostWANIP(t *testing.T) {
 	reg := newNameRegistry()
 	withNameOwnedWANDevice(t, reg)
 	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
 
 	settings := repeatedEnableSettings(t)
-	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings)); err != nil {
+	store := auditedLKGStore(t, settings)
+	// Registered after the store: cleanup runs LIFO, so the loop must stop before
+	// the directory it may still write to is removed.
+	t.Cleanup(svc.StopPolicyRouting)
+	if err := svc.StartPolicyRouting(context.Background(), settings, store); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
 

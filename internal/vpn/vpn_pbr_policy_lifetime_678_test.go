@@ -47,10 +47,9 @@ func TestSuccessfulActivationKeepsPolicySyncerAlive(t *testing.T) {
 	reg := newNameRegistry()
 	withNameOwnedWANDevice(t, reg)
 	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
-
 	settings := repeatedEnableSettings(t)
 	store := auditedLKGStore(t, settings)
+	t.Cleanup(svc.StopPolicyRouting)
 
 	var activationErr error
 	wrapped := middleware.OperationTimeout(time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
