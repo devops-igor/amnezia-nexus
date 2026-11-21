@@ -43,6 +43,13 @@ jobs:
         run: |
           python3 scripts/architecture_health.py --check --nonblocking
 
+      - name: Enforce SG1 size rule for this pull request
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 scripts/architecture_health.py --check-pr-size
+
       - name: Upload Architecture Health Report
         uses: actions/upload-artifact@v7
         if: always()

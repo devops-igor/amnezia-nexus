@@ -20,6 +20,7 @@ from scripts.architecture_health.discovery import (
     analyze_go_functions,
     classify_component,
     compute_git_churn,
+    count_content_lines_and_bytes,
     count_file_lines_and_bytes,
     detect_renames,
     find_repo_root,
@@ -34,6 +35,13 @@ from scripts.architecture_health.policy import (
     rebase_files_map,
     scan_repository,
     update_downward_ratchet,
+)
+from scripts.architecture_health.pull_request import (
+    PrSizeGateError,
+    evaluate_pull_request,
+    find_merge_base,
+    report_pull_request_result,
+    size_transition,
 )
 from scripts.architecture_health.render import (
     generate_json_report,
@@ -60,6 +68,7 @@ __all__ = [
     "analyze_go_functions",
     "classify_component",
     "compute_git_churn",
+    "count_content_lines_and_bytes",
     "count_file_lines_and_bytes",
     "detect_renames",
     "find_repo_root",
@@ -72,6 +81,11 @@ __all__ = [
     "rebase_files_map",
     "scan_repository",
     "update_downward_ratchet",
+    "PrSizeGateError",
+    "evaluate_pull_request",
+    "find_merge_base",
+    "report_pull_request_result",
+    "size_transition",
     "generate_json_report",
     "generate_markdown_summary",
     "load_baseline",

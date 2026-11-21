@@ -13,8 +13,78 @@ from scripts.architecture_health.constants import (
     DEFAULT_CEILING_LINES,
     DEFAULT_WARNING_LINES,
 )
+from scripts.architecture_health.pull_request import (
+    PrSizeGateError,
+    evaluate_pull_request,
+    report_pull_request_result,
+)
 
 logger = logging.getLogger("architecture_health")
+
+
+def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
+    """Run the pull-request SG1 size gate and return its exit code.
+
+    There is no base to compare against outside a pull request, so the gate
+    stands down and says so rather than pretending it verified anything.
+    """
+    base_ref = args.base_ref
+    if not base_ref:
+        event = os.environ.get("GITHUB_EVENT_NAME")
+        if event and event != "pull_request":
+            logger.info(
+                "SG1 pull request gate not applicable: this run is a %s event, "
+                "so there is no pull request base to compare against. Not blocking.",
+                event,
+            )
+            return 0
+        base_ref = os.environ.get("GITHUB_BASE_REF") or ""
+    if not base_ref:
+        logger.info(
+            "SG1 pull request gate not applicable: no base ref available "
+            "(no --base-ref and no GITHUB_BASE_REF). Not blocking.",
+        )
+        return 0
+
+    try:
+        result = evaluate_pull_request(
+            repo_root=repo_root,
+            base_ref=base_ref,
+            head_ref=args.head_ref,
+            ceiling_lines=args.ceiling,
+        )
+    except PrSizeGateError as exc:
+        logger.error(
+            "SG1 pull request gate FAILED to read git data for base %s: %s. "
+            "Failing closed rather than reporting a pass.",
+            base_ref,
+            exc,
+        )
+        return 1
+
+    logger.info(
+        "SG1 pull request gate: compared %d changed path(s) against merge base %s of %s.",
+        result["checked_count"],
+        result["merge_base"][:10],
+        base_ref,
+    )
+    for entry in result["skipped"]:
+        logger.info("SG1 pull request gate: skipped %s (%s).", entry["path"], entry["reason"])
+
+    if result["violations"]:
+        for line in report_pull_request_result(result):
+            logger.error(line)
+        logger.error(
+            "SG1 pull request gate FAILED with %d size violation(s). Section 4.3 forbids "
+            "crossing %d lines or growing a file already above it without a stated "
+            "per-PR justification.",
+            len(result["violations"]),
+            result["ceiling_lines"],
+        )
+        return 1
+
+    logger.info("SG1 pull request gate PASSED: no size transition introduced by this PR.")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -61,6 +131,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Report violations advisably with exit code 0 rather than failing the scan.",
     )
     parser.add_argument(
+        "--check-pr-size",
+        action="store_true",
+        help="Fail only on SG1 size transitions this pull request introduces against its merge base.",
+    )
+    parser.add_argument(
+        "--base-ref",
+        default=None,
+        help="Base branch ref for --check-pr-size (defaults to GITHUB_BASE_REF).",
+    )
+    parser.add_argument(
+        "--head-ref",
+        default="HEAD",
+        help="Head ref for --check-pr-size.",
+    )
+    parser.add_argument(
         "--report-json",
         default="architecture_health_report.json",
         help="File path to output the full structured JSON report.",
@@ -85,6 +170,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     repo_root = ah.find_repo_root(args.repo_root)
+    if args.check_pr_size:
+        return _run_pr_size_gate(args, repo_root)
     baseline_path = Path(args.baseline_file)
     if not baseline_path.is_absolute():
         baseline_path = repo_root / baseline_path
