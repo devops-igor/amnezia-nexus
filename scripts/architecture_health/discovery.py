@@ -65,17 +65,22 @@ def detect_renames(repo_root: Path, baseline_commit: Optional[str] = None) -> Di
     return renames
 
 
+def count_content_lines_and_bytes(content: bytes) -> Optional[Tuple[int, int]]:
+    """Count physical newlines and byte size of file content, returning None if binary."""
+    if b"\x00" in content:
+        return None
+    line_count = content.count(b"\n") + (1 if content and not content.endswith(b"\n") else 0)
+    return line_count, len(content)
+
+
 def count_file_lines_and_bytes(file_path: Path) -> Optional[Tuple[int, int]]:
-    """Count physical newlines and byte size of a file, returning None if binary."""
+    """Count physical newlines and byte size of a file, returning None if unreadable."""
     try:
         with open(file_path, "rb") as f:
             content = f.read()
     except Exception:
         return None
-    if b"\x00" in content:
-        return None
-    line_count = content.count(b"\n") + (1 if content and not content.endswith(b"\n") else 0)
-    return line_count, len(content)
+    return count_content_lines_and_bytes(content)
 
 
 def classify_component(rel_path: str) -> str:

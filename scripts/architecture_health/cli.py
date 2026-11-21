@@ -6,15 +6,179 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import scripts.architecture_health as ah
 from scripts.architecture_health.constants import (
     DEFAULT_CEILING_LINES,
     DEFAULT_WARNING_LINES,
 )
+from scripts.architecture_health.pull_request import (
+    PrSizeGateError,
+    evaluate_pull_request,
+    load_pull_request_context,
+    report_excused_result,
+    report_pull_request_result,
+    resolve_exception,
+)
 
 logger = logging.getLogger("architecture_health")
+
+
+def _resolve_pr_exception() -> Dict[str, Any]:
+    """Resolve this run's exception from the pull request event payload.
+
+    The label and the description both come from the payload GitHub writes for
+    the run, so the check needs no token, no API call and no write permission.
+    """
+    context = load_pull_request_context(os.environ.get("GITHUB_EVENT_PATH"))
+    return resolve_exception(labels=context["labels"], body=context["body"])
+
+
+def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
+    """Run the pull-request SG1 size gate and return its exit code.
+
+    There is no base to compare against outside a pull request, so the gate
+    stands down and says so rather than pretending it verified anything.
+    """
+    base_ref = args.base_ref
+    if not base_ref:
+        event = os.environ.get("GITHUB_EVENT_NAME")
+        if event and event != "pull_request":
+            logger.info(
+                "SG1 pull request gate not applicable: this run is a %s event, "
+                "so there is no pull request base to compare against. Not blocking.",
+                event,
+            )
+            return 0
+        base_ref = os.environ.get("GITHUB_BASE_REF") or ""
+    if not base_ref:
+        logger.info(
+            "SG1 pull request gate not applicable: no base ref available "
+            "(no --base-ref and no GITHUB_BASE_REF). Not blocking.",
+        )
+        return 0
+
+    head_ref = args.head_ref or ""
+    if not head_ref:
+        if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+            logger.error(
+                "SG1 pull request gate FAILED: no head reference was supplied, and on a "
+                "pull request checkout HEAD is the synthetic merge of the base tip and the "
+                "pull request head, so it cannot stand in for the pull request. Judging it "
+                "would compare the base tip with the merge instead of the branch point with "
+                "the head. Failing rather than reporting a verdict from the merge checkout."
+            )
+            return 1
+        head_ref = "HEAD"
+
+    try:
+        exception = _resolve_pr_exception()
+    except PrSizeGateError as exc:
+        logger.error(
+            "SG1 pull request gate FAILED to read the pull request event payload: %s. "
+            "Failing closed rather than treating an unreadable exception as absent.",
+            exc,
+        )
+        return 1
+
+    try:
+        result = evaluate_pull_request(
+            repo_root=repo_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            ceiling_lines=args.ceiling,
+            exception=exception,
+        )
+    except PrSizeGateError as exc:
+        logger.error(
+            "SG1 pull request gate FAILED to read git data for base %s: %s. "
+            "Failing closed rather than reporting a pass.",
+            base_ref,
+            exc,
+        )
+        return 1
+
+    logger.info(
+        "SG1 pull request gate: comparing %d changed path(s) between merge base %s of %s "
+        "and head %s.",
+        result["checked_count"],
+        result["merge_base"][:10],
+        base_ref,
+        result["head_ref"],
+    )
+    for entry in result["checked"]:
+        logger.info(
+            "SG1 pull request gate: %s is %d line(s) at the merge base and %d line(s) at the head.",
+            entry["path"],
+            entry["base_lines"],
+            entry["head_lines"],
+        )
+    for entry in result["skipped"]:
+        logger.info("SG1 pull request gate: skipped %s (%s).", entry["path"], entry["reason"])
+
+    # A half-exception is never a pass. The two halves are named separately so
+    # the message says exactly which one is missing, and any transition it was
+    # meant to cover is still printed: the reader must see both the missing half
+    # and the size change, not just the first of the two.
+    if exception["requested"] and not exception["valid"]:
+        for line in report_pull_request_result(result):
+            logger.error(line)
+        logger.error(
+            "SG1 pull request gate FAILED: the %s label is applied but the pull request "
+            "body has no statement under a '%s' heading. Section 4.3 requires a stated "
+            "per-PR responsibility justification, so the exception is incomplete and the "
+            "size rule still applies.",
+            exception["label"],
+            exception["heading"],
+        )
+        return 1
+
+    if result["excused"]:
+        for entry in result["excused"]:
+            logger.warning(
+                "SG1 pull request gate: excused %s by the %s label: %d line(s) at the "
+                "merge base and %d line(s) at the head (%s).",
+                entry["path"],
+                exception["label"],
+                entry["base_lines"],
+                entry["head_lines"],
+                entry["transition"],
+            )
+        for line in report_excused_result(result):
+            logger.warning(line)
+        logger.warning(
+            "SG1 pull request gate PASSED WITH EXCEPTION: %d size transition(s) excused "
+            "by the %s label and the '%s' statement in this pull request. Every excused "
+            "path is named above with both counts.",
+            len(result["excused"]),
+            exception["label"],
+            exception["heading"],
+        )
+        return 0
+
+    if result["violations"]:
+        for line in report_pull_request_result(result):
+            logger.error(line)
+        logger.error(
+            "SG1 pull request gate FAILED with %d size violation(s). Section 4.3 forbids "
+            "crossing %d lines or growing a file already above it without a stated "
+            "per-PR justification.",
+            len(result["violations"]),
+            result["ceiling_lines"],
+        )
+        return 1
+
+    if exception["valid"]:
+        logger.info(
+            "SG1 pull request gate PASSED: the %s exception is present and was not needed, "
+            "because this PR introduces no size transition. Nothing was excused.",
+            exception["label"],
+        )
+        return 0
+
+    logger.info("SG1 pull request gate PASSED: no size transition introduced by this PR.")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -61,6 +225,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Report violations advisably with exit code 0 rather than failing the scan.",
     )
     parser.add_argument(
+        "--check-pr-size",
+        action="store_true",
+        help="Fail only on SG1 size transitions this pull request introduces against its merge base.",
+    )
+    parser.add_argument(
+        "--base-ref",
+        default=None,
+        help="Base branch ref for --check-pr-size (defaults to GITHUB_BASE_REF).",
+    )
+    parser.add_argument(
+        "--head-ref",
+        default=None,
+        help=(
+            "Head ref for --check-pr-size. Required in a pull request context, where the "
+            "checked-out HEAD is the synthetic Actions merge and cannot stand in for the "
+            "pull request head; defaults to HEAD only outside a pull request."
+        ),
+    )
+    parser.add_argument(
         "--report-json",
         default="architecture_health_report.json",
         help="File path to output the full structured JSON report.",
@@ -85,6 +268,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     repo_root = ah.find_repo_root(args.repo_root)
+    if args.check_pr_size:
+        return _run_pr_size_gate(args, repo_root)
     baseline_path = Path(args.baseline_file)
     if not baseline_path.is_absolute():
         baseline_path = repo_root / baseline_path
