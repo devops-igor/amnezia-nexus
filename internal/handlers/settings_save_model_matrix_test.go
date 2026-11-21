@@ -56,7 +56,7 @@ const MX_CARDS = {
   telegramCard:      {id: 'telegram_chat_id', mk: n => '-100cell' + n, stored: s => s.telegram.chat_id, other: 'app_title'},
   gigahostCard:      {id: 'gigahost_api_key', secret: true, mk: n => 'flux_live_cell_' + n + '_0123456789', stored: s => s.gigahost.api_key, other: 'app_title'},
   notificationsCard: {id: 'notifications_cooldown', mk: n => String(100 + n), other: 'app_title', own: true},
-  policyRoutingCard: {id: 'policy_local_entries', mk: n => 'cell' + n + '.example', other: 'app_title', own: true}
+  policyRoutingCard: {id: 'policy_proxy_exceptions', mk: n => '198.51.' + n + '.0/24', other: 'app_title', own: true}
 };
 let mxN = 0;
 const mxText = el => el.textContent.replace(/\s+/g, ' ').trim();
@@ -119,7 +119,7 @@ async function mxStored(cfg) {
   if (cfg.id === 'notifications_cooldown') {
     return String((await (await realFetch(CFG.base + '/api/notifications/settings')).json()).cooldown_seconds);
   }
-  if (cfg.id === 'policy_local_entries') return policyDouble.record.local_entries.join('\n');
+  if (cfg.id === 'policy_proxy_exceptions') return policyDouble.record.proxy_exceptions.join('\n');
   throw new Error('no stored fact is defined for card ' + cfg.id);
 }
 

@@ -29,7 +29,7 @@ assert.equal(shown(badgeOf('policyRoutingCard')), false, 'a loaded policy card s
 const enable = doc.getElementById('policy_enabled');
 enable.checked = true;
 enable.dispatchEvent(new w.Event('change', {bubbles: true}));
-type('policy_local_entries', 'corp.example\n198.51.100.0/24');
+type('policy_proxy_exceptions', '203.0.113.0/24\n198.51.100.0/24');
 assert.equal(shown(badgeOf('policyRoutingCard')), true);
 assert.equal(save.disabled, false);
 
@@ -39,7 +39,7 @@ await settled();
 
 assert.equal(policyDouble.puts.length, 1, 'exactly one write was attempted');
 assert.equal(enable.checked, true, 'the refused switch stays on so it can be corrected');
-assert.equal(doc.getElementById('policy_local_entries').value, 'corp.example\n198.51.100.0/24', 'the refused text stays in the editor');
+assert.equal(doc.getElementById('policy_proxy_exceptions').value, '203.0.113.0/24\n198.51.100.0/24', 'the refused text stays in the editor');
 assert.equal(shown(badgeOf('policyRoutingCard')), true, 'a refused save must not mark the card clean');
 assert.equal(policy.getAttribute('aria-busy'), 'false');
 assert.equal(save.disabled, false, 'the operator can try again');
@@ -125,21 +125,21 @@ let release;
 const gate = new Promise(r => { release = r; });
 holdWhen = (u, o) => (String(u) === '/api/vpn/policy' && String((o && o.method) || '').toUpperCase() === 'PUT') ? gate : null;
 
-type('policy_local_entries', 'sent.example');
+type('policy_proxy_exceptions', '198.51.100.0/24');
 await until(() => !save.disabled, 'the edited card to be committable');
 save.click();
 await until(() => held > 0, 'the save request to reach the barrier');
 assert.equal(policy.getAttribute('aria-busy'), 'true');
 
-type('policy_local_entries', 'sent.example\nnewer.example');
+type('policy_proxy_exceptions', '198.51.100.0/24\n192.0.2.0/24');
 release();
 holdWhen = null;
 await until(() => policy.getAttribute('aria-busy') === 'false', 'the save to finish');
 await settled();
 
-assert.equal(doc.getElementById('policy_local_entries').value, 'sent.example\nnewer.example', 'the newer edit survived the answer');
+assert.equal(doc.getElementById('policy_proxy_exceptions').value, '198.51.100.0/24\n192.0.2.0/24', 'the newer edit survived the answer');
 assert.equal(shown(badgeOf('policyRoutingCard')), true, 'the newer edit is still unsaved');
-assert.deepEqual(policyDouble.record.local_entries, ['sent.example'], 'the stored record holds what was sent');
+assert.deepEqual(policyDouble.record.proxy_exceptions, ['198.51.100.0/24'], 'the stored record holds what was sent');
 assert.equal(policyDouble.puts.length, 1);
 `)
 }
