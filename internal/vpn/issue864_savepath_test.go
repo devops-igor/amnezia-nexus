@@ -85,14 +85,13 @@ type savePathScenario struct {
 	saved  policy.Settings
 }
 
-// newSavePathScenario activates the fixture list at pathA and returns the
-// scenario the save cases run against.
+// newSavePathScenario activates the fixture list and returns the scenario the
+// save cases run against, after asserting the precondition the preservation case
+// depends on: the save leaves the policy sources untouched while it changes a
+// setting the policy snapshot does not carry.
 func newSavePathScenario(t *testing.T, fixture *savePathFixture, server *httptest.Server, active, saved policy.Settings) *savePathScenario {
 	t.Helper()
 
-	// Preconditions this oracle depends on: the save leaves the policy sources and
-	// therefore the effective rules untouched, while it does change a setting the
-	// policy snapshot does not carry.
 	cfgActive, err := active.SyncConfig()
 	if err != nil {
 		t.Fatalf("active SyncConfig: %v", err)
@@ -107,6 +106,16 @@ func newSavePathScenario(t *testing.T, fixture *savePathFixture, server *httptes
 	if reflect.DeepEqual(active.EffectiveUpstreams(), saved.EffectiveUpstreams()) {
 		t.Fatal("fixture precondition: the save does not change the upstream list")
 	}
+
+	return activateSavePathScenario(t, fixture, server, active, saved)
+}
+
+// activateSavePathScenario wires and activates one save scenario: the fixture TLS
+// listener as the fetcher, a name-owned WAN device, the production service, a real
+// FileStore and the production activation entry point. It asserts nothing about
+// the settings, so the changed-source case can use it too.
+func activateSavePathScenario(t *testing.T, fixture *savePathFixture, server *httptest.Server, active, saved policy.Settings) *savePathScenario {
+	t.Helper()
 
 	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
 		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
@@ -132,6 +141,141 @@ func (sc *savePathScenario) effectiveUpstreams(t *testing.T) []policy.Upstream {
 	sc.svc.mu.Lock()
 	defer sc.svc.mu.Unlock()
 	return append([]policy.Upstream(nil), sc.svc.dnsUpstreams...)
+}
+
+// TestSaveWithUnchangedRulesPreservesGeneration is the required oracle for the
+// supported settings-save path: an enabled save whose effective rules are
+// unchanged must keep the published generation, leave the durable record as it
+// was, and still apply the setting the operator changed.
+//
+// The generation is the fact every flow records, so republishing it for rules
+// that did not change makes the panel report a policy change that never happened.
+func TestSaveWithUnchangedRulesPreservesGeneration(t *testing.T) {
+	const pathA = "/policy.lst"
+	fixture := newSavePathFixture(map[string][]string{pathA: domainList("savepath", 20)})
+	server := httptest.NewTLSServer(fixture.handler())
+	defer server.Close()
+
+	active := policySettingsForURL(t, "https://save-path.example"+pathA)
+	saved := active
+	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	if err := saved.Validate(); err != nil {
+		t.Fatalf("saved fixture settings are invalid: %v", err)
+	}
+
+	sc := newSavePathScenario(t, fixture, server, active, saved)
+
+	liveBefore := sc.svc.PolicyMatcher().Current()
+	if liveBefore == nil {
+		t.Fatal("no live snapshot after activation")
+	}
+	durableBefore, err := sc.store.Load(sc.ctx)
+	if err != nil || durableBefore == nil {
+		t.Fatalf("load durable generation before the save: gen=%v err=%v", durableBefore, err)
+	}
+
+	// The supported save path: the admin PUT persists the settings and calls this.
+	if err := sc.svc.StartPolicyRouting(sc.ctx, saved, sc.store, string(saved.Preset)); err != nil {
+		t.Fatalf("upstream-only save: %v", err)
+	}
+
+	live := sc.svc.PolicyMatcher().Current()
+	if live == nil {
+		t.Fatal("no live snapshot after the save")
+	}
+	if live.Generation() != liveBefore.Generation() {
+		t.Fatalf("a save whose effective rules are unchanged advanced the generation %q -> %q: every flow recorded after it would report a policy change that never happened",
+			liveBefore.Generation(), live.Generation())
+	}
+	if !live.MatchDomain("savepath0.example.com") {
+		t.Error("live snapshot lost a rule the fixture list contains")
+	}
+	durableAfter, err := sc.store.Load(sc.ctx)
+	if err != nil || durableAfter == nil {
+		t.Fatalf("load durable generation after the save: gen=%v err=%v", durableAfter, err)
+	}
+	if durableAfter.GenerationID != durableBefore.GenerationID {
+		t.Errorf("durable generation changed on a rules-unchanged save: %q -> %q", durableBefore.GenerationID, durableAfter.GenerationID)
+	}
+	if durableAfter.ContentHash != durableBefore.ContentHash {
+		t.Errorf("durable content hash changed on a rules-unchanged save: %q -> %q", durableBefore.ContentHash, durableAfter.ContentHash)
+	}
+	if durableAfter.ConfigHash != durableBefore.ConfigHash {
+		t.Errorf("durable config hash changed on a save that kept the same sources: %q -> %q", durableBefore.ConfigHash, durableAfter.ConfigHash)
+	}
+
+	// The requested setting must still be applied, and recorded as the runtime's.
+	if got, want := sc.effectiveUpstreams(t), saved.EffectiveUpstreams(); !reflect.DeepEqual(got, want) {
+		t.Errorf("live upstream list = %+v, want the saved %+v", got, want)
+	}
+	if got := sc.svc.policyRuntime().settings.UpstreamDNS; !reflect.DeepEqual(got, saved.UpstreamDNS) {
+		t.Errorf("runtime settings upstreams = %+v, want the saved %+v", got, saved.UpstreamDNS)
+	}
+}
+
+// TestSaveWithChangedSourcePublishesNewGeneration is the control that keeps the
+// preservation from freezing the policy: selecting a different source publishes
+// its content under a new generation, drops the previous source's rules and still
+// applies the requested setting.
+func TestSaveWithChangedSourcePublishesNewGeneration(t *testing.T) {
+	const (
+		pathA = "/policy-a.lst"
+		pathB = "/policy-b.lst"
+	)
+	fixture := newSavePathFixture(map[string][]string{
+		pathA: domainList("savepath-a", 20),
+		pathB: domainList("savepath-b", 20),
+	})
+	server := httptest.NewTLSServer(fixture.handler())
+	defer server.Close()
+
+	active := policySettingsForURL(t, "https://save-path.example"+pathA)
+	saved := policySettingsForURL(t, "https://save-path.example"+pathB)
+	saved.UpstreamDNS = []policy.Upstream{{Address: "1.1.1.1", Port: 53}}
+	if err := saved.Validate(); err != nil {
+		t.Fatalf("saved fixture settings are invalid: %v", err)
+	}
+
+	// The precondition helper asserts the sources are equal, which is not this
+	// case, so the scenario is wired directly.
+	sc := activateSavePathScenario(t, fixture, server, active, saved)
+
+	liveBefore := sc.svc.PolicyMatcher().Current()
+	if liveBefore == nil {
+		t.Fatal("no live snapshot after activation")
+	}
+	durableBefore, err := sc.store.Load(sc.ctx)
+	if err != nil || durableBefore == nil {
+		t.Fatalf("load durable generation before the save: gen=%v err=%v", durableBefore, err)
+	}
+
+	if err := sc.svc.StartPolicyRouting(sc.ctx, saved, sc.store, string(saved.Preset)); err != nil {
+		t.Fatalf("changed-source save: %v", err)
+	}
+
+	live := sc.svc.PolicyMatcher().Current()
+	if live == nil || live.Generation() == liveBefore.Generation() {
+		t.Fatalf("a save that selected a different source did not publish a new generation (%q)", liveBefore.Generation())
+	}
+	if !live.MatchDomain("savepath-b0.example.com") {
+		t.Error("live snapshot does not carry the saved source's rules")
+	}
+	if live.MatchDomain("savepath-a0.example.com") {
+		t.Error("live snapshot still carries the previous source's rules")
+	}
+	durableAfter, err := sc.store.Load(sc.ctx)
+	if err != nil || durableAfter == nil {
+		t.Fatalf("load durable generation after the save: gen=%v err=%v", durableAfter, err)
+	}
+	if durableAfter.GenerationID != live.Generation() {
+		t.Errorf("durable generation = %q, want the published %q", durableAfter.GenerationID, live.Generation())
+	}
+	if durableAfter.ContentHash == durableBefore.ContentHash {
+		t.Errorf("changed-source save left the durable content hash at %q", durableBefore.ContentHash)
+	}
+	if got, want := sc.effectiveUpstreams(t), saved.EffectiveUpstreams(); !reflect.DeepEqual(got, want) {
+		t.Errorf("live upstream list = %+v, want the saved %+v", got, want)
+	}
 }
 
 // TestFailedSaveWithUnchangedSourcesKeepsWriteOwnership is the second half of the
