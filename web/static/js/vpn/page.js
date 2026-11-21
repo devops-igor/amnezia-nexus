@@ -56,10 +56,15 @@ async function vpnLoadData() {
         }
         document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '-');
         document.getElementById('vpn-subnet').textContent = cfg.subnet_cidr || '-';
-        document.getElementById('vpn-sessions').textContent = String(status.connected_sessions || 0);
-        document.getElementById('vpn-active-tunnels').textContent = String(status.active_tunnels || 0);
-        document.getElementById('vpn-rx').textContent = Telemetry.formatBytes(status.rx_bytes || 0);
-        document.getElementById('vpn-tx').textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+        // Cumulative Rx/Tx live in Advanced Diagnostics as since-reset totals, so
+        // they are written here rather than described as rates.
+        const rxElem = document.getElementById('vpn-rx');
+        if (rxElem) rxElem.textContent = Telemetry.formatBytes(status.rx_bytes || 0);
+        const txElem = document.getElementById('vpn-tx');
+        if (txElem) txElem.textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+        // The sessions signal and every other overview value are owned by
+        // vpnRenderForwarderHealth -> vpnRenderSignals, which distinguishes a
+        // measured zero from an unmeasured value.
         vpnRenderForwarderHealth(status);
 
         const tbody = document.getElementById('vpn-backends-tbody');
@@ -147,6 +152,17 @@ const VPN_ACTIONS = {
     },
     'vpn-toggle-show-all-routes': function () {
         if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
+    },
+    'vpn-toggle-diagnostics': function () {
+        if (typeof vpnToggleDiagnostics === 'function') vpnToggleDiagnostics();
+    },
+    'vpn-close-diagnostics': function () {
+        if (typeof vpnCloseDiagnostics === 'function') vpnCloseDiagnostics();
+    },
+    'vpn-issue-inspect': function (btn) {
+        // Focus is handled by the row's own listener; this entry keeps the
+        // delegated handler from treating the button as an unknown action.
+        if (btn && btn.getAttribute && btn.getAttribute('data-issue-key')) return;
     },
     'vpn-set-history-window': function (btn) {
         const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
