@@ -37,10 +37,16 @@ from scripts.architecture_health.policy import (
     update_downward_ratchet,
 )
 from scripts.architecture_health.pull_request import (
+    EXCEPTION_LABEL,
+    JUSTIFICATION_HEADING,
     PrSizeGateError,
     evaluate_pull_request,
     find_merge_base,
+    load_pull_request_context,
+    parse_justification,
+    report_excused_result,
     report_pull_request_result,
+    resolve_exception,
     size_transition,
 )
 from scripts.architecture_health.render import (
@@ -82,9 +88,15 @@ __all__ = [
     "scan_repository",
     "update_downward_ratchet",
     "PrSizeGateError",
+    "EXCEPTION_LABEL",
+    "JUSTIFICATION_HEADING",
     "evaluate_pull_request",
     "find_merge_base",
+    "load_pull_request_context",
+    "parse_justification",
+    "report_excused_result",
     "report_pull_request_result",
+    "resolve_exception",
     "size_transition",
     "generate_json_report",
     "generate_markdown_summary",

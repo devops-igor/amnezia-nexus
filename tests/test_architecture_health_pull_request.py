@@ -6,6 +6,7 @@ is the most likely defect in this comparison and a fixture that is "about a
 thousand lines" cannot detect one.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -40,7 +41,13 @@ def isolate_github_env(monkeypatch: pytest.MonkeyPatch) -> None:
     This module runs inside the pull-request workflow itself, so GITHUB_* is
     normally populated. Each test sets only the variables it is about.
     """
-    for name in ("GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_STEP_SUMMARY", "GITHUB_HEAD_REF"):
+    for name in (
+        "GITHUB_EVENT_NAME",
+        "GITHUB_BASE_REF",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_HEAD_REF",
+        "GITHUB_EVENT_PATH",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -769,16 +776,27 @@ def _gate_run_body() -> str:
     # checkout on pull_request is the synthetic merge, which is the defect.
     assert "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in head
     assert '--head-ref "${PR_HEAD_SHA}"' in body
+    # The maintainer's label and the justification statement both come from the
+    # event payload, so the step needs no token and no API call.
+    assert "GITHUB_EVENT_PATH: ${{ github.event_path }}" in head
     return textwrap.dedent(body)
 
 
-def _run_gate_via_workflow(repo: Path, pr_head_sha: Optional[str]) -> subprocess.CompletedProcess:
+def _run_gate_via_workflow(
+    repo: Path,
+    pr_head_sha: Optional[str],
+    payload: Optional[Dict[str, Any]] = None,
+) -> subprocess.CompletedProcess:
     """Execute the workflow's gate body in the fixture repo, as the runner does.
 
     Actions runs a `run` block with the default shell `bash -e {0}`, which is
     what this reproduces: an unset PR_HEAD_SHA expands to an empty string and
     reaches the gate as an empty --head-ref, so the gate itself is the thing that
     must refuse to judge.
+
+    `payload` is written where the runner puts the event JSON and passed as
+    GITHUB_EVENT_PATH, so the maintainer's label is read exactly as production
+    reads it.
     """
     body = _gate_run_body()
     assert "python3 scripts/architecture_health.py" in body
@@ -802,8 +820,13 @@ def _run_gate_via_workflow(repo: Path, pr_head_sha: Optional[str]) -> subprocess
     env["GITHUB_BASE_REF"] = "main"
     env.pop("GITHUB_HEAD_REF", None)
     env.pop("PR_HEAD_SHA", None)
+    env.pop("GITHUB_EVENT_PATH", None)
     if pr_head_sha is not None:
         env["PR_HEAD_SHA"] = pr_head_sha
+    if payload is not None:
+        event_file = repo.parent / "event.json"
+        event_file.write_text(json.dumps(payload), encoding="utf-8")
+        env["GITHUB_EVENT_PATH"] = str(event_file)
     return subprocess.run(
         ["bash", "-e", "-c", body], cwd=repo, capture_output=True, text=True, env=env
     )

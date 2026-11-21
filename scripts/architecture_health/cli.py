@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import scripts.architecture_health as ah
 from scripts.architecture_health.constants import (
@@ -16,10 +16,23 @@ from scripts.architecture_health.constants import (
 from scripts.architecture_health.pull_request import (
     PrSizeGateError,
     evaluate_pull_request,
+    load_pull_request_context,
+    report_excused_result,
     report_pull_request_result,
+    resolve_exception,
 )
 
 logger = logging.getLogger("architecture_health")
+
+
+def _resolve_pr_exception() -> Dict[str, Any]:
+    """Resolve this run's exception from the pull request event payload.
+
+    The label and the description both come from the payload GitHub writes for
+    the run, so the check needs no token, no API call and no write permission.
+    """
+    context = load_pull_request_context(os.environ.get("GITHUB_EVENT_PATH"))
+    return resolve_exception(labels=context["labels"], body=context["body"])
 
 
 def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
@@ -60,11 +73,22 @@ def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
         head_ref = "HEAD"
 
     try:
+        exception = _resolve_pr_exception()
+    except PrSizeGateError as exc:
+        logger.error(
+            "SG1 pull request gate FAILED to read the pull request event payload: %s. "
+            "Failing closed rather than treating an unreadable exception as absent.",
+            exc,
+        )
+        return 1
+
+    try:
         result = evaluate_pull_request(
             repo_root=repo_root,
             base_ref=base_ref,
             head_ref=head_ref,
             ceiling_lines=args.ceiling,
+            exception=exception,
         )
     except PrSizeGateError as exc:
         logger.error(
@@ -93,6 +117,46 @@ def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
     for entry in result["skipped"]:
         logger.info("SG1 pull request gate: skipped %s (%s).", entry["path"], entry["reason"])
 
+    # A half-exception is never a pass. The two halves are named separately so
+    # the message says exactly which one is missing, and any transition it was
+    # meant to cover is still printed: the reader must see both the missing half
+    # and the size change, not just the first of the two.
+    if exception["requested"] and not exception["valid"]:
+        for line in report_pull_request_result(result):
+            logger.error(line)
+        logger.error(
+            "SG1 pull request gate FAILED: the %s label is applied but the pull request "
+            "body has no statement under a '%s' heading. Section 4.3 requires a stated "
+            "per-PR responsibility justification, so the exception is incomplete and the "
+            "size rule still applies.",
+            exception["label"],
+            exception["heading"],
+        )
+        return 1
+
+    if result["excused"]:
+        for entry in result["excused"]:
+            logger.warning(
+                "SG1 pull request gate: excused %s by the %s label: %d line(s) at the "
+                "merge base and %d line(s) at the head (%s).",
+                entry["path"],
+                exception["label"],
+                entry["base_lines"],
+                entry["head_lines"],
+                entry["transition"],
+            )
+        for line in report_excused_result(result):
+            logger.warning(line)
+        logger.warning(
+            "SG1 pull request gate PASSED WITH EXCEPTION: %d size transition(s) excused "
+            "by the %s label and the '%s' statement in this pull request. Every excused "
+            "path is named above with both counts.",
+            len(result["excused"]),
+            exception["label"],
+            exception["heading"],
+        )
+        return 0
+
     if result["violations"]:
         for line in report_pull_request_result(result):
             logger.error(line)
@@ -104,6 +168,14 @@ def _run_pr_size_gate(args: argparse.Namespace, repo_root: Path) -> int:
             result["ceiling_lines"],
         )
         return 1
+
+    if exception["valid"]:
+        logger.info(
+            "SG1 pull request gate PASSED: the %s exception is present and was not needed, "
+            "because this PR introduces no size transition. Nothing was excused.",
+            exception["label"],
+        )
+        return 0
 
     logger.info("SG1 pull request gate PASSED: no size transition introduced by this PR.")
     return 0

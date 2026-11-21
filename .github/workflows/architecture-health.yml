@@ -43,11 +43,18 @@ jobs:
         run: |
           python3 scripts/architecture_health.py --check --nonblocking
 
+      # Section 4.3 permits a size transition when the PR carries a stated
+      # per-PR responsibility justification. A maintainer grants that by applying
+      # the `sg1-size-exception` label (needs triage or write access, so a
+      # contributor cannot self-grant it); the justification itself is a statement
+      # in the PR body under a "## SG1 responsibility justification" heading.
+      # Both are read from the event payload below, so this step needs no token.
       - name: Enforce SG1 size rule for this pull request
         if: github.event_name == 'pull_request'
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
           python3 scripts/architecture_health.py --check-pr-size --head-ref "${PR_HEAD_SHA}"
 

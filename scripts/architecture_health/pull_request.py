@@ -10,10 +10,11 @@ that transition, between the PR's merge base and its head, so a PR is measured
 against the tree it branched from rather than against the base branch tip.
 """
 
+import json
 import logging
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from scripts.architecture_health.constants import (
     DEFAULT_CEILING_LINES,
@@ -26,6 +27,13 @@ logger = logging.getLogger("architecture_health")
 
 CROSSED_TRANSITION = "crossed ceiling"
 GREW_TRANSITION = "grew above ceiling"
+
+# The two halves of the exception that section 4.3 permits. The label is the
+# maintainer's control, because applying one needs triage or write access and a
+# contributor's branch cannot grant itself the permission. The heading is the
+# statement section 4.3 asks for, recorded in the pull request itself.
+EXCEPTION_LABEL = "sg1-size-exception"
+JUSTIFICATION_HEADING = "SG1 responsibility justification"
 
 
 class PrSizeGateError(RuntimeError):
@@ -47,6 +55,103 @@ def size_transition(
     if base_lines >= ceiling_lines and head_lines > base_lines:
         return GREW_TRANSITION
     return None
+
+
+def parse_justification(body: Optional[str]) -> str:
+    """Return the statement filed under the justification heading, or an empty string.
+
+    Section 4.3 asks for a stated per-PR responsibility justification, so the
+    statement lives in the pull request itself. The heading makes it findable and
+    reviewable rather than a sentence buried anywhere in the description; the text
+    under the heading up to the next heading is the statement.
+    """
+    if not body:
+        return ""
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        if stripped.lstrip("#").strip().casefold() != JUSTIFICATION_HEADING.casefold():
+            continue
+        statement: List[str] = []
+        for following in lines[index + 1 :]:
+            if following.strip().startswith("#"):
+                break
+            statement.append(following)
+        return "\n".join(statement).strip()
+    return ""
+
+
+def resolve_exception(
+    labels: Optional[List[str]] = None, body: Optional[str] = None
+) -> Dict[str, Any]:
+    """Decide whether this pull request carries a usable exception.
+
+    Both halves are required. The label is the maintainer's control: applying one
+    needs triage or write access, so a contributor cannot grant it to themselves.
+    The heading is the statement section 4.3 asks for, which only the pull request
+    itself can carry. Either half alone is reported as what it is, never as an
+    exception.
+    """
+    label_names = [str(name) for name in (labels or [])]
+    justification = parse_justification(body)
+    label_present = EXCEPTION_LABEL in label_names
+    return {
+        "label": EXCEPTION_LABEL,
+        "heading": JUSTIFICATION_HEADING,
+        "label_present": label_present,
+        "justification_present": bool(justification),
+        "justification": justification,
+        "requested": label_present,
+        "valid": label_present and bool(justification),
+    }
+
+
+def load_pull_request_context(path: Optional[str]) -> Dict[str, Any]:
+    """Read label names and the description from a GitHub pull request event payload.
+
+    The payload is the file GitHub writes for the run, so the label is read without
+    a token and without an API call, and the workflow keeps its read-only
+    permission. There is no command-line flag for this: a flag would let a branch
+    point the gate at a payload of its own making, which is the self-granted
+    exception this mechanism exists to prevent.
+
+    A missing or non-pull-request payload means no exception is requested, which
+    can only leave enforcement in place. A payload that exists but cannot be read
+    is an operational failure, raised rather than treated as "no labels".
+    """
+    if not path:
+        return {"available": False, "labels": [], "body": ""}
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PrSizeGateError(
+            f"could not read the pull request event payload {path}: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise PrSizeGateError(
+            f"the pull request event payload {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        return {"available": False, "labels": [], "body": ""}
+    pull_request = payload.get("pull_request")
+    if not isinstance(pull_request, Mapping):
+        return {"available": False, "labels": [], "body": ""}
+
+    labels = [
+        str(label.get("name", ""))
+        for label in pull_request.get("labels") or []
+        if isinstance(label, Mapping)
+    ]
+    body = pull_request.get("body")
+    return {
+        "available": True,
+        "labels": [name for name in labels if name],
+        "body": body if isinstance(body, str) else "",
+    }
 
 
 def _skip_reason(rel_path: str) -> Optional[str]:
@@ -141,8 +246,13 @@ def evaluate_pull_request(
     base_ref: str,
     head_ref: str = "HEAD",
     ceiling_lines: int = DEFAULT_CEILING_LINES,
+    exception: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compare every path the PR touches against its merge-base line count.
+
+    `exception` is the resolved result of `resolve_exception`. When it is valid,
+    every size transition found is recorded as excused and nothing blocks; when it
+    is absent or incomplete, every transition blocks exactly as before.
 
     Raises:
         PrSizeGateError: If the git data needed for the comparison cannot be read.
@@ -185,6 +295,12 @@ def evaluate_pull_request(
     checked.sort(key=lambda c: c["path"])
     violations.sort(key=lambda v: (v["transition"], v["path"]))
     skipped.sort(key=lambda s: s["path"])
+
+    excused: List[Dict[str, Any]] = []
+    if exception and exception.get("valid"):
+        excused = violations
+        violations = []
+
     return {
         "base_ref": base_ref,
         "head_ref": head_ref,
@@ -193,6 +309,8 @@ def evaluate_pull_request(
         "checked_count": len(checked),
         "checked": checked,
         "violations": violations,
+        "excused": excused,
+        "exception": exception,
         "skipped": skipped,
     }
 
@@ -210,5 +328,33 @@ def report_pull_request_result(result: Dict[str, Any]) -> List[str]:
             f"::error file={v['path']}::SG1 size rule violated ({v['transition']} at "
             f"{result['ceiling_lines']} lines): {v['path']} is {v['base_lines']} lines "
             f"{origin} and {v['head_lines']} lines at the head of this pull request."
+        )
+    return lines
+
+
+def report_excused_result(result: Dict[str, Any]) -> List[str]:
+    """Describe every excused transition, so a used exception is never silent.
+
+    One warning annotation per excused path, each naming both counts, plus a
+    summary line that states how many transitions the exception covered.
+    """
+    lines: List[str] = []
+    for v in result["excused"]:
+        origin = (
+            f"from {v['base_path']} at the merge base"
+            if v["base_path"] and v["base_path"] != v["path"]
+            else "at the merge base"
+        )
+        lines.append(
+            f"::warning file={v['path']}::SG1 size transition excused by the "
+            f"{result['exception']['label']} label ({v['transition']} at "
+            f"{result['ceiling_lines']} lines): {v['path']} is {v['base_lines']} lines "
+            f"{origin} and {v['head_lines']} lines at the head of this pull request."
+        )
+    if lines:
+        lines.append(
+            f"SG1 size rule excused {len(result['excused'])} transition(s) under the "
+            f"{result['exception']['label']} label and the "
+            f"'{result['exception']['heading']}' statement in this pull request."
         )
     return lines
