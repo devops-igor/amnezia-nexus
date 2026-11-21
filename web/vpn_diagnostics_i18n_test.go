@@ -222,6 +222,19 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 			t.Fatalf("hardcoded static label escaped the rendered oracle: %v", err)
 		}
 	})
+	t.Run("HardcodedChartCaption", func(t *testing.T) {
+		// The shipped latency chart caption is a template translation call; replacing
+		// it with English must fail the oracle in every non-English dictionary.
+		before := `{{ _ "vpn_diag_latency_p95" }}`
+		if !strings.Contains(tmplHTML, before) {
+			t.Fatal("chart caption mutation target missing")
+		}
+		mutated := strings.Replace(tmplHTML, before, "Latency p95 (ms)", 1)
+		err := vpnDiagnosticsStaticOracle(vpnDiagnosticsRenderedHTML(t, mutated, dict), dict)
+		if err == nil || !strings.Contains(err.Error(), "chart caption latency") {
+			t.Fatalf("hardcoded chart caption escaped the rendered oracle: %v", err)
+		}
+	})
 	nodePath := fixture.RequireNode()
 	for _, mutation := range []struct{ name, before, after, failure string }{
 		// A hardcoded English rate state must fail the localized oracle.

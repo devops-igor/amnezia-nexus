@@ -1079,13 +1079,11 @@
   "settings_save_read_failed": "无法读取已保存的设置，因此未保存任何内容",
   "settings_test_saves_first": "先保存上方的设置，然后立即发送",
   "policy_save_kept": "服务器拒绝了此更改。您的修改仍保留在表单中，尚未保存。",
-  "vpn_health_title": "VPN 健康状态",
   "vpn_health_checking": "正在检查 VPN 健康状态…",
   "vpn_health_unavailable": "VPN 健康状态不可用",
   "vpn_advanced_diagnostics": "高级诊断",
   "vpn_diagnostics_subtitle": "用于排查的历史记录与技术细节",
   "vpn_close_diagnostics": "关闭诊断",
-  "vpn_health_range": "历史范围",
   "vpn_history_range": "历史范围",
   "vpn_diagnostics_traffic": "流量与性能",
   "vpn_diagnostics_routing": "路由与丢包",
@@ -1093,7 +1091,6 @@
   "vpn_signal_backends": "后端",
   "vpn_signal_backends_enabled": "已启用中健康",
   "vpn_signal_backends_total": "已配置中健康",
-  "vpn_signal_sessions": "活动会话",
   "vpn_signal_sessions_mismatch": "{count} 个会话没有转发路由",
   "vpn_signal_throughput_horizon": "当前入站加出站",
   "vpn_signal_throughput_none": "尚无速率样本",
@@ -1112,5 +1109,6 @@
   "vpn_issue_inspect_session": "检查会话",
   "vpn_issue_session_id": "会话 {id}",
   "vpn_issue_entity_missing_session": "该会话已不在当前列表中。",
-  "vpn_issue_entity_missing_backend": "该后端已不在当前列表中。"
+  "vpn_issue_entity_missing_backend": "该后端已不在当前列表中。",
+  "vpn_diag_write_stalls_window": "最近 {window} 内 {count} 次写入停顿"
 }

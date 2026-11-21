@@ -299,6 +299,35 @@
     outline-offset: 2px;
 }
 
+/* The live region wraps the headline, the folded counts and the hidden problem
+   announcement, so a new affected entity reaches the status region even when the
+   headline text does not change. */
+.vpn-health-live { display: contents; }
+
+/* Accessible-name sink for the problem announcement: present for assistive
+   technology, absent from the visual layout. */
+.vpn-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Programmatic focus targets (session action cell, backend name cell) are reachable
+   by focus() but not by Tab, so the ring still has to be visible when an "Inspect"
+   action lands on them. */
+.vpn-focus-target:focus-visible,
+td[data-backend-name]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: var(--radius-sm);
+}
+
 .vpn-region-target { scroll-margin-block: var(--space-2xl); }
 
 .vpn-diag-entry {

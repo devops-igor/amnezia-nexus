@@ -202,42 +202,117 @@ console.log('VPN955_02_STATE_OK');
 	})
 
 	t.Run("SessionActionFocusesDrilldownNotDiagnostics", func(t *testing.T) {
-		runVPNHealthAcceptance(t, "en", `
-const el = id => document.getElementById(id);
-// A real session row exists in the table, as sessions.js renders it.
-const tbody = el('vpn-sessions-tbody');
+		// Real JSDOM, real shipped modules: the claim under test is that Inspect
+		// DELIVERS focus, so it is asserted from document.activeElement, not from a
+		// stubbed drill-down being called.
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireJSDOM()
+		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
+(async () => {
+const assert = require('assert');
+const d = w.document;
+
+// Render a real session row through the shipped renderer; it carries the tabindex
+// the focus path depends on.
+const tbody = d.getElementById('vpn-sessions-tbody');
 tbody.textContent = '';
-const tr = document.createElement('tr');
-tr.setAttribute('data-session-id', 'S-100');
-const cell = document.createElement('td');
-cell.setAttribute('data-action', 'vpn-toggle-session');
-cell.setAttribute('data-session-id', 'S-100');
-tr.appendChild(cell);
+const tr = w.vpnRenderSessionRow({ session_id: 'S-100', username: 'alice', status: 'active' });
 tbody.appendChild(tr);
+const cell = tr.querySelector('[data-action="vpn-toggle-session"]');
+assert(cell, 'the rendered session row carries its action cell');
+assert.strictEqual(cell.getAttribute('tabindex'), '-1', 'the action cell is programmatically focusable');
 
-let drilldownCalls = 0;
-const originalToggle = window.vpnToggleSessionDrilldown;
-window.vpnToggleSessionDrilldown = function(id) { drilldownCalls++; window.__lastDrilldown = id; };
+d.getElementById('vpn-advanced-entry').focus();
+assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus starts on the diagnostics entry');
 
-vpnRenderForwarderHealth({
+w.vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: {
         status: 'CRITICAL',
         actionable_problems: [{ severity: 'CRITICAL', message: 'No route', session_id: 'S-100', category: 'routing' }]
     }
 });
-assert(el('vpn-diagnostics').hidden !== false, 'diagnostics stayed closed');
-const action = el('vpn-fwd-problem-list').children[0].children[1];
-// The DOM mock records no click(), so invoke the row's own handler, which is what
-// a real click dispatches.
-assert(typeof action._vpnIssueAction === 'function', 'the action carries the inspect handler');
-action._vpnIssueAction({ preventDefault() {} });
-assert.strictEqual(drilldownCalls, 1, 'the session action opened the matching drilldown');
-assert.strictEqual(window.__lastDrilldown, 'S-100', 'it targeted the reported session');
-assert(el('vpn-diagnostics').hidden !== false, 'inspect must NOT open diagnostics');
-window.vpnToggleSessionDrilldown = originalToggle;
+assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'diagnostics stayed closed');
+assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'rendering alone must not move focus');
+
+const list = d.getElementById('vpn-fwd-problem-list');
+const action = list.children[0].children[1];
+action.click();
+
+// 1. Focus actually landed on the affected session's action cell.
+assert.strictEqual(d.activeElement, cell, 'Inspect moves focus to the affected session cell');
+assert.strictEqual(d.activeElement.getAttribute('data-session-id'), 'S-100', 'and to the reported session');
+
+// 2. The matching drill-down is open, and diagnostics stayed closed.
+assert(tr.classList.contains('row-expanded'), 'Inspect reveals the matching drill-down');
+const drilldown = tbody.querySelector('.vpn-session-drilldown-row[data-parent-session-id="S-100"]');
+assert(drilldown, 'the drill-down row exists');
+assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect must NOT open diagnostics');
+
+// 3. A SECOND Inspect reveals rather than closes. Toggling would remove the detail
+// the operator is trying to read.
+action.click();
+assert(tr.classList.contains('row-expanded'), 'a second Inspect keeps the drill-down open');
+assert(tbody.querySelector('.vpn-session-drilldown-row[data-parent-session-id="S-100"]'),
+    'a second Inspect keeps the drill-down row present');
+assert.strictEqual(d.activeElement, cell, 'a second Inspect keeps focus on the session cell');
+assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect still must not open diagnostics');
 console.log('VPN955_02_FOCUS_OK');
-`, "VPN955_02_FOCUS_OK")
+})().catch(e => { console.error(e); process.exit(1); });
+`})
+		out, err := execNodeScript(nodePath, script)
+		if err != nil {
+			t.Fatalf("focus acceptance failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "VPN955_02_FOCUS_OK") {
+			t.Fatalf("focus acceptance did not report its token\nOutput:\n%s", string(out))
+		}
+	})
+
+	t.Run("BackendActionFocusesBackendRow", func(t *testing.T) {
+		fixture := NewVPNTestFixture(t)
+		nodePath := fixture.RequireJSDOM()
+		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
+(async () => {
+const assert = require('assert');
+const d = w.document;
+
+w.vpnCachedServers = [{ id: 7, name: 'Beta Relay' }];
+const tbody = d.getElementById('vpn-backends-tbody');
+tbody.textContent = '';
+const tr = w.vpnRenderBackendRow({ server_id: 7, endpoint: '198.51.100.7:51820', enabled: true, status: 'active', latency_ms: 12, active_connections: 2 });
+tbody.appendChild(tr);
+const nameCell = tr.querySelector('td[data-backend-name]');
+assert(nameCell, 'the rendered backend row exposes its name cell');
+assert.strictEqual(nameCell.getAttribute('tabindex'), '-1', 'the backend name cell is programmatically focusable');
+
+d.getElementById('vpn-advanced-entry').focus();
+assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus starts on the diagnostics entry');
+
+w.vpnRenderForwarderHealth({
+    forwarder_available: true,
+    health_assessment: {
+        status: 'CRITICAL',
+        actionable_problems: [{ severity: 'CRITICAL', message: 'Backend unhealthy', backend_id: 7, category: 'backends' }]
+    }
+});
+assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'diagnostics stayed closed');
+assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'rendering alone must not move focus');
+
+d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
+assert.strictEqual(d.activeElement, nameCell, 'Inspect moves focus to the affected backend row');
+assert.strictEqual(d.activeElement.getAttribute('data-backend-name'), '7', 'and to the reported backend');
+assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect must NOT open diagnostics');
+console.log('VPN955_02_BACKEND_FOCUS_OK');
+})().catch(e => { console.error(e); process.exit(1); });
+`})
+		out, err := execNodeScript(nodePath, script)
+		if err != nil {
+			t.Fatalf("backend focus acceptance failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if !strings.Contains(string(out), "VPN955_02_BACKEND_FOCUS_OK") {
+			t.Fatalf("backend focus acceptance did not report its token\nOutput:\n%s", string(out))
+		}
 	})
 }
 
@@ -363,13 +438,22 @@ vpnRenderForwarderHealth({
     listener_running: true,
     runtime_resources: { cpu_percent: 5.0, memory_alloc_bytes: 1048576, open_file_desc: 10, max_file_desc: 100 },
     problem_routes: [{ peer_key: 'peer-1', capacity: 10, occupancy: 1, drops: 2, write_count: 5 }],
-    all_routes: [{ peer_key: 'peer-1', capacity: 10, occupancy: 1, drops: 2, write_count: 5 }]
+    all_routes: [{ peer_key: 'peer-1', capacity: 10, occupancy: 1, drops: 2, write_count: 5 }],
+    // A real reason-history payload: without one this subtest cannot say anything
+    // about the reason chart, and the old assertion (children.length >= 0) could
+    // never fail.
+    historical_series: { window_15m: [{
+        t: 100, traffic_available: true, rx_bps: 1000, tx_bps: 1000, q_pct: 10,
+        drop_rates_available: true, drop_reason_rates: { client_malformed: 2 }
+    }] }
 });
 // Real renderers reach their containers.
 assert(el('vpn-diag-drop-reasons').children.length > 0, 'drop reasons render');
 assert(el('vpn-diag-routing-counts').textContent.includes('3'), 'route integrity renders');
 assert(el('vpn-diag-engine-status').textContent.includes('VirtualTUN'), 'engine state renders');
-assert(el('vpn-chart-reasons').children.length >= 0, 'reason history container reachable');
+const reasonHistory = el('vpn-chart-reasons');
+assert(reasonHistory.children.length > 0, 'reason history renders one series per reported reason');
+assert(reasonHistory.textContent.includes('drops/s'), 'the reason series is labelled as a rate: ' + reasonHistory.textContent);
 assert(el('vpn-fwd-routes-tbody').children.length === 1, 'per-route row renders');
 console.log('VPN955_03_RENDERERS_OK');
 `, "VPN955_03_RENDERERS_OK")
@@ -454,6 +538,51 @@ assert(stroke && !stroke[1].includes(' L '), 'an unsampled gap must not be bridg
 console.log('VPN955_04_LATENCY_OK');
 `, "VPN955_04_LATENCY_OK")
 	})
+
+	t.Run("AggregateRecentWriteStallsRelocated", func(t *testing.T) {
+		// The retired slow-write tile carried a raw recent-stall count. #955 requires
+		// that value to survive in Advanced Diagnostics, so this asserts the rendered
+		// VALUE and its horizon, not just that a label exists.
+		runVPNHealthAcceptance(t, "en", `
+const el = id => document.getElementById(id);
+assert(el('vpn-diag-write-stalls-recent'), 'the runtime section carries an aggregate recent-stall row');
+
+// Measured: the count and the horizon it covers are both rendered.
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forward_latency: { stalls_recent: 7, stalls: 41, stalls_window_sec: 60 }
+});
+const measured = el('vpn-diag-write-stalls-recent').textContent;
+assert(measured.includes('7'), 'the aggregate recent-stall count is rendered: ' + measured);
+assert(measured.includes('1m'), 'and the horizon it covers: ' + measured);
+assert(measured.includes('recent write stalls over the last'), 'the label says what the number is: ' + measured);
+assert(!el('vpn-diag-write-stalls-recent').classList.contains('vpn-not-measured'), 'a measured count is not marked unmeasured');
+
+// A different horizon renders a different horizon, not a hardcoded one.
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forward_latency: { stalls_recent: 0, stalls: 41, stalls_window_sec: 300 }
+});
+const fiveMinute = el('vpn-diag-write-stalls-recent').textContent;
+assert(fiveMinute.includes('5m'), 'the horizon follows the payload: ' + fiveMinute);
+assert(fiveMinute.includes('0'), 'a measured zero is a measurement, not "Not measured": ' + fiveMinute);
+assert(!fiveMinute.includes('Not measured'), 'zero stalls over a known window is numeric');
+
+// No reported horizon means the count is not measured, never a number.
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forward_latency: { stalls_recent: 4, stalls: 41, stalls_window_sec: 0 }
+});
+assert.strictEqual(el('vpn-diag-write-stalls-recent').textContent, 'Not measured',
+    'a count with no horizon is not a measured rate');
+
+// A failed poll resets it to not measured rather than a stale number.
+vpnRenderForwarderHealth(null);
+assert.strictEqual(el('vpn-diag-write-stalls-recent').textContent, 'Not measured',
+    'an unavailable poll leaves no stale stall count');
+console.log('VPN955_04_STALLS_OK');
+`, "VPN955_04_STALLS_OK")
+	})
 }
 
 // VPN955-05: no conflated populations, no invented failures.
@@ -512,10 +641,10 @@ func TestVPN955Acceptance06LocalesThemesAndA11y(t *testing.T) {
 
 	t.Run("AllFiveLocalesCarryTheNewCopy", func(t *testing.T) {
 		required := []string{
-			"vpn_health_title", "vpn_health_checking", "vpn_health_unavailable",
+			"vpn_forwarder_health", "vpn_health_checking", "vpn_health_unavailable",
 			"vpn_advanced_diagnostics", "vpn_close_diagnostics",
 			"vpn_diagnostics_traffic", "vpn_diagnostics_routing", "vpn_diagnostics_runtime",
-			"vpn_signal_backends", "vpn_signal_sessions", "vpn_signal_drops",
+			"vpn_signal_backends", "vpn_diag_active_sessions", "vpn_signal_drops",
 			"vpn_signal_drops_since_reset", "vpn_signal_drops_unmeasured",
 			"vpn_dataplane_drops_scope", "vpn_diag_not_measured",
 			"vpn_diag_forward_p95_value", "vpn_diag_forward_p95_window",
@@ -617,6 +746,79 @@ vpnRenderForwarderHealth(healthy);
 assert.strictEqual(writes, 0, 'an unchanged poll must not rewrite the live-region text');
 console.log('VPN955_06_A11Y_OK');
 `, "VPN955_06_A11Y_OK")
+	})
+
+	t.Run("LiveRegionContainsTheProblemAnnouncement", func(t *testing.T) {
+		// Structural half: the announcement sink must be INSIDE the live region. This
+		// is a template property, so it is checked on the parsed template rather than
+		// through the attribute-less DOM mock.
+		doc, err := xhtml.Parse(strings.NewReader(fixture.TemplateHTML))
+		if err != nil {
+			t.Fatalf("parse vpn.html: %v", err)
+		}
+		region := findHTMLNodeByID(doc, "vpn-fwd-health-live")
+		if region == nil {
+			t.Fatal("#vpn-fwd-health-live live region is missing")
+		}
+		if got := getHTMLNodeAttr(region, "role"); got != "status" {
+			t.Errorf("live region role = %q, want status", got)
+		}
+		if got := getHTMLNodeAttr(region, "aria-atomic"); got != "true" {
+			t.Errorf("live region aria-atomic = %q, want true", got)
+		}
+		for _, id := range []string{"vpn-fwd-headline-summary", "vpn-fwd-problem-announcement"} {
+			nested := findHTMLNodeByID(region, id)
+			if nested == nil {
+				t.Errorf("#%s must be inside the live region, otherwise its change is not announced", id)
+			}
+		}
+	})
+
+	t.Run("NewEntityAtUnchangedSeverityIsAnnounced", func(t *testing.T) {
+		// Behavioural half: the negative case (an unchanged poll is silent) is not the
+		// whole contract. A new affected entity at an UNCHANGED severity must change
+		// the announced text, and an identical poll must not.
+		runVPNHealthAcceptance(t, "en", `
+const el = id => document.getElementById(id);
+const sink = el('vpn-fwd-problem-announcement');
+
+function critical(sessionId, username) {
+    return {
+        forwarder_available: true,
+        health_assessment: {
+            status: 'CRITICAL',
+            actionable_problems: [{
+                severity: 'CRITICAL', message: 'No forwarder route', category: 'routing',
+                session_id: sessionId, username: username
+            }]
+        }
+    };
+}
+
+// Same severity, different affected entity: incident A for alice, then B for bob.
+vpnRenderForwarderHealth(critical('S-A', 'alice'));
+const headlineAfterA = el('vpn-fwd-headline-summary').textContent;
+const announcedA = sink.textContent;
+assert(announcedA.includes('alice'), 'the announcement names the first affected entity: ' + announcedA);
+
+vpnRenderForwarderHealth(critical('S-B', 'bob'));
+assert.strictEqual(el('vpn-fwd-headline-summary').textContent, headlineAfterA,
+    'the headline text is genuinely unchanged, so only the entity differs');
+const announcedB = sink.textContent;
+assert(announcedB.includes('bob'), 'the announcement names the new affected entity: ' + announcedB);
+assert.notStrictEqual(announcedB, announcedA, 'the announced text changed when the entity changed');
+assert(!announcedB.includes('alice'), 'the stale entity is replaced, not accumulated');
+
+// An identical poll of the same payload keeps the announcement unchanged, so a
+// polite region has nothing to re-announce.
+vpnRenderForwarderHealth(critical('S-B', 'bob'));
+assert.strictEqual(sink.textContent, announcedB, 'an unchanged poll leaves the announcement alone');
+
+// And the sink is cleared with the rows it described.
+vpnRenderForwarderHealth({ forwarder_available: true, health_assessment: { status: 'HEALTHY', conditions: [] } });
+assert.strictEqual(sink.textContent, '', 'a healthy poll clears the announcement');
+console.log('VPN955_06_ANNOUNCE_OK');
+`, "VPN955_06_ANNOUNCE_OK")
 	})
 
 	t.Run("RTLUsesLogicalProperties", func(t *testing.T) {

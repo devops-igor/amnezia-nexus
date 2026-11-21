@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -103,6 +104,26 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 		}
 		if !strings.Contains(cssStr, ".vpn-numeric") || !strings.Contains(cssStr, "text-align: right") {
 			t.Error("vpn.css must right-align .vpn-numeric cells")
+		}
+		// Bind the declaration to the selector. Finding ".vpn-numeric" somewhere and
+		// "text-align: right" somewhere else passes a stylesheet that left-aligns the
+		// numeric column, so the rule's own body is what gets checked.
+		if got, ok := cssDeclaration(cssStr, ".vpn-numeric", "text-align"); !ok || got != "right" {
+			t.Errorf(".vpn-numeric text-align = %q (found=%t), want a declaration of right in that rule", got, ok)
+		}
+
+		// Counterexample control: the mutation that a substring oracle lets through.
+		// Flipping the rule to left while an unrelated `text-align: right` remains
+		// elsewhere must be detected, or this oracle proves nothing about alignment.
+		mutatedCSS := strings.Replace(cssStr, ".vpn-numeric { text-align: right; }", ".vpn-numeric { text-align: left; }", 1)
+		if mutatedCSS == cssStr {
+			t.Fatal(".vpn-numeric mutation target missing from the stylesheet")
+		}
+		if got, ok := cssDeclaration(mutatedCSS, ".vpn-numeric", "text-align"); !ok || got != "left" {
+			t.Errorf("the oracle cannot see a left-aligned .vpn-numeric rule: got %q (found=%t)", got, ok)
+		}
+		if !strings.Contains(mutatedCSS, "text-align: right") {
+			t.Fatal("the counterexample must keep an unrelated right-aligned rule, otherwise it does not test selector binding")
 		}
 	})
 
@@ -205,8 +226,10 @@ console.log('TABLE_FORMATTING_PASS');
 			if style != "" {
 				t.Errorf("Persian header %d must not carry an inline style, style=%q", i, style)
 			}
-			if exp.alignment != "" && !strings.Contains(cssStr, ".vpn-numeric") {
-				t.Errorf("Persian header %d: .vpn-numeric rule missing", i)
+			if exp.alignment != "" {
+				if got, ok := cssDeclaration(cssStr, ".vpn-numeric", "text-align"); !ok || got != "right" {
+					t.Errorf("Persian header %d: .vpn-numeric text-align = %q (found=%t), want right in that rule", i, got, ok)
+				}
 			}
 			if exp.nowrap && !strings.Contains(cssStr, "white-space: nowrap") {
 				t.Errorf("Persian header %d: stylesheet must keep the peer column unwrapped", i)
@@ -617,4 +640,47 @@ w.eval(tablesCode);
 		}
 		t.Skip("jsdom is not available in Node environment")
 	}
+}
+
+// cssDeclaration returns the value of one declaration inside the rule whose
+// selector list contains selector. It exists so a styling oracle can bind a
+// declaration to its selector: checking that ".vpn-numeric" appears somewhere and
+// "text-align: right" appears SOMEWHERE ELSE passes a stylesheet that left-aligns
+// the numeric column. The last matching rule wins, as it does in the cascade for
+// equally specific selectors.
+func cssDeclaration(css, selector, property string) (string, bool) {
+	value, found := "", false
+	declPattern := regexp.MustCompile(`(?m)(?:^|;)\s*` + regexp.QuoteMeta(property) + `\s*:\s*([^;{}]+)`)
+	close := -1
+	for {
+		open := strings.Index(css[close+1:], "{")
+		if open < 0 {
+			break
+		}
+		open += close + 1
+		end := strings.Index(css[open:], "}")
+		if end < 0 {
+			break
+		}
+		end += open
+		close = end
+
+		// The selector list is the text since the previous rule's closing brace.
+		headStart := strings.LastIndex(css[:open], "}")
+		selectors := strings.Split(css[headStart+1:open], ",")
+		matches := false
+		for _, candidate := range selectors {
+			if strings.TrimSpace(candidate) == selector {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		if decl := declPattern.FindStringSubmatch(css[open+1 : end]); len(decl) == 2 {
+			value, found = strings.TrimSpace(decl[1]), true
+		}
+	}
+	return value, found
 }

@@ -331,54 +331,122 @@ function vpnFindSessionRow(sessionId) {
     return null;
 }
 
+// vpnFocusHeading moves the caller's focus to a table heading that already exists
+// in the template with tabindex="-1", so it is genuinely focusable.
+function vpnFocusHeading(id, explanationKey) {
+    const heading = document.getElementById(id);
+    if (heading && typeof heading.focus === 'function') heading.focus();
+    const summaryEl = document.getElementById('vpn-fwd-headline-summary');
+    if (summaryEl && explanationKey) summaryEl.textContent = _(explanationKey);
+}
+
+// vpnBackendFocusCell returns the focusable cell for one backend row. Row cells are
+// matched by kind, never by element name: a plain <td> always satisfies
+// typeof node.focus === 'function', so checking the function alone would claim a
+// non-focusable cell can take focus. The search is restricted to the row's own cells
+// so a nested control's tabindex cannot stand in for the cell's.
+function vpnBackendFocusCell(row) {
+    const cells = row.children || [];
+    for (let i = 0; i < cells.length; i++) {
+        const cell = cells[i];
+        if (cell && cell.getAttribute && cell.getAttribute('tabindex') !== null) return cell;
+    }
+    return null;
+}
+
+// vpnFocusFirstFocusable focuses the first candidate that carries an explicit
+// tabindex. A plain element satisfies typeof node.focus === 'function' even when
+// the browser refuses to focus it, so focusability is read from the attribute that
+// actually grants it.
+function vpnFocusFirstFocusable(candidates) {
+    for (let i = 0; i < candidates.length; i++) {
+        const node = candidates[i];
+        if (node && typeof node.focus === 'function' && node.getAttribute && node.getAttribute('tabindex') !== null) {
+            node.focus();
+            return true;
+        }
+    }
+    return false;
+}
+
+// vpnFocusSessionIssue reveals one session's drill-down and moves focus to the
+// affected session row's action cell. Diagnostics is never touched.
+function vpnFocusSessionIssue(row) {
+    const wanted = String(row.sessionId || row.connectionId);
+    const tr = vpnFindSessionRow(wanted);
+    if (!tr) {
+        vpnFocusHeading('vpn-troubleshooting-title', 'vpn_issue_entity_missing_session');
+        return;
+    }
+    // Reveal, never toggle: the action means "show me this", so it must not close a
+    // fold the operator is already reading.
+    if (typeof vpnSetSessionDrilldownOpen === 'function') {
+        vpnSetSessionDrilldownOpen(wanted, tr, true);
+    }
+    const cell = (typeof tr.querySelector === 'function') ? tr.querySelector('[data-action="vpn-toggle-session"]') : null;
+    if (!vpnFocusFirstFocusable([cell, tr])) {
+        // No focusable target on the row means focus would silently stay put.
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+    }
+}
+
+// vpnFocusBackendIssue moves focus to the affected backend's name cell, or to the
+// backend table heading when that backend is no longer listed.
+function vpnFocusBackendIssue(row) {
+    const tbody = document.getElementById('vpn-backends-tbody');
+    const rows = (tbody && tbody.children) ? tbody.children : [];
+    for (let i = 0; i < rows.length; i++) {
+        const actionBtn = (typeof rows[i].querySelector === 'function')
+            ? rows[i].querySelector('[data-action="vpn-toggle-backend"]')
+            : null;
+        if (!actionBtn || actionBtn.getAttribute('data-server-id') !== String(row.backendId)) continue;
+        const nameCell = vpnBackendFocusCell(rows[i]);
+        if (nameCell && vpnFocusFirstFocusable([nameCell])) return;
+        vpnFocusHeading('vpn-backends-title', null);
+        return;
+    }
+    vpnFocusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
+}
+
 // vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
-// opening Advanced Diagnostics: the session row's drill-down, the matching
-// backend row, or the table heading when the entity is gone.
+// opening Advanced Diagnostics. The destination must be a node that can actually
+// take focus, and the reveal is idempotent: a second Inspect on an already-open
+// detail keeps it open instead of toggling it shut.
 function vpnFocusIssueTarget(row) {
-    const focusHeading = function(id, explanationKey) {
-        const heading = document.getElementById(id);
-        if (heading && typeof heading.focus === 'function') heading.focus();
-        const summaryEl = document.getElementById('vpn-fwd-headline-summary');
-        if (summaryEl && explanationKey) summaryEl.textContent = _(explanationKey);
-    };
-
     if (row.sessionId || row.connectionId) {
-        const wanted = String(row.sessionId || row.connectionId);
-        const tr = vpnFindSessionRow(wanted);
-        if (tr) {
-            if (typeof vpnToggleSessionDrilldown === 'function') {
-                vpnToggleSessionDrilldown(wanted, tr);
-            }
-            const cell = (typeof tr.querySelector === 'function') ? tr.querySelector('[data-action="vpn-toggle-session"]') : null;
-            if (cell && typeof cell.focus === 'function') {
-                cell.focus();
-            } else if (typeof tr.focus === 'function') {
-                tr.focus();
-            }
-            return;
-        }
-        focusHeading('vpn-troubleshooting-title', 'vpn_issue_entity_missing_session');
+        vpnFocusSessionIssue(row);
+    } else if (row.backendId) {
+        vpnFocusBackendIssue(row);
+    } else {
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+    }
+}
+
+// vpnIssueSeverityLabel returns the localized severity word for one row.
+function vpnIssueSeverityLabel(upperSev) {
+    return (upperSev === 'CRITICAL' || upperSev === 'DOWN') ? _('vpn_forwarder_critical')
+        : upperSev === 'DEGRADED' ? _('vpn_forwarder_degraded')
+        : _('vpn_forwarder_warning');
+}
+
+// vpnAnnounceProblems publishes the current problem set into the polite live region.
+// Only the headline used to be inside it, so a NEW affected entity at an unchanged
+// severity changed visible text with no announcement. This writes severity, title
+// and the known entity for every row; identical text is suppressed by vpnAssignText,
+// so an unchanged poll stays silent while a genuinely new entity is announced.
+function vpnAnnounceProblems(rows) {
+    const sink = document.getElementById('vpn-fwd-problem-announcement');
+    if (!sink) return;
+    if (!rows || rows.length === 0) {
+        vpnAssignText(sink, '');
         return;
     }
-
-    if (row.backendId) {
-        const tbody = document.getElementById('vpn-backends-tbody');
-        const rows = (tbody && tbody.children) ? tbody.children : [];
-        for (let i = 0; i < rows.length; i++) {
-            const actionBtn = (typeof rows[i].querySelector === 'function')
-                ? rows[i].querySelector('[data-action="vpn-toggle-backend"]')
-                : null;
-            if (actionBtn && actionBtn.getAttribute('data-server-id') === row.backendId) {
-                const nameCell = (typeof rows[i].querySelector === 'function') ? rows[i].querySelector('td') : null;
-                if (nameCell && typeof nameCell.focus === 'function') nameCell.focus();
-                return;
-            }
-        }
-        focusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
-        return;
-    }
-
-    focusHeading('vpn-troubleshooting-title', null);
+    const parts = rows.map(function(row) {
+        const severity = vpnIssueSeverityLabel(String(row.severity || '').toUpperCase());
+        const entity = vpnIssueEntityLabel(row);
+        return entity ? severity + ': ' + row.title + ' (' + entity + ')' : severity + ': ' + row.title;
+    });
+    vpnAssignText(sink, parts.join(' \u00b7 '));
 }
 
 // vpnRenderActiveProblemsCards renders the problem rows and returns the number of
@@ -396,6 +464,7 @@ function vpnRenderActiveProblemsCards(status, context) {
         problemListElem.hidden = true;
         vpnLastActiveProblemKeys = new Set();
         if (typeof window !== 'undefined') window.vpnLastActiveProblemKeys = vpnLastActiveProblemKeys;
+        vpnAnnounceProblems([]);
         return 0;
     }
 
@@ -423,9 +492,7 @@ function vpnRenderActiveProblemsCards(status, context) {
         severityIcon.textContent = severity === 'critical' ? '\u2297' : '\u26a0';
         severityEl.appendChild(severityIcon);
         const severityLabel = document.createElement('span');
-        severityLabel.textContent = (upperSev === 'CRITICAL' || upperSev === 'DOWN') ? _('vpn_forwarder_critical')
-            : upperSev === 'DEGRADED' ? _('vpn_forwarder_degraded')
-            : _('vpn_forwarder_warning');
+        severityLabel.textContent = vpnIssueSeverityLabel(upperSev);
         severityEl.appendChild(severityLabel);
         copy.appendChild(severityEl);
 
@@ -483,6 +550,7 @@ function vpnRenderActiveProblemsCards(status, context) {
         window.vpnLastActiveProblemKeys = keys;
         window.vpnLastActiveProblemCount = rows.length;
     }
+    vpnAnnounceProblems(rows);
     return rows.length;
 }
 
@@ -681,6 +749,28 @@ function vpnRenderTechDiagnosticCards(status, context) {
         const hsf = status.handshake_freshness || {};
         dHsFresh.textContent = '<2m: ' + (hsf.under_2m_count || 0) + ' | 2-5m: ' + (hsf.between_2m_5m_count || 0) + ' | >5m: ' + (hsf.over_5m_count || 0) + ' | ' + _('vpn_diag_peer_sync_never') + ': ' + (hsf.never_count || 0);
     }
+
+    // Aggregate recent write stalls. Issue #955 retires the slow-write summary tile
+    // but requires its raw value to stay reachable here. stalls_recent is the count
+    // over stalls_window_sec; the horizon is printed with it so the number cannot be
+    // read as a since-reset total. A window of 0 means the producer reported no
+    // horizon, so the count is not measured rather than silently timeless.
+    const dStallsRecent = document.getElementById('vpn-diag-write-stalls-recent');
+    if (dStallsRecent) {
+        const fl = status.forward_latency || {};
+        const recentStalls = fl.stalls_recent;
+        const windowSec = Number(fl.stalls_window_sec || 0);
+        if (typeof recentStalls === 'number' && Number.isFinite(recentStalls) && windowSec > 0) {
+            dStallsRecent.textContent = vpnDiagText('vpn_diag_write_stalls_window', {
+                count: recentStalls,
+                window: vpnFormatHealthWindow(windowSec)
+            });
+            dStallsRecent.classList.remove('vpn-not-measured');
+        } else {
+            dStallsRecent.textContent = _('vpn_diag_not_measured');
+            dStallsRecent.classList.add('vpn-not-measured');
+        }
+    }
     const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
     const dRoutCounts = document.getElementById('vpn-diag-routing-counts');
     const dRoutAlerts = document.getElementById('vpn-diag-routing-alerts');
@@ -794,6 +884,9 @@ function vpnResetHealthProblems() {
         problemListElem.textContent = '';
         problemListElem.hidden = true;
     }
+    // The announcement sink belongs to the live region, so a failed poll clears it
+    // together with the rows it described.
+    vpnAnnounceProblems([]);
     // Note: the Advanced Diagnostics open state belongs to the operator and is
     // deliberately NOT reset here, so a failed poll does not close a panel the
     // operator opened.
@@ -812,6 +905,7 @@ function vpnResetTechDiagnosticCards() {
         'vpn-diag-queue-occ', 'vpn-diag-queue-peak',
         'vpn-diag-drops-client', 'vpn-diag-drops-return', 'vpn-diag-drops-total', 'vpn-diag-drop-reasons',
         'vpn-diag-engine-status', 'vpn-diag-peers-status', 'vpn-diag-hs-freshness', 'vpn-diag-routing-counts',
+        'vpn-diag-write-stalls-recent',
         'vpn-diag-res-cpu', 'vpn-diag-res-mem', 'vpn-diag-res-fd',
         'vpn-fwd-counters-since'
     ];
@@ -828,6 +922,13 @@ function vpnResetTechDiagnosticCards() {
     if (dLatPct) {
         dLatPct.textContent = _('vpn_diag_not_measured');
         dLatPct.classList.add('vpn-not-measured');
+    }
+    // Same rule for the aggregate recent-stall count: no trustworthy window after a
+    // failed poll, so it is not measured rather than a number.
+    const dStallsReset = document.getElementById('vpn-diag-write-stalls-recent');
+    if (dStallsReset) {
+        dStallsReset.textContent = _('vpn_diag_not_measured');
+        dStallsReset.classList.add('vpn-not-measured');
     }
     const dRoutBadge = document.getElementById('vpn-diag-routing-badge');
     if (dRoutBadge) {
@@ -859,6 +960,8 @@ if (typeof window !== 'undefined') {
     window.vpnRenderActiveProblemsCards = vpnRenderActiveProblemsCards;
     window.vpnRenderTechDiagnosticCards = vpnRenderTechDiagnosticCards;
     window.vpnIssueRows = vpnIssueRows;
+    window.vpnIssueSeverityLabel = vpnIssueSeverityLabel;
+    window.vpnAnnounceProblems = vpnAnnounceProblems;
     window.vpnFocusIssueTarget = vpnFocusIssueTarget;
     window.vpnFormatHealthWindow = vpnFormatHealthWindow;
     window.vpnResetHealthProblems = vpnResetHealthProblems;

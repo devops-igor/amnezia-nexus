@@ -1079,13 +1079,11 @@
   "settings_save_read_failed": "Could not read the stored settings, so nothing was saved",
   "settings_test_saves_first": "Saves the settings above first, then sends now",
   "policy_save_kept": "The server refused this change. Your edits are still in the form and are not saved.",
-  "vpn_health_title": "VPN Health",
   "vpn_health_checking": "Checking VPN health...",
   "vpn_health_unavailable": "VPN health unavailable",
   "vpn_advanced_diagnostics": "Advanced Diagnostics",
   "vpn_diagnostics_subtitle": "History and technical details for troubleshooting",
   "vpn_close_diagnostics": "Close diagnostics",
-  "vpn_health_range": "History range",
   "vpn_history_range": "History range",
   "vpn_diagnostics_traffic": "Traffic & Performance",
   "vpn_diagnostics_routing": "Routing & Drops",
@@ -1093,7 +1091,6 @@
   "vpn_signal_backends": "Backends",
   "vpn_signal_backends_enabled": "Healthy backends of enabled",
   "vpn_signal_backends_total": "Healthy backends of configured",
-  "vpn_signal_sessions": "Active sessions",
   "vpn_signal_sessions_mismatch": "{count} session(s) have no forwarder route",
   "vpn_signal_throughput_horizon": "Current inbound plus outbound",
   "vpn_signal_throughput_none": "No rate samples yet",
@@ -1112,5 +1109,6 @@
   "vpn_issue_inspect_session": "Inspect session",
   "vpn_issue_session_id": "Session {id}",
   "vpn_issue_entity_missing_session": "That session is no longer in the current list.",
-  "vpn_issue_entity_missing_backend": "That backend is no longer in the current list."
+  "vpn_issue_entity_missing_backend": "That backend is no longer in the current list.",
+  "vpn_diag_write_stalls_window": "{count} recent write stalls over the last {window}"
 }

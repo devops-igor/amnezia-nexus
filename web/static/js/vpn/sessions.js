@@ -134,8 +134,12 @@ function vpnRenderSessionRow(s, route) {
 
     // 1. User cell
     const tdUser = document.createElement('td');
-    tdUser.className = 'font-weight-600';
+    tdUser.className = 'font-weight-600 vpn-focus-target';
     tdUser.style.cursor = 'pointer';
+    // Programmatic focus needs a focusable target; without tabindex focus() on a
+    // table cell is a no-op and an "Inspect" action would leave focus where it was.
+    // tabindex="-1" makes it focusable without adding it to the tab order.
+    tdUser.setAttribute('tabindex', '-1');
     tdUser.setAttribute('data-action', 'vpn-toggle-session');
     if (sessId !== null && sessId !== undefined && sessId !== '') {
         tdUser.setAttribute('data-session-id', sessId);
@@ -344,56 +348,95 @@ function vpnCreateSessionDrilldownRow(s, route) {
     return tr;
 }
 
-function vpnToggleSessionDrilldown(s, tr) {
-    let sessId = null;
-    if (s && typeof s === 'object') {
-        sessId = s.session_id || s.id || null;
-    } else if (s !== null && s !== undefined && s !== '') {
-        sessId = String(s);
+// vpnSessionIdOf returns the identifier carried by a session argument, which may
+// be an object, a string or a number. Returning a string keeps Set membership and
+// attribute comparison consistent.
+function vpnSessionIdOf(s) {
+    if (s && typeof s === 'object') return s.session_id || s.id || null;
+    if (s === null || s === undefined || s === '') return null;
+    return String(s);
+}
+
+// vpnSessionDataFor resolves the session payload for a drill-down. The row keeps the
+// payload it was rendered from, and the last polled list is the fallback, so a call
+// that only carries an identifier still renders real telemetry.
+function vpnSessionDataFor(s, tr, sessId) {
+    if (s && typeof s === 'object') return s;
+    if (tr && tr._sessionData) return tr._sessionData;
+    if (vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
+        const found = vpnLastSessions.sessions.find(function(x) {
+            return String(x.session_id || x.id) === sessId;
+        });
+        if (found) return found;
     }
+    return { id: sessId, session_id: sessId };
+}
+
+// vpnFindDrilldownRow returns the drill-down row attached to one session row.
+function vpnFindDrilldownRow(tr) {
+    const next = tr.nextElementSibling || tr.nextSibling;
+    if (!next) return null;
+    if (next.classList && next.classList.contains('vpn-session-drilldown-row')) return next;
+    if (next.className && next.className.includes('vpn-session-drilldown-row')) return next;
+    return null;
+}
+
+// vpnSessionDrilldownOpen reports whether one session's drill-down is expanded,
+// reading the identifier set when present and the row class otherwise.
+function vpnSessionDrilldownOpen(tr, sessId) {
+    if (sessId) return vpnExpandedSessionIds.has(sessId);
+    return !!(tr.classList && tr.classList.contains('row-expanded'));
+}
+
+// vpnSetSessionDrilldownState marks one session row expanded or collapsed without
+// touching its DOM neighbours.
+function vpnSetSessionDrilldownState(tr, sessId, wantOpen) {
+    if (sessId) {
+        if (wantOpen) vpnExpandedSessionIds.add(sessId);
+        else vpnExpandedSessionIds.delete(sessId);
+    }
+    if (tr.classList) {
+        if (wantOpen) tr.classList.add('row-expanded');
+        else tr.classList.remove('row-expanded');
+    } else {
+        const className = (tr.className || '').replace(/\brow-expanded\b/g, '').trim();
+        tr.className = wantOpen ? (className + ' row-expanded').trim() : className;
+    }
+}
+
+// vpnSetSessionDrilldownOpen ensures one session's drill-down is in the requested
+// state. It is idempotent, so an action that means "reveal this detail" can call it
+// repeatedly without closing a fold the operator is trying to read. The click
+// handler keeps using vpnToggleSessionDrilldown, which flips the state instead.
+function vpnSetSessionDrilldownOpen(s, tr, wantOpen) {
+    const sessId = vpnSessionIdOf(s);
 
     if (!tr && sessId && typeof document !== 'undefined') {
         tr = document.querySelector(`tr[data-session-id="${sessId}"]`);
     }
+    if (!tr) return null;
+
+    if (vpnSessionDrilldownOpen(tr, sessId) === !!wantOpen) return tr;
+
+    const existing = vpnFindDrilldownRow(tr);
+    if (existing) existing.remove();
+    vpnSetSessionDrilldownState(tr, sessId, !!wantOpen);
+
+    if (!wantOpen) return tr;
+    if (tr.parentNode) {
+        const session = vpnSessionDataFor(s, tr, sessId);
+        tr.parentNode.insertBefore(vpnCreateSessionDrilldownRow(session, vpnFindRouteForSession(session)), tr.nextSibling);
+    }
+    return tr;
+}
+
+function vpnToggleSessionDrilldown(s, tr) {
+    const sessId = vpnSessionIdOf(s);
+    if (!tr && sessId && typeof document !== 'undefined') {
+        tr = document.querySelector(`tr[data-session-id="${sessId}"]`);
+    }
     if (!tr) return;
-
-    if (!s || typeof s !== 'object') {
-        if (tr._sessionData) {
-            s = tr._sessionData;
-        } else if (vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
-            s = vpnLastSessions.sessions.find(x => String(x.session_id || x.id) === sessId) || { id: sessId, session_id: sessId };
-        } else {
-            s = { id: sessId, session_id: sessId };
-        }
-    }
-
-    const isExpanded = sessId ? vpnExpandedSessionIds.has(sessId) : (tr.classList && tr.classList.contains('row-expanded'));
-
-    if (isExpanded) {
-        if (sessId) vpnExpandedSessionIds.delete(sessId);
-        if (tr.classList) tr.classList.remove('row-expanded');
-        else tr.className = (tr.className || '').replace(/\brow-expanded\b/g, '').trim();
-
-        const next = tr.nextElementSibling || tr.nextSibling;
-        if (next && ((next.classList && next.classList.contains('vpn-session-drilldown-row')) || (next.className && next.className.includes('vpn-session-drilldown-row')))) {
-            next.remove();
-        }
-    } else {
-        if (sessId) vpnExpandedSessionIds.add(sessId);
-        if (tr.classList) tr.classList.add('row-expanded');
-        else tr.className = ((tr.className || '') + ' row-expanded').trim();
-
-        const next = tr.nextElementSibling || tr.nextSibling;
-        if (next && ((next.classList && next.classList.contains('vpn-session-drilldown-row')) || (next.className && next.className.includes('vpn-session-drilldown-row')))) {
-            next.remove();
-        }
-
-        const route = vpnFindRouteForSession(s);
-        const drilldownRow = vpnCreateSessionDrilldownRow(s, route);
-        if (tr.parentNode) {
-            tr.parentNode.insertBefore(drilldownRow, tr.nextSibling);
-        }
-    }
+    vpnSetSessionDrilldownOpen(s, tr, !vpnSessionDrilldownOpen(tr, sessId));
 }
 
 function vpnToggleSessionsProblemFilter() {
@@ -658,6 +701,7 @@ if (typeof window !== 'undefined') {
     window.vpnRenderSessionRow = vpnRenderSessionRow;
     window.vpnCreateSessionDrilldownRow = vpnCreateSessionDrilldownRow;
     window.vpnToggleSessionDrilldown = vpnToggleSessionDrilldown;
+    window.vpnSetSessionDrilldownOpen = vpnSetSessionDrilldownOpen;
     window.vpnToggleSessionsProblemFilter = vpnToggleSessionsProblemFilter;
     window.vpnRenderSessionsStaleBanner = vpnRenderSessionsStaleBanner;
     window.vpnFindSessionById = vpnFindSessionById;

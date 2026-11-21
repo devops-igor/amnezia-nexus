@@ -1079,13 +1079,11 @@
   "settings_save_read_failed": "Impossible de lire les paramètres enregistrés, rien n’a donc été enregistré",
   "settings_test_saves_first": "Enregistre d’abord les paramètres ci-dessus, puis envoie immédiatement",
   "policy_save_kept": "Le serveur a refusé ce changement. Vos modifications restent dans le formulaire et ne sont pas enregistrées.",
-  "vpn_health_title": "État du VPN",
   "vpn_health_checking": "Vérification de l’état du VPN…",
   "vpn_health_unavailable": "État du VPN indisponible",
   "vpn_advanced_diagnostics": "Diagnostics avancés",
   "vpn_diagnostics_subtitle": "Historique et détails techniques pour le dépannage",
   "vpn_close_diagnostics": "Fermer les diagnostics",
-  "vpn_health_range": "Plage d’historique",
   "vpn_history_range": "Plage d’historique",
   "vpn_diagnostics_traffic": "Trafic et performances",
   "vpn_diagnostics_routing": "Routage et abandons",
@@ -1093,7 +1091,6 @@
   "vpn_signal_backends": "Backends",
   "vpn_signal_backends_enabled": "Sains parmi les activés",
   "vpn_signal_backends_total": "Sains parmi les configurés",
-  "vpn_signal_sessions": "Sessions actives",
   "vpn_signal_sessions_mismatch": "{count} session(s) sans route de transfert",
   "vpn_signal_throughput_horizon": "Entrant et sortant actuels",
   "vpn_signal_throughput_none": "Aucun échantillon de débit",
@@ -1112,5 +1109,6 @@
   "vpn_issue_inspect_session": "Inspecter la session",
   "vpn_issue_session_id": "Session {id}",
   "vpn_issue_entity_missing_session": "Cette session ne figure plus dans la liste actuelle.",
-  "vpn_issue_entity_missing_backend": "Ce backend ne figure plus dans la liste actuelle."
+  "vpn_issue_entity_missing_backend": "Ce backend ne figure plus dans la liste actuelle.",
+  "vpn_diag_write_stalls_window": "{count} blocages d’écriture récents sur les {window} dernières"
 }

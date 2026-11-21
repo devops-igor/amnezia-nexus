@@ -1079,13 +1079,11 @@
   "settings_save_read_failed": "خواندن تنظیمات ذخیره‌شده ممکن نبود، بنابراین چیزی ذخیره نشد",
   "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند",
   "policy_save_kept": "سرور این تغییر را رد کرد. ویرایش‌های شما همچنان در فرم هستند و ذخیره نشده‌اند.",
-  "vpn_health_title": "سلامت VPN",
   "vpn_health_checking": "در حال بررسی سلامت VPN…",
   "vpn_health_unavailable": "سلامت VPN در دسترس نیست",
   "vpn_advanced_diagnostics": "عیب‌یابی پیشرفته",
   "vpn_diagnostics_subtitle": "تاریخچه و جزئیات فنی برای عیب‌یابی",
   "vpn_close_diagnostics": "بستن عیب‌یابی",
-  "vpn_health_range": "بازه تاریخچه",
   "vpn_history_range": "بازه تاریخچه",
   "vpn_diagnostics_traffic": "ترافیک و کارایی",
   "vpn_diagnostics_routing": "مسیریابی و افت بسته",
@@ -1093,7 +1091,6 @@
   "vpn_signal_backends": "بک‌اندها",
   "vpn_signal_backends_enabled": "سالم از فعال",
   "vpn_signal_backends_total": "سالم از پیکربندی‌شده",
-  "vpn_signal_sessions": "نشست‌های فعال",
   "vpn_signal_sessions_mismatch": "{count} نشست مسیر ارسال ندارد",
   "vpn_signal_throughput_horizon": "ورودی به‌علاوه خروجی کنونی",
   "vpn_signal_throughput_none": "هنوز نمونه نرخی نیست",
@@ -1112,5 +1109,6 @@
   "vpn_issue_inspect_session": "بررسی نشست",
   "vpn_issue_session_id": "نشست {id}",
   "vpn_issue_entity_missing_session": "این نشست دیگر در فهرست کنونی نیست.",
-  "vpn_issue_entity_missing_backend": "این بک‌اند دیگر در فهرست کنونی نیست."
+  "vpn_issue_entity_missing_backend": "این بک‌اند دیگر در فهرست کنونی نیست.",
+  "vpn_diag_write_stalls_window": "{count} توقف نوشتن اخیر در {window} گذشته"
 }

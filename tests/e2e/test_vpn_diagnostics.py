@@ -23,6 +23,22 @@ def _ensure_diagnostics_open(page: Page) -> None:
     expect(page.locator("#vpn-diagnostics")).to_be_visible()
 
 
+def _open_details(page: Page, selector: str) -> None:
+    """Open one native <details> fold, only when it is actually closed.
+
+    #955 ships several independent native folds inside Advanced Diagnostics
+    (#vpn-fwd-routes-details, #vpn-reason-history, #vpn-per-backend). Opening one
+    does not reveal another, so every test that asserts on a fold's content opens
+    that fold. Reading the element's own `open` property also means a second call
+    cannot collapse it.
+    """
+    details = page.locator(selector)
+    expect(details).to_be_attached()
+    if not details.evaluate("el => el.open"):
+        details.locator("summary").click()
+    assert details.evaluate("el => el.open"), f"{selector} did not open"
+
+
 def _assert_tooltip_hidden(tooltip) -> None:
     expect(tooltip).not_to_be_visible()
     assert tooltip.evaluate(
@@ -160,10 +176,20 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     diag_fields = (
         "throughput ewma5m ewma1h lat-percentiles queue-occ queue-peak "
         "drops-client drops-return drops-total engine-status peers-status "
-        "hs-freshness routing-counts res-cpu res-mem res-fd"
+        "hs-freshness routing-counts res-cpu res-mem res-fd write-stalls-recent"
     ).split()
     for f in diag_fields:
         expect(page.locator(f"#vpn-diag-{f}")).to_be_visible()
+
+    # The retired slow-write tile's raw value survives here: an aggregate recent
+    # stall count with the horizon it covers. A bare label is not a value, so the
+    # copy must carry a number (or the explicit not-measured text).
+    stall_text = page.locator("#vpn-diag-write-stalls-recent").inner_text().strip()
+    stall_window = (api_get(page, "/api/vpn/status").get("forward_latency") or {}).get("stalls_window_sec")
+    if isinstance(stall_window, (int, float)) and stall_window > 0:
+        assert re.search(r"\d", stall_text), f"aggregate stall count missing a value: {stall_text!r}"
+    else:
+        assert stall_text == "Not measured", f"stall count with no horizon must read not measured: {stall_text!r}"
 
     # An unsampled percentile must read as not measured, never 0.0 ms.
     lat_text = page.locator("#vpn-diag-lat-percentiles").inner_text().strip()
@@ -194,10 +220,16 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     for obsolete in _OBSOLETE_CHARTS:
         expect(page.locator(obsolete)).to_have_count(0)
 
-    breakdown = page.locator("details").filter(has=page.locator("#vpn-chart-reasons"))
-    breakdown.locator("summary").click()
-    for chart in ("#vpn-chart-reasons", "#vpn-chart-backends"):
-        expect(page.locator(chart)).to_be_visible()
+    # Reason history and per-backend history are SEPARATE native details after the
+    # #955 relocation: #vpn-reason-history sits in Routing & Drops and
+    # #vpn-per-backend sits in Runtime Details. Opening one does not reveal the
+    # other, so each fold is opened before it is asserted on.
+    _open_details(page, "#vpn-reason-history")
+    expect(page.locator("#vpn-chart-reasons")).to_be_visible()
+    expect(page.locator("#vpn-chart-backends")).to_be_hidden()
+
+    _open_details(page, "#vpn-per-backend")
+    expect(page.locator("#vpn-chart-backends")).to_be_visible()
     expect(page.locator("#vpn-history-fleet-note")).to_be_attached()
 
     toggles = page.locator("#vpn-history-window-toggles")
@@ -208,8 +240,14 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
         expect(btn).to_be_visible()
         btn.click()
         expect(btn).to_have_class("btn btn-sm btn-primary active")
-        for chart in _HISTORICAL_CHARTS + ("#vpn-chart-reasons", "#vpn-chart-backends"):
+        for chart in _HISTORICAL_CHARTS:
             expect(page.locator(chart)).to_be_visible()
+        # Both folds stay OPEN across a range change: the range buttons only redraw
+        # the series, they do not touch a fold's open state. Assert the fold state,
+        # not just the series visibility, so a regression that closes a fold is
+        # caught rather than silently hidden by the closed-fold invisibility check.
+        assert page.locator("#vpn-reason-history").evaluate("el => el.open")
+        assert page.locator("#vpn-per-backend").evaluate("el => el.open")
 
 
 @pytest.mark.e2e

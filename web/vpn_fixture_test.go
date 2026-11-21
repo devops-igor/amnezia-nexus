@@ -760,11 +760,39 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 		}
 	}
 
+	// Every chart caption must be localized, bound to ITS chart. A caption replaced
+	// by hardcoded English has to fail here; asserting only that the four signals are
+	// localized let that regression through.
+	captions := map[string]string{
+		"throughput": "vpn_fwd_kpi_throughput",
+		"drops":      "vpn_diag_drop_rate",
+		"latency":    "vpn_diag_latency_p95",
+		"queue":      "vpn_diag_queue_utilization",
+	}
+	captionPattern := regexp.MustCompile(`<figcaption class="vpn-chart-caption">\s*<span>([^<]+)</span>\s*<span id="vpn-chart-([a-z]+)-badges"`)
+	seenCaptions := make(map[string]bool)
+	for _, match := range captionPattern.FindAllStringSubmatch(rendered, -1) {
+		caption, chart := html.UnescapeString(match[1]), match[2]
+		key, ok := captions[chart]
+		if !ok {
+			return fmt.Errorf("unexpected chart caption for %s: %q", chart, caption)
+		}
+		if caption != dict[key] {
+			return fmt.Errorf("chart caption %s: got %q, want %q", chart, caption, dict[key])
+		}
+		seenCaptions[chart] = true
+	}
+	for chart := range captions {
+		if !seenCaptions[chart] {
+			return fmt.Errorf("chart %s has no localized caption in the rendered template", chart)
+		}
+	}
+
 	// The four signals must carry localized titles, and the health summary keeps its
 	// live-region semantics.
 	for _, signal := range []struct{ class, key string }{
 		{"backends", "vpn_signal_backends"},
-		{"sessions", "vpn_signal_sessions"},
+		{"sessions", "vpn_diag_active_sessions"},
 		{"throughput", "vpn_fwd_kpi_throughput"},
 		{"drops", "vpn_signal_drops"},
 	} {
@@ -775,8 +803,20 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 		}
 	}
 
-	if !strings.Contains(rendered, `id="vpn-fwd-headline-summary" role="status" aria-atomic="true"`) {
-		return errors.New("health summary must remain a polite atomic live region")
+	// The health summary must live inside the polite atomic live region, and that
+	// region must also contain the problem announcement. Asserting the semantic
+	// containment rather than one exact attribute string keeps this true when the
+	// region's wrapper changes.
+	liveRegion := regexp.MustCompile(`<div class="vpn-health-live" id="vpn-fwd-health-live" role="status" aria-atomic="true">([\s\S]*?)</div>`)
+	live := liveRegion.FindStringSubmatch(rendered)
+	if len(live) != 2 {
+		return errors.New("the health block must expose one polite atomic live region")
+	}
+	if !strings.Contains(live[1], `id="vpn-fwd-headline-summary"`) {
+		return errors.New("the health summary must be inside the live region")
+	}
+	if !strings.Contains(live[1], `id="vpn-fwd-problem-announcement"`) {
+		return errors.New("the problem announcement must be inside the live region")
 	}
 	if !strings.Contains(rendered, `id="vpn-advanced-entry"`) {
 		return errors.New("Advanced Diagnostics entry is missing")

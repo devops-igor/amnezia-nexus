@@ -132,9 +132,12 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		if !strings.Contains(vpnStr, `<section class="card vpn-diagnostics" id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden>`) {
 			t.Error("#vpn-diagnostics must be hidden in the template")
 		}
-		// The health summary is the single polite live region.
-		if !strings.Contains(vpnStr, `id="vpn-fwd-headline-summary" role="status" aria-atomic="true"`) {
-			t.Error("#vpn-fwd-headline-summary must be a polite atomic status region")
+		// The health summary lives inside the single polite live region.
+		if !strings.Contains(vpnStr, `id="vpn-fwd-health-live" role="status" aria-atomic="true"`) {
+			t.Error("#vpn-fwd-health-live must be a polite atomic status region")
+		}
+		if !strings.Contains(vpnStr, `id="vpn-fwd-problem-announcement"`) {
+			t.Error("the problem announcement sink is missing from the live region")
 		}
 
 		// Operational labels that moved into the definition-list shape.
@@ -145,7 +148,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_diag_drops_inbound",
 			"vpn_diag_route_integrity",
 			"vpn_signal_backends",
-			"vpn_signal_sessions",
+			"vpn_diag_active_sessions",
 			"vpn_signal_drops",
 			"vpn_dataplane_drops_scope",
 		} {
@@ -377,7 +380,12 @@ vpnRenderForwarderHealth({
     health_assessment: { status: 'HEALTHY', conditions: [] }
 });
 assert.strictEqual(text('vpn-signal-drops-value').replace(/\s+/g, ' ').trim(), '3.50 drops/s');
-assert(el('vpn-signal-throughput-sub') === null || true);
+// The throughput signal is measured here, so its supporting line states the
+// horizon rather than the no-samples text. This assertion previously read
+// "el(...) === null || true", which cannot fail.
+assert(el('vpn-signal-throughput-sub') !== null, 'the throughput signal keeps its supporting line');
+assert.strictEqual(text('vpn-signal-throughput-sub'), _('vpn_signal_throughput_horizon'), 'a measured throughput states its horizon');
+assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g, ' ').trim(), '1.00 Mbps', 'the rate renders from the payload');
 
 // Test 9: disabled backends are not failures; eligibility unknown does not invent a denominator.
 mockDoc.reset();
