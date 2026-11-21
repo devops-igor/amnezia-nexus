@@ -78,7 +78,7 @@ func (d *scriptedDevice) Close() error { return nil }
 
 // proxyQueueFixture builds a policy-active forwarder whose backend queue is pumped by
 // the real pump into dev.
-func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCache, string, string) {
+func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, string, string) {
 	t.Helper()
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
@@ -91,8 +91,6 @@ func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCa
 	// The manager owns a WAN reader; the test that created it retires it, including
 	// when an assertion fails before the case reaches its own teardown.
 	t.Cleanup(func() { _ = dem.Close() })
-	rc := newTestRouteCache()
-	fwd.SetRouteCache(rc)
 	capPath := newTestCaptureReturnPath()
 	fwd.RegisterSessionWithReturnPath("sess-backend", "conn-1", "peer-backend", "10.100.0.7", 31, capPath.path)
 	fwd.StartPumps(t.Context())
@@ -103,7 +101,7 @@ func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCa
 	if blocker, ok := dev.(interface{ releaseWrites() }); ok {
 		t.Cleanup(blocker.releaseWrites)
 	}
-	return fwd, rc, "peer-backend", "sess-backend"
+	return fwd, "peer-backend", "sess-backend"
 }
 
 func proxyPacket(dst string, port uint16) []byte {
@@ -127,7 +125,7 @@ func flowEvidenceFor(t *testing.T, fwd *Forwarder, sessionID, dst string, port u
 // admission and NO completion; releasing the writer completes it.
 func TestBackendWriteCompletionIsSeparateFromAdmission(t *testing.T) {
 	dev := newBlockingDevice()
-	fwd, _, peer, sessionID := proxyQueueFixture(t, dev)
+	fwd, peer, sessionID := proxyQueueFixture(t, dev)
 
 	if err := fwd.RouteClientToBackend(peer, proxyPacket("8.8.4.4", 443)); err != nil {
 		t.Fatalf("RouteClientToBackend: %v", err)
@@ -179,7 +177,7 @@ func TestBackendWriteFailureAndShortWriteAreDistinct(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fwd, _, peer, sessionID := proxyQueueFixture(t, tc.dev)
+			fwd, peer, sessionID := proxyQueueFixture(t, tc.dev)
 			if err := fwd.RouteClientToBackend(peer, proxyPacket("9.9.9.9", 8443)); err != nil {
 				t.Fatalf("RouteClientToBackend: %v", err)
 			}
@@ -274,7 +272,7 @@ func TestBackendWriteDelayedOutcomeAcrossReplacement(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dev := newBlockedWriteDevice(tc.failFirst)
-			fwd, _, peer, firstSession := proxyQueueFixture(t, dev)
+			fwd, peer, firstSession := proxyQueueFixture(t, dev)
 			const dst, port = "44.44.44.44", uint16(443)
 
 			if err := fwd.RouteClientToBackend(peer, proxyPacket(dst, port)); err != nil {
@@ -344,7 +342,7 @@ func TestBlockedWriterFixtureCleanupIsBounded(t *testing.T) {
 	go func() {
 		done <- t.Run("blocked_without_release", func(t *testing.T) {
 			dev := newBlockedWriteDevice(false)
-			fwd, _, peer, _ := proxyQueueFixture(t, dev)
+			fwd, peer, _ := proxyQueueFixture(t, dev)
 			if err := fwd.RouteClientToBackend(peer, proxyPacket("77.77.77.77", 443)); err != nil {
 				t.Fatalf("dispatch: %v", err)
 			}
@@ -371,7 +369,7 @@ func TestBlockedWriterFixtureCleanupIsBounded(t *testing.T) {
 // records a completion or a failure.
 func TestBackendWriteAfterDetachAttributesNothing(t *testing.T) {
 	dev := &scriptedDevice{n: -1}
-	fwd, _, peer, sessionID := proxyQueueFixture(t, dev)
+	fwd, peer, sessionID := proxyQueueFixture(t, dev)
 
 	// Stop the pump first, so the admitted packet stays queued and is then dropped
 	// by the detach rather than written.

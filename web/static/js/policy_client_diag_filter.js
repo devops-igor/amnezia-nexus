@@ -52,12 +52,6 @@
         });
     }
 
-    function evidence(entries) {
-        return rows(entries || [], function (entry) {
-            return [entry.address];
-        });
-    }
-
     function records(list) {
         return rows(list || [], function (record) {
             var addresses = (record.addresses || []).map(function (entry) {
@@ -116,7 +110,6 @@
     root.clientDiagDestinationFilter = {
         set: set,
         active: active,
-        evidence: evidence,
         records: records,
         events: events,
         flows: flows,

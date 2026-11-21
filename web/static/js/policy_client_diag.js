@@ -212,13 +212,7 @@
         if (result) {
             result.hidden = true;
         }
-        var rows = clientElement('policyClientEvidenceRows');
-        if (rows) {
-            while (rows.firstChild) {
-                rows.removeChild(rows.firstChild);
-            }
-        }
-        rows = clientElement('policyClientFlowRows');
+        var rows = clientElement('policyClientFlowRows');
         if (rows) {
             while (rows.firstChild) {
                 rows.removeChild(rows.firstChild);
@@ -272,7 +266,7 @@
                 el.textContent = '-';
             }
         });
-        ['policyClientEvidenceFoot', 'policyClientFlowFoot', 'policyClientDNSFoot'].forEach(function (id) {
+        ['policyClientFlowFoot', 'policyClientDNSFoot'].forEach(function (id) {
             var el = clientElement(id);
             if (el) {
                 el.hidden = true;
@@ -547,22 +541,6 @@
             closeDetail();
             toggle.focus();
         }
-    }
-
-    function renderEvidence(entries) {
-        var body = clientElement('policyClientEvidenceRows');
-        if (!body) {
-            return;
-        }
-        entries.forEach(function (entry) {
-            var row = root.document.createElement('tr');
-            appendCell(row, entry.address);
-            appendCell(row, clientTokenLabel('decision', entry.decision));
-            appendCell(row, entry.observed_at);
-            appendCell(row, entry.expires_at);
-            appendCell(row, entry.state);
-            body.appendChild(row);
-        });
     }
 
     // renderFlows renders the recorded decisions for one incarnation, as four
@@ -1022,26 +1000,22 @@
         lastAnswer = answer;
         // The destination filter re-renders this same answer, so every appending
         // renderer starts from an empty body and the panels never accumulate rows.
-        clearChildren('policyClientEvidenceRows');
         clearChildren('policyClientFlowRows');
         clearChildren('policyClientDNSRows');
         clearChildren('policyClientEventRows');
         clearChildren('policyClientDropRows');
         clearChildren('policyClientLimitations');
 
-        var evidenceAll = dns.entries || [];
         var recordsAll = dns.records || [];
         var eventsAll = dns.events || [];
         var flowsAll = flows.entries || [];
         var dropView = (answer && answer.drops) || {};
         var dropsAll = dropView.entries || [];
-        var evidence = destinationRows('evidence', evidenceAll);
         var records = destinationRows('records', recordsAll);
         var events = destinationRows('events', eventsAll);
         var flowEntries = destinationRows('flows', flowsAll);
         var dropEntries = destinationRows('drops', dropsAll);
 
-        renderEvidence(evidence);
         renderDNSRecords(records);
         renderDNSCoverage(dns.record_coverage);
         renderDNSEvents(events);
@@ -1060,16 +1034,8 @@
         // above keep describing what was recorded, so an empty table under a filter is
         // never read as an empty history.
         renderFilterFoot(
-            evidence.length + records.length + events.length + flowEntries.length + dropEntries.length,
-            evidenceAll.length + recordsAll.length + eventsAll.length + flowsAll.length + dropsAll.length);
-
-        var evidenceFoot = '';
-        if (!(dns.entries || []).length) {
-            evidenceFoot = clientText('policy_client_empty_evidence');
-        } else if (dns.truncated) {
-            evidenceFoot = clientText('policy_client_truncated').replace('{shown}', String((dns.entries || []).length)).replace('{total}', String(dns.total || 0));
-        }
-        renderFoot('policyClientEvidenceFoot', evidenceFoot);
+            records.length + events.length + flowEntries.length + dropEntries.length,
+            recordsAll.length + eventsAll.length + flowsAll.length + dropsAll.length);
 
         var dnsFoot = '';
         if (!(dns.records || []).length) {

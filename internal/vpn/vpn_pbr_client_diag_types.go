@@ -100,14 +100,6 @@ type ClientDiagnosisRequest struct {
 	HasRouteGeneration bool
 	// FlowLimit bounds the flow page. Zero uses the default.
 	FlowLimit int
-	// EvidenceLimit bounds the retained-evidence page. Zero uses the default.
-	EvidenceLimit int
-	// DNSRecordLimit bounds the observed-answer history page. Zero uses the
-	// collector's per-session default.
-	DNSRecordLimit int
-	// DNSEventLimit bounds the terminal-query history page. Zero uses the
-	// collector's per-session default.
-	DNSEventLimit int
 }
 
 // ClientDiagnosisTarget is one selectable session incarnation.
@@ -120,9 +112,6 @@ type ClientDiagnosisTarget struct {
 	ConnectedAt     string `json:"connected_at,omitempty"`
 	RouteLive       bool   `json:"route_live"`
 	RouteGeneration uint64 `json:"route_generation,omitempty"`
-	// EvidenceEntries is how many retained address decisions the session holds.
-	// It is a count, never a listing: the picker must stay cheap.
-	EvidenceEntries int `json:"evidence_entries"`
 }
 
 // ClientDiagnosisTargets is the client picker's answer.
@@ -146,9 +135,6 @@ type ClientDiagnosisSelection struct {
 	Username                 string  `json:"username,omitempty"`
 	AssignedIP               string  `json:"assigned_ip,omitempty"`
 	ConnectedAt              string  `json:"connected_at,omitempty"`
-	// PolicyGeneration is the published policy generation the retained evidence
-	// was compared against.
-	PolicyGeneration string `json:"policy_generation,omitempty"`
 }
 
 // ClientDiagnosisCoverage states what was read and what was not.
@@ -170,29 +156,6 @@ type ClientDiagnosisCoverage struct {
 type ClientDiagnosisNamesMatch struct {
 	Match  string `json:"match"`
 	Reason string `json:"reason,omitempty"`
-}
-
-// ClientDiagnosisEntry is one retained address decision.
-type ClientDiagnosisEntry struct {
-	Address string `json:"address"`
-	// Decision is the decision stored for the address: DIRECT or PROXY. It is
-	// the decision the cache holds, not a re-evaluation of the current policy.
-	Decision string `json:"decision"`
-	// ObservedAt is the instant the stored observation was recorded. It is
-	// omitted when the entry carries none, and AgeSeconds says why.
-	ObservedAt       string `json:"observed_at,omitempty"`
-	ExpiresAt        string `json:"expires_at,omitempty"`
-	ExpiresInSeconds int64  `json:"expires_in_seconds"`
-	// AgeSeconds is elapsed time since ObservedAt, a pointer so a just-observed
-	// entry reports 0 instead of being confused with "no age".
-	AgeSeconds           *int64 `json:"age_seconds,omitempty"`
-	AgeUnavailableReason string `json:"age_unavailable_reason,omitempty"`
-	State                string `json:"state"`
-	Generation           string `json:"generation,omitempty"`
-	// Names and NamesMatch keep the slice-2 shape: an address the cache retained
-	// cannot say which query produced it.
-	Names      []string `json:"names"`
-	NamesMatch string   `json:"names_match"`
 }
 
 // ClientDiagnosisDNSAddress is one address an observed answer wrote into the
@@ -310,21 +273,22 @@ type ClientDiagnosisEventLimits struct {
 	MaxAgeSeconds    int64 `json:"max_age_seconds"`
 }
 
-// ClientDiagnosisDNS is the DNS section: the retained address evidence (what the
-// route cache holds right now) and the observed-answer history (what the router
-// actually saw).
+// ClientDiagnosisDNS is the DNS section. It used to carry two halves: the
+// retained address evidence (what the route cache held for this session) and the
+// observed-answer history (what the router actually saw).
+//
+// This build retains neither. The route cache and its evidence are deleted, and
+// the producer that wrote the answer and query history was deleted with the DNS
+// gateway, so the section states not_recorded and keeps only the history members
+// — they are removed together with the history store, not here. The entries half
+// is gone because nothing can fill it and its table is gone from the page.
 type ClientDiagnosisDNS struct {
-	Available bool `json:"available"`
-	// State is the view state: fresh, absent, quarantined, stale_generation or
-	// retired.
-	State            string `json:"state"`
-	Generation       string `json:"generation,omitempty"`
-	QuarantinedUntil string `json:"quarantined_until,omitempty"`
+	// Available is false and State is not_recorded: no address evidence is
+	// retained, so the section has no view to describe.
+	Available bool   `json:"available"`
+	State     string `json:"state"`
 	// Names is this section's answer to "which name produced these addresses?".
-	Names     ClientDiagnosisNamesMatch `json:"names"`
-	Entries   []ClientDiagnosisEntry    `json:"entries"`
-	Total     int                       `json:"total"`
-	Truncated bool                      `json:"truncated"`
+	Names ClientDiagnosisNamesMatch `json:"names"`
 	// Records are the observed answers, newest first. RecordsAvailable reports
 	// whether a collector was consulted at all.
 	RecordsAvailable bool                             `json:"records_available"`

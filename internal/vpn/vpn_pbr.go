@@ -8,12 +8,10 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -22,8 +20,6 @@ var (
 	ErrPBRMissingHostWAN = errors.New("vpn: pbr direct egress requires a valid host WAN IP")
 	// ErrPBRMissingWANDevice indicates PBR cannot be enabled without an attached WAN packet device.
 	ErrPBRMissingWANDevice = errors.New("vpn: pbr direct egress requires an attached WAN packet device")
-	// ErrPBRMissingRouteCache indicates PBR cannot be enabled without a route cache decision source.
-	ErrPBRMissingRouteCache = errors.New("vpn: pbr direct egress requires a route cache")
 	// ErrPBRMissingPolicy indicates PBR cannot be enabled without a compiled policy matcher.
 	ErrPBRMissingPolicy = errors.New("vpn: pbr direct egress requires a policy matcher")
 	// ErrPBREmptyPolicy indicates PBR cannot be enabled with an empty or uncompiled policy snapshot.
@@ -35,7 +31,6 @@ type PBRConfig struct {
 	Enabled       bool
 	HostWANIP     netip.Addr
 	WANDevice     forwarder.PacketDevice
-	RouteCache    forwarder.RouteCache
 	PolicyMatcher *policy.Matcher
 	PolicySources []policy.SourceParsedRules
 	// UpstreamDNS is the validated upstream list the resolver is dialed with.
@@ -63,9 +58,6 @@ func ValidatePBRPrerequisites(cfg PBRConfig) error {
 	}
 	if cfg.WANDevice == nil {
 		return ErrPBRMissingWANDevice
-	}
-	if cfg.RouteCache == nil {
-		return ErrPBRMissingRouteCache
 	}
 	if cfg.PolicyMatcher == nil {
 		return ErrPBRMissingPolicy
@@ -160,17 +152,12 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		return fmt.Errorf("pbr prerequisites: %w", err)
 	}
 
-	if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
-		mem.AttachMatcher(cfg.PolicyMatcher)
-	}
-
 	dem := forwarder.NewDirectEgressManager(forwarder.DirectEgressConfig{
 		HostWANIP: cfg.HostWANIP,
 		WANDevice: cfg.WANDevice,
 	}, s.forwarder)
 
 	s.forwarder.SetDirectEgress(dem)
-	s.forwarder.SetRouteCache(cfg.RouteCache)
 	s.forwarder.SetPolicyMatcher(cfg.PolicyMatcher)
 	s.forwarder.SetDestinationClassifier(newDestinationClassifier(cfg.InventoryOverride))
 	// The recorded override and the installed classifier are written together:
@@ -262,172 +249,6 @@ func (s *Service) getPBRConfig() *PBRConfig {
 	servicePBRConfigsMu.RLock()
 	defer servicePBRConfigsMu.RUnlock()
 	return servicePBRConfigs[s]
-}
-
-// MemoryRouteCache provides an in-memory implementation of forwarder.RouteCache
-// backed by authentic policy.RouteCache with PROXY-wins, CNAME, TTL, and generation invalidation.
-type MemoryRouteCache struct {
-	mu      sync.RWMutex
-	rc      *policy.RouteCache
-	matcher *policy.Matcher
-	gen     string
-	// dnsRecords is the bounded in-memory record of the answers an observation
-	// used to write (issue #861). This build has no evidence producer, so the
-	// field is nil: the per-client diagnosis reads it, finds no collector and
-	// reports "not recorded" rather than an empty collection. It is deleted with
-	// the history store; until then nothing writes it. Guarded by dnsRecordsMu,
-	// never by mu.
-	dnsRecordsMu sync.RWMutex
-	dnsRecords   *dnsledger.Ledger
-}
-
-// NewMemoryRouteCache creates an in-memory RouteCache backed by authentic policy.RouteCache.
-func NewMemoryRouteCache() *MemoryRouteCache {
-	rc, _ := policy.NewRouteCache(policy.CacheConfig{})
-	const initialGen = "gen-initial"
-	rc.SetPolicyGeneration(initialGen)
-	m := policy.NewMatcher()
-	initSrc := policy.NewMemorySource("default", policy.ParsedRules{})
-	if snap, err := policy.CompileSnapshot(1, initialGen, []policy.SourceParsedRules{initSrc.ToSourceParsedRules()}); err == nil {
-		m.Publish(snap)
-	}
-	return &MemoryRouteCache{
-		rc:      rc,
-		matcher: m,
-		gen:     initialGen,
-	}
-}
-
-// AttachMatcher connects the active policy matcher to the route cache for evaluating DNS observations.
-func (c *MemoryRouteCache) AttachMatcher(m *policy.Matcher) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.matcher = m
-	if m != nil {
-		if snap := m.Current(); snap != nil && snap.Generation() != "" {
-			c.gen = snap.Generation()
-			c.rc.SetPolicyGeneration(c.gen)
-		}
-	}
-}
-
-// PolicyMatcher returns the attached policy matcher.
-func (c *MemoryRouteCache) PolicyMatcher() *policy.Matcher {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.matcher
-}
-
-// Lookup queries the routing decision for a destination IP in the session scope.
-//
-// The read never allocates a scope: a session without retained evidence answers
-// Unknown, which is the same answer an empty scope would give, but without
-// permanently consuming capacity for a session that may already be retired.
-func (c *MemoryRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decision {
-	if c == nil || sessionID == "" || !ip.IsValid() || !ip.Is4() {
-		return policy.Unknown
-	}
-	c.mu.Lock()
-	if c.matcher != nil {
-		if snap := c.matcher.Current(); snap != nil && snap.Generation() != "" && snap.Generation() != c.gen {
-			c.gen = snap.Generation()
-			c.rc.SetPolicyGeneration(c.gen)
-		}
-	}
-	gen := c.gen
-	sc := c.rc.Get(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
-	c.mu.Unlock()
-
-	if sc == nil {
-		return policy.Unknown
-	}
-	return sc.Lookup(ip, gen, time.Now())
-}
-
-// Set stores a routing decision for an IP in the session scope.
-func (c *MemoryRouteCache) Set(sessionID string, ip netip.Addr, d policy.Decision) {
-	if c == nil || sessionID == "" || !ip.IsValid() || !ip.Is4() {
-		return
-	}
-	c.mu.Lock()
-	gen := c.gen
-	sc, err := c.rc.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
-	c.mu.Unlock()
-	if err != nil || sc == nil {
-		return
-	}
-	if d == policy.Direct || d == policy.Proxy {
-		_ = sc.Observe(gen, []policy.Observation{
-			{
-				IP:        ip,
-				Decision:  d,
-				ExpiresAt: time.Now().Add(time.Hour),
-			},
-		}, time.Now())
-	}
-}
-
-// Observe records a routing decision for an IP in the session scope.
-func (c *MemoryRouteCache) Observe(sessionID string, ip netip.Addr, d policy.Decision) {
-	c.Set(sessionID, ip, d)
-}
-
-// DNSLedger returns the bounded DNS observation store, or nil when this cache has
-// none. It is the only reader the per-client diagnosis uses.
-func (c *MemoryRouteCache) DNSLedger() *dnsledger.Ledger {
-	if c == nil {
-		return nil
-	}
-	c.dnsRecordsMu.RLock()
-	defer c.dnsRecordsMu.RUnlock()
-	return c.dnsRecords
-}
-
-// Open opens or retrieves the session cache for the given scope.
-func (c *MemoryRouteCache) Open(scope policy.Scope) (*policy.SessionCache, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.rc.Open(scope)
-}
-
-// SessionScope returns the scope that sessionID already owns, without creating
-// one. A nil result means the session retains no evidence: it has never observed
-// DNS, or its scope was released when its route retired.
-func (c *MemoryRouteCache) SessionScope(sessionID string) *policy.SessionCache {
-	if c == nil || sessionID == "" {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.rc.Get(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
-}
-
-// RetireSessionScope releases the cache scope owned by a retired authenticated
-// session so its capacity returns to the bounded cache. It is idempotent and
-// records no tombstone: a released scope is simply absent, and re-admission of
-// the same session creates a fresh one.
-//
-// The released scope is the session's whole authority, not only its retained
-// evidence: every query the session authorized resolves inside it.
-func (c *MemoryRouteCache) RetireSessionScope(sessionID string) {
-	if sc := c.SessionScope(sessionID); sc != nil {
-		sc.Invalidate()
-	}
-}
-
-// RouteCache returns the underlying authentic policy.RouteCache.
-func (c *MemoryRouteCache) RouteCache() *policy.RouteCache {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.rc
-}
-
-// SetPolicyGeneration updates the active policy generation string on the route cache.
-func (c *MemoryRouteCache) SetPolicyGeneration(generation string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.gen = generation
-	c.rc.SetPolicyGeneration(generation)
 }
 
 // newPolicyUpstreamResolver builds the upstream resolver from the configured
@@ -544,16 +365,7 @@ func (s *Service) initPBR(ctx context.Context) error {
 		return err
 	}
 
-	// 4. Route Cache: instantiate in-memory route cache if not provided and connect to matcher
-	if cfg.RouteCache == nil {
-		memCache := NewMemoryRouteCache()
-		memCache.AttachMatcher(cfg.PolicyMatcher)
-		cfg.RouteCache = memCache
-	} else if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
-		mem.AttachMatcher(cfg.PolicyMatcher)
-	}
-
-	// 5. Upstream resolver: build it from the configured upstream list (the
+	// 4. Upstream resolver: build it from the configured upstream list (the
 	// persisted policy settings, when this activation came from them) so a
 	// blocked provider is a settings change rather than a code change. The panel
 	// serves no client DNS, so this resolver answers no query of its own; it

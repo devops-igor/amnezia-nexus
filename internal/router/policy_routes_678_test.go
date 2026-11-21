@@ -410,7 +410,7 @@ func TestPolicyStatsBaselineWithoutPBRActive(t *testing.T) {
 		t.Fatalf("GET stats = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 	out := decodeJSON(t, w)
-	for _, key := range []string{"proxy_bytes", "direct_bytes", "proxy_drops", "direct_drops", "route_cache", "route_sessions", "active_rules"} {
+	for _, key := range []string{"proxy_bytes", "direct_bytes", "proxy_drops", "direct_drops", "active_rules"} {
 		v, ok := out[key]
 		if !ok {
 			t.Fatalf("stats missing %q", key)
@@ -463,17 +463,20 @@ func TestPolicyStatsExposeAggregateCountersOnly(t *testing.T) {
 	out := decodeJSON(t, w)
 	for _, key := range []string{
 		"proxy_bytes", "direct_bytes", "proxy_drops", "direct_drops",
-		"route_cache", "route_sessions", "active_rules", "enabled",
+		"active_rules", "enabled",
 	} {
 		if _, ok := out[key]; !ok {
 			t.Errorf("stats response missing %q; got %v", key, out)
 		}
 	}
 
-	// Negative assertions: none of the disallowed fields may appear.
+	// Negative assertions: none of the disallowed fields may appear. The route
+	// cache was deleted with its evidence, so its two figures are absent rather
+	// than reported as a permanent zero.
 	for _, forbidden := range []string{
 		"domains", "queried_domains", "dns_history", "clients", "client_ip",
 		"private_ip", "credentials", "password", "api_key", "sessions",
+		"route_cache", "route_sessions",
 	} {
 		if _, ok := out[forbidden]; ok {
 			t.Errorf("stats response leaked disallowed field %q", forbidden)

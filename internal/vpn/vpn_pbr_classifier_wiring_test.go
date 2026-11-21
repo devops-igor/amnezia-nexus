@@ -31,7 +31,6 @@ func TestServicePBRInstallsAndRemovesTheAddressClassifier(t *testing.T) {
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr("198.51.200.1"),
 		WANDevice:     &mockPBRDevice{},
-		RouteCache:    &mockRouteCache{},
 		PolicyMatcher: matcher,
 	}
 

@@ -252,7 +252,7 @@ func TestNAT_LookupExpiryRetiresRemoteBindingAndReclaimsPort(t *testing.T) {
 // after the address classification behind an established flow is withdrawn and the flow is
 // re-decided as PROXY, NAT port and remote binding are retired.
 func TestNAT_ProductionDispatchAfterReclassification(t *testing.T) {
-	f, m, dev, _ := setupForwarderWithPBR(t)
+	f, m, dev := setupForwarderWithPBR(t)
 	defer func() { _ = m.Close() }()
 	m.mu.Lock()
 	m.cfg.MinPort = 45000

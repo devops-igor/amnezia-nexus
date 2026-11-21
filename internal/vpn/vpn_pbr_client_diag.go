@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
@@ -23,9 +22,6 @@ import (
 //     the manager's read lock and copies values. Nothing is created, adopted or
 //     touched.
 //   - Route identity comes from Forwarder.SessionRouteStates (value copies).
-//   - Address evidence comes from policy.SessionCache.Entries, the listing
-//     counterpart of Inspect: one atomic view load, no prune, no store, no
-//     scope allocation.
 //   - Flow evidence comes from DirectEgressManager.SnapshotSessionFlows, which
 //     never calls LookupFlow and therefore never refreshes lastSeen or retires
 //     an expired flow.
@@ -38,7 +34,7 @@ import (
 // unknown token rather than inferred from a route, a lastSeen or a current
 // policy rule.
 //
-// Cross-subsystem atomicity is not promised. The three stores are read one after
+// Cross-subsystem atomicity is not promised. The stores are read one after
 // another under their own locks, so a rekey, a retirement or a policy refresh can
 // land between them. The answer therefore re-reads the route identity after the
 // copies and reports ClientDiagnosisStateInconsistent (withholding the records)
@@ -55,8 +51,8 @@ var (
 	ErrClientDiagnosisSessionRequired = errors.New("vpn: client diagnosis requires a session id")
 )
 
-// clientDiagnosisEvidenceSource names the stores this slice reads.
-const clientDiagnosisEvidenceSource = "route_cache_entries_and_live_flows"
+// clientDiagnosisEvidenceSource names the store this slice reads.
+const clientDiagnosisEvidenceSource = "live_flows"
 
 // ClientDiagnosisTargets lists the session incarnations an administrator can
 // select. It reads the live session registry and the registered routes only.
@@ -83,7 +79,6 @@ func (s *Service) ClientDiagnosisTargets() ClientDiagnosisTargets {
 		return out
 	}
 
-	cache := s.clientDiagnosisRouteCache()
 	for _, sess := range mgr.ListActiveSessionsSnapshot() {
 		target := ClientDiagnosisTarget{
 			SessionID:      sess.ID,
@@ -96,11 +91,6 @@ func (s *Service) ClientDiagnosisTargets() ClientDiagnosisTargets {
 		if route, ok := bySession[sess.ID]; ok {
 			target.RouteLive = true
 			target.RouteGeneration = route.Generation
-		}
-		if cache != nil {
-			// Count is one view load and one map length: the picker never
-			// copies a retained set.
-			target.EvidenceEntries = cache.SessionScope(sess.ID).Count()
 		}
 		out.Clients = append(out.Clients, target)
 	}
@@ -154,8 +144,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 
 	// Copies only: each helper reads and releases its own lock, and the response
 	// is assembled outside every lock after this point.
-	entries, generation := s.clientDiagnosisEntries(sessionID, now, req.EvidenceLimit)
-	out.Selection.PolicyGeneration = generation
 	flows, flowsAvailable := clientDiagnosisSnapshotFlows(fwd, sessionID, selection.RouteGeneration, now, req.FlowLimit)
 	// The selected generation's refusals only: a row from a replaced incarnation is not this
 	// client's current evidence, and the read is still a pure ledger read.
@@ -163,8 +151,8 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	if fwd != nil {
 		dropSnapshot = fwd.ClientDropSnapshot(sessionID, selection.RouteGeneration, 0)
 	}
-	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords(sessionID, req.DNSRecordLimit)
-	dnsEvents := s.clientDiagnosisDNSEvents(sessionID, req.DNSEventLimit)
+	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords()
+	dnsEvents := s.clientDiagnosisDNSEvents()
 	if err := ctx.Err(); err != nil {
 		return ClientDiagnosisResponse{}, err
 	}
@@ -182,8 +170,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	out.Drops = clientDiagnosisDropsSection(dropSnapshot)
 
 	clientDiagnosisApplyRecords(&out, clientDiagnosisReads{
-		entries:        entries,
-		generation:     generation,
 		flows:          flows,
 		flowsAvailable: flowsAvailable,
 		dnsRecords:     dnsRecords,
@@ -248,66 +234,6 @@ func (s *Service) clientDiagnosisSources() (*forwarder.Forwarder, *session.Sessi
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.forwarder, s.sessionMgr
-}
-
-// clientDiagnosisRouteCache returns the authoritative route cache when the live
-// policy configuration provides one.
-func (s *Service) clientDiagnosisRouteCache() *MemoryRouteCache {
-	cfg := s.getPBRConfig()
-	if cfg == nil {
-		return nil
-	}
-	mem, ok := cfg.RouteCache.(*MemoryRouteCache)
-	if !ok || mem == nil {
-		return nil
-	}
-	return mem
-}
-
-// clientDiagnosisEntries reads the selected session's retained address
-// evidence and reports the policy generation it was compared against. A session
-// that holds nothing answers absent, never an error: that is a state, not a
-// failure.
-func (s *Service) clientDiagnosisEntries(sessionID string, now time.Time, limit int) (policy.SessionEntryList, string) {
-	mem := s.clientDiagnosisRouteCache()
-	if mem == nil {
-		return policy.SessionEntryList{State: policy.EvidenceAbsent, Entries: []policy.SessionEntry{}}, ""
-	}
-	generation := clientDiagnosisPolicyGeneration(s, mem)
-	// SessionScope never creates a scope, so a diagnosis cannot consume one of
-	// the cache's bounded session slots.
-	return mem.SessionScope(sessionID).Entries(generation, now, limit), generation
-}
-
-// clientDiagnosisPolicyGeneration reports the policy generation the retained
-// evidence is compared against.
-//
-// The authority is the matcher the route cache observes with: that is the
-// generation its views are keyed by, so an inactive policy runtime cannot make
-// live evidence look stale. The service's own policy runtime is the fallback for
-// a cache attached without a matcher.
-func clientDiagnosisPolicyGeneration(s *Service, mem *MemoryRouteCache) string {
-	if mem != nil {
-		if generation := matcherGeneration(mem.PolicyMatcher()); generation != "" {
-			return generation
-		}
-	}
-	if s != nil {
-		return matcherGeneration(s.PolicyMatcher())
-	}
-	return ""
-}
-
-// matcherGeneration reports the generation a matcher currently publishes, or ""
-// when it has no published snapshot.
-func matcherGeneration(matcher *policy.Matcher) string {
-	if matcher == nil {
-		return ""
-	}
-	if snap := matcher.Current(); snap != nil {
-		return snap.Generation()
-	}
-	return ""
 }
 
 // clientDiagnosisResolve matches the request against the live registry and the
@@ -409,34 +335,24 @@ func clientDiagnosisStillSelected(fwd *forwarder.Forwarder, sessionID string, ge
 	return false
 }
 
-// clientDiagnosisDNSRecords reads the session's observed-answer history from the
-// bounded collector. It reports whether a collector was consulted at all: a
-// service without one must say "not recorded", not "nothing was observed".
-func (s *Service) clientDiagnosisDNSRecords(sessionID string, limit int) (dnsledger.SessionSnapshot, bool) {
-	mem := s.clientDiagnosisRouteCache()
-	if mem == nil {
-		return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
-	}
-	ledger := mem.DNSLedger()
-	if ledger == nil {
-		return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
-	}
-	return ledger.Snapshot(sessionID, limit), true
+// clientDiagnosisDNSRecords reports the session's observed-answer history. This
+// build retains none: the collector lived on the deleted route cache, and the
+// producer that wrote it was deleted with the DNS gateway. The answer is
+// therefore always the empty snapshot with "no collector consulted", which the
+// panel renders as "not recorded" — the same answer a nil collector gave before
+// the store was removed.
+//
+// The reader and its wire mapping are removed together with the history store,
+// so this endpoint keeps one honest answer instead of a half-deleted section.
+func (s *Service) clientDiagnosisDNSRecords() (dnsledger.SessionSnapshot, bool) {
+	return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
 }
 
-// clientDiagnosisDNSEvents reads the session's terminal-query history. A service
-// without a collector answers an empty snapshot; the response reports
-// events_available=false so the panel can say "not recorded".
-func (s *Service) clientDiagnosisDNSEvents(sessionID string, limit int) dnsledger.EventSnapshot {
-	mem := s.clientDiagnosisRouteCache()
-	if mem == nil {
-		return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
-	}
-	ledger := mem.DNSLedger()
-	if ledger == nil {
-		return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
-	}
-	return ledger.SnapshotEvents(sessionID, limit)
+// clientDiagnosisDNSEvents reports the session's terminal-query history. Like
+// the answer history, no collector exists in this build, so it answers the empty
+// snapshot and the response says events_available=false.
+func (s *Service) clientDiagnosisDNSEvents() dnsledger.EventSnapshot {
+	return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
 }
 
 // clientDiagnosisSnapshotFlows reads the selected incarnation's flow records and

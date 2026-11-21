@@ -48,9 +48,9 @@ const (
 // interval are settings the snapshot does not carry, so the save is content
 // equivalent even though it is a real change to the runtime. The new syncer has no
 // record of what is already published, and without one every such save would mint a
-// new generation — which is what the forwarder's route caches key a client's DNS
-// evidence on, so the evidence would be discarded and new flows would fall back to
-// the fail-closed PROXY path.
+// new generation — which the forwarder stamps on every flow it records, so an
+// unchanged save would report a new attribution for traffic that runs exactly the
+// same policy.
 //
 // Adoption is a read: it never publishes and never commits, so it cannot take write
 // ownership from the runtime the save is replacing, and a save whose fetch is then

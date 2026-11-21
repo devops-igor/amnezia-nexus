@@ -18,9 +18,9 @@ import (
 const clientMetadataFilterScript = `
 const targets = () => ({clients: [
   {session_id: 'sess-a', connection_name: 'phone', assigned_ip: '10.100.0.5',
-   route_live: true, route_generation: 4, evidence_entries: 2},
+   route_live: true, route_generation: 4},
   {session_id: 'sess-b', connection_name: 'tablet', assigned_ip: '10.100.0.6',
-   route_live: true, route_generation: 1, evidence_entries: 0}
+   route_live: true, route_generation: 1}
 ], sampled_at: '2026-11-17T09:10:00Z', policy_routing_enabled: true, read_only: true,
  not_covered: []});
 const diagnosis = (session) => ({
@@ -28,20 +28,11 @@ const diagnosis = (session) => ({
               connection_name: session === 'sess-a' ? 'phone' : 'tablet',
               assigned_ip: session === 'sess-a' ? '10.100.0.5' : '10.100.0.6'},
   coverage: {policy_routing_enabled: true, sampled_at: '2026-11-17T09:10:00Z',
-             evidence_source: 'route_cache_entries_and_live_flows',
+             evidence_source: 'live_flows',
              not_covered: ['ipv6_not_supported', 'encrypted_dns_not_observed'],
              not_recorded: ['flow_evidence_install_failure_not_recorded']},
-  dns: {available: true, state: 'fresh', generation: 'gen-1',
+  dns: {available: true, state: 'fresh',
         names: {match: 'not_recorded', reason: 'dns_names_not_retained'},
-        entries: [
-          {address: '93.184.216.34', decision: 'DIRECT', observed_at: '2026-11-17T09:09:30Z',
-           expires_at: '2026-11-17T09:14:30Z', expires_in_seconds: 270, age_seconds: 30,
-           state: 'fresh', names: [], names_match: 'not_recorded'},
-          {address: '1.1.1.1', decision: 'PROXY', observed_at: '2026-11-17T09:09:20Z',
-           expires_at: '2026-11-17T09:14:20Z', expires_in_seconds: 260, age_seconds: 40,
-           state: 'fresh', names: [], names_match: 'not_recorded'}
-        ],
-        total: 2, truncated: false,
         records_available: true, records_total: 2, records_truncated: false,
         records: [
           {seq: 2, name: 'plain.example', qtype: 'A', rcode: 'NOERROR', aliases: [],
@@ -195,7 +186,7 @@ assert.equal(rowCells('policyClientFlowRows', 0)[1], '93.184.216.34:443 (plain.e
 assert.equal(rowCount('policyClientDNSRows'), 1, 'the answer record that matches stays');
 assert.equal(rowCount('policyClientEventRows'), 1, 'the query that matches stays');
 assert.equal(rowCount('policyClientDropRows'), 0, 'no refusal carries that destination');
-assert.equal(text('policyClientFilterFoot'), 'FILTER 3/10 "plain.example"',
+assert.equal(text('policyClientFilterFoot'), 'FILTER 3/8 "plain.example"',
   'the filter line states what it left out of the recorded rows');
 assert.equal(text('policyClientFlowFoot'), 'FLOWS 2/2',
   'the section foot still describes the recorded page, not the filtered one');
@@ -208,8 +199,8 @@ assert.equal(rowCells('policyClientFlowRows', 0)[1], '1.1.1.1:53');
 assert.equal(rowCount('policyClientDNSRows'), 0, 'no answer carries that destination');
 assert.equal(rowCount('policyClientDropRows'), 0,
   'a refusal without a tuple cannot match a destination filter');
-assert.equal(text('policyClientFilterFoot'), 'FILTER 2/10 "1.1.1.1"',
-  'the answer evidence, the flow and nothing else carry that address');
+assert.equal(text('policyClientFilterFoot'), 'FILTER 1/8 "1.1.1.1"',
+  'only the flow carries that address');
 
 // A term nothing carries says so instead of looking like an empty history.
 await setFilter('nothing.example');

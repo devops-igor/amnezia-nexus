@@ -26,7 +26,6 @@ type hostIsolationHarness struct {
 	fwd     *Forwarder
 	dem     *DirectEgressManager
 	wanDev  *mockPacketDev
-	cache   *testRouteCache
 	capture *testCaptureReturnPath
 	hostWAN netip.Addr
 	client  netip.Addr
@@ -56,8 +55,6 @@ func newHostIsolationHarness(t *testing.T, cfg DirectEgressConfig) *hostIsolatio
 	// Every remote this harness dispatches is treated as an allocation member, so
 	// each flow takes the DIRECT path this fixture exercises.
 	h.fwd.SetDestinationClassifier(newAllDirectTestClassifier())
-	h.cache = newTestRouteCache()
-	h.fwd.SetRouteCache(h.cache)
 	h.capture = newTestCaptureReturnPath()
 	h.fwd.RegisterSessionWithReturnPath(h.session, h.conn, h.peerKey, h.client.String(), 1, h.capture.path)
 	t.Cleanup(func() {

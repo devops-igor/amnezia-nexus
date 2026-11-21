@@ -7,8 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // failingPacketDev is an attached backend device whose asynchronous writes
@@ -48,7 +46,7 @@ func TestProxyAccounting_DetachDrainsAbandonedProxyQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.Start(ctx)
 	// No pumps yet: the queue keeps whatever is admitted, so the drain is
 	// observable instead of racing the egress pump.
@@ -65,7 +63,7 @@ func TestProxyAccounting_DetachDrainsAbandonedProxyQueue(t *testing.T) {
 	fwd.AttachBackendDevice(backendID, newMockPacketDev())
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Proxy)
+
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 41002, 80, 0x02, []byte("drain"))
 
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -108,7 +106,7 @@ func TestProxyAccounting_ReattachRestoresProxyDelivery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.Start(ctx)
 	fwd.StartPumps(ctx)
 	defer func() { _ = fwd.Stop() }()
@@ -126,7 +124,7 @@ func TestProxyAccounting_ReattachRestoresProxyDelivery(t *testing.T) {
 	fwd.AttachBackendDevice(backendID, oldDev)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Proxy)
+
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 41003, 80, 0x02, []byte("reattach"))
 
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -169,7 +167,7 @@ func TestProxyAccounting_AttachedDeviceWriteFailureCountsDrop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.Start(ctx)
 	fwd.StartPumps(ctx)
 	defer func() { _ = fwd.Stop() }()
@@ -187,7 +185,7 @@ func TestProxyAccounting_AttachedDeviceWriteFailureCountsDrop(t *testing.T) {
 	fwd.AttachBackendDevice(backendID, failDev)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Proxy)
+
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 41004, 80, 0x02, []byte("write-fail"))
 
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -225,7 +223,7 @@ func TestProxyAccounting_RecreatedQueueAfterDetachStillRefuses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.Start(ctx)
 	fwd.StartPumps(ctx)
 	defer func() { _ = fwd.Stop() }()
@@ -243,7 +241,7 @@ func TestProxyAccounting_RecreatedQueueAfterDetachStillRefuses(t *testing.T) {
 	}
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set("sess-after", targetIP, policy.Proxy)
+
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr("10.100.0.66"), targetIP, 41005, 80, 0x02, []byte("late-session"))
 
 	err := fwd.RouteClientToBackend("peer-after", pkt)

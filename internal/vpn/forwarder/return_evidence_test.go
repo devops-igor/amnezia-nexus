@@ -25,7 +25,6 @@ func proxyReturnFixture(t *testing.T, bufSize int) (*Forwarder, *testCaptureRetu
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	fwd.SetRouteCache(newTestRouteCache())
 	capPath := newTestCaptureReturnPath()
 	fwd.RegisterSessionWithReturnPath("sess-return", "conn-1", "peer-return", "10.100.0.7", 31, capPath.path)
 	fwd.StartPumps(t.Context())

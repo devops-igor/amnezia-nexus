@@ -27,13 +27,12 @@ import (
 // producer shows up here as a changed answer rather than as a passing unit test.
 
 type clientDiagFixture struct {
-	svc        *Service
-	fwd        *forwarder.Forwarder
-	dem        *forwarder.DirectEgressManager
-	routeCache *MemoryRouteCache
-	sessions   *session.SessionManager
-	wan        *mockPBRDevice
-	backend    *mockPBRDevice
+	svc      *Service
+	fwd      *forwarder.Forwarder
+	dem      *forwarder.DirectEgressManager
+	sessions *session.SessionManager
+	wan      *mockPBRDevice
+	backend  *mockPBRDevice
 	// returnPath is the client return path the route was registered with, kept so
 	// a rekey case can register the same incarnation again.
 	returnPath *forwarder.ReturnPath
@@ -50,11 +49,11 @@ type clientDiagFixture struct {
 
 // newClientDiagFixture builds the production chain the diagnosis reads: a
 // forwarder with a backend device, a client return path, the installed
-// classifier, the route cache and a real session registry.
+// classifier, the policy matcher and a real session registry.
 //
-// It installs no DNS resolver and no evidence producer: this build records
-// nothing for a client's lookups, which is a state the diagnosis has to report
-// rather than hide.
+// It installs no DNS resolver, no evidence producer and no route cache: this
+// build records nothing for a client's lookups, which is a state the diagnosis
+// has to report rather than hide.
 func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -68,7 +67,6 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		peerKey:  "peer-client-diag",
 	}
 
-	routeCache := NewMemoryRouteCache()
 	matcher := policy.NewMatcher()
 	rules, _, err := policy.Parse(ctx, strings.NewReader("proxy.example\n"), policy.Source{
 		ID:             "diag-rules",
@@ -83,7 +81,6 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		t.Fatalf("CompileSnapshot: %v", err)
 	}
 	matcher.Publish(snap)
-	routeCache.AttachMatcher(matcher)
 
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
 	fwd.AttachBackendDevice(11, f.backend)
@@ -105,13 +102,11 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 	f.returnPath = returnPath
 
 	f.fwd = fwd
-	f.routeCache = routeCache
 	f.svc = &Service{forwarder: fwd, sessionMgr: f.sessions}
 	if err := f.svc.ConfigurePBR(PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr("203.0.113.1"),
 		WANDevice:     f.wan,
-		RouteCache:    routeCache,
 		PolicyMatcher: matcher,
 	}); err != nil {
 		t.Fatalf("ConfigurePBR: %v", err)
@@ -197,16 +192,13 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		t.Error("the answer must declare that it is read-only")
 	}
 
-	// No producer observes DNS in this build, so the retained set is absent. The
-	// section must still be present and state that, not claim an empty history.
-	if !answer.DNS.Available {
-		t.Fatalf("dns = %+v, want the section present", answer.DNS)
+	// No producer observes DNS in this build and no store retains it, so the
+	// section is present and states that rather than claiming an empty history.
+	if answer.DNS.Available || answer.DNS.State != ClientDiagnosisTokenNotRecorded {
+		t.Errorf("dns = %+v, want an unavailable section stating not_recorded", answer.DNS)
 	}
-	if answer.DNS.State != string(policy.EvidenceAbsent) {
-		t.Errorf("dns state = %q, want absent: no DNS answer was recorded", answer.DNS.State)
-	}
-	if len(answer.DNS.Entries) != 0 {
-		t.Errorf("evidence entries = %d, want none", len(answer.DNS.Entries))
+	if answer.DNS.RecordsAvailable || answer.DNS.EventsAvailable {
+		t.Errorf("dns = %+v, want no retained answers and no query history", answer.DNS)
 	}
 	if answer.DNS.Names.Match != ClientDiagnosisNamesNotRecorded {
 		t.Errorf("names match = %q, want not_recorded: the cache keeps no names", answer.DNS.Names.Match)
@@ -349,11 +341,6 @@ func TestClientDiagnosisIsolatesClients(t *testing.T) {
 			t.Error("the first client's answer contains the other client's flow")
 		}
 	}
-	for _, entry := range answer.DNS.Entries {
-		if entry.Address == "1.1.1.1" {
-			t.Error("the first client's answer contains the other client's evidence")
-		}
-	}
 
 	// The picker lists both incarnations with their own route generations.
 	targets := f.svc.ClientDiagnosisTargets()
@@ -367,11 +354,6 @@ func TestClientDiagnosisIsolatesClients(t *testing.T) {
 		if target.SessionID == firstSession {
 			if !target.RouteLive || target.RouteGeneration == 0 {
 				t.Errorf("first client target = %+v, want a live route generation", target)
-			}
-			// Nothing records DNS answers in this build, so the picker counts the
-			// session's flows and must not imply retained evidence it does not hold.
-			if target.EvidenceEntries != 0 {
-				t.Errorf("first client target = %+v, want no retained evidence", target)
 			}
 		}
 	}
@@ -404,8 +386,8 @@ func TestClientDiagnosisRefusesAnotherIncarnation(t *testing.T) {
 		if answer.Selection.State != ClientDiagnosisStateRouteGenerationReplaced {
 			t.Fatalf("state = %q, want route_generation_replaced", answer.Selection.State)
 		}
-		if len(answer.DNS.Entries) != 0 || len(answer.Flows.Entries) != 0 {
-			t.Errorf("a replaced incarnation returned records: %+v / %+v", answer.DNS.Entries, answer.Flows.Entries)
+		if len(answer.Flows.Entries) != 0 {
+			t.Errorf("a replaced incarnation returned records: %+v", answer.Flows.Entries)
 		}
 		if answer.Selection.RequestedRouteGeneration == nil || *answer.Selection.RequestedRouteGeneration != oldGeneration {
 			t.Errorf("requested generation = %v, want the refused %d", answer.Selection.RequestedRouteGeneration, oldGeneration)
@@ -438,7 +420,7 @@ func TestClientDiagnosisRefusesAnotherIncarnation(t *testing.T) {
 		if answer.Selection.State != ClientDiagnosisStateUnknownSession {
 			t.Fatalf("state = %q, want unknown_session", answer.Selection.State)
 		}
-		if len(answer.DNS.Entries) != 0 || len(answer.Flows.Entries) != 0 {
+		if len(answer.Flows.Entries) != 0 {
 			t.Error("an unknown session returned records")
 		}
 		if !clientDiagHas(answer.Limitations, ClientDiagnosisLimitSessionEnd) {
@@ -460,7 +442,7 @@ func TestClientDiagnosisRefusesAnotherIncarnation(t *testing.T) {
 		if answer.Selection.State != ClientDiagnosisStateRouteAbsent {
 			t.Fatalf("state = %q, want route_absent", answer.Selection.State)
 		}
-		if len(answer.DNS.Entries) != 0 || len(answer.Flows.Entries) != 0 {
+		if len(answer.Flows.Entries) != 0 {
 			t.Error("a session without a route returned records")
 		}
 	})
@@ -484,7 +466,7 @@ func TestClientDiagnosisPolicyDisabledAndMissingService(t *testing.T) {
 		if answer.DNS.Available || answer.Flows.Available {
 			t.Error("a disabled policy path must not report available sections")
 		}
-		if len(answer.DNS.Entries) != 0 || len(answer.Flows.Entries) != 0 {
+		if len(answer.Flows.Entries) != 0 {
 			t.Error("a disabled policy path returned records")
 		}
 	})
@@ -540,8 +522,8 @@ func TestClientDiagnosisBusyAndCancelled(t *testing.T) {
 }
 
 // TestClientDiagnosisLeavesEveryStoreUntouched is the read-only control: the
-// counters, cache entries, flow table and explain verdict are identical before
-// and after a diagnosis request.
+// counters and the flow table are identical before and after a diagnosis
+// request.
 func TestClientDiagnosisLeavesEveryStoreUntouched(t *testing.T) {
 	f := newClientDiagFixture(t)
 	f.sendTCP(t, f.example, 43001, 443)
@@ -550,10 +532,7 @@ func TestClientDiagnosisLeavesEveryStoreUntouched(t *testing.T) {
 
 	proxyBytesBefore, directBytesBefore, proxyDropsBefore := f.svc.PolicyDispatchCounters()
 	directDropsBefore := f.svc.PolicyDirectDrops()
-	entriesBefore, sessionsBefore := f.svc.PolicyRouteCacheSize()
 	flowsBefore := f.dem.SnapshotSessionFlows(sessionID, generation, time.Now(), 0)
-	lookupBefore := f.routeCache.Lookup(sessionID, f.example)
-	cacheEntriesBefore := f.routeCache.SessionScope(sessionID).Count()
 
 	for i := 0; i < 3; i++ {
 		if _, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: sessionID}); err != nil {
@@ -569,17 +548,6 @@ func TestClientDiagnosisLeavesEveryStoreUntouched(t *testing.T) {
 	if got := f.svc.PolicyDirectDrops(); got != directDropsBefore {
 		t.Errorf("direct drops moved: %d -> %d", directDropsBefore, got)
 	}
-	entriesAfter, sessionsAfter := f.svc.PolicyRouteCacheSize()
-	if entriesAfter != entriesBefore || sessionsAfter != sessionsBefore {
-		t.Errorf("route cache size moved: %d/%d -> %d/%d", entriesBefore, sessionsBefore, entriesAfter, sessionsAfter)
-	}
-	if got := f.routeCache.Lookup(sessionID, f.example); got != lookupBefore {
-		t.Errorf("evidence verdict moved: %v -> %v", lookupBefore, got)
-	}
-	if got := f.routeCache.SessionScope(sessionID).Count(); got != cacheEntriesBefore {
-		t.Errorf("retained entry count moved: %d -> %d", cacheEntriesBefore, got)
-	}
-
 	// The flow records themselves must be identical, including lastSeen: a read
 	// that refreshed or retired one would change this.
 	flowsAfter := f.dem.SnapshotSessionFlows(sessionID, generation, time.Now(), 0)
@@ -625,27 +593,6 @@ func TestClientDiagnosisStillSelected(t *testing.T) {
 // assembled from, so their branches are covered individually rather than only
 // through one end-to-end path.
 func TestClientDiagnosisHelperContracts(t *testing.T) {
-	t.Run("MatcherGeneration", func(t *testing.T) {
-		if got := matcherGeneration(nil); got != "" {
-			t.Errorf("nil matcher generation = %q, want empty", got)
-		}
-		empty := policy.NewMatcher()
-		if got := matcherGeneration(empty); got != "" {
-			t.Errorf("unpublished matcher generation = %q, want empty", got)
-		}
-		published := policy.NewMatcher()
-		snap, err := policy.CompileSnapshot(1, "gen-pub", []policy.SourceParsedRules{
-			policy.NewMemorySource("s", policy.ParsedRules{}).ToSourceParsedRules(),
-		})
-		if err != nil {
-			t.Fatalf("CompileSnapshot: %v", err)
-		}
-		published.Publish(snap)
-		if got := matcherGeneration(published); got != "gen-pub" {
-			t.Errorf("published matcher generation = %q, want gen-pub", got)
-		}
-	})
-
 	t.Run("RouteIndexKeepsTheNewestGeneration", func(t *testing.T) {
 		index := clientDiagnosisRouteIndex([]forwarder.SessionRoute{
 			{SessionID: "sess-a", Generation: 2},

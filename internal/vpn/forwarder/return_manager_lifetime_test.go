@@ -50,9 +50,8 @@ func newManagerLifetimeFixture(t *testing.T, queueSize int) *managerLifetimeFixt
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })
-	// No published policy snapshot and no route-cache evidence: every dispatch takes the
-	// fail-closed PROXY default, which is the branch that reads dispatch evidence.
-	fwd.SetRouteCache(newTestRouteCache())
+	// No published policy snapshot: every dispatch takes the fail-closed PROXY
+	// default, which is the branch that reads dispatch evidence.
 	capture := newTestCaptureReturnPath()
 	fwd.RegisterSessionWithReturnPath(lifetimeSessionID, "conn-lifetime", lifetimePeer, lifetimeClientIP, lifetimeBackendID, capture.path)
 	fwd.StartPumps(t.Context())

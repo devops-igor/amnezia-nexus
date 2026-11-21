@@ -6,8 +6,6 @@ import (
 	"net/netip"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // proxyAccountingWaitFor polls cond until it is true or the deadline expires.
@@ -46,7 +44,7 @@ func TestProxyAccounting_DetachedBackendRefusesAndCounts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.Start(ctx)
 	fwd.StartPumps(ctx)
 	defer func() { _ = fwd.Stop() }()
@@ -64,7 +62,7 @@ func TestProxyAccounting_DetachedBackendRefusesAndCounts(t *testing.T) {
 	fwd.AttachBackendDevice(backendID, dev)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Proxy)
+
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 41001, 80, 0x02, []byte("proxy-loss"))
 
 	// Phase 1: the attached backend carries the proxy-required packet.

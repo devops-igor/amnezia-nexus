@@ -5,45 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
-type testRouteCache struct {
-	mu        sync.Mutex
-	decisions map[string]map[netip.Addr]policy.Decision
-}
-
-func newTestRouteCache() *testRouteCache {
-	return &testRouteCache{
-		decisions: make(map[string]map[netip.Addr]policy.Decision),
-	}
-}
-
-func (c *testRouteCache) Set(sessionID string, ip netip.Addr, d policy.Decision) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.decisions[sessionID] == nil {
-		c.decisions[sessionID] = make(map[netip.Addr]policy.Decision)
-	}
-	c.decisions[sessionID][ip] = d
-}
-
-func (c *testRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decision {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if sess, ok := c.decisions[sessionID]; ok {
-		if d, ok := sess[ip]; ok {
-			return d
-		}
-	}
-	return policy.Unknown
-}
-
-func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *mockPacketDev, *testRouteCache) {
+func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *mockPacketDev) {
 	fwd := NewForwarder(nil, "10.100.0.0/16", 100)
 	fwd.SetPBREnabled(true)
 
@@ -58,10 +26,7 @@ func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *moc
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
 
-	rc := newTestRouteCache()
-	fwd.SetRouteCache(rc)
-
-	return fwd, dem, wanDev, rc
+	return fwd, dem, wanDev
 }
 
 func TestPolicyDispatch_PBROff_AllProxy(t *testing.T) {
@@ -94,7 +59,7 @@ func TestPolicyDispatch_PBROff_AllProxy(t *testing.T) {
 }
 
 func TestPolicyDispatch_ProhibitedDestinations(t *testing.T) {
-	fwd, _, _, _ := setupForwarderWithPBR(t)
+	fwd, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-prohibited"
 	backendID := int64(201)
@@ -134,7 +99,7 @@ func TestPolicyDispatch_ProhibitedDestinations(t *testing.T) {
 // drop ledger under the existing prohibited-destination token rather than being
 // proxied to a backend that could not answer it.
 func TestPolicyDispatch_GatewayDNSIsProhibitedDestination(t *testing.T) {
-	fwd, _, _, _ := setupForwarderWithPBR(t)
+	fwd, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-gwdns"
 	backendID := int64(202)
@@ -286,7 +251,7 @@ func TestPolicyDispatch_LegacyForwardsExternalResolverPort53(t *testing.T) {
 }
 
 func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
-	fwd, _, _, _ := setupForwarderWithPBR(t)
+	fwd, _, _ := setupForwarderWithPBR(t)
 
 	proxyCIDR := netip.MustParsePrefix("198.51.200.0/24")
 	snap, err := policy.CompileSnapshot(1, "gen-snap", []policy.SourceParsedRules{
@@ -332,12 +297,13 @@ func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
 	}
 }
 
-// TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide pins that a retained
-// PROXY decision is not an input: an uncovered destination proxies because the
-// address is uncovered, and the flow states that branch rather than the evidence
-// token a removed migration row used to produce.
+// TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide pins that an uncovered
+// destination proxies because the address is uncovered, and that the flow states
+// that branch rather than an evidence token. The route cache that used to hold
+// such a decision is deleted, so the input cannot exist at all; the assertion
+// keeps the observable half — the reason recorded on the flow.
 func TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide(t *testing.T) {
-	fwd, dem, _, rc := setupForwarderWithPBR(t)
+	fwd, dem, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-rc-proxy"
 	backendID := int64(204)
@@ -348,9 +314,6 @@ func TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-rc-proxy", peerKey, clientIP, backendID, capPath.path)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	// The session holds a retained PROXY decision for this destination. It must not
-	// decide: the address is uncovered, so the uncovered row proxies and says so.
-	rc.Set(sessionID, targetIP, policy.Proxy)
 
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 34567, 80, 0x02, nil)
 	err := fwd.RouteClientToBackend(peerKey, pkt)
@@ -376,7 +339,7 @@ func TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide(t *testing.T) {
 // routes DIRECT and records the allocation branch. What the route cache holds for
 // the same destination is irrelevant here.
 func TestPolicyDispatch_AddressClassificationDecidesDirect(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-rc-direct"
 	backendID := int64(205)
@@ -412,7 +375,7 @@ func TestPolicyDispatch_AddressClassificationDecidesDirect(t *testing.T) {
 }
 
 func TestPolicyDispatch_UnknownRoute_SafeDefault(t *testing.T) {
-	fwd, _, _, _ := setupForwarderWithPBR(t)
+	fwd, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-unknown"
 	backendID := int64(206)
@@ -440,7 +403,7 @@ func TestPolicyDispatch_UnknownRoute_SafeDefault(t *testing.T) {
 }
 
 func TestPolicyDispatch_ProxyBackendUnavailable_FailClosed(t *testing.T) {
-	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-failclosed"
 	backendID := int64(999) // Will delete queue to simulate backend outage
@@ -477,7 +440,7 @@ func TestPolicyDispatch_ProxyBackendUnavailable_FailClosed(t *testing.T) {
 // behind it changes: stickiness is a property of the flow, not of the inputs that
 // created it.
 func TestPolicyDispatch_FlowStickinessAcrossReclassification(t *testing.T) {
-	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-stickiness"
 	backendID := int64(207)
@@ -523,7 +486,7 @@ func TestPolicyDispatch_FlowStickinessAcrossReclassification(t *testing.T) {
 }
 
 func TestPolicyDispatch_TwoClientIsolation(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerA := "peer-iso-A"
 	peerB := "peer-iso-B"
@@ -579,7 +542,7 @@ func TestPolicyDispatch_TwoClientIsolation(t *testing.T) {
 }
 
 func TestPolicyDispatch_AccountingMetrics(t *testing.T) {
-	fwd, _, _, _ := setupForwarderWithPBR(t)
+	fwd, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-metrics"
 	backendID := int64(208)
@@ -728,7 +691,7 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 }
 
 func TestPolicyDispatch_RouteRetirementFlowInvalidation(t *testing.T) {
-	fwd, dem, _, _ := setupForwarderWithPBR(t)
+	fwd, dem, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-invalidation"
 	clientIP := "10.100.0.81"
@@ -825,7 +788,7 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 }
 
 func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r2b1"
 	clientIP := "10.100.0.83"
@@ -854,7 +817,7 @@ func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T)
 }
 
 func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r2h1"
 	clientIP := "10.100.0.84"
@@ -906,7 +869,7 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 }
 
 func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r3b1"
 	clientIP := "10.100.0.85"
@@ -954,7 +917,7 @@ func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.
 }
 
 func TestPolicyDispatch_R3H1_DirectWANReplyRetirementWriteFenceContinuous(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r3h1"
 	clientIP := "10.100.0.86"

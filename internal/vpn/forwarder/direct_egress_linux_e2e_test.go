@@ -295,10 +295,8 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	// The packet path decides by destination address. The echo target is
 	// classified as an allocation member, so its flows take the DIRECT path; the
 	// proxy and unknown destinations in the subtests below stay uncovered and
-	// therefore proxy. The route cache is still configured as production does and
-	// holds no decision for any of them: retained evidence no longer routes.
+	// therefore proxy.
 	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
-	fwd.SetRouteCache(newTestRouteCache())
 
 	fwd.StartPumps(t.Context())
 	defer fwd.StopPumps()

@@ -221,10 +221,10 @@ const clientTargetsScript = `
 const targets = () => ({clients: [
   {session_id: 'sess-a', connection_id: 'conn-a', connection_name: 'phone',
    assigned_ip: '10.100.0.5', connected_at: '2026-11-17T09:00:00Z',
-   route_live: true, route_generation: 3, evidence_entries: 2},
+   route_live: true, route_generation: 3},
   {session_id: 'sess-b', connection_id: 'conn-b', connection_name: 'tablet',
    assigned_ip: '10.100.0.6', connected_at: '2026-11-17T09:05:00Z',
-   route_live: true, route_generation: 1, evidence_entries: 0}
+   route_live: true, route_generation: 1}
 ], sampled_at: '2026-11-17T09:10:00Z', policy_routing_enabled: true, read_only: true,
  not_covered: ['application_success_not_observable']});
 const diagnosis = (session, generation) => ({
@@ -232,16 +232,11 @@ const diagnosis = (session, generation) => ({
               connection_name: session === 'sess-a' ? 'phone' : 'tablet',
               assigned_ip: session === 'sess-a' ? '10.100.0.5' : '10.100.0.6'},
   coverage: {policy_routing_enabled: true, sampled_at: '2026-11-17T09:10:00Z',
-             evidence_source: 'route_cache_entries_and_live_flows',
+             evidence_source: 'live_flows',
              not_covered: ['application_success_not_observable'],
              not_recorded: ['dns_names_not_retained']},
-  dns: {available: true, state: 'fresh', generation: 'gen-1',
-        names: {match: 'not_recorded', reason: 'dns_names_not_retained'},
-        entries: [{address: '93.184.216.34', decision: 'DIRECT',
-                   observed_at: '2026-11-17T09:09:30Z', expires_at: '2026-11-17T09:14:30Z',
-                   expires_in_seconds: 270, age_seconds: 30, state: 'fresh',
-                   names: [], names_match: 'not_recorded'}],
-        total: 1, truncated: false},
+  dns: {available: true, state: 'fresh',
+        names: {match: 'not_recorded', reason: 'dns_names_not_retained'}},
   flows: {available: true, state: 'recorded', scanned: 2, scan_complete: true, total: 1,
           truncated: false,
           entries: [{protocol: 'tcp', client_src_port: 40002, destination_ip: '93.184.216.34',
@@ -307,10 +302,8 @@ assert.equal(text('policyClientStateValue'), 'STATE:live',
 assert.equal(text('policyClientGenerationValue'), '3');
 assert.equal(text('policyClientEvaluatedValue'), '2026-11-17T09:10:00Z');
 
-assert.equal(rowCount('policyClientEvidenceRows'), 1, 'one retained address is rendered');
-assert.deepEqual(rowCells('policyClientEvidenceRows', 0),
-  ['93.184.216.34', 'DECISION:direct', '2026-11-17T09:09:30Z',
-   '2026-11-17T09:14:30Z', 'fresh']);
+assert.equal(w.document.getElementById('policyClientEvidenceRows'), null,
+  'the retained-address table is gone with the route cache it read');
 
 assert.equal(rowCount('policyClientFlowRows'), 1, 'one live flow is rendered');
 assert.deepEqual(rowHeaders('policyClientFlowRows'),
@@ -342,7 +335,8 @@ assert.equal(resultHidden(), false);
 // new answer exists.
 selectClient('sess-b');
 assert.equal(resultHidden(), true, 'the previous answer must not stay visible');
-assert.equal(rowCount('policyClientEvidenceRows'), 0, 'previous rows must be cleared');
+assert.equal(w.document.getElementById('policyClientFlowRows').children.length, 0,
+  'previous flow rows must be cleared');
 assert.equal(rowCount('policyClientFlowRows'), 0, 'previous rows must be cleared');
 assert.equal(text('policyClientSessionValue'), '-', 'the identity must be reset');
 
@@ -410,7 +404,6 @@ await settle();
 assert.equal(resultHidden(), true, 'a mismatched answer must not render');
 assert.equal(alertText().state, 'stale', 'the discard must be visible to the operator');
 assert.equal(alertText().text, 'policy_client_stale_answer');
-assert.equal(rowCount('policyClientEvidenceRows'), 0);
 `)
 }
 
@@ -485,8 +478,7 @@ responder = async (url, opts) => {
             not_covered: []};
   }
   return {selection: {session_id: 'sess-a', state: 'live', route_generation: 2},
-    dns: {available: true, state: 'fresh', entries: [
-      {address: '1.1.1.1', decision: 'PROXY', state: 'fresh'}], total: 9, truncated: true,
+    dns: {available: false, state: 'not_recorded',
       names: {match: 'not_recorded'}},
     flows: {available: true, state: 'recorded', scanned: 16384, scan_complete: false,
             total: 600, truncated: true, entries: [
@@ -515,9 +507,6 @@ selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
 
-assert.equal(w.document.getElementById('policyClientEvidenceFoot').hidden, false,
-  'a truncated evidence page must say so');
-assert.equal(text('policyClientEvidenceFoot'), 'TRUNC 1/9');
 assert.equal(w.document.getElementById('policyClientFlowFoot').hidden, false);
 assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384',
   'the flow count must be presented as a windowed count, with the partial scan stated');

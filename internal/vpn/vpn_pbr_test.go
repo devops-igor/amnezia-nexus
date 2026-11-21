@@ -52,12 +52,6 @@ func (m *mockPBRDevice) Close() error {
 	return nil
 }
 
-type mockRouteCache struct{}
-
-func (c *mockRouteCache) Lookup(sessionID string, dst netip.Addr) policy.Decision {
-	return policy.Unknown
-}
-
 func TestService_PBRDefaultDisabled(t *testing.T) {
 	svc, err := NewVPNService(nil, nil)
 	if err != nil {
@@ -80,7 +74,6 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 
 	validWAN := netip.MustParseAddr("198.51.200.1")
 	dev := &mockPBRDevice{}
-	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
 	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
 		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
@@ -97,12 +90,11 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 		cfg     PBRConfig
 		wantErr error
 	}{
-		{name: "unspecified 0.0.0.0 host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("0.0.0.0"), WANDevice: dev, RouteCache: rc, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
-		{name: "loopback host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("127.0.0.1"), WANDevice: dev, RouteCache: rc, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
-		{name: "missing WAN packet device", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: nil, RouteCache: rc, PolicyMatcher: matcher}, wantErr: ErrPBRMissingWANDevice},
-		{name: "missing route cache", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: nil, PolicyMatcher: matcher}, wantErr: ErrPBRMissingRouteCache},
-		{name: "missing policy matcher", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: rc, PolicyMatcher: nil}, wantErr: ErrPBRMissingPolicy},
-		{name: "empty policy matcher rules", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: rc, PolicyMatcher: emptyMatcher}, wantErr: ErrPBREmptyPolicy},
+		{name: "unspecified 0.0.0.0 host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("0.0.0.0"), WANDevice: dev, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
+		{name: "loopback host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("127.0.0.1"), WANDevice: dev, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
+		{name: "missing WAN packet device", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: nil, PolicyMatcher: matcher}, wantErr: ErrPBRMissingWANDevice},
+		{name: "missing policy matcher", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: nil}, wantErr: ErrPBRMissingPolicy},
+		{name: "empty policy matcher rules", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: emptyMatcher}, wantErr: ErrPBREmptyPolicy},
 	}
 
 	for _, tt := range tests {
@@ -130,7 +122,6 @@ func TestService_PBREnableAndTeardown(t *testing.T) {
 
 	validWAN := netip.MustParseAddr("198.51.200.1")
 	dev := &mockPBRDevice{}
-	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
 	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
 		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
@@ -142,7 +133,6 @@ func TestService_PBREnableAndTeardown(t *testing.T) {
 		Enabled:       true,
 		HostWANIP:     validWAN,
 		WANDevice:     dev,
-		RouteCache:    rc,
 		PolicyMatcher: matcher,
 	}
 
@@ -186,7 +176,6 @@ func TestService_StartWithPBREnabled(t *testing.T) {
 
 	validWAN := netip.MustParseAddr("198.51.200.1")
 	dev := &mockPBRDevice{}
-	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
 	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
 		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
@@ -197,7 +186,6 @@ func TestService_StartWithPBREnabled(t *testing.T) {
 	svc.SetPBRConfig(PBRConfig{
 		HostWANIP:     validWAN,
 		WANDevice:     dev,
-		RouteCache:    rc,
 		PolicyMatcher: matcher,
 	})
 
@@ -257,27 +245,6 @@ func TestService_StartWithPBRDisabled_Default(t *testing.T) {
 	}
 }
 
-func TestMemoryRouteCache(t *testing.T) {
-	rc := NewMemoryRouteCache()
-	ip := netip.MustParseAddr("1.1.1.1")
-	sessionID := "sess-test-1"
-
-	if d := rc.Lookup(sessionID, ip); d != policy.Unknown {
-		t.Fatalf("expected policy.Unknown for unrecorded IP, got %v", d)
-	}
-
-	rc.Set(sessionID, ip, policy.Direct)
-	if d := rc.Lookup(sessionID, ip); d != policy.Direct {
-		t.Fatalf("expected policy.Direct after Set, got %v", d)
-	}
-
-	ip2 := netip.MustParseAddr("8.8.8.8")
-	rc.Set(sessionID, ip2, policy.Proxy)
-	if d := rc.Lookup(sessionID, ip2); d != policy.Proxy {
-		t.Fatalf("expected policy.Proxy after Set, got %v", d)
-	}
-}
-
 func TestService_StartWithPBR_DefaultDependencies(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
@@ -304,24 +271,6 @@ func TestService_StartWithPBR_DefaultDependencies(t *testing.T) {
 		t.Fatal("expected PBR to be enabled on service")
 	}
 
-	rc := svc.forwarder.RouteCache()
-	if rc == nil {
-		t.Fatal("expected forwarder route cache to be non-nil")
-	}
-	mem, ok := rc.(*MemoryRouteCache)
-	if !ok {
-		t.Fatalf("expected MemoryRouteCache, got %T", rc)
-	}
-
-	// The route cache is installed and empty: this build records no DNS evidence,
-	// so nothing can have decided anything for a session yet.
-	sessionID := "sess-deps-1"
-	if d := mem.Lookup(sessionID, netip.MustParseAddr("93.184.216.34")); d != policy.Unknown {
-		t.Fatalf("expected Unknown with no observation, got %v", d)
-	}
-	if mem.DNSLedger() != nil {
-		t.Error("startup installed a DNS evidence collector this build does not fill")
-	}
 	if cfg := svc.getPBRConfig(); cfg != nil && cfg.DNSResolver == nil {
 		t.Error("startup did not build the configured upstream resolver")
 	}
