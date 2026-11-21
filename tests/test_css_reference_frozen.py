@@ -48,17 +48,19 @@ def test_reference_is_the_original_505_bytes() -> None:
 
 
 def test_reference_has_no_settings_surface_rule() -> None:
-    leaked = css_surface.classes_in(_fixture_text()) & css_surface.SETTINGS_SURFACE_CLASSES
-    assert not leaked, f"new Settings classes were copied into the frozen reference: {sorted(leaked)}"
+    leaked = css_surface.classes_in(_fixture_text()) & css_surface.SURFACE_CLASSES
+    assert not leaked, (
+        f"new surface classes were copied into the frozen reference: {sorted(leaked)}"
+    )
 
 
 def test_exemption_is_exactly_the_difference_from_the_reference() -> None:
     modular = css_surface.classes_in("\n".join(_sheets().values()))
     reference = css_surface.classes_in(_fixture_text())
     new = modular - reference
-    assert css_surface.SETTINGS_SURFACE_CLASSES == new, {
-        "exempt but not new": sorted(css_surface.SETTINGS_SURFACE_CLASSES - new),
-        "new but not exempt": sorted(new - css_surface.SETTINGS_SURFACE_CLASSES),
+    assert css_surface.SURFACE_CLASSES == new, {
+        "exempt but not new": sorted(css_surface.SURFACE_CLASSES - new),
+        "new but not exempt": sorted(new - css_surface.SURFACE_CLASSES),
     }
 
 
@@ -73,16 +75,61 @@ def test_what_the_differential_compares_has_no_unexplained_class() -> None:
     assert not extra, f"classes compared against a reference that never had them: {sorted(extra)}"
 
 
-def test_legacy_view_removes_exactly_the_three_utilities_from_vpn() -> None:
+def test_legacy_view_sets_aside_the_surface_without_losing_a_legacy_selector() -> None:
+    """Every selector removed is a new-surface one, and the utilities are among them.
+
+    This is the property the exemption depends on: the differential may stop
+    comparing a selector only because that selector uses a class the reference
+    never had. A legacy selector leaving the compared view would silently delete
+    coverage, so it is asserted from the removed set rather than from a count.
+    """
     sheets = _sheets()
     view = css_surface.legacy_view(sheets)
-    norm = lambda css: " ".join(css_surface.strip_comments(css).split())  # noqa: E731
-    before = css_surface.selector_lists(sheets["vpn"])
-    after = css_surface.selector_lists(view["vpn"])
-    assert sorted(set(before) - set(after)) == sorted(css_surface.SETTINGS_UTILITY_SELECTORS)
-    assert len(before) - len(after) == len(css_surface.SETTINGS_UTILITY_SELECTORS)
+    for name in view:
+        before = set(css_surface.individual_selectors(sheets[name]))
+        after = set(css_surface.individual_selectors(view[name]))
+        removed = before - after
+        lost = sorted(
+            s
+            for s in removed
+            if not (set(css_surface._CLASS_RE.findall(s)) & css_surface.SURFACE_CLASSES)
+        )
+        assert not lost, f"{name}: legacy selectors left the compared view: {lost}"
+    removed_vpn = set(css_surface.individual_selectors(sheets["vpn"])) - set(
+        css_surface.individual_selectors(view["vpn"])
+    )
+    assert css_surface.SETTINGS_UTILITY_SELECTORS <= removed_vpn
+    # Sheets that define no new-surface class are compared byte for byte, so
+    # their rules are not merely present but unmodified.
     assert all(view[name] == sheets[name] for name in view if name != "vpn")
-    assert norm(view["vpn"]) != norm(sheets["vpn"])
+    assert "vpn" in view and view["vpn"] != sheets["vpn"]
+
+
+def test_a_selector_shared_with_a_new_class_keeps_its_legacy_half() -> None:
+    """A mixed selector list is rewritten, not deleted, so the legacy half stays compared.
+
+    `td[data-backend-name]:focus-visible` shares a rule with the new
+    `.vpn-focus-target:focus-visible`. Dropping the whole rule with the new
+    selector would take a legacy selector out of the differential unnoticed.
+    """
+    view = css_surface.legacy_view(_sheets())
+    assert "td[data-backend-name]:focus-visible" in css_surface.individual_selectors(view["vpn"])
+    assert ".vpn-focus-target:focus-visible" not in css_surface.individual_selectors(view["vpn"])
+
+
+def test_a_comment_between_rules_cannot_hide_the_selector_that_follows_it() -> None:
+    """Comment prose containing a comma must not be split as a selector list.
+
+    A new-surface comment followed by a legacy rule is the shape that made an
+    earlier version drop the rule after the comment.
+    """
+    css = (
+        "/* uses .vpn-health, .vpn-overview and their children */\n"
+        ".info-card-grid { gap: 4px; }\n"
+    )
+    view, removed = css_surface._drop_surface(css, css_surface.SURFACE_CLASSES)
+    assert removed == []
+    assert ".info-card-grid" in css_surface.individual_selectors(view)
 
 
 def test_a_legacy_value_changed_in_a_modular_sheet_stays_in_the_compared_view() -> None:
