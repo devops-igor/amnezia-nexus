@@ -842,7 +842,7 @@ def test_settings_two_tabs_do_not_undo_each_others_security_saves(
 FOCUS_CONTROLS = [
     ("#app_title", "#app_title"),
     ("#appearance_language", "#appearance_language"),
-    ("#policy_local_entries", "#policy_local_entries"),
+    ("#policy_proxy_exceptions", "#policy_proxy_exceptions"),
     ("#notificationSaveBtn", "#notificationSaveBtn"),
     ("#repoLink-amneziawg-go", "#repoLink-amneziawg-go"),
     ("#captcha_enabled", "#captcha_enabled + .switch-slider"),
