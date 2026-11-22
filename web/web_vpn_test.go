@@ -765,9 +765,10 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 
-	// 3. Assert stylesheet cache-busting (the release version, so a corrected
-	// stylesheet is fetched instead of served from a day-old cache entry) and
-	// cascade order across all shell and auth templates
+	// 3. Assert stylesheet cache identity across all shell and auth templates:
+	// every link carries one, and the stylesheet this change replaced carries the
+	// identity of its own bytes rather than the release version the predecessor
+	// also served (the release did not move, so ?v=<release> is the old URL).
 	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
 	for _, tmpl := range templatesToCheck {
 		tmplData, err := fs.ReadFile(templatesFS, tmpl)
@@ -776,14 +777,23 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		}
 		tmplStr := string(tmplData)
 		cleanTmplStr := stripHTMLComments(tmplStr)
+		links := stylesheetLinksOf(t, cleanTmplStr)
 		for _, name := range canonicalStylesheetOrder {
-			expectedLink := `href="/static/css/` + name + `.css?v=` + assetVersionAction + `"`
-			if !strings.Contains(cleanTmplStr, expectedLink) {
-				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
+			path := "/static/css/" + name + ".css"
+			form, ok := links[path]
+			if !ok {
+				t.Errorf("%s missing stylesheet link %s", tmpl, path)
+				continue
+			}
+			if form == refBare {
+				t.Errorf("%s links %s with no cache identity, so a corrected stylesheet can stay cached for up to a day", tmpl, path)
 			}
 		}
+		if form, ok := links["/static/css/vpn.css"]; ok && form != refAssetBytes {
+			t.Errorf("%s identifies vpn.css by %s; this delivery changed its bytes without moving the release", tmpl, form)
+		}
 
-		extracted := extractActiveStylesheetOrder(cleanTmplStr)
+		extracted := extractActiveStylesheetOrder(normalizeAssetActions(cleanTmplStr))
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Errorf("%s stylesheet link order mismatch: got %v, want %v", tmpl, extracted, canonicalStylesheetOrder)
 		}

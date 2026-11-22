@@ -463,10 +463,10 @@
 {{ end }}
 
 {{ define "scripts" }}
-<script src="/static/js/vpn/backends.js"></script>
-<script src="/static/js/vpn/health_problems.js"></script>
-<script src="/static/js/vpn/health_summary.js"></script>
-<script src="/static/js/vpn/charts.js"></script>
-<script src="/static/js/vpn/sessions.js"></script>
-<script src="/static/js/vpn/page.js"></script>
+<script src="{{ asset_url "/static/js/vpn/backends.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/health_problems.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/health_summary.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/charts.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/sessions.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>
 {{ end }}

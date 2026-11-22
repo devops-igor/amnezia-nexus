@@ -718,6 +718,9 @@ func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]str
 			}
 			return key
 		},
+		// vpn.html requests its changed scripts through asset_url; the fixture
+		// resolves them against the bytes this build ships.
+		"asset_url": AssetURL,
 	}).Parse(source)
 	if err != nil {
 		t.Fatal(err)

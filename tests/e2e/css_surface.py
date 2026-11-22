@@ -228,3 +228,22 @@ def legacy_view(sheets: dict[str, str]) -> dict[str, str]:
                 )
         out[name] = view
     return out
+
+
+# The computed-style differential takes the sheets it compares from the shell
+# template's link list, not from a fixed list, so a link the parser cannot read
+# removes a sheet from the comparison instead of failing. A stylesheet identified
+# by its own bytes carries a quoted argument inside a quoted attribute, which is
+# not valid HTML until that action is resolved, so this module resolves it — and
+# it lives here, beside the rest of the Playwright-free surface logic, so the
+# offline suite can check the resolver without a browser.
+ASSET_URL_ACTION = re.compile(r'\{\{\s*asset_url\s+"(/static/css/[\w.-]+)"\s*\}\}')
+
+
+def resolve_asset_actions(html: str) -> str:
+    """Replace each content-derived stylesheet action with its path plus a sentinel.
+
+    The sentinel is deliberately not a version: it only keeps the tag parseable
+    and marks that the real identity comes from the stylesheet's bytes.
+    """
+    return ASSET_URL_ACTION.sub(r"\1?v=@asset-bytes@", html)

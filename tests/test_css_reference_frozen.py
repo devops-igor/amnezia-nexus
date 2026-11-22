@@ -41,6 +41,53 @@ def _fixture_text() -> str:
     return FIXTURE.read_text(encoding="utf-8")
 
 
+# The differential takes the sheets it compares from the shell template's link
+# list rather than from SHEETS, so a link the parser cannot read silently removes
+# a sheet from the comparison instead of failing. A stylesheet identified by its
+# own bytes carries a quoted argument inside a quoted attribute, which is not
+# valid HTML until that action is resolved; these two checks keep the resolver
+# honest and keep the parsed list equal to the cascade the shell declares.
+def test_stylesheet_action_resolver_keeps_the_tag_readable() -> None:
+    source = (
+        '<link rel="stylesheet" href="{{ asset_url "/static/css/vpn.css" }}">\n'
+        '<link rel="stylesheet" href="/static/css/settings.css?v={{ .app_version }}">'
+    )
+    resolved = css_surface.resolve_asset_actions(source)
+    assert "asset_url" not in resolved, "a content-derived action must not survive into the parser"
+    assert "/static/css/vpn.css?v=@asset-bytes@" in resolved
+
+
+def test_shell_stylesheet_link_parser_reads_every_cascade_entry() -> None:
+    # The differential builds its sheet list from the shell template's links, so
+    # a link the parser cannot read drops a sheet from the comparison silently.
+    # This reproduces the parse over the shipped template with the same code.
+    template = (REPO_ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+    from html.parser import HTMLParser
+
+    class Parser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stylesheets: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag.lower() != "link":
+                return
+            attr = {k.lower(): (v.strip() if isinstance(v, str) else "") for k, v in attrs}
+            if attr.get("rel", "").lower() != "stylesheet" or "disabled" in attr:
+                return
+            if attr.get("media", "").lower() == "print":
+                return
+            m = re.search(r"/static/css/(\w+\.css)", attr.get("href", ""))
+            if m:
+                self.stylesheets.append(m.group(1))
+
+    parser = Parser()
+    parser.feed(css_surface.resolve_asset_actions(re.sub(r"<!--[\s\S]*?-->", "", template)))
+    assert parser.stylesheets == [f"{name}.css" for name in SHEETS], (
+        "a stylesheet link the differential would not see: " f"{parser.stylesheets}"
+    )
+
+
 def test_reference_is_the_original_505_bytes() -> None:
     data = FIXTURE.read_bytes()
     assert len(data) == FIXTURE_BYTES

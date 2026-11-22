@@ -166,8 +166,17 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmplStr := string(tmplSource)
-	if !strings.Contains(tmplStr, `<script src="/static/js/vpn/page.js"></script>`) {
-		t.Errorf("expected rendered templates/vpn.html to contain '<script src=\"/static/js/vpn/page.js\"></script>'")
+	// The controller is requested through its content-derived URL: the release
+	// did not move in this change, so a bare path or ?v=<release> is the URL the
+	// predecessor served and a returning browser keeps running that controller
+	// against this markup.
+	if !strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>`) {
+		t.Errorf("expected templates/vpn.html to request the VPN controller through its asset bytes: %s",
+			`<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>`)
+	}
+	if strings.Contains(tmplStr, `<script src="/static/js/vpn/page.js"></script>`) {
+		t.Errorf("templates/vpn.html still requests /static/js/vpn/page.js bare, which is the URL the " +
+			"predecessor served and a warm cache still holds")
 	}
 
 	inlineScriptRegex := regexp.MustCompile(`(?s)<script(?:\s+type="[^"]*")?>\s*[^<]`)

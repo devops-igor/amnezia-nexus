@@ -187,6 +187,8 @@ func TestQRTemplateExecution(t *testing.T) {
 	funcMap := template.FuncMap{
 		"_":        func(k string, args ...any) string { return k },
 		"has_role": func(u any, roles ...string) bool { return true },
+		// base.html requests the changed stylesheet's URL from its bytes.
+		"asset_url": AssetURL,
 		"json": func(v any) (string, error) {
 			b, err := json.Marshal(v)
 			return string(b), err

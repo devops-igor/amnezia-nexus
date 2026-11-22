@@ -908,6 +908,8 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 	funcMap := template.FuncMap{
 		"_": func(k string) string { return k },
 		"t": func(k string) string { return k },
+		// base.html requests the changed stylesheet's URL from its bytes.
+		"asset_url": AssetURL,
 		"safe_js": func(v any) template.JS {
 			switch val := v.(type) {
 			case string:
