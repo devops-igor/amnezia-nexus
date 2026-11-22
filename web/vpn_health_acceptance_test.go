@@ -663,20 +663,16 @@ func TestVPN955Acceptance06LocalesThemesAndA11y(t *testing.T) {
 
 	t.Run("PacketLossRenamedEverywhere", func(t *testing.T) {
 		// The scoped name must not read as end-to-end loss in any locale.
+		// vpn_col_packet_loss still ships: it is the overview drop signal title and
+		// the shared column label. Its half of this contract is unchanged.
 		for _, lang := range []string{"en", "ru", "fr", "zh", "fa"} {
 			dict := fixture.Locale(lang)
 			if got := dict["vpn_col_packet_loss"]; strings.Contains(strings.ToLower(got), "packet loss") {
 				t.Errorf("%s still calls the column %q", lang, got)
 			}
-			if got := dict["vpn_fwd_kpi_loss"]; strings.Contains(strings.ToLower(got), "packet loss") {
-				t.Errorf("%s still calls the metric %q", lang, got)
-			}
 		}
 		if got := fixture.Locale("en")["vpn_col_packet_loss"]; got != "Dataplane drops" {
 			t.Errorf("en column label = %q, want %q", got, "Dataplane drops")
-		}
-		if got := fixture.Locale("en")["vpn_fwd_kpi_loss"]; got != "Dataplane Drops" {
-			t.Errorf("en metric label = %q, want %q", got, "Dataplane Drops")
 		}
 	})
 

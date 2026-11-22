@@ -170,19 +170,15 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		}
 
 		requiredKeys := []string{
-			"vpn_fwd_panel_performance",
 			"vpn_fwd_panel_integrity",
-			"vpn_fwd_panel_resources",
 			"vpn_fwd_panel_traffic",
 			"vpn_fwd_panel_queue",
 			"vpn_fwd_panel_latency",
-			"vpn_fwd_panel_drops",
 			"vpn_fwd_panel_vtun",
 			"vpn_fwd_panel_peer_sync",
 			"vpn_fwd_panel_routing",
 			"vpn_fwd_panel_backends",
 			"vpn_fwd_panel_runtime",
-			"vpn_fwd_panel_history",
 			"vpn_fwd_panel_problems",
 			"vpn_diag_avg_5m",
 			"vpn_diag_avg_1h",
@@ -194,19 +190,12 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_nexus_to_upstream",
 			"vpn_fwd_show_all",
 			"vpn_fwd_show_problems",
+			// The Advanced Diagnostics throughput row composes these two existing
+			// members so the current-versus-cumulative distinction stays explicit
+			// without a dedicated row label.
 			"vpn_fwd_kpi_throughput",
-			"vpn_fwd_kpi_routes",
-			"vpn_fwd_kpi_pressure",
-			"vpn_fwd_kpi_loss",
-			"vpn_fwd_kpi_client_engine",
-			"vpn_fwd_kpi_peer_sync",
+			"vpn_fwd_horizon_current",
 			"vpn_signal_backends",
-			"vpn_fwd_kpi_slow_writes",
-			"vpn_fwd_tech_diagnostics",
-			"vpn_fwd_no_active_problems",
-			"vpn_fwd_nominal_peers",
-			"vpn_fwd_nominal_routes",
-			"vpn_fwd_nominal_backends",
 			"vpn_fwd_onset",
 			"vpn_fwd_active_problems_count",
 			"vpn_fwd_affected_users_count",

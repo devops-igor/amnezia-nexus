@@ -733,7 +733,6 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	// Every relocated diagnostic value must keep its localized label, now as a
 	// <dt>/<dd> pair inside Advanced Diagnostics rather than a dense panel row.
 	fields := map[string]string{
-		"vpn-diag-throughput":      "vpn_diag_throughput_now",
 		"vpn-diag-ewma5m":          "vpn_diag_avg_5m",
 		"vpn-diag-ewma1h":          "vpn_diag_avg_1h",
 		"vpn-diag-queue-occ":       "vpn_forwarder_queue",
@@ -759,6 +758,14 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	fieldPattern := regexp.MustCompile(`<dt>([^<]+)</dt><dd[^>]*id="([^"]+)"`)
 	for _, match := range fieldPattern.FindAllStringSubmatch(rendered, -1) {
 		labels[match[2]] = html.UnescapeString(match[1])
+	}
+	// The throughput row labels itself by composing two existing members rather
+	// than a dedicated row key. Asserted as the composition, not the single key:
+	// the current / cumulative distinction has to stay explicit in every locale.
+	wantThroughputLabel := dict["vpn_fwd_kpi_throughput"] + " (" + dict["vpn_fwd_horizon_current"] + ")"
+	if labels["vpn-diag-throughput"] != wantThroughputLabel {
+		return fmt.Errorf("static label vpn-diag-throughput: got %q, want %q",
+			labels["vpn-diag-throughput"], wantThroughputLabel)
 	}
 	for id, key := range fields {
 		if labels[id] != dict[key] {

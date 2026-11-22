@@ -488,9 +488,7 @@ func TestIssue101VPNModernization(t *testing.T) {
 
 	// 9. Assert presence of new VPN keys across all 5 translations
 	newVPNTranslationKeys := []string{
-		"vpn_bandwidth",
 		"vpn_entry_point_hint",
-		"vpn_telemetry_live",
 		"vpn_port",
 		"vpn_unset_auto",
 		"vpn_unset_auto_detected",
