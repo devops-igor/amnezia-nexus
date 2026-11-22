@@ -34,7 +34,7 @@ var coreScripts = []string{
 }
 
 func getVPNFuncMap() template.FuncMap {
-	return template.FuncMap{
+	return withAssetURL(template.FuncMap{
 		"_": func(key string, args ...any) string {
 			return key
 		},
@@ -47,10 +47,7 @@ func getVPNFuncMap() template.FuncMap {
 		"safe_js": func(s any) template.JS {
 			return template.JS(fmt.Sprint(s))
 		},
-		// The page asks for each changed asset's URL from its bytes, so the
-		// fixture supplies the production resolver rather than a stand-in.
-		"asset_url": AssetURL,
-	}
+	})
 }
 
 // vpnTestAppVersion stands in for config.AppVersion, which this package cannot

@@ -711,17 +711,14 @@ func vpnDiagnosticsTranslationsJS(t *testing.T, lang string) string {
 
 func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]string) string {
 	t.Helper()
-	parsed, err := template.New("vpn.html").Funcs(template.FuncMap{
+	parsed, err := template.New("vpn.html").Funcs(withAssetURL(template.FuncMap{
 		"_": func(key string) string {
 			if value, ok := dict[key]; ok {
 				return value
 			}
 			return key
 		},
-		// vpn.html requests its changed scripts through asset_url; the fixture
-		// resolves them against the bytes this build ships.
-		"asset_url": AssetURL,
-	}).Parse(source)
+	})).Parse(source)
 	if err != nil {
 		t.Fatal(err)
 	}
