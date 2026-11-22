@@ -172,6 +172,10 @@ type VPNTestFixture struct {
 	PageJS           string
 	ParsedDOM        *xhtml.Node
 	MockFetches      map[string]string
+	// TablesJS is the real NexusTable controller, loaded only when a harness asks
+	// for it. It must be read separately because the fixture's own script list is
+	// the six VPN modules and tables.js ships in base.html's head.
+	TablesJS string
 }
 
 // JSDOMHarnessOptions configures a JSDOM evaluation harness.
@@ -181,7 +185,13 @@ type JSDOMHarnessOptions struct {
 	Direction        string
 	IncludeFakeClock bool
 	IncludeFetchMock bool
-	ExtraJS          string
+	// IncludeNexusTable installs the real tables.js before the companion modules,
+	// the position base.html gives it. Without it no NexusTable exists, so no row
+	// is ever hidden by a search term, a status filter or pagination: a test of a
+	// reveal that then asserted focus on a "visible" row would be asserting
+	// against a table that never hid anything.
+	IncludeNexusTable bool
+	ExtraJS           string
 }
 
 // NewVPNTestFixture initializes a VPN test fixture with loaded templates, styles, and parsed DOM.
@@ -280,6 +290,15 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	}
 	pageJS := string(pageBytes)
 
+	tablesBytes, err := readFixtureStaticAsset(staticFS, "static/js/tables.js")
+	if err != nil {
+		t.Fatalf("failed to read static tables asset %s: %v", "static/js/tables.js", err)
+	}
+	if len(strings.TrimSpace(string(tablesBytes))) == 0 {
+		t.Fatalf("failed to read static tables asset %s: %v", "static/js/tables.js", errors.New("empty content"))
+	}
+	tablesJS := string(tablesBytes)
+
 	return &VPNTestFixture{
 		t:                t,
 		NodePath:         nodePath,
@@ -291,6 +310,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 		ChartsJS:         chartsJS,
 		BackendsJS:       backendsJS,
 		PageJS:           pageJS,
+		TablesJS:         tablesJS,
 		ParsedDOM:        doc,
 		MockFetches:      make(map[string]string),
 	}
@@ -383,6 +403,18 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if htmlBody == "" {
 		htmlBody = f.TemplateHTML
 	}
+	tablesScript := ""
+	if opts.IncludeNexusTable {
+		if len(strings.TrimSpace(f.TablesJS)) == 0 {
+			f.t.Fatalf("failed to read static tables asset %s: %v", "js/tables.js", errors.New("empty content"))
+		}
+		// tables.js is a UMD module: under CommonJS it assigns module.exports and
+		// never touches the global object. In a script tag the module system is
+		// absent, so it takes the `root.NexusTable = NexusTable` branch. The tag is
+		// emitted literally instead of as an addScript argument so the wrapped
+		// global assignment below is not needed to fake that branch.
+		tablesScript = f.TablesJS
+	}
 	var b strings.Builder
 	b.WriteString(jsdomBootstrapSnippet + "\n")
 	if opts.IncludeFakeClock {
@@ -449,6 +481,7 @@ addScript(%q);
 addScript(%q);
 addScript(%q);
 addScript(%q);
+addScript(%q);
 ['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
     Object.defineProperty(w, prop, {
         get() { return w.eval(prop); },
@@ -456,7 +489,7 @@ addScript(%q);
         configurable: true
     });
 });
-`, docHTML, f.TranslationsJS(lang), f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
+`, docHTML, f.TranslationsJS(lang), tablesScript, f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
