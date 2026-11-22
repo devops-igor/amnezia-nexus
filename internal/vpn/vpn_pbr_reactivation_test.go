@@ -144,7 +144,10 @@ func withNameOwnedWANDevice(t *testing.T, reg *nameRegistry) {
 // The generation carries the configuration hash a syncer computes for
 // repeatedEnableSettings, because a stored generation without it is *foreign* to
 // the selected configuration and must not be used as its baseline (#678 F678-05).
-func seededStore(t *testing.T) policy.Store {
+//
+// It returns the concrete *memoryStore so a test can also read the commit counter
+// and prove the durable commit path was really invoked.
+func seededStore(t *testing.T) *memoryStore {
 	t.Helper()
 	m := &memoryStore{}
 	gen := &policy.Generation{
@@ -155,7 +158,7 @@ func seededStore(t *testing.T) policy.Store {
 		CIDRs:         []string{"203.0.113.0/24"},
 	}
 	gen.ContentHash = policy.ComputeContentHash(gen.CIDRs)
-	m.committed = gen
+	m.seed(gen)
 	return m
 }
 
@@ -211,6 +214,13 @@ func TestRepeatedEnableDoesNotRebuildWANDevice(t *testing.T) {
 
 	// Second enable on the same Service with policy already on.
 	err := activateOnce(svc, settings, store)
+
+	// The double must keep proving the durable commit path is really invoked:
+	// seeding does not count as a commit, so a non-zero count can only come from a
+	// real Commit call made by a sync cycle.
+	if store.commitCount() < 1 {
+		t.Fatal("no durable commit was made during activation; the store double would no longer prove the commit path runs")
+	}
 
 	// The defect's signature must be gone.
 	if errors.Is(err, errDeviceBusy) {

@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,24 +21,82 @@ import (
 // memoryStore is a policy.Store backed by memory. It proves the durable commit path
 // is really invoked and lets a test simulate a stored generation without touching
 // the filesystem.
+//
+// It is safe for concurrent use, and it has to be: a durable store is shared by
+// design. Activation registers a syncer whose Run loop primes its own baseline from
+// this store in the background, while a later enabled save runs a synchronous cycle
+// (and therefore a commit) against the same store on the caller's goroutine.
+// Since the sync cycle no longer waits for a network fetch, those two really do run
+// at the same time, so the double models a durable store instead of depending on
+// the two goroutines happening not to overlap.
 type memoryStore struct {
+	mu        sync.Mutex
 	committed *policy.Generation
 	loadErr   error
 	commits   int
 }
 
 func (m *memoryStore) Commit(_ context.Context, gen *policy.Generation) error {
-	m.commits++
+	// Mirror the durable store's Commit: the derived fields are written onto the
+	// candidate the caller owns, and the bytes the store keeps are a separate value.
+	// A real store serializes, so the caller retains its own object and a concurrent
+	// load can never observe a candidate that is still being built.
 	gen.ContentHash = policy.ComputeContentHash(gen.CIDRs)
-	m.committed = gen
+	gen.CIDRCount = len(gen.CIDRs)
+	stored := cloneGeneration(gen)
+	m.mu.Lock()
+	m.commits++
+	m.committed = stored
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *memoryStore) Load(_ context.Context) (*policy.Generation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.loadErr != nil {
 		return nil, m.loadErr
 	}
-	return m.committed, nil
+	if m.committed == nil {
+		return nil, nil
+	}
+	// A durable load unmarshals into a value the caller owns, so each caller gets
+	// its own copy rather than a pointer another goroutine may be replacing.
+	return cloneGeneration(m.committed), nil
+}
+
+// commitCount reports how many durable commits this store accepted. It is how a
+// test proves the commit path was really invoked rather than assuming it.
+func (m *memoryStore) commitCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.commits
+}
+
+// seed stores gen as the generation a later Load returns, the way a store that
+// already holds durable state does. It takes the same lock as the concurrent
+// methods so a seeded double is never written outside its own synchronisation.
+func (m *memoryStore) seed(gen *policy.Generation) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.committed = cloneGeneration(gen)
+}
+
+// cloneGeneration copies a generation the way a durable store's serialize-and-reload
+// cycle does, so no two goroutines share a mutable generation.
+func cloneGeneration(gen *policy.Generation) *policy.Generation {
+	if gen == nil {
+		return nil
+	}
+	out := *gen
+	out.CIDRs = append([]string(nil), gen.CIDRs...)
+	if gen.SourcesMeta != nil {
+		out.SourcesMeta = make(map[string]policy.SourceMeta, len(gen.SourcesMeta))
+		for id, meta := range gen.SourcesMeta {
+			out.SourcesMeta[id] = meta
+		}
+	}
+	return &out
 }
 
 // serviceForActivation builds a VPN service. NewVPNService(nil, nil) already
