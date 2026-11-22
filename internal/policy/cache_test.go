@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// TestCache_ErrorHandling covers the fail-closed side of the loader. The positive
+// predecessor case lives in TestFileStoreLoadsPredecessorGeneration, and both must
+// hold: a reader that accepts everything is as broken as one that refuses an
+// upgrade.
 func TestCache_ErrorHandling(t *testing.T) {
 	tempDir := t.TempDir()
 	store := NewFileStore(tempDir)

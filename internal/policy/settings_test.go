@@ -1,7 +1,10 @@
 package policy
 
 import (
+	"context"
 	"encoding/json"
+	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -246,6 +249,9 @@ func TestValidateAllowsDisabledWithConfiguredExceptions(t *testing.T) {
 	}
 }
 
+// A shorter exception list is a deliberate operator edit, not a suspicious
+// download. The derived configuration therefore carries no truncation guard, and
+// the cycle's only count-based refusal is the zero-rule one.
 func TestSyncConfigUsesProductionBounds(t *testing.T) {
 	s := DefaultSettings()
 	s.ProxyExceptions = []string{"203.0.113.0/24"}
@@ -258,12 +264,81 @@ func TestSyncConfigUsesProductionBounds(t *testing.T) {
 	if cfg.RefreshInterval != 3*time.Hour {
 		t.Errorf("RefreshInterval = %v, want 3h", cfg.RefreshInterval)
 	}
-	if cfg.ForceShrink {
-		t.Error("ForceShrink = true; a shrunk rule set must fail rather than replace a valid policy")
-	}
 	wantParse := DefaultParseLimits()
 	if cfg.ParseLimits != wantParse {
 		t.Errorf("ParseLimits = %+v, want production defaults %+v", cfg.ParseLimits, wantParse)
+	}
+}
+
+// A valid reduction of the operator's own list must reach the matcher, while the
+// zero-rule refusal must still fire. Both directions are asserted against the real
+// syncer and store, so neither can pass by the other's absence.
+func TestSyncerAcceptsExplicitShrinkAndStillRefusesZeroRules(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+	matcher := NewMatcher()
+
+	publish := func(t *testing.T, entries ...string) (SyncResult, error) {
+		t.Helper()
+		settings := DefaultSettings()
+		settings.Enabled = true
+		settings.ProxyExceptions = entries
+		cfg, err := settings.SyncConfig()
+		if err != nil {
+			t.Fatalf("SyncConfig(%v) = %v", entries, err)
+		}
+		syncer, err := NewSyncer(matcher, store, cfg)
+		if err != nil {
+			t.Fatalf("NewSyncer: %v", err)
+		}
+		return syncer.SyncOnce(context.Background())
+	}
+
+	// Four distinct exceptions activate.
+	if _, err := publish(t, "198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"); err != nil {
+		t.Fatalf("four-entry activation: %v", err)
+	}
+	if got := matcher.Current().CIDRCount(); got != 4 {
+		t.Fatalf("published count = %d, want 4", got)
+	}
+
+	// Removing three of the four is the ordinary edit this list exists for. It must
+	// publish, not be refused as a truncated download.
+	res, err := publish(t, "198.51.100.1")
+	if err != nil {
+		t.Fatalf("a valid reduction to one exception must publish; the only list guard left is the zero-rule one: %v", err)
+	}
+	if !res.Published {
+		t.Fatal("the reduction published nothing")
+	}
+	if got := matcher.Current(); got.CIDRCount() != 1 || !got.MatchIPv4(netip.MustParseAddr("198.51.100.1")) {
+		t.Fatalf("after the reduction the matcher holds %d prefixes and match(198.51.100.1)=%t, want 1 and true",
+			got.CIDRCount(), got.MatchIPv4(netip.MustParseAddr("198.51.100.1")))
+	}
+	// The removed prefixes are gone from the live policy, which is the point of the
+	// edit: they return to the classifier instead of staying forced through PROXY.
+	for _, removed := range []string{"198.51.100.2", "198.51.100.3", "198.51.100.4"} {
+		if matcher.Current().MatchIPv4(netip.MustParseAddr(removed)) {
+			t.Errorf("removed exception %s still matches after the reduction", removed)
+		}
+	}
+
+	// The negative control: an empty list is still refused, and the refusal must not
+	// disturb the one prefix that is live.
+	settings := DefaultSettings()
+	settings.Enabled = true
+	emptyCfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig for an empty list: %v", err)
+	}
+	emptySyncer, err := NewSyncer(matcher, store, emptyCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	if _, err := emptySyncer.SyncOnce(context.Background()); err == nil {
+		t.Fatal("an empty exception list published a snapshot; the zero-rule refusal must still fire")
+	}
+	if got := matcher.Current().CIDRCount(); got != 1 {
+		t.Fatalf("live count after the refused empty publish = %d, want the surviving 1", got)
 	}
 }
 
@@ -362,6 +437,174 @@ func TestSettingsLoadsTheLegacyExceptionKey(t *testing.T) {
 	}
 }
 
+// An explicitly empty current list is operator intent, and the decoder must not
+// turn it into "the key was absent" and substitute the predecessor list. The
+// consequence is not cosmetic: the handler treats a nil list as an omission and
+// merges the stored entries back, so clearing the only exception textarea answered
+// 200 while the old overrides stayed installed.
+//
+// Each case names the decoded list AND its nilness, because only the nilness
+// distinguishes "the operator cleared this" from "there was nothing to read" for
+// every consumer downstream of the decoder.
+func TestSettingsDecodeSeparatesEmptyListFromAbsentKey(t *testing.T) {
+	cases := []struct {
+		name     string
+		stored   string
+		wantList []string
+		wantNil  bool
+	}{
+		{
+			name:     "explicit_empty_current_key",
+			stored:   `{"enabled":true,"proxy_exceptions":[],"sync_interval_seconds":3600}`,
+			wantList: []string{},
+			wantNil:  false,
+		},
+		{
+			name:     "absent_current_key_falls_back",
+			stored:   `{"enabled":true,"local_entries":["203.0.113.0/24"],"sync_interval_seconds":3600}`,
+			wantList: []string{"203.0.113.0/24"},
+			wantNil:  false,
+		},
+		{
+			name:     "null_current_key_falls_back_to_predecessor",
+			stored:   `{"enabled":true,"proxy_exceptions":null,"local_entries":["203.0.113.0/24"],"sync_interval_seconds":3600}`,
+			wantList: []string{"203.0.113.0/24"},
+			wantNil:  false,
+		},
+		{
+			name:     "both_keys_read_current",
+			stored:   `{"proxy_exceptions":[],"local_entries":["203.0.113.0/24"],"sync_interval_seconds":3600}`,
+			wantList: []string{},
+			wantNil:  false,
+		},
+		{
+			name:     "no_list_key_at_all",
+			stored:   `{"enabled":true,"sync_interval_seconds":3600}`,
+			wantList: nil,
+			wantNil:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var decoded Settings
+			if err := json.Unmarshal([]byte(tc.stored), &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := decoded.ProxyExceptions == nil; got != tc.wantNil {
+				t.Fatalf("ProxyExceptions nil = %t, want %t; the decoder must preserve the difference "+
+					"between an empty list the operator saved and no list at all", got, tc.wantNil)
+			}
+			if !slices.Equal(decoded.ProxyExceptions, tc.wantList) {
+				t.Fatalf("ProxyExceptions = %v, want %v", decoded.ProxyExceptions, tc.wantList)
+			}
+			// An explicit empty record must survive Normalize unchanged: that is the
+			// value the handler's merge step reads as a deliberate removal.
+			if !tc.wantNil && len(tc.wantList) == 0 && decoded.Normalize().ProxyExceptions == nil {
+				t.Error("Normalize turned an explicit empty list into nil")
+			}
+		})
+	}
+}
+
+// A JSON body whose current key is the only list and holds an empty array must
+// validate and derive zero prefixes rather than erroring, so the clear reaches the
+// runtime guards instead of being rejected as malformed.
+func TestSettingsExplicitEmptyListValidates(t *testing.T) {
+	const stored = `{"enabled":true,"proxy_exceptions":[],"sync_interval_seconds":3600}`
+	var decoded Settings
+	if err := json.Unmarshal([]byte(stored), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("an explicit empty list must be a valid record (the runtime owns the refusal): %v", err)
+	}
+	cfg, err := decoded.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	if len(cfg.LocalRules.CIDRs) != 0 {
+		t.Fatalf("derived %d prefixes from an empty list, want 0", len(cfg.LocalRules.CIDRs))
+	}
+}
+
+// A predecessor record's exception list accepted domain lines beside prefixes.
+// Those lines cannot be applied by this build, and copying them into an IPv4-only
+// field made whole-record validation reject the record — which took the operator's
+// working IPv4 policy down with an inert domain entry.
+//
+// The decode boundary therefore keeps the prefixes and separates the rest. Both
+// halves are asserted, so a fix that silently dropped the whole list would fail
+// just as loudly as one that copied it through.
+func TestSettingsLegacyMixedEntriesKeepIPv4AndRetireDomains(t *testing.T) {
+	const stored = `{"enabled":true,"preset":"aggregate",` +
+		`"local_entries":["198.51.100.0/24","example.com","203.0.113.7"],` +
+		`"sync_interval_seconds":3600}`
+
+	var decoded Settings
+	if err := json.Unmarshal([]byte(stored), &decoded); err != nil {
+		t.Fatalf("a predecessor record with a mixed list must still load: %v", err)
+	}
+	want := []string{"198.51.100.0/24", "203.0.113.7"}
+	if !slices.Equal(decoded.ProxyExceptions, want) {
+		t.Fatalf("loaded exceptions = %v, want only the IPv4 entries %v", decoded.ProxyExceptions, want)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("the record must be usable so the operator keeps their IPv4 policy: %v", err)
+	}
+	cfg, err := decoded.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	if len(cfg.LocalRules.CIDRs) != 2 {
+		t.Fatalf("derived %d prefixes, want the 2 surviving IPv4 entries", len(cfg.LocalRules.CIDRs))
+	}
+
+	// The retired content is reported from the same stored bytes, so the surface
+	// that shows the record can explain the shorter list.
+	retirement := ReviewStoredRecord([]byte(stored))
+	if !slices.Equal(retirement.NonIPv4Entries, []string{"example.com"}) {
+		t.Fatalf("retired entries = %v, want [example.com]", retirement.NonIPv4Entries)
+	}
+	if retirement.SourceSelection != "aggregate" {
+		t.Errorf("retired source selection = %q, want %q", retirement.SourceSelection, "aggregate")
+	}
+
+	// A domain-only predecessor list leaves no usable prefix. The record is then
+	// empty for this build, which the runtime's zero-rule guard reports — it is not
+	// a validation failure that hides the reason.
+	const domainsOnly = `{"enabled":true,"local_entries":["example.com"],"sync_interval_seconds":3600}`
+	var empty Settings
+	if err := json.Unmarshal([]byte(domainsOnly), &empty); err != nil {
+		t.Fatalf("a domain-only predecessor list must load: %v", err)
+	}
+	if len(empty.ProxyExceptions) != 0 {
+		t.Fatalf("domain-only list kept %v, want nothing applicable", empty.ProxyExceptions)
+	}
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("the empty-for-this-build record must validate; the zero-rule refusal owns it: %v", err)
+	}
+	if got := ReviewStoredRecord([]byte(domainsOnly)).NonIPv4Entries; !slices.Equal(got, []string{"example.com"}) {
+		t.Errorf("retired entries for a domain-only list = %v, want [example.com]", got)
+	}
+}
+
+// A record already written in the current shape retires nothing, so an ordinary
+// upgrade and an ordinary save raise no warning.
+func TestReviewStoredRecordReportsNothingForCurrentShape(t *testing.T) {
+	current := []byte(`{"enabled":true,"proxy_exceptions":["198.51.100.0/24"],"sync_interval_seconds":3600}`)
+	if retirement := ReviewStoredRecord(current); !retirement.Empty() {
+		t.Fatalf("current-shape record reported a retirement: %+v (%s)", retirement, retirement.Summary())
+	}
+	prefixOnlyLegacy := []byte(`{"enabled":true,"local_entries":["198.51.100.0/24"],"sync_interval_seconds":3600}`)
+	if retirement := ReviewStoredRecord(prefixOnlyLegacy); !retirement.Empty() {
+		t.Fatalf("prefix-only predecessor record reported a retirement: %+v", retirement)
+	}
+	if retirement := ReviewStoredRecord([]byte(`not json`)); !retirement.Empty() {
+		t.Fatalf("unparsable bytes produced a retirement claim: %+v", retirement)
+	}
+}
+
 func TestSettingsKeyValue(t *testing.T) {
 	// The key is persistence-visible: changing it orphans an operator's saved
 	// configuration, so pin it.
@@ -405,19 +648,25 @@ func TestLegacyRecordKeepsExceptionsAndExplainsDroppedFields(t *testing.T) {
 		t.Fatalf("parsed %d prefixes, want 2", len(prefixes))
 	}
 
-	// The dropped content is reported, not silently discarded.
-	var legacyRecord legacySettings
-	if err := json.Unmarshal([]byte(legacy), &legacyRecord); err != nil {
-		t.Fatalf("unmarshal legacy shape: %v", err)
+	// The dropped content is reported, not silently discarded, and it is reported
+	// from the stored bytes by the reader the production surfaces use.
+	retirement := ReviewStoredRecord([]byte(legacy))
+	if retirement.SourceSelection != "aggregate" {
+		t.Errorf("retirement source selection = %q, want %q", retirement.SourceSelection, "aggregate")
 	}
-	dropped := migrateLegacyRecord(legacyRecord)
-	if len(dropped) != 3 {
-		t.Fatalf("migration report = %v, want 3 dropped items (selection, custom URLs, exclusions)", dropped)
+	if retirement.CustomURLCount != 1 {
+		t.Errorf("retirement custom URL count = %d, want 1", retirement.CustomURLCount)
 	}
-	joined := strings.Join(dropped, "; ")
+	if retirement.ExcludedDomainCount != 1 {
+		t.Errorf("retirement excluded domain count = %d, want 1", retirement.ExcludedDomainCount)
+	}
+	if len(retirement.NonIPv4Entries) != 0 {
+		t.Errorf("a prefix-only exception list retired %v, want nothing", retirement.NonIPv4Entries)
+	}
+	joined := retirement.Summary()
 	for _, want := range []string{"aggregate", "custom list URL", "excluded domain"} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("migration report %q does not mention %q", joined, want)
+			t.Errorf("retirement summary %q does not mention %q", joined, want)
 		}
 	}
 }
@@ -425,11 +674,8 @@ func TestLegacyRecordKeepsExceptionsAndExplainsDroppedFields(t *testing.T) {
 // A legacy record with nothing but operator addresses reports nothing dropped,
 // so the ordinary upgrade path carries no alarming notice.
 func TestLegacyRecordWithOnlyExceptionsReportsNoLoss(t *testing.T) {
-	legacyRecord := legacySettings{
-		Enabled:      true,
-		LocalEntries: []string{"203.0.113.0/24"},
-	}
-	if dropped := migrateLegacyRecord(legacyRecord); len(dropped) != 0 {
-		t.Fatalf("migration report = %v, want none", dropped)
+	const prefixOnly = `{"enabled":true,"local_entries":["203.0.113.0/24"]}`
+	if retirement := ReviewStoredRecord([]byte(prefixOnly)); !retirement.Empty() {
+		t.Fatalf("migration report = %+v, want none", retirement)
 	}
 }

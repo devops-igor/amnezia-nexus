@@ -436,7 +436,53 @@
         setPolicyElementText('policyCdnNotice', renderPolicyCDNNotice(cdn));
     }
 
+    // renderPolicyRetirement states what the stored record held and this build
+    // could not carry. It is empty when the record carried nothing retired, so an
+    // ordinary prefix-only upgrade shows no warning at all.
+    //
+    // Without it an operator whose predecessor list held domain lines would see a
+    // shorter list than they saved and no explanation, which reads as lost
+    // configuration. The text names the retired entries themselves rather than only
+    // counting them, because the operator is the one who recognises what they wrote.
+    function renderPolicyRetirement(record) {
+        var notice = policyElement('policyLegacyNotice');
+        if (!notice) {
+            return;
+        }
+        var retired = record && record.retired ? record.retired : null;
+        if (!retired) {
+            notice.textContent = '';
+            return;
+        }
+        var parts = [];
+        var nonIPv4 = Array.isArray(retired.non_ipv4_entries) ? retired.non_ipv4_entries : [];
+        if (nonIPv4.length > 0) {
+            parts.push(policyText('policy_legacy_entries_retired')
+                .replace('{entries}', nonIPv4.join(', ')));
+        }
+        if (retired.source_selection) {
+            parts.push(policyText('policy_legacy_source_retired')
+                .replace('{source}', String(retired.source_selection)));
+        }
+        var customURLs = Number(retired.custom_url_count) || 0;
+        if (customURLs > 0) {
+            parts.push(policyText('policy_legacy_urls_retired')
+                .replace('{count}', String(customURLs)));
+        }
+        var excluded = Number(retired.excluded_domain_count) || 0;
+        if (excluded > 0) {
+            parts.push(policyText('policy_legacy_exclusions_retired')
+                .replace('{count}', String(excluded)));
+        }
+        notice.textContent = parts.join(' ');
+    }
+
+    // renderPolicyStatus renders the runtime block. What the stored record could not
+    // carry is rendered beside it by renderPolicyRetirement, because the two answer
+    // different questions: what is running, and what the operator's saved record
+    // used to hold.
     function renderPolicyStatus(record, status) {
+        renderPolicyRetirement(record);
         var snapshot = policyRuntimeSnapshot({ status: status });
         if (snapshot) {
             // The newest real observation is also what a failed recovery read keeps.

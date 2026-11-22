@@ -428,9 +428,6 @@ func TestStartPolicyRoutingUsesSettingsDerivedConfig(t *testing.T) {
 	if got := cfg.LocalRules.CIDRs[1].String(); got != "198.51.100.7/32" {
 		t.Errorf("derived second prefix = %q, want 198.51.100.7/32", got)
 	}
-	if cfg.ForceShrink {
-		t.Error("derived config enables ForceShrink; a shrunk set must fail")
-	}
 }
 
 // Guard the shape of the activation error so the API's 422 response body keeps

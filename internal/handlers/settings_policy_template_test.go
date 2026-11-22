@@ -28,7 +28,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devops-igor/amnezia-nexus/internal/config"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/web"
@@ -152,28 +151,46 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 	})
 
 	t.Run("ControllerURLIsCacheBusted", func(t *testing.T) {
-		// /static/* is served with a 24-hour max-age. The controller must carry a
-		// version query, or a browser keeps the pre-update script and silently
+		// /static/* is served with a 24-hour max-age. The controller must carry an
+		// identity query, or a browser keeps the pre-update script and silently
 		// omits the newer form fields from the save payload.
-		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
-		if !strings.Contains(adminBody, versioned) {
-			t.Errorf("admin settings page does not load the versioned policy controller %q", versioned)
+		//
+		// The identity must follow the delivered bytes, not the release version: this
+		// change rewrote the controller without moving the release, so a
+		// ?v=<release> URL is exactly the URL the predecessor served and a returning
+		// browser would keep the incompatible script.
+		const controller = "/static/js/policy_routing.js"
+		src := ""
+		for _, candidate := range collectShellLinks(t, adminBody).scripts {
+			if path, _, _ := strings.Cut(candidate, "?"); path == controller {
+				src = candidate
+			}
 		}
-		if strings.Contains(adminBody, `src="/static/js/policy_routing.js"`) {
-			t.Error("admin settings page loads the unversioned policy controller; a cached script can omit new fields")
+		if src == "" {
+			t.Fatalf("admin settings page does not load %s at all", controller)
+		}
+		if !strings.Contains(src, "?v=") {
+			t.Errorf("admin settings page loads %q with no cache identity; a cached script can omit new fields", src)
+		}
+		if want := controller + "?v=" + deliveredAssetDigest(t, controller); src != want {
+			t.Errorf("admin settings page loads %q, want %q so the identity follows the delivered bytes", src, want)
+		}
+		if src == versionedAssetURL(controller) {
+			t.Errorf("admin settings page loads %q, which is the release-version URL the predecessor also "+
+				"served; a returning browser keeps the incompatible controller", src)
 		}
 	})
 
 	t.Run("ControllerLoadedOnlyForAdmins", func(t *testing.T) {
-		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
-		if !strings.Contains(adminBody, versioned) {
-			t.Errorf("admin settings page does not load the policy controller %q", versioned)
+		adminPrefix := fmt.Sprintf(`src="%s?v=`, "/static/js/policy_routing.js")
+		if !strings.Contains(adminBody, adminPrefix) {
+			t.Errorf("admin settings page does not load the policy controller (%q missing)", adminPrefix)
 		}
 		supportBody := renderSettingsPage(t, models.RoleSupport)
 		if strings.Contains(supportBody, `id="policyRoutingCard"`) {
 			t.Error("support operator received the admin-only policy section")
 		}
-		if strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) || strings.Contains(supportBody, versioned) {
+		if strings.Contains(supportBody, adminPrefix) || strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) {
 			t.Error("support operator's page loads the policy controller")
 		}
 	})

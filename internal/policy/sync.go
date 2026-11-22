@@ -29,11 +29,15 @@ const (
 //
 // It carries no network input by design: the routing authority is the destination
 // classifier, and the operator's contribution is the local IPv4 exception list.
+//
+// There is no truncation/reduction knob. That guard belonged to a downloaded feed
+// whose list could arrive truncated; with every rule operator-supplied and
+// validated before it is stored, a shorter candidate list is a deliberate edit.
+// The cycle's remaining refusal is the zero-rule one.
 type SyncConfig struct {
 	LocalRules      ParsedRules   `json:"-"`
 	RefreshInterval time.Duration `json:"refresh_interval"`
 	ParseLimits     ParseLimits   `json:"parse_limits"`
-	ForceShrink     bool          `json:"force_shrink"`
 }
 
 // SourceSyncStats records the execution metrics for an individual rule source
@@ -242,17 +246,8 @@ func (s *Syncer) Status() Status {
 	return out
 }
 
-func (s *Syncer) checkShrink(totalCandidateRules int) error {
-	currentSnap := s.matcher.Current()
-	if currentSnap != nil {
-		prevRules := currentSnap.CIDRCount()
-		if prevRules > 0 && !s.cfg.ForceShrink && totalCandidateRules < prevRules/2 {
-			return fmt.Errorf("shrink guard: new rules count (%d) is less than 50%% of previous count (%d)", totalCandidateRules, prevRules)
-		}
-	}
-	return nil
-}
-
+// nextVersion returns the version a newly published generation takes: one past
+// the newest one this syncer can see.
 func (s *Syncer) nextVersion() uint64 {
 	if s.cachedGen != nil {
 		return s.cachedGen.Version + 1
@@ -298,10 +293,6 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	totalRules := len(local.Rules.CIDRs)
 	if totalRules == 0 {
 		err := errors.New("cannot publish policy snapshot with zero rules")
-		s.recordFailure(err, statsMap, startTime)
-		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
-	}
-	if err := s.checkShrink(totalRules); err != nil {
 		s.recordFailure(err, statsMap, startTime)
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
 	}

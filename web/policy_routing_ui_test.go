@@ -35,6 +35,7 @@ func policySectionHTMLForTest(t *testing.T) string {
 		"is_admin": func(user any) bool {
 			return true
 		},
+		"asset_url": AssetURL,
 	}
 	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html", "templates/settings_save_controls.html")
 	if err != nil {
@@ -102,6 +103,13 @@ w._ = key => {
   // resolves to its own key, so an assertion can name the exact key a branch chose.
   if (key === 'policy_inventory_age_value') return '{days} d / max {max}';
   if (key === 'policy_inventory_override_active') return 'OVERRIDE {count} · {digest}';
+  // The retirement notice carries the retired entries and counts as placeholders.
+  // A key stubbed to itself would silently swallow the substitution, so an
+  // assertion could not tell "named the entry" from "printed the key".
+  if (key === 'policy_legacy_entries_retired') return 'retired entries: {entries}';
+  if (key === 'policy_legacy_source_retired') return 'retired source: {source}';
+  if (key === 'policy_legacy_urls_retired') return 'retired URLs: {count}';
+  if (key === 'policy_legacy_exclusions_retired') return 'retired exclusions: {count}';
   return key;
 };
 
@@ -853,4 +861,83 @@ func TestPolicyRoutingModuleElementIDs(t *testing.T) {
 			t.Errorf("controller looks up #%s, which the rendered policy section does not define", id)
 		}
 	}
+}
+
+// The exception list is the section's one routing input, so its two directions are
+// pinned here against the shipped controller and the shipped markup:
+//
+//   - an explicit empty list must reach the server as an empty array. The whole
+//     point of the clear is that the request says so; a payload that omits the key
+//     is read as "keep what is stored" and the operator's clear silently does
+//     nothing;
+//   - a record the server reports as partly retired must be explained on the page.
+//     An operator whose predecessor list held domain lines would otherwise see a
+//     shorter list than they saved and no reason for it.
+func TestPolicyRoutingControllerSendsAnExplicitEmptyList(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), `
+// The operator clears the only exception textarea and saves. The shipped controller
+// always sends the key, so the server can tell this apart from a client that has no
+// editor for it.
+responder = async (url, opts) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
+    return {status: 'ok', enabled: false, proxy_exceptions: [], sync_interval_seconds: 21600,
+            policy_status: {enabled: false, cidr_count: 4, sync_state: 'disabled'}};
+  }
+  if (url.endsWith('/api/vpn/policy')) return {enabled: false, proxy_exceptions: ['203.0.113.0/24'],
+    sync_interval_seconds: 21600,
+    status: {enabled: false, cidr_count: 4, sync_state: 'disabled'}};
+  throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
+};
+editField('policy_proxy_exceptions', '');
+await w.savePolicySettings();
+await settle();
+
+const puts = requestsTo('/api/vpn/policy', 'PUT');
+assert.equal(puts.length, 1, 'one save is exactly one PUT');
+assert.ok(Object.prototype.hasOwnProperty.call(puts[0].body, 'proxy_exceptions'),
+  'the payload must carry proxy_exceptions even when the list is empty; omitting it means "keep the stored list"');
+assert.deepEqual(puts[0].body.proxy_exceptions, [],
+  'clearing the editor must send an empty array, which is the value that means "remove them all"');
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value, '',
+  'the accepted empty record leaves the editor empty');
+`)
+}
+
+func TestPolicyRoutingControllerExplainsRetiredLegacyEntries(t *testing.T) {
+	runPolicyControllerScenario(t, `
+const retired = {source_selection: 'aggregate', custom_url_count: 1, excluded_domain_count: 0,
+  non_ipv4_entries: ['example.com'], summary: 'irrelevant to the rendering'};
+const record = () => ({enabled: true, proxy_exceptions: ['198.51.100.0/24'], sync_interval_seconds: 21600,
+  inventory_override: [], retired: retired,
+  status: {enabled: true, cidr_count: 1, sync_state: 'synced', last_success: '', last_error: ''}});
+responder = async (url) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (url.endsWith('/api/vpn/policy')) return record();
+  throw new Error('unexpected ' + url);
+};
+`, `
+// The surviving IPv4 entry is shown, and the retired domain line is named rather
+// than only counted: the operator is the one who recognises what they wrote.
+assert.equal(w.document.getElementById('policy_proxy_exceptions').value, '198.51.100.0/24',
+  'the IPv4 prefix the upgrade kept must still be shown');
+const notice = text('policyLegacyNotice');
+assert.ok(notice.indexOf('example.com') !== -1,
+  'the retired entry must be named on the page, not only counted: ' + JSON.stringify(notice));
+assert.ok(notice.indexOf('aggregate') !== -1,
+  'the retired source selection must be explained too: ' + JSON.stringify(notice));
+assert.ok(notice.indexOf('policy_legacy_entries_retired') === -1,
+  'the placeholder key must have been substituted, not printed raw: ' + JSON.stringify(notice));
+assert.ok(notice.indexOf('retired entries: ') !== -1,
+  'the notice must render the translated sentence for the retired entries: ' + JSON.stringify(notice));
+`)
+}
+
+// A record the server reports as carrying nothing retired must render no notice at
+// all, so an ordinary prefix-only upgrade is silent rather than alarming.
+func TestPolicyRoutingControllerSilentWhenNothingWasRetired(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), `
+assert.equal(text('policyLegacyNotice'), '',
+  'a record that carried nothing retired must not render a warning');
+`)
 }

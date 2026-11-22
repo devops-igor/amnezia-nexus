@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -135,19 +136,40 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 // loadPolicySettings reads the persisted policy routing record. An absent row
 // yields the disabled default, which keeps existing and fresh installs on the
 // old all-proxy route.
+//
+// A record written by an earlier build is read through the same boundary the admin
+// API uses, so a predecessor list keeps its IPv4 prefixes and this build never
+// receives a domain line it would reject. What the record could not carry is
+// reported rather than dropped in silence.
 func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, error) {
 	settings := policy.DefaultSettings()
 	if db == nil {
 		return settings, nil
 	}
+	raw, found, err := db.GetSettingRaw(ctx, policy.SettingsKey)
+	if err != nil {
+		return settings, err
+	}
+	if !found || !raw.Valid || raw.String == "" {
+		return settings, nil
+	}
+	storedBytes := []byte(raw.String)
 	var stored policy.Settings
-	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
+	if err := json.Unmarshal(storedBytes, &stored); err != nil {
 		return settings, err
 	}
 	// An absent row leaves the target untouched. A row that says nothing at all
 	// is the same fresh-install state, so both yield the disabled default.
 	if stored.IsZero() {
 		return settings, nil
+	}
+	// The retirement is logged where the record is actually loaded, so an operator
+	// reading startup logs learns why their exception list is shorter than what
+	// they saved under the predecessor representation.
+	if retirement := policy.ReviewStoredRecord(storedBytes); !retirement.Empty() {
+		slog.Warn("Stored policy routing record was written by an earlier build; "+
+			"its IPv4 exceptions are kept and the rest cannot be applied",
+			"retired", retirement.Summary())
 	}
 	return stored.Normalize(), nil
 }

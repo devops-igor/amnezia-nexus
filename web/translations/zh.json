@@ -1054,5 +1054,9 @@
   "policy_save_kept": "服务器拒绝了此更改。您的修改仍保留在表单中，尚未保存。",
   "policy_proxy_exceptions_label": "PROXY 例外（IPv4）",
   "policy_proxy_exceptions_hint": "每行一个 IPv4 地址或 CIDR。忽略空行和注释。这些范围内的每个地址都会在分类器作出判断之前强制走 PROXY，因此可以用它把地址移出直连路径。未列出的地址由分类器依据俄罗斯地址分配和 CDN 排除集合决定。",
-  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24"
+  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24",
+  "policy_legacy_entries_retired": "此列表比您保存的更短：{entries} 无法应用，因为此版本仅路由 IPv4 例外。读取记录时已移除这些行；如果仍需要，请在此重新添加。",
+  "policy_legacy_source_retired": "保存的来源选择 {source} 已不存在，已被停用。",
+  "policy_legacy_urls_retired": "已停用 {count} 个保存的外部列表网址：不再下载任何列表。",
+  "policy_legacy_exclusions_retired": "已停用 {count} 个保存的排除域名：域名规则不再影响路由。"
 }

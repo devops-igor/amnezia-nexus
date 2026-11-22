@@ -1054,5 +1054,9 @@
   "policy_save_kept": "The server refused this change. Your edits are still in the form and are not saved.",
   "policy_proxy_exceptions_label": "PROXY exceptions (IPv4)",
   "policy_proxy_exceptions_hint": "One IPv4 address or CIDR per line. Blank lines and comments are ignored. Every address in these ranges is forced through PROXY before the classifier decides, so this is how you take an address off the direct path. Anything you do not list is decided by the classifier from the Russian allocation and the CDN exclusion set.",
-  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24"
+  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24",
+  "policy_legacy_entries_retired": "This list is shorter than what you saved: {entries} could not be applied, because this build routes IPv4 exceptions only. Those entries were removed when the record was read; re-add them here if you still need them.",
+  "policy_legacy_source_retired": "The saved source selection {source} no longer exists and was retired.",
+  "policy_legacy_urls_retired": "{count} saved external list URL(s) were retired: no list is downloaded any more.",
+  "policy_legacy_exclusions_retired": "{count} saved excluded domain name(s) were retired: a domain rule no longer affects routing."
 }

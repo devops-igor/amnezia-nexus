@@ -1054,5 +1054,9 @@
   "policy_save_kept": "Le serveur a refusé ce changement. Vos modifications restent dans le formulaire et ne sont pas enregistrées.",
   "policy_proxy_exceptions_label": "Exceptions PROXY (IPv4)",
   "policy_proxy_exceptions_hint": "Une adresse IPv4 ou un CIDR par ligne. Les lignes vides et les commentaires sont ignorés. Chaque adresse de ces plages passe obligatoirement par PROXY avant la décision du classifieur : c'est ainsi qu'une adresse est retirée du chemin direct. Tout ce qui n'est pas listé est décidé par le classifieur à partir de l'allocation russe et de l'ensemble d'exclusion CDN.",
-  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24"
+  "policy_proxy_exceptions_placeholder": "203.0.113.7\n198.51.100.0/24",
+  "policy_legacy_entries_retired": "Cette liste est plus courte que celle que vous avez enregistrée : {entries} n'ont pas pu être appliqués, car cette version ne route que des exceptions IPv4. Ces lignes ont été retirées lors de la lecture de l'enregistrement ; rajoutez-les ici si vous en avez encore besoin.",
+  "policy_legacy_source_retired": "La sélection de source {source} enregistrée n'existe plus et a été retirée.",
+  "policy_legacy_urls_retired": "{count} URL de liste externe enregistrée(s) ont été retirées : plus aucune liste n'est téléchargée.",
+  "policy_legacy_exclusions_retired": "{count} nom(s) de domaine exclu enregistré(s) ont été retirés : une règle de domaine n'influence plus le routage."
 }

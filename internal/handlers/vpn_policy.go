@@ -64,14 +64,22 @@ var errPolicySettingsSuperseded = errors.New("policy settings were replaced by a
 // activation is refused. present distinguishes "the record existed" from "the
 // key was absent", so compensation restores the previous record exactly instead
 // of materializing a default one.
+//
+// retirement is what the stored bytes held that this build cannot apply. It is
+// carried beside the decoded record because the two are different facts about the
+// same row: the record is what is in effect, the retirement is what an operator
+// saved under the predecessor representation and lost by upgrading. Reporting only
+// the first would leave a domain-bearing record looking complete.
 type previousPolicyRecord struct {
-	settings policy.Settings
-	present  bool
+	settings   policy.Settings
+	present    bool
+	retirement policy.LegacyRetirement
 }
 
-// loadPolicyRecord reads the persisted record together with its presence. An
-// absent or all-zero row yields the disabled default, which is what keeps
-// existing and fresh installs on the old all-proxy route.
+// loadPolicyRecord reads the persisted record together with its presence and what
+// the stored bytes could not carry. An absent or all-zero row yields the disabled
+// default, which is what keeps existing and fresh installs on the old all-proxy
+// route.
 func (h *Handlers) loadPolicyRecord(ctx context.Context) (previousPolicyRecord, error) {
 	rec := previousPolicyRecord{settings: policy.DefaultSettings()}
 	if h.db == nil {
@@ -84,8 +92,9 @@ func (h *Handlers) loadPolicyRecord(ctx context.Context) (previousPolicyRecord, 
 	if !found || !raw.Valid || raw.String == "" {
 		return rec, nil
 	}
+	storedBytes := []byte(raw.String)
 	var stored policy.Settings
-	if err := json.Unmarshal([]byte(raw.String), &stored); err != nil {
+	if err := json.Unmarshal(storedBytes, &stored); err != nil {
 		return rec, fmt.Errorf("decode policy settings: %w", err)
 	}
 	// A row that says nothing is treated as absent, the same way the admin GET
@@ -95,6 +104,7 @@ func (h *Handlers) loadPolicyRecord(ctx context.Context) (previousPolicyRecord, 
 	}
 	rec.settings = stored.Normalize()
 	rec.present = true
+	rec.retirement = policy.ReviewStoredRecord(storedBytes)
 	return rec, nil
 }
 
@@ -160,11 +170,12 @@ func (h *Handlers) restorePolicySettings(ctx context.Context, previous previousP
 func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	settings, err := h.policySettingsOrDefault(ctx)
+	record, err := h.loadPolicyRecord(ctx)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to load policy settings")
 		return
 	}
+	settings := record.settings
 
 	response := map[string]any{
 		"enabled":               settings.Enabled,
@@ -172,11 +183,35 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"inventory_override":    stringsOrEmpty(settings.InventoryOverride),
 		"sync_interval_seconds": settings.SyncInterval,
 	}
+	// What the stored row held and this build could not carry is reported on the
+	// surface that shows the row, so an operator whose saved list contained domain
+	// lines learns why it is shorter than what they wrote, instead of concluding
+	// the panel lost part of their configuration.
+	if !record.retirement.Empty() {
+		response["retired"] = retirementPayload(record.retirement)
+	}
 	if h.vpnSvc != nil {
 		response["status"] = h.vpnSvc.PolicyStatusSnapshot()
 	}
 
 	h.JSON(w, http.StatusOK, response)
+}
+
+// retirementPayload renders what an upgrade could not carry from a stored record.
+// It is composed of facts derived from the stored bytes, so a surface showing it
+// never claims a retirement the record does not contain.
+func retirementPayload(retirement policy.LegacyRetirement) map[string]any {
+	nonIPv4 := retirement.NonIPv4Entries
+	if nonIPv4 == nil {
+		nonIPv4 = []string{}
+	}
+	return map[string]any{
+		"source_selection":      retirement.SourceSelection,
+		"custom_url_count":      retirement.CustomURLCount,
+		"excluded_domain_count": retirement.ExcludedDomainCount,
+		"non_ipv4_entries":      nonIPv4,
+		"summary":               retirement.Summary(),
+	}
 }
 
 // stringsOrEmpty reports an empty JSON array rather than null for a list the

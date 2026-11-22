@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -32,7 +31,7 @@ import (
 // Runtime prerequisite gating (a published non-empty snapshot plus working
 // direct egress) is deliberately NOT re-implemented here. That contract lives in
 // vpn.ValidatePBRPrerequisites / ErrPBREmptyPolicy and the Syncer's zero-rule
-// and shrink guards, which stay the single owner of fail-closed enablement.
+// guard, which stay the single owner of fail-closed enablement.
 
 // SettingsKey is the settings-table key holding the persisted policy record.
 // The existing key/value settings table is sufficient: the issue asks for "a
@@ -89,78 +88,6 @@ type Settings struct {
 	// than stored as an override that would apply only part of what was
 	// submitted.
 	InventoryOverride []string `json:"inventory_override,omitempty"`
-}
-
-// legacySettings is the record shape earlier builds persisted. It exists only to
-// migrate a stored row: the preset, custom-URL and excluded-domain selections no
-// longer exist, and domain rules no longer reach a packet decision.
-type legacySettings struct {
-	Enabled           bool     `json:"enabled"`
-	Preset            string   `json:"preset"`
-	CustomURLs        []string `json:"custom_urls"`
-	LocalEntries      []string `json:"local_entries"`
-	ExcludedDomains   []string `json:"excluded_domains"`
-	SyncInterval      int64    `json:"sync_interval_seconds"`
-	InventoryOverride []string `json:"inventory_override"`
-}
-
-// UnmarshalJSON accepts the current wire shape and the shape an earlier build
-// wrote.
-//
-// The exception list was called "local_entries" when it also accepted domain
-// lines. A stored record still carries the operator's addresses under that key, so
-// reading only the new name would silently discard a configuration the operator
-// saved — the opposite of what a rename should do. The old key is read as a
-// fallback and only when the new one is absent, so a record carrying both is read
-// from the current field.
-//
-// The other legacy fields decode into nothing: their content cannot be represented
-// any more, and migrateLegacyRecord reports what a stored record could not carry.
-func (s *Settings) UnmarshalJSON(data []byte) error {
-	type current Settings
-	var decoded current
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	// A separate pass reads only the legacy exception key. Decoding it into the
-	// legacy struct keeps the field names in one place.
-	if len(decoded.ProxyExceptions) == 0 {
-		var legacy wireLegacyExceptions
-		if err := json.Unmarshal(data, &legacy); err != nil {
-			return err
-		}
-		decoded.ProxyExceptions = legacy.LocalEntries
-	}
-	*s = Settings(decoded)
-	return nil
-}
-
-// wireLegacyExceptions is the one legacy field a load still honors.
-type wireLegacyExceptions struct {
-	LocalEntries []string `json:"local_entries"`
-}
-
-// migrateLegacyRecord reports which stored values cannot be carried into the
-// current record, so loading a row written by an earlier build is an explained
-// downgrade rather than a silent loss.
-//
-// The exception list survives: an operator's IPv4 prefixes under the old
-// local_entries key are still the prefixes this build proxies. What cannot
-// survive is the source selection and its fetched content — there is no feed any
-// more — and the domain half of the old record, because a domain rule never
-// determined a packet's route.
-func migrateLegacyRecord(legacy legacySettings) []string {
-	var dropped []string
-	if legacy.Preset != "" {
-		dropped = append(dropped, fmt.Sprintf("source selection %q", legacy.Preset))
-	}
-	if len(legacy.CustomURLs) > 0 {
-		dropped = append(dropped, fmt.Sprintf("%d custom list URL(s)", len(legacy.CustomURLs)))
-	}
-	if len(legacy.ExcludedDomains) > 0 {
-		dropped = append(dropped, fmt.Sprintf("%d excluded domain name(s)", len(legacy.ExcludedDomains)))
-	}
-	return dropped
 }
 
 // DefaultSettings returns the fresh-install configuration: policy routing
@@ -354,12 +281,20 @@ func (s Settings) ParsedInventoryOverride() (*InventoryOverride, error) {
 }
 
 // SyncConfig derives the Syncer configuration for the current record using the
-// production parse bounds. ForceShrink stays false: a suspiciously short list
-// must fail rather than silently replace a valid active policy.
+// production parse bounds.
 //
 // The derived configuration has no sources. The classifier is the policy
 // authority and the exception list is local, so the cycle compiles the operator's
 // prefixes alone and needs no network.
+//
+// There is deliberately no truncation-protection setting here. That guard existed
+// to catch a downloaded list that arrived truncated mid-transfer, and it compared
+// a candidate count against the live one. Nothing is downloaded any more: the list
+// is an operator-supplied, fully validated replacement, so a candidate that holds
+// fewer prefixes than the last one is the edit the operator just asked for, not
+// evidence of a broken transfer. Refusing it made the page's only routing input
+// unable to apply a normal reduction. The zero-rule refusal is a different guard
+// and still owns "nothing to publish".
 func (s Settings) SyncConfig() (SyncConfig, error) {
 	if err := s.Validate(); err != nil {
 		return SyncConfig{}, err
@@ -372,6 +307,5 @@ func (s Settings) SyncConfig() (SyncConfig, error) {
 		LocalRules:      ParsedRules{CIDRs: prefixes},
 		RefreshInterval: s.Interval(),
 		ParseLimits:     DefaultParseLimits(),
-		ForceShrink:     false,
 	}, nil
 }
