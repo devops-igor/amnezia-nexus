@@ -99,6 +99,15 @@ function vpnRenderBackendRow(b) {
     const srvId = b.server_id || b.id || '';
     const displayStatus = b.enabled === false ? 'disabled' : (b.status || '');
     tr.setAttribute('data-status', displayStatus);
+    // The row carries BOTH of the backend record's identities, because they are two
+    // different id spaces and nothing may substitute one for the other:
+    //   - data-server-id (below, on the action buttons) is the server identity the
+    //     enable/delete actions post to, and the #N the row displays;
+    //   - data-tunnel-id here is this backend row's own tunnel id, which is what the
+    //     diagnostics payload reports as backend_id. An "Inspect" action that names
+    //     a backend matches on THIS, never on the server id.
+    // Both come from the same backend record, so neither is a lookup across spaces.
+    if (b.id != null) tr.setAttribute('data-tunnel-id', String(b.id));
 
     const tdServer = document.createElement('td');
     // Programmatic focus needs a focusable target: an "Inspect" action that names a

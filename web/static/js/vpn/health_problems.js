@@ -390,22 +390,50 @@ function vpnFocusSessionIssue(row) {
     }
 }
 
+// vpnFindBackendRowByTunnelId returns the backend table row whose own tunnel id is
+// the one the problem reports. It walks the tbody's rows rather than depending on a
+// selector engine, the same way the session lookup does.
+//
+// The row's own tunnel id (data-tunnel-id) is what the diagnostics payload reports
+// as backend_id, because that value comes from the session/route backend tunnel id.
+// The row's data-server-id is a DIFFERENT id space — it is the server the row's
+// enable/delete actions post to — so it is never compared against a problem.
+function vpnFindBackendRowByTunnelId(tbody, tunnelId) {
+    const rows = (tbody && tbody.children) ? tbody.children : [];
+    const wanted = String(tunnelId);
+    for (let i = 0; i < rows.length; i++) {
+        const candidate = rows[i];
+        if (!candidate || typeof candidate.getAttribute !== 'function') continue;
+        if (candidate.getAttribute('data-tunnel-id') === wanted) return candidate;
+    }
+    return null;
+}
+
 // vpnFocusBackendIssue moves focus to the affected backend's name cell, or to the
 // backend table heading when that backend is no longer listed.
 function vpnFocusBackendIssue(row) {
-    const tbody = document.getElementById('vpn-backends-tbody');
-    const rows = (tbody && tbody.children) ? tbody.children : [];
-    for (let i = 0; i < rows.length; i++) {
-        const actionBtn = (typeof rows[i].querySelector === 'function')
-            ? rows[i].querySelector('[data-action="vpn-toggle-backend"]')
-            : null;
-        if (!actionBtn || actionBtn.getAttribute('data-server-id') !== String(row.backendId)) continue;
-        const nameCell = vpnBackendFocusCell(rows[i]);
-        if (nameCell && vpnFocusFirstFocusable([nameCell])) return;
-        vpnFocusHeading('vpn-backends-title', null);
+    const tr = vpnFindBackendRowByTunnelId(document.getElementById('vpn-backends-tbody'), row.backendId);
+    if (!tr) {
+        vpnFocusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
         return;
     }
-    vpnFocusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
+    const nameCell = vpnBackendFocusCell(tr);
+    if (nameCell && vpnFocusFirstFocusable([nameCell])) return;
+    vpnFocusHeading('vpn-backends-title', null);
+}
+
+// vpnIssueDestinationHeading names the card that owns a problem carrying no entity
+// id. Such a problem is a statement about a SURFACE rather than about a row that has
+// vanished, and the surface is named by its category. Keying this on an explicit
+// category set is what keeps a backend-scoped condition (for example "no healthy
+// backends available to route traffic") out of the sessions table while a
+// connection, routing or dataplane condition keeps the destination it already had;
+// pointing every fallback at one card would only move the error.
+const VPN_BACKEND_CATEGORIES = ['backend'];
+function vpnIssueDestinationHeading(category) {
+    const c = String(category || '').toLowerCase();
+    if (VPN_BACKEND_CATEGORIES.indexOf(c) !== -1) return 'vpn-backends-title';
+    return 'vpn-troubleshooting-title';
 }
 
 // vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
@@ -418,7 +446,7 @@ function vpnFocusIssueTarget(row) {
     } else if (row.backendId) {
         vpnFocusBackendIssue(row);
     } else {
-        vpnFocusHeading('vpn-troubleshooting-title', null);
+        vpnFocusHeading(vpnIssueDestinationHeading(row.category), null);
     }
 }
 
@@ -963,6 +991,7 @@ if (typeof window !== 'undefined') {
     window.vpnIssueSeverityLabel = vpnIssueSeverityLabel;
     window.vpnAnnounceProblems = vpnAnnounceProblems;
     window.vpnFocusIssueTarget = vpnFocusIssueTarget;
+    window.vpnIssueDestinationHeading = vpnIssueDestinationHeading;
     window.vpnFormatHealthWindow = vpnFormatHealthWindow;
     window.vpnResetHealthProblems = vpnResetHealthProblems;
     window.vpnResetTechDiagnosticCards = vpnResetTechDiagnosticCards;

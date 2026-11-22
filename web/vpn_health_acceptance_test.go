@@ -280,7 +280,10 @@ const d = w.document;
 w.vpnCachedServers = [{ id: 7, name: 'Beta Relay' }];
 const tbody = d.getElementById('vpn-backends-tbody');
 tbody.textContent = '';
-const tr = w.vpnRenderBackendRow({ server_id: 7, endpoint: '198.51.100.7:51820', enabled: true, status: 'active', latency_ms: 12, active_connections: 2 });
+// The backend record as the API sends it: id is the backend TUNNEL id and
+// server_id is the server id, and both are always present. Inspect matches on the
+// tunnel id, so a fixture that omitted it would not exercise the real path.
+const tr = w.vpnRenderBackendRow({ id: 7, server_id: 7, endpoint: '198.51.100.7:51820', enabled: true, status: 'active', latency_ms: 12, active_connections: 2 });
 tbody.appendChild(tr);
 const nameCell = tr.querySelector('td[data-backend-name]');
 assert(nameCell, 'the rendered backend row exposes its name cell');
