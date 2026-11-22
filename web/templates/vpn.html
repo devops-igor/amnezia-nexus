@@ -17,7 +17,7 @@
                 </h2>
                 <span class="badge" id="vpn-fwd-status-badge" hidden>
                     <svg class="icon" aria-hidden="true"><use id="vpn-fwd-status-icon" href="#icon-activity"></use></svg>
-                    <span id="vpn-fwd-status-text">{{ _ "vpn_health_unavailable" }}</span>
+                    <span id="vpn-fwd-status-text">{{ _ "vpn_forwarder_unavailable" }}</span>
                 </span>
             </div>
             <div class="vpn-health-live" id="vpn-fwd-health-live" role="status" aria-atomic="true">
@@ -70,7 +70,7 @@
 
     <div class="card stat-card" data-signal="drops">
         <div class="stat-card-header">
-            <span class="stat-card-title">{{ _ "vpn_signal_drops" }}</span>
+            <span class="stat-card-title">{{ _ "vpn_col_packet_loss" }}</span>
             <svg class="icon text-muted" aria-hidden="true"><use href="#icon-alert-triangle"></use></svg>
         </div>
         <div class="stat-card-value" id="vpn-signal-drops-value">-</div>
@@ -139,9 +139,11 @@
 
         <dl class="vpn-metrics">
             <div><dt>{{ _ "vpn_diag_throughput_now" }}</dt><dd class="font-mono" id="vpn-diag-throughput">-</dd></div>
+            <div><dt>{{ _ "vpn_diag_packet_rate" }}</dt><dd class="font-mono" id="vpn-diag-packet-rate">{{ _ "vpn_diag_not_measured" }}</dd></div>
             <div><dt>{{ _ "vpn_diag_avg_5m" }}</dt><dd class="font-mono" id="vpn-diag-ewma5m">-</dd></div>
             <div><dt>{{ _ "vpn_diag_avg_1h" }}</dt><dd class="font-mono" id="vpn-diag-ewma1h">-</dd></div>
             <div><dt>{{ _ "vpn_diag_forward_p95_recent" }}</dt><dd class="font-mono" id="vpn-diag-lat-percentiles">{{ _ "vpn_diag_not_measured" }}</dd></div>
+            <div><dt>{{ _ "vpn_diag_max_duration" }}</dt><dd class="font-mono" id="vpn-diag-lat-max">{{ _ "vpn_diag_not_measured" }}</dd></div>
         </dl>
 
         <dl class="vpn-metrics" id="vpn-cumulative-totals">
@@ -158,6 +160,7 @@
             <div><dt>{{ _ "vpn_fwd_panel_integrity" }}</dt><dd><span class="badge badge-secondary" id="vpn-diag-routing-badge">{{ _ "vpn_fwd_consistent" }}</span></dd></div>
             <div><dt>{{ _ "vpn_forwarder_queue" }}</dt><dd class="font-mono" id="vpn-diag-queue-occ">-</dd></div>
             <div><dt>{{ _ "vpn_forwarder_peak" }}</dt><dd class="font-mono" id="vpn-diag-queue-peak">-</dd></div>
+            <div><dt>{{ _ "vpn_diag_queue_above_50" }}</dt><dd class="font-mono" id="vpn-diag-queue-dwell">{{ _ "vpn_diag_not_measured" }}</dd></div>
             <div><dt>{{ _ "vpn_fwd_counters_since" }}</dt><dd class="font-mono" id="vpn-fwd-counters-since">-</dd></div>
         </dl>
         <div id="vpn-diag-routing-alerts" class="vpn-alerts" hidden></div>
@@ -225,6 +228,7 @@
 
         <dl class="vpn-metrics">
             <div><dt>{{ _ "vpn_diag_recent_write_stalls" }}</dt><dd class="font-mono" id="vpn-diag-write-stalls-recent">{{ _ "vpn_diag_not_measured" }}</dd></div>
+            <div><dt>{{ _ "vpn_diag_write_stalls_cumulative" }}</dt><dd class="font-mono" id="vpn-diag-write-stalls-total">{{ _ "vpn_diag_not_measured" }}</dd></div>
         </dl>
 
         <dl class="vpn-metrics">

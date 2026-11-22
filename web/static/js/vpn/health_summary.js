@@ -57,11 +57,92 @@ function vpnFormatHealthBps(bps) {
     return b.toFixed(0) + ' bps';
 }
 
+// vpnFormatHealthPps renders an aggregate packet rate. A value that is not a
+// measurement returns null so the caller renders the not-measured state instead
+// of a number nobody sampled.
 function vpnFormatHealthPps(pps) {
     if (!vpnSignalMeasured(pps)) return null;
     if (pps >= 1e6) return (pps / 1e6).toFixed(2) + ' Mpps';
     if (pps >= 1e3) return (pps / 1e3).toFixed(2) + ' Kpps';
     return pps.toFixed(1) + ' pps';
+}
+
+// vpnFormatHealthDuration renders an ACCUMULATED duration, keeping the remainder
+// of each unit so a since-reset counter is not silently floored: 90s is "1m 30s",
+// not "1m". Distinct from vpnFormatHealthWindow, which renders a sample horizon.
+function vpnFormatHealthDuration(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+    return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
+
+// vpnSetDiagnosticText is the single writer of a diagnostic row's value AND its
+// measured/unmeasured state. Writing both together is what stops a row from
+// showing a number while still carrying the not-measured marker, or the reverse.
+function vpnSetDiagnosticText(el, measured, text) {
+    if (!el) return;
+    el.textContent = text;
+    if (measured) {
+        el.classList.remove('vpn-not-measured');
+    } else {
+        el.classList.add('vpn-not-measured');
+    }
+}
+
+// vpnRenderRestoredAggregates restores the four aggregate diagnostics that #955
+// left without any UI consumer. Each one lived in a retired KPI tile; every
+// surviving read of the same field is per-backend or per-route, which does not
+// preserve an aggregate across entity retirement. They are rendered into the
+// existing Advanced Diagnostics definition-list rows, so no summary tile returns.
+// One helper per value: the availability rule of each aggregate is independent,
+// and a merged function would have had to interleave four unrelated conditions.
+function vpnRenderRestoredAggregates(status) {
+    const s = (status && typeof status === 'object') ? status : {};
+    vpnRenderPacketRate(s.rates || {});
+    vpnRenderMaxWriteMs(s.forward_latency || {});
+    vpnRenderQueueDwell(s.queue_pressure || {});
+    vpnRenderStallsTotal(s.forward_latency || {});
+}
+
+// Aggregate packet rate: rx_pps + tx_pps for the whole forwarder. The rate
+// payload's own availability flag decides measured vs not measured, and a
+// missing direction is absent data rather than a half-drawn sum.
+function vpnRenderPacketRate(rates) {
+    const ok = rates.available === true && vpnSignalMeasured(rates.rx_pps) && vpnSignalMeasured(rates.tx_pps);
+    vpnSetDiagnosticText(document.getElementById('vpn-diag-packet-rate'), ok,
+        ok ? vpnFormatHealthPps(rates.rx_pps + rates.tx_pps) : _('vpn_diag_not_measured'));
+}
+
+// Aggregate max write duration over COMPLETED writes. max_ms starts at 0, so 0
+// cannot be told apart from "nothing completed" and reads not measured;
+// write_total counts ADMITTED writes, so it cannot prove a completion either.
+function vpnRenderMaxWriteMs(latency) {
+    const ok = vpnSignalMeasured(latency.max_ms) && latency.max_ms > 0;
+    vpnSetDiagnosticText(document.getElementById('vpn-diag-lat-max'), ok,
+        ok ? vpnDiagText('vpn_diag_historical_ms', {value: latency.max_ms}) : _('vpn_diag_not_measured'));
+}
+
+// Accumulated seconds the aggregate queue spent above 50% utilization, plus the
+// current streak. Plain since-reset counters, so a present 0 is a measurement.
+function vpnRenderQueueDwell(queue) {
+    const ok = vpnSignalMeasured(queue.total_seconds_above_50);
+    const streak = vpnSignalMeasured(queue.consecutive_above_50_sec) ? queue.consecutive_above_50_sec : 0;
+    vpnSetDiagnosticText(document.getElementById('vpn-diag-queue-dwell'), ok, ok
+        ? vpnDiagText('vpn_diag_duration_streak', {
+            total: vpnFormatHealthDuration(queue.total_seconds_above_50),
+            streak: vpnFormatHealthDuration(streak)
+        })
+        : _('vpn_diag_not_measured'));
+}
+
+// Aggregate cumulative write stalls: the since-reset total for the whole
+// forwarder. Per-route counts cannot stand in for it, because a retired route
+// takes its counters with it.
+function vpnRenderStallsTotal(latency) {
+    const ok = vpnSignalMeasured(latency.stalls);
+    vpnSetDiagnosticText(document.getElementById('vpn-diag-write-stalls-total'), ok,
+        ok ? String(latency.stalls) : _('vpn_diag_not_measured'));
 }
 
 // vpnSetSignalValue writes a measured value plus its unit, or the not-measured
@@ -179,8 +260,12 @@ function vpnRenderSignals(status) {
             throughputEl.appendChild(unit);
         }
     }
+    // The value cell already reads "Not measured" when the rate payload has no
+    // sample, so the supporting line only states the horizon when there IS one.
+    // A second "no samples" sentence would restate the same state in different
+    // words, which is why #955 does not carry a separate key for it.
     vpnSetSignalSub('vpn-signal-throughput-sub',
-        throughputValue === null ? _('vpn_signal_throughput_none') : _('vpn_signal_throughput_horizon'), false);
+        throughputValue === null ? '' : _('vpn_signal_throughput_horizon'), false);
 
     // Dataplane drops: the CURRENT rate and the since-reset total are separate
     // facts with separate labels and units. Scoped to the dataplane, not
@@ -193,12 +278,12 @@ function vpnRenderSignals(status) {
     // be read as end-to-end packet loss, and always separates the cumulative
     // since-reset count from the current rate.
     const dropSubParts = [];
-    if (dropRate === null) {
-        dropSubParts.push(_('vpn_signal_drops_unmeasured'));
-    }
     if (dropTotal !== null) {
         dropSubParts.push(vpnDiagText('vpn_signal_drops_since_reset', {count:dropTotal}));
     }
+    // The value cell already reads "Not measured" when no rate sample exists, so
+    // this line does not restate it: it keeps the independently available
+    // since-reset total and the dataplane scope.
     dropSubParts.push(_('vpn_dataplane_drops_scope'));
     vpnSetSignalSub('vpn-signal-drops-sub', dropSubParts.join(' \u00b7 '), false);
 }
@@ -548,6 +633,7 @@ function vpnRenderForwarderHealth(status) {
         vpnRenderActiveProblemsCards(null, {});
         vpnResetTechDiagnosticCards();
         vpnRenderSignals(null);
+        vpnRenderRestoredAggregates(null);
         vpnRenderRoutePressure(null, []);
 
         const countersSinceElem = document.getElementById('vpn-fwd-counters-since');
@@ -635,6 +721,7 @@ function vpnRenderForwarderHealth(status) {
     });
     vpnRenderHealthStatus(status, typeof problemCount === 'number' ? problemCount : 0);
     vpnRenderSignals(status);
+    vpnRenderRestoredAggregates(status);
 
     // Delegate the technical detail panels and the historical charts. They live
     // inside the Advanced Diagnostics disclosure, whose open state is never
@@ -646,7 +733,8 @@ function vpnRenderForwarderHealth(status) {
         dropsQueueFull: dropsQueueFull,
         dropsNoRoute: dropsNoRoute,
         dropsOversize: dropsOversize,
-        fmtBps: vpnFormatHealthBps
+        fmtBps: vpnFormatHealthBps,
+        fmtPps: vpnFormatHealthPps
     });
 
     if (typeof vpnRenderHistoryCharts === 'function' && status.historical_series) {
@@ -673,4 +761,12 @@ if (typeof window !== 'undefined') {
     window.vpnToggleDiagnostics = vpnToggleDiagnostics;
     window.vpnCloseDiagnostics = vpnCloseDiagnostics;
     window.vpnFormatHealthBps = vpnFormatHealthBps;
+    window.vpnFormatHealthPps = vpnFormatHealthPps;
+    window.vpnFormatHealthDuration = vpnFormatHealthDuration;
+    window.vpnSetDiagnosticText = vpnSetDiagnosticText;
+    window.vpnRenderRestoredAggregates = vpnRenderRestoredAggregates;
+    window.vpnRenderPacketRate = vpnRenderPacketRate;
+    window.vpnRenderMaxWriteMs = vpnRenderMaxWriteMs;
+    window.vpnRenderQueueDwell = vpnRenderQueueDwell;
+    window.vpnRenderStallsTotal = vpnRenderStallsTotal;
 }

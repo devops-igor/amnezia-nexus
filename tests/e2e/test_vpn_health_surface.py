@@ -99,17 +99,57 @@ def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     assert all(b is not None for b in boxes)
     assert boxes[0]["y"] < boxes[1]["y"] < boxes[2]["y"]
 
-    # #vpn-diag-lat-max is retired: the default percentile is the recent
-    # forward-write reservoir, not the unprovable historical one.
-    expect(page.locator("#vpn-diag-lat-max")).to_have_count(0)
+    # The default percentile is the recent forward-write reservoir, not the
+    # historical global one; #vpn-diag-lat-max is a DIFFERENT row that carries the
+    # aggregate maximum write duration and is expected to be present.
+    expect(page.locator("#vpn-diag-lat-max")).to_be_visible()
 
     diag_fields = (
-        "throughput ewma5m ewma1h lat-percentiles queue-occ queue-peak "
-        "drops-client drops-return drops-total engine-status peers-status "
-        "hs-freshness routing-counts res-cpu res-mem res-fd write-stalls-recent"
+        "throughput packet-rate ewma5m ewma1h lat-percentiles lat-max queue-occ "
+        "queue-peak queue-dwell drops-client drops-return drops-total engine-status "
+        "peers-status hs-freshness routing-counts res-cpu res-mem res-fd "
+        "write-stalls-recent write-stalls-total"
     ).split()
     for f in diag_fields:
         expect(page.locator(f"#vpn-diag-{f}")).to_be_visible()
+
+    # The four aggregate values the compact redesign had left without a surface.
+    # Each must show a real value or the explicit not-measured text, never a blank.
+    status = api_get(page, "/api/vpn/status")
+    rates = status.get("rates") or {}
+    latency = status.get("forward_latency") or {}
+    queue = status.get("queue_pressure") or {}
+
+    pps_text = page.locator("#vpn-diag-packet-rate").inner_text().strip()
+    pps_ok = (rates.get("available") is True
+              and isinstance(rates.get("rx_pps"), (int, float))
+              and isinstance(rates.get("tx_pps"), (int, float)))
+    if pps_ok:
+        assert re.search(r"\d", pps_text), f"aggregate packet rate missing a value: {pps_text!r}"
+        assert "pps" in pps_text, f"aggregate packet rate missing its unit: {pps_text!r}"
+    else:
+        assert pps_text == "Not measured", f"unavailable rate must read not measured: {pps_text!r}"
+
+    dwell_text = page.locator("#vpn-diag-queue-dwell").inner_text().strip()
+    if isinstance(queue.get("total_seconds_above_50"), (int, float)):
+        assert re.search(r"\d", dwell_text), f"queue dwell missing a value: {dwell_text!r}"
+    else:
+        assert dwell_text == "Not measured", f"absent dwell must read not measured: {dwell_text!r}"
+
+    total_text = page.locator("#vpn-diag-write-stalls-total").inner_text().strip()
+    if isinstance(latency.get("stalls"), (int, float)):
+        assert re.search(r"\d", total_text), f"cumulative stalls missing a value: {total_text!r}"
+    else:
+        assert total_text == "Not measured", f"absent cumulative stalls must read not measured: {total_text!r}"
+
+    max_text = page.locator("#vpn-diag-lat-max").inner_text().strip()
+    max_ms = latency.get("max_ms")
+    if isinstance(max_ms, (int, float)) and max_ms > 0:
+        assert re.search(r"\d", max_text), f"aggregate max duration missing a value: {max_text!r}"
+    else:
+        # max_ms is the max over completed writes and starts at 0, so 0 is not a
+        # measurement and must not be printed as a sampled zero.
+        assert max_text == "Not measured", f"unprovable max must read not measured: {max_text!r}"
 
     # The retired slow-write tile's raw value survives here: an aggregate recent
     # stall count with the horizon it covers. A bare label is not a value, so the

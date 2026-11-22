@@ -748,6 +748,12 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 		"vpn-diag-res-mem":         "vpn_diag_memory",
 		"vpn-diag-res-fd":          "vpn_diag_file_descriptors",
 		"vpn-diag-lat-percentiles": "vpn_diag_forward_p95_recent",
+		// The four aggregate rows restored in round 3 must carry localized labels
+		// too, so a hardcoded English heading fails here in every non-English locale.
+		"vpn-diag-packet-rate":        "vpn_diag_packet_rate",
+		"vpn-diag-lat-max":            "vpn_diag_max_duration",
+		"vpn-diag-queue-dwell":        "vpn_diag_queue_above_50",
+		"vpn-diag-write-stalls-total": "vpn_diag_write_stalls_cumulative",
 	}
 	labels := make(map[string]string)
 	fieldPattern := regexp.MustCompile(`<dt>([^<]+)</dt><dd[^>]*id="([^"]+)"`)
@@ -794,7 +800,7 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 		{"backends", "vpn_signal_backends"},
 		{"sessions", "vpn_diag_active_sessions"},
 		{"throughput", "vpn_fwd_kpi_throughput"},
-		{"drops", "vpn_signal_drops"},
+		{"drops", "vpn_col_packet_loss"},
 	} {
 		pattern := regexp.MustCompile(`data-signal="` + signal.class + `">\s*<div class="stat-card-header">\s*<span class="stat-card-title">([^<]+)</span>`)
 		match := pattern.FindStringSubmatch(rendered)

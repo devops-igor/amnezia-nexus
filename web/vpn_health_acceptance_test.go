@@ -641,11 +641,11 @@ func TestVPN955Acceptance06LocalesThemesAndA11y(t *testing.T) {
 
 	t.Run("AllFiveLocalesCarryTheNewCopy", func(t *testing.T) {
 		required := []string{
-			"vpn_forwarder_health", "vpn_health_checking", "vpn_health_unavailable",
+			"vpn_forwarder_health", "vpn_health_checking", "vpn_forwarder_unavailable",
 			"vpn_advanced_diagnostics", "vpn_close_diagnostics",
 			"vpn_diagnostics_traffic", "vpn_diagnostics_routing", "vpn_diagnostics_runtime",
-			"vpn_signal_backends", "vpn_diag_active_sessions", "vpn_signal_drops",
-			"vpn_signal_drops_since_reset", "vpn_signal_drops_unmeasured",
+			"vpn_signal_backends", "vpn_diag_active_sessions", "vpn_col_packet_loss",
+			"vpn_signal_drops_since_reset", "vpn_diag_queue_above_50",
 			"vpn_dataplane_drops_scope", "vpn_diag_not_measured",
 			"vpn_diag_forward_p95_value", "vpn_diag_forward_p95_window",
 			"vpn_issue_inspect", "vpn_issue_inspect_session",

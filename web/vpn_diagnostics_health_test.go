@@ -43,6 +43,8 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn-diag-ewma5m",
 			"vpn-diag-ewma1h",
 			"vpn-diag-lat-percentiles",
+			"vpn-diag-packet-rate",
+			"vpn-diag-lat-max",
 			"vpn-diag-queue-occ",
 			"vpn-diag-queue-peak",
 			"vpn-diag-drops-client",
@@ -58,6 +60,8 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn-diag-res-cpu",
 			"vpn-diag-res-mem",
 			"vpn-diag-res-fd",
+			"vpn-diag-queue-dwell",
+			"vpn-diag-write-stalls-total",
 			"vpn-diag-be-traffic",
 			"vpn-chart-throughput",
 			"vpn-chart-queue",
@@ -149,7 +153,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_diag_route_integrity",
 			"vpn_signal_backends",
 			"vpn_diag_active_sessions",
-			"vpn_signal_drops",
+			"vpn_col_packet_loss",
 			"vpn_dataplane_drops_scope",
 		} {
 			expectedTag := fmt.Sprintf(`{{ _ "%s" }}`, labelKey)
@@ -196,7 +200,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_fwd_kpi_loss",
 			"vpn_fwd_kpi_client_engine",
 			"vpn_fwd_kpi_peer_sync",
-			"vpn_fwd_kpi_backends",
+			"vpn_signal_backends",
 			"vpn_fwd_kpi_slow_writes",
 			"vpn_fwd_tech_diagnostics",
 			"vpn_fwd_no_active_problems",
@@ -695,9 +699,12 @@ assert.strictEqual(text('vpn-fwd-status-text'), 'Down');
 vpnRenderForwarderHealth(null);
 assert.strictEqual(text('vpn-fwd-counters-since'), '-');
 assert.strictEqual(text('vpn-signal-drops-value'), 'Not measured');
-assert(text('vpn-signal-drops-sub').includes('No drop-rate samples yet'), 'an unavailable poll must not keep a stale count');
 assert(text('vpn-signal-drops-sub').includes('not end-to-end packet loss'), 'the dataplane scope is always stated');
 assert(!text('vpn-signal-drops-sub').includes('109'), 'the retired count must not survive as stale data');
+// The value cell already reads "Not measured"; the supporting line must not
+// restate it, so with no independently available total it carries no digits at all.
+assert(!/\\d/.test(text('vpn-signal-drops-sub')), 'no stale number survives in the supporting line');
+assert(text('vpn-signal-throughput-sub') === '', 'an unmeasured throughput states no horizon');
 `
 	script := vpnDiagnosticsHealthScript(t, string(source), assertions)
 	if out, err := execNodeScript(node, script); err != nil {
