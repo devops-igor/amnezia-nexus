@@ -92,9 +92,13 @@ func (h *Handlers) loadPolicyRecord(ctx context.Context) (previousPolicyRecord, 
 	if !found || !raw.Valid || raw.String == "" {
 		return rec, nil
 	}
+	// DecodeStoredRecord, not json.Unmarshal: this is bytes this panel wrote in
+	// exchange for a database row, and an earlier build's row may legitimately
+	// carry domain lines this build cannot apply. Migration leniency belongs to
+	// this reader alone; a request body is refused whole instead.
 	storedBytes := []byte(raw.String)
-	var stored policy.Settings
-	if err := json.Unmarshal(storedBytes, &stored); err != nil {
+	stored, err := policy.DecodeStoredRecord(storedBytes)
+	if err != nil {
 		return rec, fmt.Errorf("decode policy settings: %w", err)
 	}
 	// A row that says nothing is treated as absent, the same way the admin GET
@@ -386,6 +390,10 @@ func (h *Handlers) decodePolicyPut(w http.ResponseWriter, r *http.Request) (poli
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return incoming, false
 	}
+	// json.Unmarshal reaches Settings.UnmarshalJSON, the wire reader: it accepts
+	// the predecessor key an already-open page still sends, but it filters nothing,
+	// so every submitted entry reaches Normalize/Validate below. Stored bytes use
+	// policy.DecodeStoredRecord instead, which is where migration leniency lives.
 	incoming = incoming.Normalize()
 
 	if err := incoming.Validate(); err != nil {

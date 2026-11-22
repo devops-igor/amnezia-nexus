@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,98 @@ func newPolicyStartupFixture(t *testing.T) (*database.DB, *config.Config, policy
 
 	cfg := &config.Config{DataDir: dir, VPNEnabled: true}
 	return db, cfg, settings
+}
+
+// TestStartupLoadsPredecessorRowAndKeepsItsIPv4Policy is the migration positive
+// control for the reader split.
+//
+// A row an earlier build wrote may hold domain lines beside prefixes, and it must
+// still load: refusing it would take the operator's working IPv4 policy down with an
+// inert entry, and could leave the panel unable to start. That leniency is now
+// confined to policy.DecodeStoredRecord, which is what this startup path calls, so
+// it is asserted here rather than inferred from the request path.
+//
+// The row is left byte-identical, and the decoded record still activates through the
+// real startup function: a forgiving load that published nothing would not be an
+// upgrade, only a different failure.
+func TestStartupLoadsPredecessorRowAndKeepsItsIPv4Policy(t *testing.T) {
+	dir := t.TempDir()
+	db, err := database.New(filepath.Join(dir, "panel.db"), policyStartupTestSecret)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const predecessor = `{"enabled":true,"preset":"aggregate",` +
+		`"local_entries":["203.0.113.0/24","example.com"],"sync_interval_seconds":3600}`
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, json.RawMessage(predecessor)); err != nil {
+		t.Fatalf("seed the predecessor row: %v", err)
+	}
+
+	loaded, err := loadPolicySettings(context.Background(), db)
+	if err != nil {
+		t.Fatalf("a predecessor row must load; failing here is the F957-04 defect: %v", err)
+	}
+	if !loaded.Enabled {
+		t.Error("the stored enabled flag did not survive the load")
+	}
+	if len(loaded.ProxyExceptions) != 1 || loaded.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("loaded exceptions = %v, want only the usable IPv4 prefix", loaded.ProxyExceptions)
+	}
+
+	// Reading the row is not a migration of the row: the operator's stored bytes are
+	// untouched, so nothing was silently destroyed on the way in.
+	raw, found, err := db.GetSettingRaw(context.Background(), policy.SettingsKey)
+	if err != nil || !found || !raw.Valid {
+		t.Fatalf("re-read the raw row: found=%v err=%v", found, err)
+	}
+	if raw.String != predecessor {
+		t.Fatalf("the stored row changed during the load:\n got %s\nwant %s", raw.String, predecessor)
+	}
+
+	// The upgrade path completes: the prefix this build kept still activates.
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+
+	syncCfg, err := loaded.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	store := policy.NewFileStore(filepath.Join(dir, "policy"))
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	prefixes := make([]string, 0, len(syncCfg.LocalRules.CIDRs))
+	for _, prefix := range syncCfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-predecessor-row",
+		Version:       1,
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed the policy snapshot: %v", err)
+	}
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	cfg := &config.Config{DataDir: dir, VPNEnabled: true}
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatalf("policy routing did not activate from the predecessor row's surviving prefix; status=%+v",
+			vpnSvc.PolicyStatusSnapshot())
+	}
 }
 
 // TestPersistedPolicyActivationFailureKeepsPanelUp is the P2-B regression: an

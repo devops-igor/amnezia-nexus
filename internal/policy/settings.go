@@ -72,9 +72,12 @@ type Settings struct {
 	// blank lines and comments are ignored.
 	//
 	// The wire name is "proxy_exceptions". A record written by an earlier build
-	// carries the same operator addresses under "local_entries"; UnmarshalJSON
-	// accepts that key so an upgrade does not silently drop them, and a save
-	// always writes the current name.
+	// carries the same operator addresses under "local_entries"; both readers
+	// accept that key so an upgrade does not silently drop them, and a save always
+	// writes the current name. The two readers differ in severity, not in which
+	// keys they read: DecodeStoredRecord (stored bytes) keeps the entries this
+	// build can apply and reports the rest, while UnmarshalJSON (a request body)
+	// keeps everything so an unusable entry refuses the whole request.
 	ProxyExceptions []string `json:"proxy_exceptions,omitempty"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`

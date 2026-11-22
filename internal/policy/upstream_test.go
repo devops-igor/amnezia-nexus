@@ -224,6 +224,15 @@ func TestStoredRecordWithRemovedUpstreamFieldStillLoads(t *testing.T) {
 	if err := json.Unmarshal(stored, &decoded); err != nil {
 		t.Fatalf("unmarshal a record carrying the removed upstream_dns field: %v", err)
 	}
+	// ...and the stored-record reader agrees: a row written by an earlier build
+	// keeps loading through the path the panel actually uses at startup.
+	storedDecoded, err := DecodeStoredRecord(stored)
+	if err != nil {
+		t.Fatalf("DecodeStoredRecord on a record carrying the removed field: %v", err)
+	}
+	if len(storedDecoded.ProxyExceptions) != 1 || storedDecoded.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("stored reader exceptions = %v, want the stored entry", storedDecoded.ProxyExceptions)
+	}
 	if !decoded.Enabled {
 		t.Error("the record's enabled flag was lost")
 	}

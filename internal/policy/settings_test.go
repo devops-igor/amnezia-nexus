@@ -416,11 +416,15 @@ func TestSettingsJSONFieldNames(t *testing.T) {
 // A record written by an earlier build carries the operator's addresses under
 // "local_entries". The rename must read them, or an upgrade would silently discard
 // a configuration the operator saved.
-func TestSettingsLoadsTheLegacyExceptionKey(t *testing.T) {
+//
+// This is a stored-record case, so it uses the migration reader. The wire reader
+// accepts the same key for an already-open predecessor client, which the handler
+// tests cover; the two readers are deliberately not interchangeable.
+func TestDecodeStoredRecordLoadsTheLegacyExceptionKey(t *testing.T) {
 	const stored = `{"enabled":true,"local_entries":["203.0.113.0/24"],"sync_interval_seconds":3600}`
 
-	var decoded Settings
-	if err := json.Unmarshal([]byte(stored), &decoded); err != nil {
+	decoded, err := DecodeStoredRecord([]byte(stored))
+	if err != nil {
 		t.Fatalf("a stored record from an earlier build must still load: %v", err)
 	}
 	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != "203.0.113.0/24" {
@@ -429,11 +433,12 @@ func TestSettingsLoadsTheLegacyExceptionKey(t *testing.T) {
 
 	// A record carrying both keys is read from the current one.
 	const both = `{"proxy_exceptions":["198.51.100.0/24"],"local_entries":["203.0.113.0/24"]}`
-	if err := json.Unmarshal([]byte(both), &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	stored2, err := DecodeStoredRecord([]byte(both))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if len(decoded.ProxyExceptions) != 1 || decoded.ProxyExceptions[0] != "198.51.100.0/24" {
-		t.Fatalf("a record carrying both keys read %v, want the current field", decoded.ProxyExceptions)
+	if len(stored2.ProxyExceptions) != 1 || stored2.ProxyExceptions[0] != "198.51.100.0/24" {
+		t.Fatalf("a record carrying both keys read %v, want the current field", stored2.ProxyExceptions)
 	}
 }
 
@@ -533,16 +538,20 @@ func TestSettingsExplicitEmptyListValidates(t *testing.T) {
 // field made whole-record validation reject the record — which took the operator's
 // working IPv4 policy down with an inert domain entry.
 //
-// The decode boundary therefore keeps the prefixes and separates the rest. Both
+// The MIGRATION reader therefore keeps the prefixes and separates the rest. Both
 // halves are asserted, so a fix that silently dropped the whole list would fail
 // just as loudly as one that copied it through.
-func TestSettingsLegacyMixedEntriesKeepIPv4AndRetireDomains(t *testing.T) {
+//
+// The same bytes through the WIRE reader keep the domain line, because a request is
+// refused whole rather than shortened. That pairing is the point of the next test;
+// this one pins the stored-record half.
+func TestDecodeStoredRecordKeepsIPv4AndRetiresDomains(t *testing.T) {
 	const stored = `{"enabled":true,"preset":"aggregate",` +
 		`"local_entries":["198.51.100.0/24","example.com","203.0.113.7"],` +
 		`"sync_interval_seconds":3600}`
 
-	var decoded Settings
-	if err := json.Unmarshal([]byte(stored), &decoded); err != nil {
+	decoded, err := DecodeStoredRecord([]byte(stored))
+	if err != nil {
 		t.Fatalf("a predecessor record with a mixed list must still load: %v", err)
 	}
 	want := []string{"198.51.100.0/24", "203.0.113.7"}
@@ -574,8 +583,8 @@ func TestSettingsLegacyMixedEntriesKeepIPv4AndRetireDomains(t *testing.T) {
 	// empty for this build, which the runtime's zero-rule guard reports — it is not
 	// a validation failure that hides the reason.
 	const domainsOnly = `{"enabled":true,"local_entries":["example.com"],"sync_interval_seconds":3600}`
-	var empty Settings
-	if err := json.Unmarshal([]byte(domainsOnly), &empty); err != nil {
+	empty, err := DecodeStoredRecord([]byte(domainsOnly))
+	if err != nil {
 		t.Fatalf("a domain-only predecessor list must load: %v", err)
 	}
 	if len(empty.ProxyExceptions) != 0 {
@@ -586,6 +595,65 @@ func TestSettingsLegacyMixedEntriesKeepIPv4AndRetireDomains(t *testing.T) {
 	}
 	if got := ReviewStoredRecord([]byte(domainsOnly)).NonIPv4Entries; !slices.Equal(got, []string{"example.com"}) {
 		t.Errorf("retired entries for a domain-only list = %v, want [example.com]", got)
+	}
+}
+
+// The two readers must not be interchangeable, and this is the asymmetry that
+// makes the distinction worth having.
+//
+// Identical bytes holding one unusable entry: the stored-record reader keeps the
+// usable prefix and reports the rest, because an earlier build legitimately wrote
+// that row and it must still load. The wire reader keeps every submitted line, so
+// Validate sees the bad one and refuses the whole request. A single lenient decoder
+// serving both is what let a live typo become a shorter valid list.
+func TestStoredRecordReaderIsForgivingAndWireReaderIsNot(t *testing.T) {
+	const body = `{"enabled":true,"local_entries":["198.51.100.0/24","213.180.192.0/33"],` +
+		`"sync_interval_seconds":3600}`
+
+	stored, err := DecodeStoredRecord([]byte(body))
+	if err != nil {
+		t.Fatalf("the migration reader must load an accepted predecessor row: %v", err)
+	}
+	if !slices.Equal(stored.ProxyExceptions, []string{"198.51.100.0/24"}) {
+		t.Fatalf("migration reader kept %v, want the one usable prefix", stored.ProxyExceptions)
+	}
+	if retired := ReviewStoredRecord([]byte(body)).NonIPv4Entries; !slices.Equal(retired, []string{"213.180.192.0/33"}) {
+		t.Errorf("reported retired entries = %v, want the unusable line named", retired)
+	}
+
+	var wire Settings
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		t.Fatalf("the wire reader must decode the submitted body: %v", err)
+	}
+	if !slices.Equal(wire.ProxyExceptions, []string{"198.51.100.0/24", "213.180.192.0/33"}) {
+		t.Fatalf("wire reader produced %v; a submitted entry must not be filtered before validation", wire.ProxyExceptions)
+	}
+	if err := wire.Validate(); err == nil {
+		t.Fatal("the wire reader's output validated; one unusable submitted entry must refuse the whole request")
+	}
+}
+
+// An explicit empty predecessor list is a deliberate clear, so the migration reader
+// must not return nil for it. The handler's merge step reads nil as "the save
+// omitted the field" and merges the stored entries back, which would answer 200
+// while the old overrides stayed installed.
+func TestDecodeStoredRecordKeepsExplicitEmptyLegacyListNonNil(t *testing.T) {
+	for _, tc := range []struct{ name, stored string }{
+		{name: "predecessor_key", stored: `{"enabled":false,"local_entries":[],"sync_interval_seconds":3600}`},
+		{name: "current_key", stored: `{"enabled":false,"proxy_exceptions":[],"sync_interval_seconds":3600}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoded, err := DecodeStoredRecord([]byte(tc.stored))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if decoded.ProxyExceptions == nil {
+				t.Fatal("an explicit empty list decoded as nil, which reads as an absent key downstream")
+			}
+			if len(decoded.ProxyExceptions) != 0 {
+				t.Fatalf("empty list decoded as %v", decoded.ProxyExceptions)
+			}
+		})
 	}
 }
 

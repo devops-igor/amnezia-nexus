@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -221,6 +222,130 @@ func TestPutPolicyFromMixedPredecessorRowKeepsIPv4Policy(t *testing.T) {
 		t.Fatalf("disabling while the stored row held a retired domain = %d, want 200; body=%s",
 			disabled.Code, disabled.Body.String())
 	}
+}
+
+// TestPutPolicyRefusesAnInvalidListUnderBothKeys is the F957-06 regression, and it
+// is deliberately paired.
+//
+// The same body — one good prefix, one domestic exception with a /33 typo — is
+// submitted under the current key and under the predecessor key. Both must be
+// refused atomically with nothing persisted, because a request is a request
+// whichever alias it uses. A single-sided test cannot show the asymmetry that
+// produced the defect: under one key the typo was rejected, and under the other the
+// decoder dropped it, so a truncated but valid-looking list was stored with a 200.
+//
+// The harm of that second outcome is asserted too, not just its cause. The
+// destination the dropped entry protected kept matching PROXY before the request;
+// after it, the operator's exception is gone while the classifier still calls the
+// destination DIRECT, so the traffic leaves direct. The live matcher is therefore
+// checked after each refusal, as is the durable row.
+func TestPutPolicyRefusesAnInvalidListUnderBothKeys(t *testing.T) {
+	const (
+		// A documentation prefix plus the domestic exception an operator would add
+		// to keep a domestic destination on the proxy path.
+		protected = "213.180.192.0/19"
+		probe     = "213.180.192.1"
+	)
+
+	for _, key := range []string{"proxy_exceptions", "local_entries"} {
+		t.Run(key, func(t *testing.T) {
+			h := newPolicyListFixture(t)
+
+			seed := `{"enabled":true,"proxy_exceptions":["198.51.100.0/24","` + protected + `"],"sync_interval_seconds":3600}`
+			seeded := putPolicy(t, h, seed)
+			if seeded.Code != http.StatusOK {
+				t.Fatalf("seeding = %d, want 200; body=%s", seeded.Code, seeded.Body.String())
+			}
+			if got := storedExceptions(t, h); len(got) != 2 {
+				t.Fatalf("seeded list = %v, want both accepted prefixes", got)
+			}
+			if !policyMatcherCovers(t, h, probe) {
+				t.Fatalf("the seeded record does not route %s through the exception list; the refusal below would prove nothing", probe)
+			}
+
+			// The typo is one ordinary prefix mistake: 192.0/33 does not exist.
+			body := `{"enabled":true,"` + key + `":["198.51.100.0/24","213.180.192.0/33"],"sync_interval_seconds":3600}`
+			refused := putPolicy(t, h, body)
+			if refused.Code != http.StatusBadRequest {
+				t.Fatalf("submitting an invalid entry under %q = %d, want 400; body=%s. "+
+					"A success here means the decoder dropped the entry instead of the request being refused",
+					key, refused.Code, refused.Body.String())
+			}
+			if got := storedExceptions(t, h); len(got) != 2 || !contains(got, protected) {
+				t.Fatalf("durable list after the refused save = %v; the accepted record must survive untouched", got)
+			}
+			if !policyMatcherCovers(t, h, probe) {
+				t.Fatalf("%s no longer matches a PROXY exception after the refused save, so it silently left the operator's proxy path", probe)
+			}
+			// The operator must learn what was wrong, not just that something was.
+			if body := refused.Body.String(); !strings.Contains(body, "proxy exception rejected") {
+				t.Fatalf("refusal body = %s, want the exception-list reason", body)
+			}
+		})
+	}
+}
+
+// TestPutPolicyEmptyListClearsUnderBothKeys is the other half of the pairing: an
+// explicit empty list is a deliberate clear whichever key carries it.
+//
+// Under the predecessor key the empty array used to decode to nil, which the merge
+// step reads as "the save omitted the field" and answers 200 while the old list
+// stays installed — a clear that silently did nothing. Asserting only the status
+// code would pass the broken build, so the durable row and a re-read through GET
+// are both asserted.
+func TestPutPolicyEmptyListClearsUnderBothKeys(t *testing.T) {
+	for _, key := range []string{"proxy_exceptions", "local_entries"} {
+		t.Run(key, func(t *testing.T) {
+			h := newPolicyListFixture(t)
+
+			seed := `{"enabled":false,"proxy_exceptions":["203.0.113.0/24"],"sync_interval_seconds":3600}`
+			if seeded := putPolicy(t, h, seed); seeded.Code != http.StatusOK {
+				t.Fatalf("seeding = %d, want 200; body=%s", seeded.Code, seeded.Body.String())
+			}
+
+			cleared := putPolicy(t, h, `{"enabled":false,"`+key+`":[],"sync_interval_seconds":3600}`)
+			if cleared.Code != http.StatusOK {
+				t.Fatalf("clearing under %q = %d, want 200; body=%s", key, cleared.Code, cleared.Body.String())
+			}
+			if got := storedExceptions(t, h); len(got) != 0 {
+				t.Fatalf("durable list after clearing under %q = %v; an explicit empty list must clear, "+
+					"not be merged back from the stored record", key, got)
+			}
+			record := getPolicyRecord(t, h)
+			if entries, _ := record["proxy_exceptions"].([]any); len(entries) != 0 {
+				t.Fatalf("GET after clearing under %q reported %v; the record was not actually cleared", key, record["proxy_exceptions"])
+			}
+		})
+	}
+}
+
+// contains reports whether list holds want.
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// policyMatcherCovers reports whether the live policy matcher routes addr through
+// the exception list. It reads the running runtime, not the stored record, so a
+// save that persisted but failed to activate cannot look correct.
+func policyMatcherCovers(t *testing.T, h *Handlers, addr string) bool {
+	t.Helper()
+	if h.vpnSvc == nil {
+		t.Fatal("fixture has no VPN service; the live policy path cannot be observed")
+	}
+	matcher := h.vpnSvc.PolicyMatcher()
+	if matcher == nil {
+		return false
+	}
+	snapshot := matcher.Current()
+	if snapshot == nil {
+		return false
+	}
+	return snapshot.MatchIPv4(netip.MustParseAddr(addr))
 }
 
 // TestPutPolicyStillRejectsNewlySubmittedDomains is the unchanged half of the

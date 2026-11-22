@@ -14,9 +14,26 @@ package policy
 // than the record itself, and they must be able to change without touching
 // validation.
 //
-// One rule governs the whole file: decide on what the stored bytes SAY, never on
-// what a decoded value happens to contain. A list is allowed to be empty, and an
-// empty list the operator saved is intent, not absence.
+// Two readers, because reading a stored row and reading a request are different
+// decisions.
+//
+//   - Settings.UnmarshalJSON is the WIRE reader. It understands the predecessor
+//     key so an existing client keeps working, but it hands the submitted list to
+//     the caller exactly as submitted: no line is dropped, so Validate sees the
+//     whole request and refuses it atomically when a line is not an IPv4 rule.
+//   - DecodeStoredRecord is the MIGRATION reader. A row an earlier build wrote may
+//     legitimately hold domain lines this build cannot apply, and that row must
+//     still load; so this reader keeps the usable prefixes and reports the rest.
+//
+// Keeping one lenient decoder for both is the defect this split exists to
+// prevent: it turned a live request with a typo into a shorter, valid-looking
+// list, which persisted and then silently lost the operator's PROXY override.
+// Any caller decoding stored bytes uses DecodeStoredRecord; any caller decoding a
+// request body uses the wire decoder. Never the other way round.
+//
+// One rule governs both: decide on what the bytes SAY, never on what a decoded
+// value happens to contain. A list is allowed to be empty, and an empty list the
+// operator saved is intent, not absence.
 
 import (
 	"bytes"
@@ -38,13 +55,21 @@ type legacySettings struct {
 	InventoryOverride []string `json:"inventory_override"`
 }
 
-// UnmarshalJSON accepts the current wire shape and the shape an earlier build
-// wrote.
+// UnmarshalJSON decodes a policy record from a REQUEST body.
 //
-// The exception list was called "local_entries" when it also accepted domain
-// lines. A stored record still carries the operator's addresses under that key, so
-// reading only the new name would silently discard a configuration the operator
-// saved — the opposite of what a rename should do.
+// This is the wire reader, and it is deliberately not the reader used for stored
+// bytes (see DecodeStoredRecord). A request is either accepted whole or refused
+// whole, so nothing an operator submitted is filtered here: an entry this build
+// cannot apply has to reach Validate, which refuses the whole request with a
+// reason. A decoder that quietly dropped the unusable line would hand the handler
+// a shorter, perfectly valid list to persist and return 200 for — the operator's
+// typo would silently remove a PROXY override that was protecting a destination,
+// while the classifier kept treating it as a DIRECT candidate.
+//
+// The predecessor key is still accepted, because the controller an already-open
+// predecessor tab runs sends it and there is no way to update JavaScript in a page
+// that is already executing. Its value is taken exactly as submitted, for the same
+// reason.
 //
 // Two decisions here are deliberately made on what the bytes SAY rather than on
 // what the decoded value happens to contain, because a list is allowed to be
@@ -56,17 +81,9 @@ type legacySettings struct {
 //     would merge the stored entries back and answer 200 while the old list stays
 //     installed;
 //   - a record carrying both keys is read from the current one.
-//
-// The predecessor list accepted domain lines beside prefixes. Those lines cannot
-// be applied by this build, so they are separated from the prefixes here, at the
-// one boundary that reads a stored record, instead of being copied into a field
-// whose validation would reject the whole record and take the operator's working
-// IPv4 policy down with an inert domain entry. What was separated is reported by
-// ReviewStoredRecord, so the retirement is explained rather than silent.
 func (s *Settings) UnmarshalJSON(data []byte) error {
-	type current Settings
-	var decoded current
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoded, err := decodeCurrentFields(data)
+	if err != nil {
 		return err
 	}
 	if !jsonObjectHasKey(data, "proxy_exceptions") {
@@ -74,11 +91,57 @@ func (s *Settings) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
+		// Verbatim: the submitted list reaches Validate unfiltered, so one invalid
+		// entry refuses the whole request instead of being discarded.
+		decoded.ProxyExceptions = legacy.LocalEntries
+	}
+	*s = decoded
+	return nil
+}
+
+// DecodeStoredRecord reads a policy record that is already stored.
+//
+// This is the MIGRATION reader, and it is the only reader that separates what an
+// earlier build could express from what this build can apply. A record on disk was
+// accepted by the build that wrote it: it may legitimately hold domain lines that
+// this build has no rule for, and failing the whole record on those would take the
+// operator's working IPv4 policy down with an inert entry and could leave the panel
+// unable to start. So the usable prefixes are kept, the rest is dropped here, and
+// ReviewStoredRecord explains it on the surfaces that show the record.
+//
+// The leniency is bounded to this reader on purpose. It is not a property of the
+// decoder, so it cannot leak into a live request; a request body goes through
+// Settings.UnmarshalJSON and is refused whole. Callers must not use this for
+// bytes an operator just sent.
+func DecodeStoredRecord(data []byte) (Settings, error) {
+	decoded, err := decodeCurrentFields(data)
+	if err != nil {
+		return Settings{}, err
+	}
+	if !jsonObjectHasKey(data, "proxy_exceptions") {
+		legacy, err := decodeLegacyExceptionKey(data)
+		if err != nil {
+			return Settings{}, err
+		}
 		kept, _ := splitLegacyEntries(legacy.LocalEntries)
 		decoded.ProxyExceptions = kept
 	}
-	*s = Settings(decoded)
-	return nil
+	return decoded, nil
+}
+
+// decodeCurrentFields decodes the current field set, including the current
+// exception key, without any predecessor handling. Both readers share it so they
+// can differ in exactly one decision: what to do with a predecessor list.
+//
+// The local type drops Settings' methods, which is what keeps this from calling
+// back into UnmarshalJSON.
+func decodeCurrentFields(data []byte) (Settings, error) {
+	type current Settings
+	var decoded current
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return Settings{}, err
+	}
+	return Settings(decoded), nil
 }
 
 // jsonObjectHasKey reports whether a JSON object carries a usable value under key,
@@ -118,7 +181,16 @@ func decodeLegacyExceptionKey(data []byte) (wireLegacyExceptions, error) {
 // is either a prefix the packet path can match or content this build has no rule
 // for, and the two are reported separately so the caller can keep the first and
 // explain the second.
+//
+// A list that was present stays present: a non-nil input returns a non-nil —
+// possibly empty — kept slice. That is the difference between an operator who
+// cleared the list and a record that never carried one, and the caller's merge
+// step reads exactly that distinction. Returning nil for a cleared list is what
+// would turn a deliberate empty list back into "the key was absent".
 func splitLegacyEntries(entries []string) (kept, retired []string) {
+	if entries != nil {
+		kept = make([]string, 0, len(entries))
+	}
 	for _, raw := range entries {
 		line := strings.TrimSpace(raw)
 		if isIgnoredLine(line) {

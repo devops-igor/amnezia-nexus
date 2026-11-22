@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -137,10 +136,14 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 // yields the disabled default, which keeps existing and fresh installs on the
 // old all-proxy route.
 //
-// A record written by an earlier build is read through the same boundary the admin
-// API uses, so a predecessor list keeps its IPv4 prefixes and this build never
-// receives a domain line it would reject. What the record could not carry is
-// reported rather than dropped in silence.
+// It reads through policy.DecodeStoredRecord, the migration reader: a record
+// written by an earlier build may legitimately hold domain lines this build has no
+// rule for, and that record still has to load, keeping its IPv4 prefixes, or the
+// panel could fail to start over content it cannot apply. What the record could
+// not carry is reported rather than dropped in silence.
+//
+// This leniency is specific to stored bytes. An incoming request goes through the
+// wire decoder and is refused whole when any entry is unusable.
 func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, error) {
 	settings := policy.DefaultSettings()
 	if db == nil {
@@ -154,8 +157,8 @@ func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, 
 		return settings, nil
 	}
 	storedBytes := []byte(raw.String)
-	var stored policy.Settings
-	if err := json.Unmarshal(storedBytes, &stored); err != nil {
+	stored, err := policy.DecodeStoredRecord(storedBytes)
+	if err != nil {
 		return settings, err
 	}
 	// An absent row leaves the target untouched. A row that says nothing at all
