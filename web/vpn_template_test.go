@@ -597,9 +597,15 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 	})
 
 	t.Run("CoreScriptNonClassicType", func(t *testing.T) {
-		mutated := strings.Replace(rendered, `src="/static/js/tables.js"`, `src="/static/js/tables.js" type="module"`, 1)
+		// The table engine is delivered under the digest of its own bytes, so the
+		// attribute has to be read from the render. Spelling the bare tag here
+		// would silently stop mutating anything the page emits — the same mistake
+		// as pinning a bare URL, and the mutation would then "pass" by doing
+		// nothing.
+		target := emittedSrcAttr(t, rendered, "/static/js/tables.js")
+		mutated := strings.Replace(rendered, target, withExtraAttribute(target, `type="module"`), 1)
 		if mutated == rendered {
-			t.Fatal("failed to apply core script non-classic type mutation")
+			t.Fatalf("failed to apply core script non-classic type mutation")
 		}
 		if err := validateRenderedVPNPage(mutated); err == nil {
 			t.Fatal("expected validateRenderedVPNPage to reject core script module type, but it passed")

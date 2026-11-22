@@ -33,6 +33,29 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// DeliveredAssets are the /static paths this delivery replaced in place: the
+// six VPN modules, the stylesheet every shell links and the table engine the
+// VPN page's reveal depends on. The release version did not move with them, so
+// ?v=<release> is exactly the URL their predecessor served and a returning
+// browser keeps the old bytes. Each one therefore has to be requested through
+// AssetURL, in every shell that loads it.
+//
+// This is the only place that set is spelled. A check that kept its own copy
+// could answer "every asset is identified" while the copy was missing the asset
+// whose bytes moved, which is how the table engine stayed bare behind a green
+// VPN-only guard. A delivery that changes another shipped asset adds it here and
+// the checks that consume this list cover it without further edits.
+var DeliveredAssets = []string{
+	"/static/css/vpn.css",
+	"/static/js/tables.js",
+	"/static/js/vpn/backends.js",
+	"/static/js/vpn/health_problems.js",
+	"/static/js/vpn/health_summary.js",
+	"/static/js/vpn/charts.js",
+	"/static/js/vpn/sessions.js",
+	"/static/js/vpn/page.js",
+}
+
 // AssetURL returns the URL a template emits for one asset of this build: the
 // path with a query derived from the bytes embedded for it. A path this build
 // does not ship is an error, so a missing asset fails the render instead of
@@ -42,11 +65,19 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 // asset by path and asks for its URL, so no asset can carry a hand-typed version
 // that outlives its bytes.
 func AssetURL(path string) (string, error) {
+	return AssetURLFor(StaticFS, path)
+}
+
+// AssetURLFor is the same computation against another root. The build binds
+// AssetURL; a test binds the same function to a copy of the assets so it can
+// change one file's bytes and read the URL that results, rather than restating
+// the derivation and proving a second implementation agrees with itself.
+func AssetURLFor(root fs.FS, path string) (string, error) {
 	name, ok := strings.CutPrefix(path, "/")
 	if !ok || !strings.HasPrefix(name, "static/") {
 		return "", fmt.Errorf("asset URL for %q: only /static assets carry a content identity", path)
 	}
-	version, err := AssetVersion(StaticFS, name)
+	version, err := AssetVersion(root, name)
 	if err != nil {
 		return "", err
 	}

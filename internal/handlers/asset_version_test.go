@@ -364,10 +364,18 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 				seen[path] = "?" + query
 			}
 			// A settings controller is compared with the identity its own template
-			// declares; any other script on the shell must carry the release version.
+			// declares. A script this delivery changed carries the digest of its
+			// bytes — the layout's table engine is one, and it must not be held to
+			// the release version the predecessor also served. Anything else must
+			// carry the release version.
 			controllers := declaredAssetQueries(t)
 			for path, query := range seen {
 				wantQuery, ok := controllers[path]
+				if !ok && slices.Contains(web.DeliveredAssets, path) {
+					delivered := expectedAssetURL(t, settingsAssetRef{path: path, identity: identityAssetBytes})
+					wantQuery = strings.TrimPrefix(delivered, path)
+					ok = true
+				}
 				if !ok {
 					wantQuery = want
 				}

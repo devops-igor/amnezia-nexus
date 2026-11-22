@@ -28,7 +28,6 @@ package web
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"html/template"
 	"io/fs"
 	"regexp"
@@ -38,18 +37,12 @@ import (
 	"testing/fstest"
 )
 
-// vpnDeliveredAssets are the assets this change replaced without moving the
-// release version: the six VPN modules and the stylesheet every shell links.
-// Each one therefore has to be referenced through its own bytes.
-var vpnDeliveredAssets = []string{
-	"/static/css/vpn.css",
-	"/static/js/vpn/backends.js",
-	"/static/js/vpn/health_problems.js",
-	"/static/js/vpn/health_summary.js",
-	"/static/js/vpn/charts.js",
-	"/static/js/vpn/sessions.js",
-	"/static/js/vpn/page.js",
-}
+// vpnDeliveredAssets is the delivery's own list of changed assets, taken from
+// the single definition AssetURL's consumers read. This package keeps no second
+// copy: a copy that omitted an asset would answer "every asset is identified"
+// while the omitted one was served bare, which is precisely how the table engine
+// the VPN page depends on stayed outside the previous guard.
+var vpnDeliveredAssets = DeliveredAssets
 
 // vpnScriptDependencyOrder is the synchronous chain vpn.html loads. Each module
 // calls the one before it, so the order is a contract and not a preference.
@@ -77,20 +70,14 @@ func deliveredAssetDigest(t *testing.T, path string) string {
 }
 
 // assetResolverFor returns the template action the page uses, bound to root.
-// AssetURL reads the embedded build; binding the same computation to another
-// root is what lets the byte-change check vary one asset's bytes while every
-// other part of the render stays the shipped one.
+// AssetURL reads the embedded build; binding the same function to another root
+// is what lets the byte-change check vary one asset's bytes while every other
+// part of the render stays the shipped one. It calls the production derivation
+// rather than restating it: a second spelling of the query is the drift that
+// lets a page emit a URL no test computes.
 func assetResolverFor(root fs.FS) func(string) (string, error) {
 	return func(path string) (string, error) {
-		name, ok := strings.CutPrefix(path, "/")
-		if !ok || !strings.HasPrefix(name, "static/") {
-			return "", fmt.Errorf("asset URL for %q: only /static assets carry a content identity", path)
-		}
-		version, err := AssetVersion(root, name)
-		if err != nil {
-			return "", err
-		}
-		return path + "?v=" + version, nil
+		return AssetURLFor(root, path)
 	}
 }
 
@@ -284,7 +271,11 @@ func deliveredAssetDigestOf(t *testing.T, root fs.FS, path string) string {
 // changed in between, and only that link may move.
 func TestVPNStylesheetURLMovesWithTheAssetBytes(t *testing.T) {
 	const changed = "/static/css/vpn.css"
-	root := deliveredStaticCopy(t, changed)
+	// The whole delivered set is copied, not just the stylesheet: base.html also
+	// requests the table engine through asset_url now, and AssetURL refuses a path
+	// the root does not hold. Copying only the asset under test would make this
+	// check fail for a reason unrelated to the stylesheet it exercises.
+	root := deliveredStaticCopy(t, DeliveredAssets...)
 
 	before := stylesheetHrefs(t, renderFileWith(t, "base.html", shellFuncMapWith(assetResolverFor(root))))
 	if got := stylesheetHrefFor(t, before, changed); got != changed+"?v="+deliveredAssetDigest(t, changed) {
@@ -536,9 +527,13 @@ func TestEveryShellLoadsDeliveredAssetsUnderTheirBytes(t *testing.T) {
 	}
 
 	// The shells this delivery must cover. vpn.css is linked by every shell that
-	// can be reached before or after signing in; the modules only by the page.
+	// can be reached before or after signing in; the table engine and the modules
+	// only by the layout and the page. This pin is not the identity rule — the
+	// identity rule reads web.DeliveredAssets — it exists so a shell that stops
+	// linking an asset cannot make that asset silently disappear from this scan.
 	wantShells := map[string][]string{
-		"/static/css/vpn.css": {"base.html", "login.html", "setup.html", "change_password.html"},
+		"/static/css/vpn.css":  {"base.html", "login.html", "setup.html", "change_password.html"},
+		"/static/js/tables.js": {"base.html"},
 	}
 	for _, path := range vpnScriptDependencyOrder {
 		wantShells[path] = []string{"vpn.html"}
