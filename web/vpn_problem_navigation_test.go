@@ -19,20 +19,32 @@ import (
 // internal comparison, and each pair includes a control that must stay green so a
 // fix cannot pass by swapping one wrong destination for another.
 
-// runVPNProblemNavigationScript evaluates one JSDOM assertion script against the
-// shipped VPN modules and Requires its success token. Missing jsdom fails closed
-// through RequireJSDOM rather than silently skipping.
+// ExtraJS runs in Node after the shared harness installs the embedded assets
+// in the JSDOM window (w). Check the binding in that window, not in Node.
+const navigationBindingPrelude = `
+assert.strictEqual(typeof w.vpnFocusIssueTarget, 'function',
+    'the JSDOM window must bind vpnFocusIssueTarget from health_problems.js');
+`
+
+// runVPNProblemNavigationScript requires the harness to execute, even locally.
+// The shared fixture's optional dependency probe can skip before any assertion
+// runs, leaving the enclosing test and package green.
 func runVPNProblemNavigationScript(t *testing.T, assertions, wantToken string) {
 	t.Helper()
 	fixture := NewVPNTestFixture(t)
-	nodePath := fixture.RequireJSDOM()
-	script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: assertions})
-	out, err := execNodeScript(nodePath, script)
-	if err != nil {
-		t.Fatalf("navigation script failed: %v\nOutput:\n%s", err, string(out))
+	if fixture.NodePath == "" {
+		t.Fatal("Inspect navigation tests require Node.js (see CONTRIBUTING.md)")
 	}
-	if !strings.Contains(string(out), wantToken) {
-		t.Fatalf("navigation script did not report %q\nOutput:\n%s", wantToken, string(out))
+	script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: navigationBindingPrelude + assertions})
+	out, err := execNodeScript(fixture.NodePath, script)
+	if err != nil {
+		t.Fatalf("navigation script failed: %v\nOutput:\n%s", err, out)
+	}
+	if strings.HasPrefix(string(out), "JSDOM_NOT_AVAILABLE:") {
+		t.Fatalf("Inspect navigation tests require jsdom; install it and set NODE_PATH (see CONTRIBUTING.md):\n%s", out)
+	}
+	if !strings.HasSuffix("\n"+strings.TrimSpace(string(out)), "\n"+wantToken) {
+		t.Fatalf("navigation script did not report %q\nOutput:\n%s", wantToken, out)
 	}
 }
 
