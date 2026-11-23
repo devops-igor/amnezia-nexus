@@ -90,9 +90,12 @@ VPN_SURFACE_CLASSES = frozenset({
 
 # Every class the page-content surface adds beyond the frozen reference. The
 # shell's content area carries it so the two-step button scale reaches the
-# controls a page renders, which the reference predates.
+# controls a page renders, which the reference predates. `nav-tab` is here for the
+# same reason: the server page declares it in a template style block, so the
+# frozen reference has never known it, and the page-content scale names it.
 PORTAL_SURFACE_CLASSES = frozenset({
     "portal-page",
+    "nav-tab",
 })
 
 # Every class newly introduced beyond the frozen reference, whichever sheet holds

@@ -434,6 +434,160 @@ func portalCSSRule(css, selector string) string {
 	return css[open : open+end]
 }
 
+// portalDeclarations returns the declarations of the first rule whose selector
+// list contains selector exactly, or "" when the sheet has no such rule. Unlike
+// portalCSSRule this copes with a grouped selector list, which is how the
+// component steps are declared, and it drops comments first so a rule preceded by
+// one is still found by its selector.
+func portalDeclarations(css, selector string) string {
+	for _, rule := range strings.Split(stripCSSComments(css), "}") {
+		open := strings.Index(rule, "{")
+		if open < 0 {
+			continue
+		}
+		for _, candidate := range strings.Split(rule[:open], ",") {
+			if strings.TrimSpace(candidate) == selector {
+				return rule[open+1:]
+			}
+		}
+	}
+	return ""
+}
+
+// stripCSSComments removes /* ... */ blocks, so a selector is matched against its
+// own text rather than against the tail of the comment above it. The web package
+// already ships that helper for the settings stylesheet tests; this file uses it
+// rather than declaring a second one.
+
+// TestPortalComponentControlsUseTheScaleSteps covers the controls that are not in
+// the .btn family: a tab, a chip, a table page control, the search field's clear
+// affordance and a dialog's close button are pressed too, and each of them used
+// to set its own padding or its own height. The steps are read from the sheet, so
+// a rule that drifts off a step is reported here rather than only in a browser.
+func TestPortalComponentControlsUseTheScaleSteps(t *testing.T) {
+	sheet, err := StaticFS.ReadFile("static/css/vpn.css")
+	if err != nil {
+		t.Fatalf("read vpn.css: %v", err)
+	}
+	css := string(sheet)
+
+	largeStep := "min-height: calc(var(--space-xl) + var(--space-sm))"
+	compactFloor := []string{".portal-page .tab", ".portal-page .config-tab", ".portal-page .filter-chip"}
+	compactFixed := []string{".portal-page .modal-close", ".portal-page .page-btn"}
+
+	if decls := portalDeclarations(css, ".portal-page .nav-tab"); !strings.Contains(decls, largeStep) || !strings.Contains(decls, "padding-block: 0") {
+		t.Errorf("the page-level tab bar is not on the large step:\n%s", decls)
+	}
+	for _, selector := range compactFloor {
+		decls := portalDeclarations(css, selector)
+		if !strings.Contains(decls, "min-height: var(--space-xl)") || !strings.Contains(decls, "padding-block: 0") {
+			t.Errorf("%s is not on the compact step:\n%s", selector, decls)
+		}
+	}
+	for _, selector := range compactFixed {
+		decls := portalDeclarations(css, selector)
+		if !strings.Contains(decls, "height: var(--space-xl)") || !strings.Contains(decls, "min-height: var(--space-xl)") {
+			t.Errorf("%s states its own height and is not on the compact step:\n%s", selector, decls)
+		}
+	}
+
+	// The clear affordance is inset in the search field: the step alone would push a
+	// 32px control past the field's lower edge, so its own centring has to be part of
+	// the rule.
+	clear := portalDeclarations(css, ".portal-page .table-search-clear")
+	for _, want := range []string{"width: var(--space-xl)", "height: var(--space-xl)", "min-height: var(--space-xl)", "inset-block-start: 50%", "translate: 0 -50%", "inset-inline-end"} {
+		if !strings.Contains(clear, want) {
+			t.Errorf("the search clear affordance is missing %q, so it does not stay inside its field:\n%s", want, clear)
+		}
+	}
+}
+
+// TestPortalComponentControlsDoNotSizeThemselvesInline is the same guard as
+// TestPortalPagesDoNotSizeControlsInline for the components that are not in the
+// .btn family: an inline height or vertical padding on one of them outranks the
+// scale in exactly the same way.
+func TestPortalComponentControlsDoNotSizeThemselvesInline(t *testing.T) {
+	components := []string{"nav-tab", "tab", "config-tab", "filter-chip", "page-btn", "modal-close", "table-search-clear"}
+	blocked := []string{"padding", "height", "font-size", "line-height"}
+	for _, page := range portalPages {
+		t.Run(page.Template, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(renderPortalPage(t, page.Template)))
+			if err != nil {
+				t.Fatalf("parse rendered %s: %v", page.Template, err)
+			}
+			portalWalk(doc, func(n *html.Node) {
+				if !insidePortalPage(n) {
+					return
+				}
+				matched := ""
+				for _, component := range components {
+					if portalHasClass(n, component) {
+						matched = component
+					}
+				}
+				if matched == "" {
+					return
+				}
+				style := portalAttr(n, "style")
+				for _, property := range blocked {
+					if strings.Contains(style, property) {
+						t.Errorf("%s control sizes itself inline (%s): %s %q", matched, property, style, portalText(n))
+					}
+				}
+			})
+		})
+	}
+}
+
+// TestPortalNamedInteractiveTargetsKeepFortyFour pins the exceptions: the VPN
+// health surface's controls and its two disclosure summaries carry the 44px
+// interactive target an acceptance test requires. They are named in one rule, and
+// none of them may also appear in a rule that states a 32 or 40 px height, which
+// would shrink the target back.
+func TestPortalNamedInteractiveTargetsKeepFortyFour(t *testing.T) {
+	sheet, err := StaticFS.ReadFile("static/css/vpn.css")
+	if err != nil {
+		t.Fatalf("read vpn.css: %v", err)
+	}
+	css := string(sheet)
+
+	named := []string{
+		".portal-page .vpn-diag-entry",
+		".portal-page .vpn-issue-action",
+		".portal-page .vpn-windows .btn",
+		".portal-page .vpn-config > summary",
+		".portal-page .vpn-diag-fold > summary",
+	}
+	for _, selector := range named {
+		decls := portalDeclarations(css, selector)
+		if !strings.Contains(decls, "min-block-size: 44px") {
+			t.Errorf("%s does not state the 44px interactive target:\n%s", selector, decls)
+		}
+	}
+
+	// A selector named above must not also be scaled: that is how an exception
+	// silently stops being one.
+	for _, rule := range strings.Split(css, "}") {
+		open := strings.Index(rule, "{")
+		if open < 0 {
+			continue
+		}
+		decls := rule[open+1:]
+		scales := strings.Contains(decls, "min-height: var(--space-xl)") ||
+			strings.Contains(decls, "min-height: calc(var(--space-xl) + var(--space-sm))")
+		if !scales {
+			continue
+		}
+		for _, selector := range named {
+			for _, candidate := range strings.Split(rule[:open], ",") {
+				if strings.TrimSpace(candidate) == selector {
+					t.Errorf("%s is also given a scale step, which would shrink the 44px target", selector)
+				}
+			}
+		}
+	}
+}
+
 // tokenValue returns a custom property's value from a :root block.
 func tokenValue(t *testing.T, css, name string) string {
 	t.Helper()
