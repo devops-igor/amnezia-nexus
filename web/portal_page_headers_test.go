@@ -588,6 +588,128 @@ func TestPortalNamedInteractiveTargetsKeepFortyFour(t *testing.T) {
 	}
 }
 
+// TestPageOwnedDialogsCarryTheMarker pins the scope change: a page's own dialogs
+// are rendered from its scripts block, which sits outside <main>. The shell wraps
+// that block in the same marker, so the page scale reaches those dialogs. Without
+// the marker a dialog's controls keep whatever height the component sheet gives
+// them, and nothing in the page's content area shows the difference.
+func TestPageOwnedDialogsCarryTheMarker(t *testing.T) {
+	shellDialogs := map[string]bool{"langModal": true, "nexusConfirmModal": true}
+	seen := 0
+	for _, page := range portalPages {
+		t.Run(page.Template, func(t *testing.T) {
+			doc, err := html.Parse(strings.NewReader(renderPortalPage(t, page.Template)))
+			if err != nil {
+				t.Fatalf("parse rendered %s: %v", page.Template, err)
+			}
+			portalWalk(doc, func(n *html.Node) {
+				if !portalHasClass(n, "modal-backdrop") {
+					return
+				}
+				if shellDialogs[portalAttr(n, "id")] || inShell(n) {
+					return
+				}
+				seen++
+				if !insidePortalPage(n) {
+					t.Errorf("%s renders the %q dialog outside the page marker, so the scale cannot reach its controls",
+						page.Template, portalAttr(n, "id"))
+				}
+			})
+		})
+	}
+	// A check that found no page-owned dialog would pass while proving nothing.
+	if seen == 0 {
+		t.Fatal("no page-owned dialog was found in any rendered page; the check covers nothing")
+	}
+}
+
+// TestPortalOffScaleExceptionsAreNamed pins the controls that stay off the two
+// steps. Each one is a pressed control that cannot take a step without breaking the
+// row, the line or the track it lives in, so it keeps its own geometry and states
+// why. None of them may also be given a step, which is how an exception silently
+// stops being one.
+func TestPortalOffScaleExceptionsAreNamed(t *testing.T) {
+	sheet, err := StaticFS.ReadFile("static/css/vpn.css")
+	if err != nil {
+		t.Fatalf("read vpn.css: %v", err)
+	}
+	css := string(sheet)
+
+	exceptions := []struct {
+		selector string
+		wants    []string
+		reason   string
+	}{
+		{".portal-page .data-table th.sortable", []string{"height: auto"}, "a header cell's height is the row's"},
+		{".portal-page .switch", []string{"width: 44px", "height: 24px"}, "a toggle track has track geometry"},
+		{".portal-page .client-meta > span[onclick]", []string{"min-height: 0"}, "a script-generated count action is text in a line"},
+		{".portal-page .cell-detail-toggle", []string{"min-height: 0"}, "a flow disclosure is text in a table cell"},
+	}
+
+	for _, exception := range exceptions {
+		decls := portalDeclarations(css, exception.selector)
+		if decls == "" {
+			t.Errorf("%s is off the scale with no recorded rule (%s)", exception.selector, exception.reason)
+			continue
+		}
+		for _, want := range exception.wants {
+			if !strings.Contains(decls, want) {
+				t.Errorf("%s does not state %q, so its geometry is not pinned:\n%s", exception.selector, want, decls)
+			}
+		}
+	}
+
+	for _, rule := range strings.Split(stripCSSComments(css), "}") {
+		open := strings.Index(rule, "{")
+		if open < 0 {
+			continue
+		}
+		decls := rule[open+1:]
+		selectors := strings.Split(rule[:open], ",")
+		scales := strings.Contains(decls, "min-height: var(--space-xl)") ||
+			strings.Contains(decls, "min-height: calc(var(--space-xl) + var(--space-sm))") ||
+			strings.Contains(decls, "height: var(--space-xl)") ||
+			strings.Contains(decls, "height: calc(var(--space-xl) + var(--space-sm))")
+		if scales {
+			for _, exception := range exceptions {
+				for _, candidate := range selectors {
+					if strings.TrimSpace(candidate) == exception.selector {
+						t.Errorf("%s is a recorded exception but is also given a scale step", exception.selector)
+					}
+				}
+			}
+			continue
+		}
+		// The other direction: a rule that removes the floor inside the page scale
+		// may only name a recorded exception. Anything else there would silently take
+		// a control off the scale while the rule above still claims to set it.
+		if !strings.Contains(decls, "min-height: 0") {
+			continue
+		}
+		inPageScale := false
+		for _, candidate := range selectors {
+			if strings.HasPrefix(strings.TrimSpace(candidate), ".portal-page") {
+				inPageScale = true
+			}
+		}
+		if !inPageScale {
+			continue
+		}
+		for _, candidate := range selectors {
+			trimmed := strings.TrimSpace(candidate)
+			recorded := false
+			for _, exception := range exceptions {
+				if trimmed == exception.selector {
+					recorded = true
+				}
+			}
+			if !recorded {
+				t.Errorf("%s removes the height floor inside the page scale but is not a recorded exception", trimmed)
+			}
+		}
+	}
+}
+
 // tokenValue returns a custom property's value from a :root block.
 func tokenValue(t *testing.T, css, name string) string {
 	t.Helper()

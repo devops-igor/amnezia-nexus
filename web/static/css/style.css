@@ -3484,6 +3484,37 @@ td[data-backend-name]:focus-visible {
 .portal-page .vpn-diag-fold > summary {
     min-block-size: 44px;
 }
+
+/* Pressed controls that stay off the two steps, each with the reason it cannot
+   take one. They are named rather than merely left out, because a control that is
+   silently off the scale looks exactly like one nobody noticed — which is how the
+   first pass at this scale managed to look complete while a page's own dialog kept
+   three different button heights.
+
+   - A sortable table header is a cell in a row: the whole cell is the target and
+     its height is the row's, so a 32 or 40 px floor would crop the header row.
+   - A switch is a 44x24 track with an 18 px knob travelling between two inset
+     positions. Its height is the track's geometry, not a control box; a 32 px one
+     would leave the knob travelling in a track built for 24.
+   - Two script-generated actions are text inside a line of text: the users page's
+     connection count in a table cell's meta line, and the per-client flow
+     disclosure inside a Live flows cell. Both are reachable by keyboard as well as
+     pointer, both take their height from their line box, and a 32 px box would
+     grow every row of the table they sit in. */
+.portal-page .data-table th.sortable {
+    height: auto;
+}
+
+.portal-page .switch {
+    width: 44px;
+    height: 24px;
+}
+
+.portal-page .client-meta > span[onclick],
+.portal-page .cell-detail-toggle {
+    min-height: 0;
+    height: auto;
+}
 /* ===== Settings page layout ===== */
 /* Cards sit directly in one grid. Two independent stacks side by side differ in
    height without bound (the Gigahost card alone is taller than most of the other

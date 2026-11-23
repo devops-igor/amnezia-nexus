@@ -565,7 +565,12 @@
         })();
     </script>
 
-    {{ block "scripts" . }}{{ end }}
+    {{/* Everything a page emits from its scripts block — its dialogs and any control
+         a script builds — belongs to the page as much as its content does, so it
+         carries the same marker. Without this the page-content scale reached only
+         what renders inside <main>, and the dialogs a page renders here (the users
+         page's share dialog is one) kept their own heights. */}}
+    <div class="portal-page">{{ block "scripts" . }}{{ end }}</div>
 </body>
 
 </html>
