@@ -199,10 +199,13 @@ and the metadata recorded with it describe the same instant.
   (`SetDestinationClassifier` from `vpn.ConfigurePBR` / `TeardownPBR`), so a
   disabled data path holds no stale classification. A nil classifier answers
   "uncovered", which is the fail-safe proxy row.
-- A DROP row never becomes a flow: it is refused before flow state exists and
-  recorded in the drop ledger by the producer (`drop_ledger.go`). A
-  DIRECT dispatch the WAN path refuses is recorded as a refusal with the
-  producer's token, never re-decided as PROXY.
+- An admission DROP row is refused before flow state exists and recorded in the
+  drop ledger by the producer (`drop_ledger.go`). A DIRECT dispatch the WAN path
+  refuses is recorded as a refusal with the producer's token, never re-decided as
+  PROXY — in the drop ledger when the refusal leaves no flow behind, and on the
+  flow's own `failed` outcome once the entry exists, so one refusal is not
+  reported twice (`drop_refusal.go`). A row 6 refusal that happens after the flow
+  entry exists therefore adds no ledger row.
 - The chosen route and the branch that chose it are written onto the flow once,
   by the function that decided (`RecordFlowDecision`, `flow_evidence.go`), so a
   reused 5-tuple cannot inherit another decision's explanation.

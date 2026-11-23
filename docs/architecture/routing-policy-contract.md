@@ -47,7 +47,7 @@ client diagnosis names the row instead of inviting a reader to infer it.
 | 3 | inside the Russian allocation **and** a known multi-region CDN | PROXY | `allocation_cdn_excluded` |
 | 4 | inside the Russian allocation, no CDN exclusion | DIRECT | `allocation_direct` |
 | 5 | unknown or uncovered destination | PROXY | `no_trusted_evidence` |
-| 6 | required direct egress unavailable | DROP, no automatic switch | `direct_egress_unavailable` in the drop ledger |
+| 6 | required direct egress unavailable | DROP, no automatic switch | `direct_egress_unavailable` — on the flow, or in the drop ledger when no flow exists |
 
 Row 1 is evaluated before every input that could ask for DIRECT (`egressInput`),
 so an operator rule — including an inventory override that names a private or
@@ -61,6 +61,17 @@ recorded as a DROP with the producer's own token
 (`forwarder.recordDirectRefusal`, `drop_refusal.go`) and is never re-decided as
 PROXY: a direct path that cannot deliver must not be reported as a working proxy
 path, which is what re-deciding the packet would do.
+
+Where that record lands follows from whether a flow entry exists yet, and the
+step that refused knows it. A refusal that leaves no flow behind — no
+direct-egress manager at all, a decision record that could not be installed, or a
+dispatch refused for a full flow table or an exhausted port pool, neither of
+which keeps the entry it may have created — is published to the drop ledger, the
+only place that client's refusal can appear. A dispatch failure that happens after
+the flow entry exists stays on that flow: it is that flow's `failed` outcome
+carrying the token of the failing step, not a second ledger row, because the flow
+already holds the evidence and the helper declines to report one refusal twice
+(`drop_refusal.go`).
 
 Two things are applied around the contract, not inside it:
 
@@ -179,7 +190,9 @@ The address-side guard is `forwarder.IsProhibitedIPv4Destination`
 The panel serves no DNS of its own, so the gateway address issued client profiles
 formerly named as their resolver is an ordinary private destination here: a packet
 to it is refused like any other internal destination, on every port, under the
-policy path.
+policy path. The resolver pair a newly generated profile does carry, and how its
+slots are rendered, is defined outside this contract
+([Module ownership conventions](module-ownership-conventions.md)).
 
 ## 7. What classification does not mean
 
@@ -191,12 +204,23 @@ policy path.
   this host's own WAN address, so a service that refuses foreign source addresses
   still fails. The per-flow record keeps *routed direct and written to WAN*
   distinct from *routed direct and failed* (`FlowForwardWritten`,
-  `FlowForwardFailed`): the second is the signal that the egress location, not the
-  classifier, is the problem.
+  `FlowForwardFailed`), and a failure names the step that refused:
+  `direct_egress_unavailable` when no WAN device was attached at dispatch,
+  `wan_write_failed` when the device write itself failed, or `return_path_closed`
+  when that write reports the upstream return path closed (`recordDirectForward`,
+  `flow_evidence.go`). This is evidence about this host's own delivery path. It
+  is not evidence about where the destination is hosted, and a failed dispatch on
+  its own does not establish that the remote service refused the connection: the
+  flow record observes neither.
 - **A successful WAN write is not proof the application worked.** It records that
   the packet left through this host's WAN interface and nothing about the reply.
-  The return direction is a separate observation, reported as `not_observed` when
-  no reply was seen.
+  The return direction is a separate observation, and its two labels are not
+  interchangeable (`clientDiagnosisFlowReturn`,
+  `vpn_pbr_client_diag_wire.go`): a DIRECT flow that saw no reply reports
+  `not_observed`, while a PROXY flow no reply was attributed to reports
+  `not_measured`, because the proxy return direction is measured only once a reply
+  reverses to that flow. `not_measured` therefore does not state that no reply
+  arrived.
 - **The CDN exclusion list is conservative.** `geodb.KnownCDNASNs` holds ten ASNs
   — Cloudflare (AS13335, AS209242), Fastly (AS54113), Akamai (AS20940, AS16625,
   AS35994), Amazon (AS16509, AS14618), Google (AS15169) and Microsoft (AS8075).
@@ -214,9 +238,9 @@ policy path.
 Reading a decision is part of the contract, because "why was this proxied" is the
 question an operator actually asks.
 
-`vpn.PolicyStatus` (`PolicyStatusSnapshot`) reports the live picture on the
-existing policy endpoints (`GET /api/vpn/policy`, `GET /api/vpn/policy/stats` —
-admin-only, `internal/router/router.go`):
+`vpn.PolicyStatus` (`PolicyStatusSnapshot`) is returned in full by
+`GET /api/vpn/policy` alone, nested under the `status` key of that response
+(admin-only, `internal/router/router.go`):
 
 | Field | Meaning |
 | :--- | :--- |
@@ -226,10 +250,18 @@ admin-only, `internal/router/router.go`):
 | `inventory` | the committed artifact's source, retrieval date, digest, prefix count, age against the staleness threshold, and the override's own count and digest |
 | `cdn` | the exclusion set in force, with `error` set when it cannot be described |
 
+`GET /api/vpn/policy/stats` is not a second view of that table. It returns the
+dispatch counters (`proxy_bytes`, `direct_bytes`, `proxy_drops`, `direct_drops`)
+plus three fields copied out of the status — `enabled`, `active_rules` (the
+published `cidr_count`) and `sync_state` — and no generation, inventory, CDN or
+error field (`GetPolicyStatsHandler`, `internal/handlers/vpn_policy.go`).
+
 Per-flow evidence — decision time, policy generation, reason token, backend
 tunnel, forward/return counters and dispatch outcome — is held by the forwarder
-and rendered by the client diagnosis (`decision_reason`). A refusal before any
-flow exists is recorded in the drop ledger instead, with the producer's token.
+and rendered by the client diagnosis (`decision_reason`). A DROP decided at
+admission, before any flow entry exists — row 1, and row 6 where the refusal
+leaves no flow behind — is recorded in the drop ledger instead, with the
+producer's token; a row 6 failure after the entry exists stays on that flow (§2).
 
 ## 9. Limitations
 
