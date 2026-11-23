@@ -103,6 +103,7 @@ function vpnDisposeChartInteractions(clearActiveHover) {
     const hasActiveHover = typeof window !== 'undefined' && !!window._vpnActiveChartHover;
     if (tip && (!hasActiveHover || clearActiveHover === true)) {
         tip.style.display = 'none';
+        tip.hidden = true;
     }
     const crosshairs = (document.querySelectorAll && typeof document.querySelectorAll === 'function')
         ? document.querySelectorAll('.chart-crosshair')
@@ -126,10 +127,12 @@ function vpnRenderHistoryCharts(series) {
     if (!series || typeof series !== 'object') {
         if (typeof window !== 'undefined') window._vpnActiveChartHover = null;
         const tip = document.getElementById('vpn-chart-tooltip');
-        if (tip) tip.style.display = 'none';
+        if (tip) { tip.style.display = 'none'; tip.hidden = true; }
         return;
     }
     const w = (typeof vpnHistoryWindow !== 'undefined') ? vpnHistoryWindow : '15m';
+    // The visible ranges are 15m / 1h / 24h (#955); the payload still carries the
+    // other windows, so an explicit request for them keeps working.
     let points = [];
     if (w === '1m') points = series.window_1m || [];
     else if (w === '5m') points = series.window_5m || [];
@@ -391,6 +394,7 @@ function vpnRenderHistoryCharts(series) {
             }
 
             if (tooltip) {
+                tooltip.hidden = false;
                 const timeStr = vpnFormatTime(pt ? pt.t : null);
                 tooltip.innerHTML = formatTooltipFn(timeStr, val, pt, idx);
                 tooltip.style.display = 'block';
@@ -411,7 +415,7 @@ function vpnRenderHistoryCharts(series) {
                 window._vpnActiveChartHover = null;
             }
             if (crosshair) crosshair.style.display = 'none';
-            if (tooltip) tooltip.style.display = 'none';
+            if (tooltip) { tooltip.style.display = 'none'; tooltip.hidden = true; }
         };
 
         overlay._vpnMouseMove = onMouseMove;
@@ -610,7 +614,7 @@ function vpnRenderHistoryCharts(series) {
         } else {
             window._vpnActiveChartHover = null;
             const tip = document.getElementById('vpn-chart-tooltip');
-            if (tip) tip.style.display = 'none';
+            if (tip) { tip.style.display = 'none'; tip.hidden = true; }
         }
     }
 }
@@ -624,11 +628,11 @@ function vpnSetHistoryWindow(w) {
     if (toggles) {
         const btns = toggles.querySelectorAll('button');
         for (let i = 0; i < btns.length; i++) {
-            if (btns[i].textContent.trim() === w) {
-                btns[i].className = 'btn btn-sm btn-primary active';
-            } else {
-                btns[i].className = 'btn btn-sm btn-secondary';
-            }
+            // Selection is exposed as aria-pressed as well as the class, so it is
+            // not carried by colour alone.
+            const isCurrent = btns[i].textContent.trim() === w;
+            btns[i].className = isCurrent ? 'btn btn-sm btn-primary active' : 'btn btn-sm btn-secondary';
+            btns[i].setAttribute('aria-pressed', isCurrent ? 'true' : 'false');
         }
     }
     if (vpnLastStatus && vpnLastStatus.forwarder_available === true && vpnLastStatus.historical_series) {

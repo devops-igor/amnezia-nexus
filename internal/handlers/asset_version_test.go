@@ -32,6 +32,7 @@ import (
 	"golang.org/x/net/html"
 
 	"github.com/devops-igor/amnezia-nexus/internal/config"
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/web"
 )
@@ -186,6 +187,100 @@ func renderChangePasswordPage(t *testing.T) string {
 	return w.Body.String()
 }
 
+// shellDeclaredAsset is one asset a shell template links, with the identity the
+// template declared for it.
+type shellDeclaredAsset struct {
+	query    string
+	identity assetIdentity
+}
+
+// shellDeclaredAssets maps every /static asset one shell template declares to
+// the identity that template declared for it. The declared form is read from the
+// shipped template rather than from a list kept here, so a second copy of "which
+// asset uses which form" cannot drift from the page.
+func shellDeclaredAssets(t *testing.T, shell string) map[string]shellDeclaredAsset {
+	t.Helper()
+	body, err := web.TemplatesFS.ReadFile("templates/" + shell)
+	if err != nil {
+		t.Fatalf("read %s: %v", shell, err)
+	}
+	assets := make(map[string]shellDeclaredAsset)
+	for _, ref := range settingsSurfaceAssets(string(body)) {
+		declared := shellDeclaredAsset{identity: ref.identity}
+		if ref.identity != identityUnversioned {
+			declared.query = strings.TrimPrefix(expectedAssetURL(t, ref), ref.path)
+		}
+		assets[ref.path] = declared
+	}
+	return assets
+}
+
+// renderVPNPage returns the real /vpn page through the production handler, so
+// the template helpers, the layout and the scripts block are all the shipped ones.
+func renderVPNPage(t *testing.T) string {
+	t.Helper()
+	h, _, _ := setupTestHandlers(t)
+	req := httptest.NewRequest(http.MethodGet, "/vpn", nil)
+	ctx := middleware.WithSession(req.Context(), &models.SessionData{
+		UserID: "vpn-asset-admin",
+		Role:   models.RoleAdmin,
+	})
+	ctx = middleware.WithCSRFToken(ctx, "csrf-test-token")
+	w := httptest.NewRecorder()
+	h.VPNPageHandler(w, req.WithContext(ctx))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /vpn = %d, want 200", w.Code)
+	}
+	return w.Body.String()
+}
+
+// TestVPNPageServesEveryModuleUnderItsAssetBytes is the delivery check on the
+// real page: the six modules are requested at the digest of the bytes this build
+// ships, in the order they depend on each other. The reference URL comes from
+// the production helper, so a template that stopped calling it fails here even
+// though the template text would still name each module.
+func TestVPNPageServesEveryModuleUnderItsAssetBytes(t *testing.T) {
+	wantOrder := []string{
+		"/static/js/vpn/backends.js",
+		"/static/js/vpn/health_problems.js",
+		"/static/js/vpn/health_summary.js",
+		"/static/js/vpn/charts.js",
+		"/static/js/vpn/sessions.js",
+		"/static/js/vpn/page.js",
+	}
+
+	emitted := map[string]string{}
+	var gotOrder []string
+	for _, src := range collectShellLinks(t, renderVPNPage(t)).scripts {
+		path, _, hasQuery := strings.Cut(src, "?")
+		if !slices.Contains(wantOrder, path) {
+			continue
+		}
+		emitted[path] = src
+		if !hasQuery {
+			t.Errorf("%s is requested bare, so a browser that cached the predecessor copy keeps running it", path)
+			continue
+		}
+		gotOrder = append(gotOrder, path)
+	}
+
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("the page loads %v; the modules form a synchronous chain and the page must load %v", gotOrder, wantOrder)
+	}
+	for _, path := range wantOrder {
+		want, err := web.AssetURL(path)
+		if err != nil {
+			t.Fatalf("AssetURL(%s): %v", path, err)
+		}
+		if got := emitted[path]; got != want {
+			t.Errorf("%s is served at %q, want %q", path, got, want)
+		}
+		if strings.HasSuffix(emitted[path], "?v="+config.AppVersion) {
+			t.Errorf("%s is identified by the release version, which did not move in this delivery", path)
+		}
+	}
+}
+
 func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 	if config.AppVersion == "" {
 		t.Fatal("config.AppVersion is empty, so a missing value could not be told from a present one")
@@ -193,7 +288,8 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 	want := "?v=" + config.AppVersion
 
 	// The stylesheet set and order are not part of this change, so they are
-	// pinned here to prove the links differ in the version query and nothing else.
+	// pinned here to prove the links differ in the identity query and nothing
+	// else.
 	wantStylesheets := []string{
 		"/static/css/tokens.css", "/static/css/base.css", "/static/css/layout.css",
 		"/static/css/components.css", "/static/css/tables.css", "/static/css/server.css",
@@ -226,12 +322,33 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 			}
 			links := collectShellLinks(t, body)
 
+			// Each shell declares exactly one identity per asset it links. A
+			// stylesheet or controller this change replaced carries the digest of
+			// its own bytes, because the release version is the URL its
+			// predecessor also served.
+			declared := shellDeclaredAssets(t, strings.Fields(shell.name)[0])
+
 			var gotPaths []string
 			for _, href := range links.stylesheets {
 				path, query, _ := strings.Cut(href, "?")
 				gotPaths = append(gotPaths, path)
-				if "?"+query != want {
-					t.Errorf("stylesheet %s carries %q, want %q", path, "?"+query, want)
+				declaration, ok := declared[path]
+				if !ok {
+					t.Errorf("stylesheet %s is linked but no shell template declares its identity", path)
+					continue
+				}
+				// The assets this change replaced must be cache-identified;
+				// the others keep the identity they already carry, including the
+				// layout's own bare scripts, which are not part of this change.
+				if path == "/static/css/vpn.css" && declaration.identity != identityAssetBytes {
+					t.Errorf("stylesheet %s is declared as %s; this delivery changed its bytes without "+
+						"moving the release, so it must be identified by the bytes themselves", path, declaration.identity)
+				}
+				if declaration.identity == identityUnversioned {
+					continue
+				}
+				if "?"+query != declaration.query {
+					t.Errorf("stylesheet %s carries %q, want %q (declared in the template)", path, "?"+query, declaration.query)
 				}
 			}
 			if !slices.Equal(gotPaths, wantStylesheets) {
@@ -247,10 +364,18 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 				seen[path] = "?" + query
 			}
 			// A settings controller is compared with the identity its own template
-			// declares; any other script on the shell must carry the release version.
-			declared := declaredAssetQueries(t)
+			// declares. A script this delivery changed carries the digest of its
+			// bytes — the layout's table engine is one, and it must not be held to
+			// the release version the predecessor also served. Anything else must
+			// carry the release version.
+			controllers := declaredAssetQueries(t)
 			for path, query := range seen {
-				wantQuery, ok := declared[path]
+				wantQuery, ok := controllers[path]
+				if !ok && slices.Contains(web.DeliveredAssets, path) {
+					delivered := expectedAssetURL(t, settingsAssetRef{path: path, identity: identityAssetBytes})
+					wantQuery = strings.TrimPrefix(delivered, path)
+					ok = true
+				}
 				if !ok {
 					wantQuery = want
 				}

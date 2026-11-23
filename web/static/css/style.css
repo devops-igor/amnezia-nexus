@@ -2763,6 +2763,384 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
 }
 
 /* ========================================
+   Issue #955: VPN Health surface
+
+   Compact problem-first health panel, a four-signal overview built from the
+   existing .stat-card pattern, one Advanced Diagnostics disclosure and a
+   collapsed configuration strip. Composes existing tokens only: no new global
+   custom property, font or component system.
+   ======================================== */
+
+.vpn-page-title, .vpn-health-title, .vpn-health-head, .vpn-config-body,
+.vpn-diag-header, .vpn-diag-heading, .vpn-windows, .vpn-issue-severity,
+.vpn-fold-label, .vpn-fold-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs) var(--space-sm);
+}
+
+.vpn-page-title .icon { width: 24px; height: 24px; }
+
+.vpn-health { display: grid; gap: var(--space-sm); padding: var(--space-md); margin-bottom: var(--space-md); }
+
+/* Copy grows, the diagnostics entry keeps its own column on wide viewports. */
+.vpn-health-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: var(--space-md);
+    row-gap: var(--space-sm);
+}
+
+.vpn-health-copy, .vpn-config-field, .vpn-issue-copy {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.vpn-health-copy, .vpn-issue-copy { gap: var(--space-xs); }
+.vpn-issue-copy { padding-block: var(--space-xs); }
+.vpn-health-title { margin: 0; font-size: 1.0625rem; gap: var(--space-sm); }
+.vpn-health-title .icon { width: 20px; height: 20px; color: var(--text-secondary); }
+
+/* The badge keeps the shared .badge geometry but stays sentence-case and legible
+   in both themes: primary text on the semantic tint. */
+.vpn-health .badge {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+.vpn-health .badge .icon { width: 14px; height: 14px; }
+.vpn-health .badge.badge-success { background: var(--success-bg); border-color: var(--success-border); }
+.vpn-health .badge.badge-success .icon { color: var(--success); }
+.vpn-health .badge.badge-warn { background: var(--warning-bg); border-color: var(--warning-border); }
+.vpn-health .badge.badge-warn .icon { color: var(--warning); }
+.vpn-health .badge.badge-danger { background: var(--danger-bg); border-color: var(--danger-border); }
+.vpn-health .badge.badge-danger .icon { color: var(--danger); }
+
+.vpn-health-summary {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+.vpn-health-counts {
+    margin: 0;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+.vpn-health-summary:focus, .vpn-region-target:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* The live region wraps the headline, the folded counts and the hidden problem
+   announcement, so a new affected entity reaches the status region even when the
+   headline text does not change. */
+.vpn-health-live { display: contents; }
+
+/* Accessible-name sink for the problem announcement: present for assistive
+   technology, absent from the visual layout. */
+.vpn-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Programmatic focus targets (session action cell, backend name cell) are reachable
+   by focus() but not by Tab, so the ring still has to be visible when an "Inspect"
+   action lands on them. */
+.vpn-focus-target:focus-visible,
+td[data-backend-name]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: var(--radius-sm);
+}
+
+.vpn-region-target { scroll-margin-block: var(--space-2xl); }
+
+.vpn-diag-entry {
+    grid-column: 2;
+    grid-row: 1;
+    min-block-size: 44px;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    white-space: normal;
+    text-align: start;
+}
+
+.vpn-chevron { width: 16px; height: 16px; flex: none; transition: transform var(--transition-fast); }
+
+.vpn-diag-entry[aria-expanded="true"] .vpn-chevron,
+.vpn-config[open] > summary .vpn-chevron,
+.vpn-diag-fold[open] > summary .vpn-chevron { transform: rotate(180deg); }
+
+/* --- Problem rows --- */
+
+.vpn-issue-list { grid-column: 1 / -1; display: grid; gap: var(--space-sm); margin: 0; padding: 0; list-style: none; }
+
+.vpn-issue {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-sm) var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border-inline-start: 3px solid var(--warning);
+    background: var(--warning-bg);
+    border-radius: var(--radius-sm);
+}
+
+.vpn-issue[data-severity="critical"] { border-inline-start-color: var(--danger); background: var(--danger-bg); }
+
+.vpn-issue-severity { font-size: 0.8125rem; font-weight: 650; color: var(--warning); }
+.vpn-issue[data-severity="critical"] .vpn-issue-severity { color: var(--danger); }
+.vpn-issue-title { margin: 0; font-size: 0.9375rem; font-weight: 600; line-height: 1.35; color: var(--text-primary); }
+.vpn-issue-entity { margin: 0; font-size: 0.8125rem; color: var(--text-secondary); }
+.vpn-issue-action { justify-self: start; min-block-size: 44px; white-space: normal; text-align: start; }
+
+/* --- Overview: exactly four signals in the reused grid --- */
+
+.vpn-overview {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--space-md);
+    margin-bottom: var(--space-md);
+}
+
+.vpn-overview .stat-card { min-height: 0; padding: var(--space-md); justify-content: start; gap: var(--space-xs); overflow-wrap: anywhere; }
+.vpn-overview .stat-card-title { text-transform: none; letter-spacing: 0; font-size: 0.875rem; color: var(--text-secondary); }
+.vpn-overview .stat-card-title .icon { width: 18px; height: 18px; }
+
+.vpn-overview .stat-card-value {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-xs);
+    margin: 0;
+    font-size: 1.25rem;
+    word-break: normal;
+}
+
+.vpn-overview .stat-card-sub { margin: 0; padding: 0; font-size: 0.8125rem; color: var(--text-secondary); }
+.vpn-signal-unit { font-size: 0.8125rem; font-weight: 600; }
+.vpn-signal-mismatch { color: var(--warning); font-weight: 600; }
+
+/* A signal with no trustworthy sample is text: never a number, never a badge. */
+.vpn-not-measured { font-family: var(--font-family); font-size: 0.9375rem; color: var(--text-secondary); }
+
+/* --- Configuration strip and diagnostic folds --- */
+
+.vpn-config { padding: var(--space-xs) var(--space-sm); margin-bottom: var(--space-md); }
+.vpn-diag-fold { min-inline-size: 0; border-block-end: 1px solid var(--border-color); }
+
+.vpn-config > summary, .vpn-diag-fold > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    min-block-size: 44px;
+    padding-inline: var(--space-sm);
+    list-style: none;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.875rem;
+    border-radius: var(--radius-sm);
+}
+
+.vpn-config > summary::-webkit-details-marker, .vpn-diag-fold > summary::-webkit-details-marker { display: none; }
+.vpn-config > summary:hover, .vpn-diag-fold > summary:hover { background: var(--bg-card-hover); }
+.vpn-config > summary:active, .vpn-diag-fold > summary:active { background: var(--bg-secondary); }
+.vpn-config-body { gap: var(--space-md); padding: var(--space-sm); }
+.vpn-config-grow { flex: 1 1 240px; }
+
+.vpn-config-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+/* --- Advanced Diagnostics --- */
+
+.vpn-diagnostics { padding: var(--space-md); margin-bottom: var(--space-md); }
+.vpn-diag-header { justify-content: space-between; align-items: flex-start; gap: var(--space-sm) var(--space-md); padding-block-end: var(--space-md); }
+.vpn-diag-header .card-title { margin: 0 0 var(--space-xs); font-size: 1.0625rem; }
+
+.vpn-secondary { margin: 0; font-size: 0.8125rem; line-height: 1.45; color: var(--text-secondary); }
+
+.vpn-diag-section {
+    display: grid;
+    gap: var(--space-md);
+    padding-block: var(--space-md);
+    border-block-start: 1px solid var(--border-color);
+    min-inline-size: 0;
+}
+
+.vpn-diag-section:last-child { padding-block-end: 0; }
+.vpn-diag-section > h3, .vpn-diag-heading > h3 { margin: 0; font-size: 1rem; }
+.vpn-subsection { display: grid; gap: var(--space-xs); min-inline-size: 0; }
+.vpn-subsection > h4 { margin: 0; font-size: 0.875rem; font-weight: 600; color: var(--text-secondary); }
+.vpn-diag-heading { justify-content: space-between; gap: var(--space-sm) var(--space-md); }
+.vpn-windows { gap: var(--space-xs); }
+.vpn-windows .btn { min-inline-size: 44px; min-block-size: 44px; }
+
+/* Selection is carried by aria-pressed, an underline and the background, so it is
+   never hue alone. */
+.vpn-windows .btn[aria-pressed="true"] {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border-color: var(--accent);
+    box-shadow: inset 0 -2px var(--accent);
+}
+
+/* --- Charts --- */
+
+.vpn-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm) var(--space-md); min-inline-size: 0; }
+
+.vpn-chart {
+    display: grid;
+    gap: var(--space-xs);
+    min-inline-size: 0;
+    margin: 0;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+}
+
+.vpn-chart-caption { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--space-xs) var(--space-sm); font-size: 0.875rem; font-weight: 650; }
+.vpn-chart-caption .text-muted { font-size: 0.75rem; font-weight: 400; }
+
+/* charts.js injects a fixed-height SVG; the container owns the box so an empty
+   window keeps the same height as a measured one. */
+.vpn-chart-body { position: relative; min-height: 70px; display: flex; align-items: center; }
+.vpn-chart-body svg { display: block; width: 100%; height: 70px; overflow: visible; color: var(--text-accent); }
+.vpn-chart-axis { display: flex; justify-content: space-between; gap: var(--space-sm); font-family: var(--font-mono); font-size: 0.65rem; }
+
+.vpn-chart-tooltip {
+    position: absolute;
+    z-index: 100;
+    padding: 4px 8px;
+    pointer-events: none;
+    white-space: nowrap;
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    background: var(--bg-card);
+    border: 1px solid var(--border-hover);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+}
+
+/* --- Definition-list metrics --- */
+
+.vpn-metrics { display: grid; align-content: start; gap: 0; margin: 0; min-inline-size: 0; }
+
+.vpn-metrics > div {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-xs) var(--space-md);
+    padding-block: var(--space-sm);
+    border-block-end: 1px solid var(--border-color);
+    font-size: 0.875rem;
+}
+
+.vpn-metrics > div:last-child { border-block-end: none; }
+.vpn-metrics dt { color: var(--text-secondary); }
+.vpn-metrics dd { margin: 0; font-weight: 600; color: var(--text-primary); overflow-wrap: anywhere; }
+.vpn-io-down, .vpn-io-up { color: var(--text-secondary); }
+
+.vpn-alerts {
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    color: var(--danger);
+    background: var(--danger-bg);
+    border: 1px solid var(--danger-border);
+    font-size: 0.8125rem;
+    overflow-wrap: anywhere;
+}
+
+/* --- Route table region --- */
+
+.vpn-fold-label, .vpn-fold-actions { min-width: 0; gap: var(--space-xs) var(--space-sm); }
+.vpn-fold-actions { justify-content: flex-end; font-weight: 400; font-size: 0.8125rem; }
+
+/* The 540px minimum route table scrolls inside this named region and must never
+   widen the document. */
+.vpn-route-table-region { max-width: 100%; overflow: auto; margin-block-start: var(--space-sm); }
+.vpn-route-table-region .data-table { min-inline-size: 540px; font-size: 0.85rem; }
+.vpn-route-table-region .data-table th, .vpn-route-table-region .data-table td { padding: var(--space-sm) var(--space-md); }
+.vpn-numeric { text-align: right; }
+.vpn-backend-select { max-width: 260px; margin-block-end: var(--space-sm); }
+.vpn-empty { padding: var(--space-md); text-align: center; font-size: 0.85rem; color: var(--text-secondary); }
+
+/* --- Existing table cards --- */
+
+.vpn-table-card { margin-bottom: var(--space-lg); }
+.vpn-card-head { flex-wrap: wrap; gap: var(--space-sm); margin-bottom: var(--space-md); }
+.vpn-card-head .card-title { margin-bottom: 0; }
+.vpn-table-loading { padding: var(--space-2xl) var(--space-md); text-align: center; color: var(--text-muted); }
+.vpn-table-loading .spinner { width: 24px; height: 24px; margin: 0 auto var(--space-sm); }
+.vpn-modal-hint { margin-bottom: var(--space-md); }
+
+.vpn-modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    margin-top: var(--space-lg);
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border-color);
+}
+
+/* --- Responsive --- */
+
+@media (max-width: 1023px) {
+    .vpn-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+}
+
+@media (max-width: 767px) {
+    .vpn-health-main { grid-template-columns: minmax(0, 1fr); }
+    .vpn-diag-entry { grid-column: 1; grid-row: auto; justify-self: stretch; }
+    .vpn-issue, .vpn-chart-grid { grid-template-columns: minmax(0, 1fr); }
+    .vpn-overview .stat-card { padding: var(--space-sm) var(--space-md); }
+}
+
+@media (max-width: 359px) {
+    .vpn-overview { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Reduced motion covers the elements THEMSELVES, not only their descendants: the
+   shared .card and .stat-card transitions live on the container, so a
+   descendant-only rule leaves the health card animating. */
+@media (prefers-reduced-motion: reduce) {
+    .vpn-health, .vpn-health *, .vpn-overview, .vpn-overview *,
+    .vpn-config, .vpn-config *, .vpn-diagnostics, .vpn-diagnostics *,
+    .vpn-table-card, .vpn-table-card *, .vpn-chevron, .vpn-chart {
+        transition: none !important;
+        animation: none !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ========================================
    Issue #101: Modernized VPN Section & Tables
    ======================================== */
 

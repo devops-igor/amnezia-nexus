@@ -118,10 +118,17 @@ class StylesheetLinkParser(HTMLParser):
 
 
 def extract_base_template_stylesheets(repo_root: Path) -> list[str]:
-    """Parse active stylesheet filenames from web/templates/base.html in document order."""
+    """Parse active stylesheet filenames from web/templates/base.html in document order.
+
+    A stylesheet may be identified by the release version or by its own bytes;
+    either way it belongs in the comparison, so the content-derived action is
+    resolved before parsing rather than dropped with the tag it appears in.
+    """
     base_file = repo_root / "web" / "templates" / "base.html"
     base_html = base_file.read_text(encoding="utf-8")
-    clean_html = re.sub(r"<!--[\s\S]*?-->", "", base_html)
+    clean_html = css_surface.resolve_asset_actions(
+        re.sub(r"<!--[\s\S]*?-->", "", base_html)
+    )
     parser = StylesheetLinkParser()
     parser.feed(clean_html)
     assert parser.stylesheets, "Failed to extract stylesheet links from base.html"

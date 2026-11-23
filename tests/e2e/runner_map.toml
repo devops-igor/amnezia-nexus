@@ -61,6 +61,7 @@ paths = [
   "tests/e2e/test_share.py",
   "tests/e2e/test_servers.py",
   "tests/e2e/test_vpn_diagnostics.py",
+  "tests/e2e/test_vpn_health_surface.py",
   "tests/e2e/test_traffic.py",
   "tests/e2e/test_multiprotocol_server.py",
 ]

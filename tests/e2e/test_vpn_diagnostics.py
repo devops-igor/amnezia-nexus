@@ -9,10 +9,34 @@ from playwright.sync_api import Page, expect
 from tests.e2e.conftest import api_get, assert_response_shape
 
 
-def _ensure_tech_details_open(page: Page) -> None:
-    tech_details = page.locator("#vpn-fwd-tech-details")
-    if not tech_details.evaluate("el => el.open"):
-        page.locator("#vpn-fwd-tech-details > summary").click()
+def _ensure_diagnostics_open(page: Page) -> None:
+    """Open Advanced Diagnostics through its own entry, only when closed.
+
+    #955 replaced the old #vpn-fwd-tech-details fold with a single
+    #vpn-advanced-entry / #vpn-diagnostics disclosure. The panel is never
+    auto-opened, so a check that needs it open must do so explicitly without
+    toggling an already-open panel shut.
+    """
+    entry = page.locator("#vpn-advanced-entry")
+    if entry.get_attribute("aria-expanded") != "true":
+        entry.click()
+    expect(page.locator("#vpn-diagnostics")).to_be_visible()
+
+
+def _open_details(page: Page, selector: str) -> None:
+    """Open one native <details> fold, only when it is actually closed.
+
+    #955 ships several independent native folds inside Advanced Diagnostics
+    (#vpn-fwd-routes-details, #vpn-reason-history, #vpn-per-backend). Opening one
+    does not reveal another, so every test that asserts on a fold's content opens
+    that fold. Reading the element's own `open` property also means a second call
+    cannot collapse it.
+    """
+    details = page.locator(selector)
+    expect(details).to_be_attached()
+    if not details.evaluate("el => el.open"):
+        details.locator("summary").click()
+    assert details.evaluate("el => el.open"), f"{selector} did not open"
 
 
 def _assert_tooltip_hidden(tooltip) -> None:
@@ -62,116 +86,48 @@ _CHART_BADGE_PATTERNS = {
 
 
 @pytest.mark.e2e
-def test_vpn_dashboard_navigation_and_banner(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> sees headline forwarder health status banner."""
-    page = authenticated_page
-    page.goto(f"{base_url}/vpn")
-    page.wait_for_load_state("networkidle")
-
-    # Verify not redirected to login
-    assert "/login" not in page.url
-    assert "/vpn" in page.url
-
-    # Headline status banner elements
-    for loc in (
-        "#vpn-fwd-status-badge",
-        "#vpn-fwd-status-text",
-        "#vpn-fwd-headline-summary",
-    ):
-        expect(page.locator(loc)).to_be_visible()
-
-
-@pytest.mark.e2e
-def test_vpn_kpi_summary_bar(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> verifies 8 KPI summary cards are rendered."""
-    page = authenticated_page
-    page.goto(f"{base_url}/vpn")
-    page.wait_for_load_state("networkidle")
-
-    kpi_keys = (
-        "throughput routes-sessions queue-pressure packet-loss "
-        "client-engine peer-sync backends slow-writes"
-    ).split()
-    for loc in [f"#vpn-kpi-{k}" for k in kpi_keys]:
-        expect(page.locator(loc)).to_be_visible()
-
-    # The Peer Sync tile reports SYNCHRONIZATION (desired vs actual peers from
-    # status.peer_sync), not the handshake peer count it used to render
-    # (issue #424 round 4, item H). peer_sync is omitempty, so an absent payload
-    # must render an explicit unavailable state, never a misleading '0 / 0'.
-    peer_sync_kpi = page.locator("#vpn-kpi-peer-sync")
-    status_data = api_get(page, "/api/vpn/status")
-    peer_sync = status_data.get("peer_sync")
-    if isinstance(peer_sync, dict):
-        expected = f"{peer_sync['actual_peers']} / {peer_sync['desired_peers']}"
-        expect(peer_sync_kpi).to_have_text(expected)
-    else:
-        assert peer_sync_kpi.inner_text().strip() not in ("", "0 / 0")
-
-
-@pytest.mark.e2e
-def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> verifies diagnostic telemetry panel fields."""
-    page = authenticated_page
-    page.goto(f"{base_url}/vpn")
-    page.wait_for_load_state("networkidle")
-
-    _ensure_tech_details_open(page)
-
-    cards = page.locator(
-        "#vpn-fwd-tech-details > div > div > div.card, #vpn-fwd-tech-details > div > div.card"
-    )
-    expect(cards).to_have_count(4)
-
-    diag_fields = (
-        "throughput ewma5m ewma1h lat-percentiles lat-max queue-occ queue-peak "
-        "drops-client drops-return drops-total engine-status peers-status "
-        "hs-freshness routing-counts res-cpu res-mem res-fd"
-    ).split()
-    for f in diag_fields:
-        expect(page.locator(f"#vpn-diag-{f}")).to_be_visible()
-
-    for obsolete in (
-        "#vpn-diag-packets",
-        "#vpn-diag-res-goroutines",
-        "#vpn-diag-res-gc",
-    ):
-        expect(page.locator(obsolete)).to_have_count(0)
-
-
-@pytest.mark.e2e
 def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> interactive time window toggle (15m, 1h, 6h, 24h)."""
+    """Navigate to /vpn -> interactive time window toggle (15m, 1h, 24h)."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Ensure technical details disclosure is open
-    _ensure_tech_details_open(page)
+    # Advanced Diagnostics is closed by default; open it explicitly.
+    _ensure_diagnostics_open(page)
 
     for chart in _HISTORICAL_CHARTS:
         expect(page.locator(chart)).to_be_visible()
     for obsolete in _OBSOLETE_CHARTS:
         expect(page.locator(obsolete)).to_have_count(0)
 
-    breakdown = page.locator("details:not(#vpn-fwd-tech-details)").filter(
-        has=page.locator("#vpn-chart-reasons")
-    )
-    breakdown.locator("summary").click()
-    for chart in ("#vpn-chart-reasons", "#vpn-chart-backends"):
-        expect(page.locator(chart)).to_be_visible()
+    # Reason history and per-backend history are SEPARATE native details after the
+    # #955 relocation: #vpn-reason-history sits in Routing & Drops and
+    # #vpn-per-backend sits in Runtime Details. Opening one does not reveal the
+    # other, so each fold is opened before it is asserted on.
+    _open_details(page, "#vpn-reason-history")
+    expect(page.locator("#vpn-chart-reasons")).to_be_visible()
+    expect(page.locator("#vpn-chart-backends")).to_be_hidden()
+
+    _open_details(page, "#vpn-per-backend")
+    expect(page.locator("#vpn-chart-backends")).to_be_visible()
     expect(page.locator("#vpn-history-fleet-note")).to_be_attached()
 
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
 
-    for win in ("1h", "6h", "24h", "15m"):
+    for win in ("1h", "24h", "15m"):
         btn = toggles.locator(f"button:has-text('{win}')")
         expect(btn).to_be_visible()
         btn.click()
         expect(btn).to_have_class("btn btn-sm btn-primary active")
-        for chart in _HISTORICAL_CHARTS + ("#vpn-chart-reasons", "#vpn-chart-backends"):
+        for chart in _HISTORICAL_CHARTS:
             expect(page.locator(chart)).to_be_visible()
+        # Both folds stay OPEN across a range change: the range buttons only redraw
+        # the series, they do not touch a fold's open state. Assert the fold state,
+        # not just the series visibility, so a regression that closes a fold is
+        # caught rather than silently hidden by the closed-fold invisibility check.
+        assert page.locator("#vpn-reason-history").evaluate("el => el.open")
+        assert page.locator("#vpn-per-backend").evaluate("el => el.open")
 
 
 @pytest.mark.e2e
@@ -183,8 +139,8 @@ def test_vpn_historical_charts_interaction_and_kpis(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Ensure technical details disclosure is open
-    _ensure_tech_details_open(page)
+    # Advanced Diagnostics is closed by default; open it explicitly.
+    _ensure_diagnostics_open(page)
 
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
@@ -230,7 +186,7 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
     page.wait_for_load_state("networkidle")
 
     # Open technical details disclosure if collapsed
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     # Inject an unavailable history series with unavailable flags and zero sample count
     page.evaluate("""() => {
@@ -280,7 +236,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     page.evaluate("""() => {
         const pt = { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
@@ -317,7 +273,7 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    _ensure_tech_details_open(page)
+    _ensure_diagnostics_open(page)
 
     details = page.locator("#vpn-fwd-routes-details")
     expect(details).to_be_visible()
@@ -364,11 +320,10 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Production JS auto-expands both disclosures conditionally: the outer one on
-    # new health problems and the inner one on route pressure. Open each only
-    # when closed so this check stays independent of dashboard health state and
-    # never toggles an already-open disclosure shut.
-    _ensure_tech_details_open(page)
+    # #955 removed every auto-expand: neither Advanced Diagnostics nor the route
+    # fold opens itself. Open both explicitly, and only when closed, so this check
+    # stays independent of dashboard health state.
+    _ensure_diagnostics_open(page)
     routes_details = page.locator("#vpn-fwd-routes-details")
     if not routes_details.evaluate("el => el.open"):
         page.locator("#vpn-fwd-routes-details > summary").click()
@@ -445,7 +400,9 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
 
     assert result["wrapper_client_width"] <= 375
     assert result["table_scroll_width"] >= 540
-    assert result["table_min_width_style"] == "540px"
+    # The 540px minimum is stylesheet-owned now, so assert the real containment
+    # rather than an inline style value.
+    assert result["table_min_width_style"] == ""
     assert result["wrapper_scroll_width"] > result["wrapper_client_width"]
     assert result["wrapper_overflow_x"] == "auto"
     assert result["scroll_left_ltr"] > 0

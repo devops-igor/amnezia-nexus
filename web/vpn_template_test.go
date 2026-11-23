@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ var coreScripts = []string{
 }
 
 func getVPNFuncMap() template.FuncMap {
-	return template.FuncMap{
+	return withAssetURL(template.FuncMap{
 		"_": func(key string, args ...any) string {
 			return key
 		},
@@ -46,7 +47,7 @@ func getVPNFuncMap() template.FuncMap {
 		"safe_js": func(s any) template.JS {
 			return template.JS(fmt.Sprint(s))
 		},
-	}
+	})
 }
 
 // vpnTestAppVersion stands in for config.AppVersion, which this package cannot
@@ -360,9 +361,37 @@ func TestRenderedVPNTemplateScriptPlacementAndOrder(t *testing.T) {
 	}
 }
 
+// emittedSrcAttr returns the exact src="…" attribute a rendered page carries for
+// path, whatever query the template emitted for it. The mutation tests below
+// need the real attribute: the identity of a delivered script comes from its
+// bytes, so it cannot be spelled as a literal here without pinning a query this
+// change is meant to stop pinning.
+func emittedSrcAttr(t *testing.T, markup, path string) string {
+	t.Helper()
+	pattern := regexp.MustCompile(`src="` + regexp.QuoteMeta(path) + `\?v=[^"]*"`)
+	matches := pattern.FindAllString(markup, -1)
+	if len(matches) == 0 {
+		t.Fatalf("%s is not requested under a cache identity in the rendered markup, so the mutation "+
+			"could not be applied and a passing mutation check would prove nothing", path)
+	}
+	if len(matches) > 1 {
+		t.Fatalf("%s is requested %d times (%v); the mutation would be ambiguous", path, len(matches), matches)
+	}
+	return matches[0]
+}
+
+// withExtraAttribute turns src="…" into src="…" <attr>: the attribute is added
+// after the closed value, not inside it.
+func withExtraAttribute(attr, extra string) string {
+	return attr + " " + extra
+}
+
 func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
-	mutated := strings.Replace(rendered, `src="/static/js/vpn/backends.js"`, `src="/static/js/vpn/backends.js" async`, 1)
+	scriptsBlock := renderVPNScriptsBlock(t)
+
+	target := emittedSrcAttr(t, rendered, "/static/js/vpn/backends.js")
+	mutated := strings.Replace(rendered, target, withExtraAttribute(target, "async"), 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply async mutation")
 	}
@@ -374,29 +403,40 @@ func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 		t.Fatalf("expected error mentioning 'async', got: %v", err)
 	}
 
-	// Also check scripts block
-	scriptsBlock := renderVPNScriptsBlock(t)
-	mutatedBlock := strings.Replace(scriptsBlock, `src="/static/js/vpn/backends.js"`, `src="/static/js/vpn/backends.js" async`, 1)
+	blockTarget := emittedSrcAttr(t, scriptsBlock, "/static/js/vpn/backends.js")
+	mutatedBlock := strings.Replace(scriptsBlock, blockTarget, withExtraAttribute(blockTarget, "async"), 1)
+	if mutatedBlock == scriptsBlock {
+		t.Fatal("failed to apply async mutation to scripts block")
+	}
 	if err := validateVPNScriptsBlock(mutatedBlock); err == nil || !strings.Contains(err.Error(), "async") {
 		t.Fatalf("expected validateVPNScriptsBlock to reject async mutant, got: %v", err)
 	}
 }
 
+// emittedScriptTag is the whole script element a rendered page carries for path.
+func emittedScriptTag(t *testing.T, markup, path string) string {
+	t.Helper()
+	return `<script ` + emittedSrcAttr(t, markup, path) + `></script>`
+}
+
 func TestRenderedVPNTemplateRejectInlineScriptMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
-	mutated := strings.Replace(rendered, `<script src="/static/js/vpn/page.js"></script>`,
-		`<script src="/static/js/vpn/page.js"></script><script>window.unexpectedInline = true</script>`, 1)
+	scriptsBlock := renderVPNScriptsBlock(t)
+
+	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/page.js")
+	mutated := strings.Replace(rendered, pageTag, pageTag+`<script>window.unexpectedInline = true</script>`, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply inline script mutation")
 	}
-	err := validateRenderedVPNPage(mutated)
-	if err == nil {
+	if err := validateRenderedVPNPage(mutated); err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject inline script mutant, but it passed")
 	}
 
-	scriptsBlock := renderVPNScriptsBlock(t)
-	mutatedBlock := strings.Replace(scriptsBlock, `<script src="/static/js/vpn/page.js"></script>`,
-		`<script src="/static/js/vpn/page.js"></script><script>window.unexpectedInline = true</script>`, 1)
+	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/page.js")
+	mutatedBlock := strings.Replace(scriptsBlock, blockTag, blockTag+`<script>window.unexpectedInline = true</script>`, 1)
+	if mutatedBlock == scriptsBlock {
+		t.Fatal("failed to apply inline script mutation to scripts block")
+	}
 	if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
 		t.Fatal("expected validateVPNScriptsBlock to reject inline script mutant, but it passed")
 	}
@@ -404,19 +444,22 @@ func TestRenderedVPNTemplateRejectInlineScriptMutant(t *testing.T) {
 
 func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
-	mutated := strings.Replace(rendered, `<script src="/static/js/vpn/page.js"></script>`,
-		`<script src="/static/js/vpn/page.js"></script><script src="/static/js/vpn/extra.js"></script>`, 1)
+	scriptsBlock := renderVPNScriptsBlock(t)
+
+	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/page.js")
+	mutated := strings.Replace(rendered, pageTag, pageTag+`<script src="/static/js/vpn/extra.js"></script>`, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply extra script mutation")
 	}
-	err := validateRenderedVPNPage(mutated)
-	if err == nil {
+	if err := validateRenderedVPNPage(mutated); err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject extra script mutant, but it passed")
 	}
 
-	scriptsBlock := renderVPNScriptsBlock(t)
-	mutatedBlock := strings.Replace(scriptsBlock, `<script src="/static/js/vpn/page.js"></script>`,
-		`<script src="/static/js/vpn/page.js"></script><script src="/static/js/vpn/extra.js"></script>`, 1)
+	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/page.js")
+	mutatedBlock := strings.Replace(scriptsBlock, blockTag, blockTag+`<script src="/static/js/vpn/extra.js"></script>`, 1)
+	if mutatedBlock == scriptsBlock {
+		t.Fatal("failed to apply extra script mutation to scripts block")
+	}
 	if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
 		t.Fatal("expected validateVPNScriptsBlock to reject extra script mutant, but it passed")
 	}
@@ -424,24 +467,30 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 
 func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
-	// Swap backends.js and health_problems.js
-	b1 := `<script src="/static/js/vpn/backends.js"></script>`
-	b2 := `<script src="/static/js/vpn/health_problems.js"></script>`
+
+	// Swap backends.js and health_problems.js, keeping each element's own
+	// identity query with it: the order is what this rejects, not the URLs.
+	b1 := emittedScriptTag(t, rendered, "/static/js/vpn/backends.js")
+	b2 := emittedScriptTag(t, rendered, "/static/js/vpn/health_problems.js")
 	mutated := strings.Replace(rendered, b1, "__PLACEHOLDER__", 1)
 	mutated = strings.Replace(mutated, b2, b1, 1)
 	mutated = strings.Replace(mutated, "__PLACEHOLDER__", b2, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply order mutation")
 	}
-	err := validateRenderedVPNPage(mutated)
-	if err == nil {
+	if err := validateRenderedVPNPage(mutated); err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject order mutant, but it passed")
 	}
 
 	scriptsBlock := renderVPNScriptsBlock(t)
-	mutatedBlock := strings.Replace(scriptsBlock, b1, "__PLACEHOLDER__", 1)
-	mutatedBlock = strings.Replace(mutatedBlock, b2, b1, 1)
-	mutatedBlock = strings.Replace(mutatedBlock, "__PLACEHOLDER__", b2, 1)
+	blk1 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends.js")
+	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/health_problems.js")
+	mutatedBlock := strings.Replace(scriptsBlock, blk1, "__PLACEHOLDER__", 1)
+	mutatedBlock = strings.Replace(mutatedBlock, blk2, blk1, 1)
+	mutatedBlock = strings.Replace(mutatedBlock, "__PLACEHOLDER__", blk2, 1)
+	if mutatedBlock == scriptsBlock {
+		t.Fatal("failed to apply order mutation to scripts block")
+	}
 	if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
 		t.Fatal("expected validateVPNScriptsBlock to reject order mutant, but it passed")
 	}
@@ -467,11 +516,9 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 
 	for _, tc := range typeMutants {
 		t.Run(tc.name, func(t *testing.T) {
-			origTarget := fmt.Sprintf(`src="%s"`, tc.targetSrc)
-			mutatedTarget := fmt.Sprintf(`src="%s" %s`, tc.targetSrc, tc.attr)
-
 			// Page check
-			mutatedPage := strings.Replace(rendered, origTarget, mutatedTarget, 1)
+			origTarget := emittedSrcAttr(t, rendered, tc.targetSrc)
+			mutatedPage := strings.Replace(rendered, origTarget, withExtraAttribute(origTarget, tc.attr), 1)
 			if mutatedPage == rendered {
 				t.Fatalf("failed to apply %s mutation to rendered page", tc.name)
 			}
@@ -480,7 +527,8 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 			}
 
 			// Block check
-			mutatedBlock := strings.Replace(scriptsBlock, origTarget, mutatedTarget, 1)
+			origBlockTarget := emittedSrcAttr(t, scriptsBlock, tc.targetSrc)
+			mutatedBlock := strings.Replace(scriptsBlock, origBlockTarget, withExtraAttribute(origBlockTarget, tc.attr), 1)
 			if mutatedBlock == scriptsBlock {
 				t.Fatalf("failed to apply %s mutation to scripts block", tc.name)
 			}
@@ -549,9 +597,15 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 	})
 
 	t.Run("CoreScriptNonClassicType", func(t *testing.T) {
-		mutated := strings.Replace(rendered, `src="/static/js/tables.js"`, `src="/static/js/tables.js" type="module"`, 1)
+		// The table engine is delivered under the digest of its own bytes, so the
+		// attribute has to be read from the render. Spelling the bare tag here
+		// would silently stop mutating anything the page emits — the same mistake
+		// as pinning a bare URL, and the mutation would then "pass" by doing
+		// nothing.
+		target := emittedSrcAttr(t, rendered, "/static/js/tables.js")
+		mutated := strings.Replace(rendered, target, withExtraAttribute(target, `type="module"`), 1)
 		if mutated == rendered {
-			t.Fatal("failed to apply core script non-classic type mutation")
+			t.Fatalf("failed to apply core script non-classic type mutation")
 		}
 		if err := validateRenderedVPNPage(mutated); err == nil {
 			t.Fatal("expected validateRenderedVPNPage to reject core script module type, but it passed")

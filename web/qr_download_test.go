@@ -184,7 +184,7 @@ func TestQRTemplateExecution(t *testing.T) {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	funcMap := template.FuncMap{
+	funcMap := withAssetURL(template.FuncMap{
 		"_":        func(k string, args ...any) string { return k },
 		"has_role": func(u any, roles ...string) bool { return true },
 		"json": func(v any) (string, error) {
@@ -222,7 +222,7 @@ func TestQRTemplateExecution(t *testing.T) {
 			}
 			return nil
 		},
-	}
+	})
 
 	templates := []string{"server.html", "my_connections.html", "user_share.html", "users.html"}
 	for _, tmplName := range templates {
