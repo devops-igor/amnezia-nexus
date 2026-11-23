@@ -56,10 +56,15 @@ async function vpnLoadData() {
         }
         document.getElementById('vpn-listen-port').textContent = String(cfg.listen_port || '-');
         document.getElementById('vpn-subnet').textContent = cfg.subnet_cidr || '-';
-        document.getElementById('vpn-sessions').textContent = String(status.connected_sessions || 0);
-        document.getElementById('vpn-active-tunnels').textContent = String(status.active_tunnels || 0);
-        document.getElementById('vpn-rx').textContent = Telemetry.formatBytes(status.rx_bytes || 0);
-        document.getElementById('vpn-tx').textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+        // Cumulative Rx/Tx live in Advanced Diagnostics as since-reset totals, so
+        // they are written here rather than described as rates.
+        const rxElem = document.getElementById('vpn-rx');
+        if (rxElem) rxElem.textContent = Telemetry.formatBytes(status.rx_bytes || 0);
+        const txElem = document.getElementById('vpn-tx');
+        if (txElem) txElem.textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+        // The sessions signal and every other overview value are owned by
+        // vpnRenderForwarderHealth -> vpnRenderSignals, which distinguishes a
+        // measured zero from an unmeasured value.
         vpnRenderForwarderHealth(status);
 
         const tbody = document.getElementById('vpn-backends-tbody');
@@ -135,6 +140,203 @@ function vpnStopPolling() {
     }
 }
 
+// vpnFindSessionRow returns the session table row for one identifier. It walks the
+// tbody's rows rather than relying on a selector engine, so the same lookup works
+// in every environment and never depends on CSS.escape for an id.
+function vpnFindSessionRow(sessionId) {
+    const tbody = document.getElementById('vpn-sessions-tbody');
+    if (!tbody || !tbody.children) return null;
+    const wanted = String(sessionId);
+    for (let i = 0; i < tbody.children.length; i++) {
+        const candidate = tbody.children[i];
+        if (!candidate || typeof candidate.getAttribute !== 'function') continue;
+        if (candidate.getAttribute('data-session-id') === wanted) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+// vpnFocusHeading moves the caller's focus to a table heading that already exists
+// in the template with tabindex="-1", so it is genuinely focusable.
+function vpnFocusHeading(id, explanationKey) {
+    const heading = document.getElementById(id);
+    if (heading && typeof heading.focus === 'function') heading.focus();
+    const summaryEl = document.getElementById('vpn-fwd-headline-summary');
+    if (summaryEl && explanationKey) summaryEl.textContent = _(explanationKey);
+}
+
+// vpnBackendFocusCell returns the focusable cell for one backend row. Row cells are
+// matched by kind, never by element name: a plain <td> always satisfies
+// typeof node.focus === 'function', so checking the function alone would claim a
+// non-focusable cell can take focus. The search is restricted to the row's own cells
+// so a nested control's tabindex cannot stand in for the cell's.
+function vpnBackendFocusCell(row) {
+    const cells = row.children || [];
+    for (let i = 0; i < cells.length; i++) {
+        const cell = cells[i];
+        if (cell && cell.getAttribute && cell.getAttribute('tabindex') !== null) return cell;
+    }
+    return null;
+}
+
+// vpnFocusFirstFocusable focuses the first candidate that carries an explicit
+// tabindex. A plain element satisfies typeof node.focus === 'function' even when
+// the browser refuses to focus it, so focusability is read from the attribute that
+// actually grants it.
+function vpnFocusFirstFocusable(candidates) {
+    for (let i = 0; i < candidates.length; i++) {
+        const node = candidates[i];
+        if (node && typeof node.focus === 'function' && node.getAttribute && node.getAttribute('tabindex') !== null) {
+            node.focus();
+            return true;
+        }
+    }
+    return false;
+}
+
+// vpnRevealSessionRow makes one session row EXIST and be visible, so a focus call
+// that follows actually moves. A session can be missing from the table for a reason
+// that is not a missing session: the problems-only filter excludes it BEFORE
+// rendering, so no row is appended and the table's own filters never see it. The
+// order therefore matters — leave the problems-only view so the row is rendered,
+// resolve it again, then let the table clear its search/status filter and page to it.
+//
+// The problems-only choice is NOT restored afterwards. Restoring it would re-render
+// the list without the row, so focus would land on a node no longer in the document
+// and the revealed detail would disappear under the operator. It is instead LEFT
+// CLEARED through the toggle handler that owns that state, so the toolbar button's
+// class and label both read as inactive. This function never writes
+// vpnSessionsFilterOnlyProblems itself, so the flag and the control cannot disagree.
+function vpnRevealSessionRow(sessionId) {
+    if (!document.getElementById('vpn-sessions-tbody')) return null;
+
+    if (vpnSessionsFilterOnlyProblems === true && typeof vpnToggleSessionsProblemFilter === 'function') {
+        vpnToggleSessionsProblemFilter();
+    }
+
+    const tr = vpnFindSessionRow(sessionId);
+    if (!tr) return null;
+    if (vpnSessionsTableInstance && typeof vpnSessionsTableInstance.revealRow === 'function') {
+        return vpnSessionsTableInstance.revealRow(tr) ? tr : null;
+    }
+    return tr.style.display === 'none' ? null : tr;
+}
+
+// vpnRevealBackendRow makes one backend row visible before focus is called on it.
+//
+// The row EXISTS whenever the backend is listed, so a failed lookup can only mean
+// "not listed". It can still be invisible, because NexusTable hides a row for two
+// separate reasons — a search term or status filter excluded it, or it sits on a
+// page the table is not showing — and only the table knows which. Clearing either
+// one from here would be a guess, so the reveal goes through the table's own
+// operation, which resolves the page AFTER the filters are cleared.
+//
+// A revealed row stays revealed: the operator's search term and status chip are
+// visibly cleared, and restoring them would hide the row the moment focus landed.
+function vpnRevealBackendRow(tr) {
+    if (!tr) return null;
+    if (vpnTableInstance && typeof vpnTableInstance.revealRow === 'function') {
+        return vpnTableInstance.revealRow(tr) ? tr : null;
+    }
+    return tr.style.display === 'none' ? null : tr;
+}
+
+// vpnFocusSessionIssue reveals one session's drill-down and moves focus to the
+// affected session row's action cell. Diagnostics is never touched.
+//
+// The missing-entity explanation is reported only when the session is genuinely not
+// in the polled data. A session the problems-only filter excluded exists in the
+// data, so it is revealed instead: the operator is never told a session is gone
+// while it is still listed.
+function vpnFocusSessionIssue(row) {
+    const wanted = String(row.sessionId || row.connectionId);
+    const tr = vpnRevealSessionRow(wanted);
+    if (!tr) {
+        const known = (typeof vpnFindSessionById === 'function') ? vpnFindSessionById(wanted) : null;
+        if (!known) {
+            vpnFocusHeading('vpn-troubleshooting-title', 'vpn_issue_entity_missing_session');
+            return;
+        }
+        // The session is in the data but no row could be produced for it. That is
+        // not the missing-session statement, so nothing is rewritten here.
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+        return;
+    }
+    // Reveal, never toggle: the action means "show me this", so it must not close a
+    // fold the operator is already reading.
+    if (typeof vpnSetSessionDrilldownOpen === 'function') {
+        vpnSetSessionDrilldownOpen(wanted, tr, true);
+    }
+    const cell = (typeof tr.querySelector === 'function') ? tr.querySelector('[data-action="vpn-toggle-session"]') : null;
+    if (!vpnFocusFirstFocusable([cell, tr])) {
+        // No focusable target on the row means focus would silently stay put.
+        vpnFocusHeading('vpn-troubleshooting-title', null);
+    }
+}
+
+// vpnFindBackendRowByTunnelId returns the backend table row whose own tunnel id is
+// the one the problem reports. It walks the tbody's rows rather than depending on a
+// selector engine, the same way the session lookup does.
+//
+// The row's own tunnel id (data-tunnel-id) is what the diagnostics payload reports
+// as backend_id, because that value comes from the session/route backend tunnel id.
+// The row's data-server-id is a DIFFERENT id space — it is the server the row's
+// enable/delete actions post to — so it is never compared against a problem.
+function vpnFindBackendRowByTunnelId(tbody, tunnelId) {
+    const rows = (tbody && tbody.children) ? tbody.children : [];
+    const wanted = String(tunnelId);
+    for (let i = 0; i < rows.length; i++) {
+        const candidate = rows[i];
+        if (!candidate || typeof candidate.getAttribute !== 'function') continue;
+        if (candidate.getAttribute('data-tunnel-id') === wanted) return candidate;
+    }
+    return null;
+}
+
+// vpnFocusBackendIssue moves focus to the affected backend's name cell, or to the
+// backend table heading when that backend is no longer listed.
+function vpnFocusBackendIssue(row) {
+    const found = vpnFindBackendRowByTunnelId(document.getElementById('vpn-backends-tbody'), row.backendId);
+    const tr = vpnRevealBackendRow(found);
+    if (!tr) {
+        vpnFocusHeading('vpn-backends-title', 'vpn_issue_entity_missing_backend');
+        return;
+    }
+    const nameCell = vpnBackendFocusCell(tr);
+    if (nameCell && vpnFocusFirstFocusable([nameCell])) return;
+    vpnFocusHeading('vpn-backends-title', null);
+}
+
+// vpnIssueDestinationHeading names the card that owns a problem carrying no entity
+// id. Such a problem is a statement about a SURFACE rather than about a row that has
+// vanished, and the surface is named by its category. Keying this on an explicit
+// category set is what keeps a backend-scoped condition (for example "no healthy
+// backends available to route traffic") out of the sessions table while a
+// connection, routing or dataplane condition keeps the destination it already had;
+// pointing every fallback at one card would only move the error.
+const VPN_BACKEND_CATEGORIES = ['backend'];
+function vpnIssueDestinationHeading(category) {
+    const c = String(category || '').toLowerCase();
+    if (VPN_BACKEND_CATEGORIES.indexOf(c) !== -1) return 'vpn-backends-title';
+    return 'vpn-troubleshooting-title';
+}
+
+// vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
+// opening Advanced Diagnostics. The destination must be a node that can actually
+// take focus, and the reveal is idempotent: a second Inspect on an already-open
+// detail keeps it open instead of toggling it shut.
+function vpnFocusIssueTarget(row) {
+    if (row.sessionId || row.connectionId) {
+        vpnFocusSessionIssue(row);
+    } else if (row.backendId) {
+        vpnFocusBackendIssue(row);
+    } else {
+        vpnFocusHeading(vpnIssueDestinationHeading(row.category), null);
+    }
+}
+
+
 const VPN_ACTIONS = {
     'vpn-open-edit-endpoint': function () {
         if (typeof vpnOpenEditEndpointModal === 'function') vpnOpenEditEndpointModal();
@@ -147,6 +349,17 @@ const VPN_ACTIONS = {
     },
     'vpn-toggle-show-all-routes': function () {
         if (typeof vpnToggleShowAllRoutes === 'function') vpnToggleShowAllRoutes();
+    },
+    'vpn-toggle-diagnostics': function () {
+        if (typeof vpnToggleDiagnostics === 'function') vpnToggleDiagnostics();
+    },
+    'vpn-close-diagnostics': function () {
+        if (typeof vpnCloseDiagnostics === 'function') vpnCloseDiagnostics();
+    },
+    'vpn-issue-inspect': function (btn) {
+        // Focus is handled by the row's own listener; this entry keeps the
+        // delegated handler from treating the button as an unknown action.
+        if (btn && btn.getAttribute && btn.getAttribute('data-issue-key')) return;
     },
     'vpn-set-history-window': function (btn) {
         const win = btn.dataset ? btn.dataset.window : (btn.getAttribute ? btn.getAttribute('data-window') : null);
@@ -262,4 +475,9 @@ if (typeof window !== 'undefined') {
     window.vpnToggleShowAllRoutes = vpnToggleShowAllRoutes;
     window.vpnStopPolling = vpnStopPolling;
     window.initVpnEventListeners = initVpnEventListeners;
+    window.vpnFindSessionRow = vpnFindSessionRow;
+    window.vpnRevealSessionRow = vpnRevealSessionRow;
+    window.vpnBackendFocusCell = vpnBackendFocusCell;
+    window.vpnFocusIssueTarget = vpnFocusIssueTarget;
+    window.vpnIssueDestinationHeading = vpnIssueDestinationHeading;
 }

@@ -905,7 +905,7 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	funcMap := template.FuncMap{
+	funcMap := withAssetURL(template.FuncMap{
 		"_": func(k string) string { return k },
 		"t": func(k string) string { return k },
 		"safe_js": func(v any) template.JS {
@@ -939,7 +939,7 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 			}
 			return s[start:end]
 		},
-	}
+	})
 
 	tmpl, err := template.New("base.html").Funcs(funcMap).ParseFS(templatesFS, "base.html", "server.html")
 	if err != nil {

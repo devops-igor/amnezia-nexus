@@ -317,7 +317,10 @@ func TestIssue101VPNModernization(t *testing.T) {
 		t.Fatalf("GetTranslationsSubFS failed: %v", err)
 	}
 
-	// 1. Assert vpn.html contains all 36 required DOM element IDs
+	// 1. Assert vpn.html contains the required DOM element IDs. The #955 redesign
+	// replaced the old four-card block: #vpn-active-tunnels no longer exists (a route
+	// mismatch replaces it, and only when one is reported), while the cumulative Rx/Tx
+	// totals moved into Advanced Diagnostics.
 	requiredDOMIDs := []string{
 		"vpn-listener-badge",
 		"vpn-listen-port",
@@ -325,7 +328,6 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"vpn-public-endpoint",
 		"vpn-edit-endpoint-btn",
 		"vpn-sessions",
-		"vpn-active-tunnels",
 		"vpn-rx",
 		"vpn-tx",
 		"vpnTableContainer",
@@ -486,9 +488,7 @@ func TestIssue101VPNModernization(t *testing.T) {
 
 	// 9. Assert presence of new VPN keys across all 5 translations
 	newVPNTranslationKeys := []string{
-		"vpn_bandwidth",
 		"vpn_entry_point_hint",
-		"vpn_telemetry_live",
 		"vpn_port",
 		"vpn_unset_auto",
 		"vpn_unset_auto_detected",
@@ -648,8 +648,18 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	vpnStr := string(vpnData)
-	if !strings.Contains(vpnStr, `style="gap: var(--space-sm);"`) {
-		t.Errorf("vpn.html missing style=\"gap: var(--space-sm);\" for live telemetry dot spacing")
+	// The inline "live telemetry" dot row is gone with the old bandwidth card; the
+	// redesigned surfaces express spacing through the scoped stylesheet instead, so
+	// an inline style must NOT remain in the template.
+	if strings.Contains(vpnStr, `style="gap: var(--space-sm);"`) {
+		t.Errorf("vpn.html must not carry the retired inline telemetry-dot spacing style")
+	}
+	cssGapData, err := fs.ReadFile(staticFS, "css/vpn.css")
+	if err != nil {
+		t.Fatalf("failed to read css/vpn.css: %v", err)
+	}
+	if !strings.Contains(string(cssGapData), "gap: var(--space-sm)") {
+		t.Errorf("vpn.css missing gap: var(--space-sm) used by the redesigned surfaces")
 	}
 
 	cssData, err := fs.ReadFile(staticFS, "css/style.css")
@@ -743,16 +753,22 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	vpnStr := string(vpnData)
-	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable" style="width: 100%; min-width: 100%;">`) {
-		t.Errorf("vpn.html missing table#vpnBackendsTable with style=\"width: 100%%; min-width: 100%%;\"")
+	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable">`) {
+		t.Errorf("vpn.html missing table#vpnBackendsTable with the interactive-table contract")
+	}
+	// Full width is carried by .interactive-table in the stylesheet rather than an
+	// inline style, which #955 removed along with the rest of the large inline styling.
+	if strings.Contains(vpnStr, `style="width: 100%; min-width: 100%;"`) {
+		t.Errorf("vpn.html must not carry inline full-width table styling")
 	}
 	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
 		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 
-	// 3. Assert stylesheet cache-busting (the release version, so a corrected
-	// stylesheet is fetched instead of served from a day-old cache entry) and
-	// cascade order across all shell and auth templates
+	// 3. Assert stylesheet cache identity across all shell and auth templates:
+	// every link carries one, and the stylesheet this change replaced carries the
+	// identity of its own bytes rather than the release version the predecessor
+	// also served (the release did not move, so ?v=<release> is the old URL).
 	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
 	for _, tmpl := range templatesToCheck {
 		tmplData, err := fs.ReadFile(templatesFS, tmpl)
@@ -761,14 +777,23 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		}
 		tmplStr := string(tmplData)
 		cleanTmplStr := stripHTMLComments(tmplStr)
+		links := stylesheetLinksOf(t, cleanTmplStr)
 		for _, name := range canonicalStylesheetOrder {
-			expectedLink := `href="/static/css/` + name + `.css?v=` + assetVersionAction + `"`
-			if !strings.Contains(cleanTmplStr, expectedLink) {
-				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
+			path := "/static/css/" + name + ".css"
+			form, ok := links[path]
+			if !ok {
+				t.Errorf("%s missing stylesheet link %s", tmpl, path)
+				continue
+			}
+			if form == refBare {
+				t.Errorf("%s links %s with no cache identity, so a corrected stylesheet can stay cached for up to a day", tmpl, path)
 			}
 		}
+		if form, ok := links["/static/css/vpn.css"]; ok && form != refAssetBytes {
+			t.Errorf("%s identifies vpn.css by %s; this delivery changed its bytes without moving the release", tmpl, form)
+		}
 
-		extracted := extractActiveStylesheetOrder(cleanTmplStr)
+		extracted := extractActiveStylesheetOrder(normalizeAssetActions(cleanTmplStr))
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Errorf("%s stylesheet link order mismatch: got %v, want %v", tmpl, extracted, canonicalStylesheetOrder)
 		}

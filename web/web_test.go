@@ -268,13 +268,22 @@ func TestPhase3TablesAndTelemetryEngine(t *testing.T) {
 	}
 	baseStr := string(baseData)
 
-	requiredScripts := []string{
-		"src=\"/static/js/tables.js\"",
-		"src=\"/static/js/telemetry.js\"",
-	}
-	for _, script := range requiredScripts {
-		if !strings.Contains(baseStr, script) {
-			t.Errorf("base.html missing required script %q", script)
+	// The requirement is that the layout loads the table engine and the telemetry
+	// poller before any page script, not that it spells either one bare. The table
+	// engine is now identified by its own bytes, so a bare-only assertion here
+	// would either fail the delivery or force the bare URL back. The reference is
+	// read with this package's own tag classifier, so both accepted forms — and
+	// this check and the asset-identity checks — come from one reading of a tag.
+	for _, script := range []string{"/static/js/tables.js", "/static/js/telemetry.js"} {
+		found := false
+		for _, tag := range assetTagPattern.FindAllString(baseStr, -1) {
+			if path, _, _, ok := classifyAssetTag(tag); ok && path == script {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("base.html no longer loads required script %q", script)
 		}
 	}
 
