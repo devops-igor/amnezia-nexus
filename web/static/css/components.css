@@ -205,13 +205,17 @@
    values drop below the 4.5:1 threshold for badge-sized text (success 2.35:1,
    warn 2.02:1, info 2.56:1), so the light theme paints the badge text in a
    darker shade of the same hue. The dark theme keeps its colours, and the hue --
-   which is what carries the meaning -- is unchanged in both. */
+   which is what carries the meaning -- is unchanged in both.
+
+   Only the defined badge classes are overridden. The stylesheet has no
+   `.badge-warning` rule, so adding one here would have invented a surface the
+   frozen pre-split reference never had; a badge rendered with that name inherits
+   the theme's body text colour and already clears the threshold. */
 [data-theme="light"] .badge-success {
     color: #046c4e;
 }
 
-[data-theme="light"] .badge-warn,
-[data-theme="light"] .badge-warning {
+[data-theme="light"] .badge-warn {
     color: #92400e;
 }
 
