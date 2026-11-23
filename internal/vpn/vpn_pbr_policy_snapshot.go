@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // This file owns the snapshot ordering that makes policy activation fail closed:
@@ -19,19 +20,33 @@ import (
 // has its own contract and its own guard interactions, and because the ordering
 // here is the substance of #678 F678-03.
 
-// ensureInitialSnapshot guarantees the matcher holds a non-empty policy snapshot
-// before activation proceeds.
+// ensureInitialSnapshot guarantees activation has a routing authority before it
+// proceeds.
 //
-// Ordering is what makes this correct (#678 F678-03). The durable last-known-good
-// baseline is published into the matcher *first*, so the synchronous sync that
-// follows is evaluated against the previous rule count. Without that, a fresh
-// matcher has no previous count, the shrink guard has nothing to compare against,
-// and a complete-but-shortened upstream list is accepted as the first-ever
-// snapshot — overwriting both the live policy and the durable generation while
-// every other guard (transport, content-type, empty list) reports success.
+// The authority is the destination classifier, not the operator's exception list.
+// The snapshot holds the operator's PROXY overrides, and an override that names
+// nothing is a valid configuration: every destination then takes the classifier's
+// answer (rows 3 to 5 of the routing contract in forwarder/routing_decision.go).
+// So a published snapshot with zero rules is not an absent policy, and this
+// handshake must not refuse it.
 //
-// So the sequence is: prime baseline → one synchronous sync → settle → require
-// rules.
+// What it must still refuse is a data path with no routing authority at all:
+// every destination then answers "uncovered", the fail-safe proxy default takes
+// all traffic, nothing can route DIRECT, and the policy would be inert while the
+// panel reported it enabled. That is a question about the installed classifier,
+// not about the rule count, and it is answered here — before the first sync — by
+// the nil-classifier check at the top of this function.
+//
+// Ordering is what makes the rest correct (#678 F678-03). The durable
+// last-known-good baseline is published into the matcher *first*, so the
+// synchronous sync that follows is evaluated against the previous rule count.
+// Without that, a fresh matcher has no previous count, the shrink guard has
+// nothing to compare against, and a complete-but-shortened upstream list is
+// accepted as the first-ever snapshot — overwriting both the live policy and the
+// durable generation while every other guard reports success.
+//
+// So the sequence is: require authority → prime baseline → one synchronous sync
+// → settle.
 //   - baseline primed and the sync succeeds: the new generation was accepted
 //     against a real previous count, which is the ordinary refresh path.
 //   - baseline primed and the sync fails or is refused by a guard: the primed
@@ -43,10 +58,11 @@ import (
 //   - a durable generation that exists but cannot be used: refused explicitly
 //     rather than synced over, because that would destroy the last recoverable
 //     copy.
-//
-// If no rules are live at the end, activation is refused with an error an
-// operator can act on.
-func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher) error {
+func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher, classifier forwarder.DestinationClassifier) error {
+	if classifier == nil {
+		return fmt.Errorf("%w: no destination classifier is installed, so no destination could be classified", ErrPolicyActivationNoRules)
+	}
+
 	baseline, baselineErr := syncer.PrimeBaseline(ctx)
 	if baselineErr != nil {
 		// A stored generation that cannot be used is a distinct, actionable state:
@@ -63,15 +79,7 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()
 
-	if err := settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), syncer.GenerationViolations, baseline, syncRes, syncErr); err != nil {
-		return err
-	}
-
-	snap := matcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
-		return ErrPolicyActivationNoRules
-	}
-	return nil
+	return settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), baseline, syncRes, syncErr)
 }
 
 // settleInitialSync decides what the first synchronous sync's outcome means for
@@ -85,14 +93,11 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 // source-faithful (#678 F678-05): a durable generation that belongs to a
 // *different* source configuration must never be published as this one's rules,
 // however usable it looks, because the selected list has then never loaded.
-// violations is the selected guard validator (built-in plus operator exclusions),
-// so a retained generation is never published with a newly excluded name.
 func settleInitialSync(
 	ctx context.Context,
 	store policy.Store,
 	matcher *policy.Matcher,
 	configHash string,
-	violations func(*policy.Generation) []string,
 	baseline policy.BaselineStatus,
 	syncRes policy.SyncResult,
 	syncErr error,
@@ -114,7 +119,7 @@ func settleInitialSync(
 		slog.Warn("Policy sync failed at startup and the stored generation is not valid rules for this configuration; refusing activation", "err", syncErr)
 		return fmt.Errorf("%w: initial sync of the selected configuration failed (%v) and the stored last-known-good generation is not valid rules for it (different source configuration or never-proxy guarded domains)", ErrPolicyActivationNoRules, syncErr)
 	case syncErr != nil:
-		if loadErr := loadLastKnownGoodWithGuard(ctx, store, matcher, configHash, violations); loadErr != nil {
+		if loadErr := loadLastKnownGood(ctx, store, matcher, configHash); loadErr != nil {
 			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
 				ErrPolicyActivationNoRules, syncErr, loadErr)
 		}
@@ -133,18 +138,11 @@ func settleInitialSync(
 // guard PrimeBaseline applies must hold on this fallback path, otherwise a failed
 // first sync of a new source could still authorize traffic with unrelated rules.
 func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.Matcher, wantConfigHash string) error {
-	return loadLastKnownGoodWithGuard(ctx, store, matcher, wantConfigHash, nil)
-}
-
-// loadLastKnownGoodWithGuard is loadLastKnownGood with the selected guard
-// validator. A nil validator falls back to the built-in guard, which is what
-// direct callers and older tests expect.
-func loadLastKnownGoodWithGuard(ctx context.Context, store policy.Store, matcher *policy.Matcher, wantConfigHash string, violations func(*policy.Generation) []string) error {
 	gen, err := store.Load(ctx)
 	if err != nil {
 		return err
 	}
-	snap, err := validateLastKnownGood(gen, wantConfigHash, violations)
+	snap, err := validateLastKnownGood(gen, wantConfigHash)
 	if err != nil {
 		return err
 	}
@@ -155,27 +153,18 @@ func loadLastKnownGoodWithGuard(ctx context.Context, store policy.Store, matcher
 // validateLastKnownGood checks a durable generation against the selected
 // configuration and guard and compiles it. Keeping the decisions in one place
 // stops the fallback from drifting from PrimeBaseline.
-func validateLastKnownGood(gen *policy.Generation, wantConfigHash string, violations func(*policy.Generation) []string) (*policy.Snapshot, error) {
+func validateLastKnownGood(gen *policy.Generation, wantConfigHash string) (*policy.Snapshot, error) {
 	if gen == nil {
 		return nil, errors.New("no last-known-good policy generation stored")
 	}
 	if wantConfigHash != "" && gen.ConfigHash != wantConfigHash {
 		return nil, errors.New("stored last-known-good generation belongs to a different source configuration")
 	}
-	// Defense in depth: a generation is a record of what an older build and
-	// older settings published, and the guard or the operator exclusions may
-	// have gained patterns since. Never publish rules the current guard forbids.
-	if violations == nil {
-		violations = policy.GenerationNeverProxyViolations
-	}
-	if found := violations(gen); len(found) > 0 {
-		return nil, fmt.Errorf("stored last-known-good generation contains %d never-proxy guarded domain(s), including %q", len(found), found[0])
-	}
 	snap, err := policy.GenerationToSnapshot(gen)
 	if err != nil {
 		return nil, err
 	}
-	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+	if snap.CIDRCount() == 0 {
 		return nil, errors.New("stored policy generation contains no rules")
 	}
 	return snap, nil

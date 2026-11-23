@@ -4,11 +4,7 @@ package vpn
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -266,14 +262,6 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 		}
 	}
 
-	// ---- Authentic fixture-scoped HTTPS policy source -------------------------
-	listBody := "example.com\ncdn.example.net\n"
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(listBody))
-	}))
-	defer srv.Close()
-
 	// ---- 1. admin/settings/source: persist the record -------------------------
 	dataDir, err := os.MkdirTemp("", "nexus-pbr-e2e-")
 	if err != nil {
@@ -287,7 +275,7 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	}
 	defer func() { _ = db.Close() }()
 
-	settings := policyE2ESettingsForFixture(srv.URL)
+	settings := policyE2ESettingsForFixture()
 	if err := settings.Validate(); err != nil {
 		return fail("fixture settings invalid: %v", err)
 	}
@@ -300,7 +288,7 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	if err != nil {
 		return fail("reload settings: %v", err)
 	}
-	if reloaded.Preset != settings.Preset || reloaded.Enabled != settings.Enabled {
+	if len(reloaded.ProxyExceptions) != len(settings.ProxyExceptions) || reloaded.Enabled != settings.Enabled {
 		return fail("persisted settings did not round-trip: got %+v want %+v", reloaded, settings)
 	}
 	say("PHASE settings-persisted")
@@ -311,7 +299,7 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	// a successful earlier sync would. This makes activation deterministic inside the
 	// namespace (no dependency on the fixture server being reachable from it) while
 	// still exercising the real sync -> commit -> publish path.
-	if _, syncRes, err := runPolicyE2ESync(settings, store, srv); err != nil {
+	if _, syncRes, err := runPolicyE2ESync(settings, store); err != nil {
 		return fail("priming policy sync: %v", err)
 	} else if !syncRes.Published {
 		return fail("priming policy sync did not publish a snapshot")
@@ -334,7 +322,7 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	if svc.DirectEgress() == nil {
 		return fail("DirectEgress() = nil after activation")
 	}
-	if snap := svc.PolicyMatcher().Current(); snap == nil || snap.DomainCount() == 0 {
+	if snap := svc.PolicyMatcher().Current(); snap == nil || snap.CIDRCount() == 0 {
 		return fail("no rule-bearing snapshot published by activation")
 	}
 	say("PHASE activation-enabled")
@@ -363,7 +351,7 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	if err != nil {
 		return fail("reload settings after restart: %v", err)
 	}
-	if reloaded2.Preset != settings.Preset || reloaded2.SyncInterval != settings.SyncInterval {
+	if len(reloaded2.ProxyExceptions) != len(settings.ProxyExceptions) || reloaded2.SyncInterval != settings.SyncInterval {
 		return fail("settings did not survive restart: got %+v want %+v", reloaded2, settings)
 	}
 	// Activating from persisted settings alone must reproduce the policy from the
@@ -391,10 +379,12 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 
 	// ---- 5. negative controls must still hold -------------------------------
 	// Missing source: activation must refuse and must not leave PBR enabled.
-	bad := policyE2ESettingsForFixture(srv.URL)
-	bad.Preset = "not_a_preset"
+	// A record whose exception line is not an address must be refused by
+	// validation, so an unusable body cannot reach activation at all.
+	bad := policyE2ESettingsForFixture()
+	bad.ProxyExceptions = []string{"not-a-prefix"}
 	if err := bad.Validate(); err == nil {
-		return fail("invalid preset passed Validate; fail-closed validation regressed")
+		return fail("an unparseable exception line passed Validate; fail-closed validation regressed")
 	}
 	svc3, err := newPolicyE2EService()
 	if err != nil {
@@ -431,13 +421,6 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 	dataDir := t.TempDir()
 
-	listBody := "example.com\ncdn.example.net\n"
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(listBody))
-	}))
-	defer srv.Close()
-
 	db, err := openPolicyE2EDB(dataDir)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -445,7 +428,7 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	// 1. admin/settings/source persisted through the production settings table.
-	settings := policyE2ESettingsForFixture(srv.URL)
+	settings := policyE2ESettingsForFixture()
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("fixture settings invalid: %v", err)
 	}
@@ -456,7 +439,7 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload settings: %v", err)
 	}
-	if reloaded.Preset != settings.Preset || !reloaded.Enabled {
+	if len(reloaded.ProxyExceptions) != 1 || !reloaded.Enabled {
 		t.Fatalf("settings did not round-trip through the settings table: got %+v want %+v", reloaded, settings)
 	}
 	if reloaded.SyncInterval != settings.SyncInterval {
@@ -465,7 +448,7 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 
 	// 2. real source sync: hardened fetch -> parse -> durable commit -> publish.
 	store := policyE2EFileStore(dataDir)
-	matcher, res, err := runPolicyE2ESync(settings, store, srv)
+	matcher, res, err := runPolicyE2ESync(settings, store)
 	if err != nil {
 		t.Fatalf("policy sync: %v", err)
 	}
@@ -473,11 +456,14 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 		t.Fatal("sync did not publish a snapshot")
 	}
 	snap := matcher.Current()
-	if snap == nil || snap.DomainCount() == 0 {
-		t.Fatalf("published snapshot has no domain rules: %+v", snap)
+	if snap == nil || snap.CIDRCount() == 0 {
+		t.Fatalf("published snapshot has no prefixes: %+v", snap)
 	}
-	if !snap.MatchDomain("example.com") {
-		t.Error("published snapshot does not match a rule from the fetched list")
+	if !snap.MatchIPv4(netip.MustParseAddr("203.0.113.7")) {
+		t.Error("published snapshot does not match the operator's exception prefix")
+	}
+	if snap.MatchIPv4(netip.MustParseAddr("198.51.100.7")) {
+		t.Error("published snapshot matches an address the operator did not list")
 	}
 
 	// 3. restart: a fresh DB handle and a fresh store load reproduce the same policy
@@ -491,10 +477,10 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload settings after restart: %v", err)
 	}
-	if restarted.Preset != settings.Preset || restarted.SyncInterval != settings.SyncInterval {
+	if len(restarted.ProxyExceptions) != len(settings.ProxyExceptions) || restarted.SyncInterval != settings.SyncInterval {
 		t.Fatalf("settings did not survive restart: got %+v want %+v", restarted, settings)
 	}
-	matcher2, res2, err := runPolicyE2ESync(restarted, store, srv)
+	matcher2, res2, err := runPolicyE2ESync(restarted, store)
 	if err != nil {
 		t.Fatalf("policy sync after restart: %v", err)
 	}
@@ -527,22 +513,21 @@ func TestPolicyEnablementPersistRestartDisableNoPrivileges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload before negative: %v", err)
 	}
-	bad := policyE2ESettingsForFixture(srv.URL)
-	bad.Preset = "not_a_preset"
+	bad := policyE2ESettingsForFixture()
+	bad.ProxyExceptions = []string{"not-a-prefix"}
 	if err := bad.Validate(); err == nil {
-		t.Fatal("invalid preset passed Validate; fail-closed validation regressed")
+		t.Fatal("an unparseable exception line passed Validate; fail-closed validation regressed")
 	}
-	badReq := policyE2ESettingsForFixture(srv.URL)
-	badReq.Preset = policy.PresetCustom
-	badReq.CustomURLs = []string{"https://10.0.0.5/internal.lst"}
+	badReq := policyE2ESettingsForFixture()
+	badReq.InventoryOverride = []string{"https://10.0.0.5/internal.lst"}
 	if err := badReq.Validate(); err == nil {
-		t.Fatal("SSRF target passed Validate")
+		t.Fatal("a markup document passed Validate as an inventory override")
 	}
 	after, err := loadPolicyE2ESettings(db)
 	if err != nil {
 		t.Fatalf("reload after negative: %v", err)
 	}
-	if after.Preset != before.Preset || after.Enabled != before.Enabled {
+	if len(after.ProxyExceptions) != len(before.ProxyExceptions) || after.Enabled != before.Enabled {
 		t.Fatalf("a rejected configuration modified the stored record: %+v -> %+v", before, after)
 	}
 }
@@ -554,23 +539,22 @@ func openPolicyE2EDB(dataDir string) (*database.DB, error) {
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 }
 
-// policyE2ESettingsForFixture builds a custom-preset record pointed at the fixture
-// list. The record must satisfy the real validator, which only permits HTTPS on
-// port 443, so the URL uses a canonical form and the fetcher's fixture seam routes
-// the connection to the local listener. Only that seam relaxes TLS trust; production
-// defaults are untouched.
-func policyE2ESettingsForFixture(listURL string) policy.Settings {
+// policyE2ESettingsForFixture builds the record an operator actually saves now:
+// policy routing enabled with an IPv4 PROXY exception list, and no source
+// selection at all. There is nothing to fetch, so activation has no external
+// dependency and the journey does not need a fixture list server.
+func policyE2ESettingsForFixture() policy.Settings {
 	s := policy.DefaultSettings()
 	s.Enabled = true
-	s.Preset = policy.PresetCustom
-	s.CustomURLs = []string{fixtureCanonicalListURL}
+	s.ProxyExceptions = []string{policyE2EExceptionPrefix}
 	s.SyncInterval = int64(policy.MinSyncInterval.Seconds())
 	return s
 }
 
-// fixtureCanonicalListURL is the port-443 URL the settings record stores. It passes
-// ValidateFetchURL exactly as an operator URL would.
-const fixtureCanonicalListURL = "https://lists.example/policy.lst"
+// policyE2EExceptionPrefix is the operator exception the journey proxies. It is a
+// documentation range, so no committed allocation or CDN ASN can produce the
+// PROXY decision on its own.
+const policyE2EExceptionPrefix = "203.0.113.0/24"
 
 func persistPolicyE2ESettings(db *database.DB, settings policy.Settings) error {
 	return db.SetSetting(context.Background(), policy.SettingsKey, settings)
@@ -583,7 +567,7 @@ func loadPolicyE2ESettings(db *database.DB) (policy.Settings, error) {
 	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
 		return settings, err
 	}
-	if stored.Preset == "" && !stored.Enabled && stored.SyncInterval == 0 && len(stored.CustomURLs) == 0 {
+	if !stored.Enabled && stored.SyncInterval == 0 && len(stored.ProxyExceptions) == 0 {
 		return settings, nil
 	}
 	return stored.Normalize(), nil
@@ -593,41 +577,19 @@ func policyE2EFileStore(dataDir string) policy.Store {
 	return policy.NewFileStore(filepath.Join(dataDir, "policy"))
 }
 
-// newFixtureFetcher builds the hardened Fetcher but routes its DNS and TCP dial to
-// the fixture listener. This is the established fixture seam used by the policy
-// package's own fetch tests; production code paths and TLS verification defaults
-// are untouched.
-func newFixtureFetcher(srv *httptest.Server) *policy.Fetcher {
-	serverAddr := srv.Listener.Addr().String()
-	f := policy.NewFetcher(policy.FetchLimits{
-		MaxSourceBytes: 1 << 20,
-		MaxLineBytes:   4096,
-		Timeout:        30 * time.Second,
-	})
-	f.SetFixtureTLSTrust(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true},
-		func(context.Context, string) ([]netip.Addr, error) {
-			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-		},
-		func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", serverAddr)
-		})
-	return f
-}
-
-// runPolicyE2ESync drives the real Syncer against the fixture server and returns
-// the published matcher plus the sync result. TLS verification is disabled only
-// through the fetcher's fixture seam, never by changing production defaults: the
-// fetcher is constructed with the fixture's trusted client and the URL is a
-// localhost test listener that the SSRF validator would not accept on its own.
-func runPolicyE2ESync(settings policy.Settings, store policy.Store, srv *httptest.Server) (*policy.Matcher, policy.SyncResult, error) {
+// runPolicyE2ESync drives the real Syncer over the record's exception list and
+// returns the published matcher plus the sync result.
+//
+// There is no fetch here because there is nothing to fetch: the cycle compiles the
+// operator's prefixes and publishes them. The durable commit and the atomic
+// publication are the production ones.
+func runPolicyE2ESync(settings policy.Settings, store policy.Store) (*policy.Matcher, policy.SyncResult, error) {
 	matcher := policy.NewMatcher()
-	fetcher := newFixtureFetcher(srv)
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		return nil, policy.SyncResult{}, err
 	}
-	syncer, err := policy.NewSyncer(matcher, fetcher, store, cfg)
+	syncer, err := policy.NewSyncer(matcher, store, cfg)
 	if err != nil {
 		return nil, policy.SyncResult{}, err
 	}
@@ -642,12 +604,8 @@ func newPolicyE2EService() (*Service, error) {
 	return NewVPNService(nil, nil)
 }
 
-// activatePolicyE2E runs the production activation entry point the admin PUT
-// handler uses. StartPolicyRouting builds its own matcher, syncs, and falls back to
-// the durable last-known-good generation when the live fetch cannot complete, so
-// callers must not pre-seed a matcher (doing so would be silently discarded).
 func activatePolicyE2E(svc *Service, settings policy.Settings, store policy.Store) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	return svc.StartPolicyRouting(ctx, settings, store, string(settings.Preset))
+	return svc.StartPolicyRouting(ctx, settings, store)
 }

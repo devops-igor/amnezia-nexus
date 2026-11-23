@@ -2,7 +2,6 @@ package policy
 
 import (
 	"fmt"
-	"net/netip"
 	"time"
 )
 
@@ -25,8 +24,7 @@ import (
 //   - the source configuration is compared through the syncer's config hash
 //     (source identity, order, URL, format and bare-domain mode), so an added,
 //     removed or reconfigured source always publishes;
-//   - merged domain rules are compared entry by entry including their match
-//     flags, and IPv4 prefixes as a canonical set, so declaration order,
+//   - IPv4 prefixes are compared as a canonical set, so declaration order,
 //     duplicate declarations and map iteration order can neither fake a change
 //     nor hide one;
 //   - each source's own rules are compared too, so a rule that is supplied by a
@@ -43,9 +41,9 @@ import (
 // A content-equivalent refresh reuses the incumbent identity, so the generation
 // the forwarder stamps on the flows it records does not move; everything else
 // about the cycle (durable commit, atomic publication, status) is unchanged.
-func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
+func (s *Syncer) candidateIdentity(startTime time.Time, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
 	retain := s.retainableGeneration()
-	if s.equivalentTo(retain, domains, cidrs, perSource) {
+	if s.equivalentTo(retain, cidrs, perSource) {
 		return retain.Version, retain.GenerationID, retain.CreatedAt
 	}
 	version := s.nextVersion()
@@ -69,107 +67,16 @@ func (s *Syncer) retainableGeneration() *Generation {
 	return gen
 }
 
-// equivalentTo reports whether the candidate aggregated rules are the effective
-// content of gen, attribution included. Attribution is compared through the
-// durable digest when the generation has one, and through the syncer's own
-// previous cycle otherwise; see sameSourceAttribution.
-func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) bool {
+// equivalentTo reports whether the candidate rules are the effective content of
+// gen. Attribution needs no second comparison any more: the operator's exception
+// list is the only rule source, so a change that moves a rule between sources
+// cannot happen, and the durable digest covers exactly the prefixes compared
+// here.
+func (s *Syncer) equivalentTo(gen *Generation, cidrs []string, perSource []SourceParsedRules) bool {
 	if gen == nil {
 		return false
 	}
-	if !equalFlagMap(gen.Domains, domains) {
-		return false
-	}
-	if !equalStringSet(gen.CIDRs, cidrs) {
-		return false
-	}
-	return s.sameSourceAttribution(gen, perSource)
-}
-
-// sameSourceAttribution reports whether every configured source still supplies
-// exactly the rules the live generation was compiled from.
-//
-// The syncer's own record of its last cycle is the most direct answer, and it is
-// what this decision always used while a syncer is alive. Once the syncer is
-// gone — the first refresh after a restart, or the cycle a save's replacement
-// syncer runs after adopting the last-known-good policy — only the durable
-// generation is left. The attribution digest recorded with it (provenance.go) is
-// what keeps the question answerable then: routing is identical in that case, but
-// which list an explanation names is not, and that is a real change.
-//
-// A generation written before the digest existed has neither, and attribution
-// genuinely cannot be compared against it. Answering true there is the honest
-// answer: an unchanged merged policy is not a change, and publishing would
-// re-derive attribution the durable generation never recorded. The next
-// successful cycle records the digest, so that gap is one cycle and never
-// recurring: from then on attribution-only moves publish.
-func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsedRules) bool {
-	if len(perSource) != s.expectedSourceCount() {
-		return true
-	}
-	if len(s.cachedSources) == len(s.cfg.Sources) {
-		return s.sameCachedSourceAttribution(perSource)
-	}
-	if candidate, ok := attributionDigest(perSource); ok && gen.AttributionHash != "" {
-		return gen.AttributionHash == candidate
-	}
-	return true
-}
-
-// expectedSourceCount is the number of per-source rule sets a cycle produces:
-// every configured external source, plus the local source when it has rules.
-// The stored digest and the candidate digest must cover the same set; stripping
-// one side made every restart look like an attribution change.
-func (s *Syncer) expectedSourceCount() int {
-	if len(s.cfg.LocalRules.Domains) == 0 && len(s.cfg.LocalRules.CIDRs) == 0 {
-		return len(s.cfg.Sources)
-	}
-	return len(s.cfg.Sources) + 1
-}
-
-// sameCachedSourceAttribution compares the candidate per-source rules with the
-// per-source rules of this syncer's own last cycle.
-func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool {
-	for _, item := range perSource {
-		previous, ok := s.cachedSources[item.SourceID]
-		if !ok {
-			if item.SourceID != localSourceID {
-				return true
-			}
-			// Local rules come from the syncer configuration, not from a fetched
-			// cached source. appendLocalRules only lets a cycle reach this
-			// comparison when the guard removes nothing from them, so the
-			// configured rules are exactly the candidate's local rules.
-			if !equalFlagMap(s.cfg.LocalRules.Domains, item.Rules.Domains) ||
-				!equalPrefixSet(s.cfg.LocalRules.CIDRs, item.Rules.CIDRs) {
-				return false
-			}
-			continue
-		}
-		if !equalFlagMap(previous.rules.Domains, item.Rules.Domains) {
-			return false
-		}
-		if !equalPrefixSet(previous.rules.CIDRs, item.Rules.CIDRs) {
-			return false
-		}
-	}
-	return true
-}
-
-// equalFlagMap compares two rule flag maps. Parsing collapses duplicate
-// declarations into one entry per base domain, so equality here is equality of
-// the effective rule set however the list was written.
-func equalFlagMap[T ~uint32](a, b map[string]T) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for key, aFlags := range a {
-		bFlags, ok := b[key]
-		if !ok || bFlags != aFlags {
-			return false
-		}
-	}
-	return true
+	return equalStringSet(gen.CIDRs, cidrs)
 }
 
 // equalStringSet compares two canonical prefix lists as sets. A list that only
@@ -189,28 +96,6 @@ func equalStringSet(a, b []string) bool {
 	}
 	for item := range set {
 		if _, ok := other[item]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// equalPrefixSet compares two parsed prefix lists as canonical sets, for the same
-// reason as equalStringSet: declaration order and duplicates are not changes.
-func equalPrefixSet(a, b []netip.Prefix) bool {
-	set := make(map[netip.Prefix]struct{}, len(a))
-	for _, prefix := range a {
-		set[prefix.Masked()] = struct{}{}
-	}
-	other := make(map[netip.Prefix]struct{}, len(b))
-	for _, prefix := range b {
-		other[prefix.Masked()] = struct{}{}
-	}
-	if len(set) != len(other) {
-		return false
-	}
-	for prefix := range set {
-		if _, ok := other[prefix]; !ok {
 			return false
 		}
 	}

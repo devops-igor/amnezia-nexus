@@ -19,9 +19,11 @@ import (
 // The decisive condition is a held *baseline load*, not a timing window: the store
 // wrapper below returns the real read first and then blocks, so the old Run sits
 // between "the generation has been obtained" and "it is published" while the new
-// source is accepted and refreshed. Only the store wrapper, fixture TLS trust and
-// the WAN device are substituted; the service entry points, syncer, fetch, parser,
-// FileStore, matcher and ownership boundary are production code.
+// configuration is accepted and refreshed.
+//
+// The policy content a save changes is the operator's IPv4 exception list. Only the
+// store wrapper and the WAN device are substituted; the service entry points,
+// syncer, FileStore, matcher and ownership boundary are production code.
 
 // gatedBaselineStore wraps a real store and holds exactly one Load call in flight,
 // after the underlying read has returned. It also counts accepted commits, which is
@@ -91,27 +93,7 @@ func (g *gatedBaselineStore) releaseHeld() {
 
 // TestSupersededRunBaselineCannotRepublishOldRules is the F678-06 regression.
 func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
-	const (
-		pathA = "/policy-a.lst"
-		pathB = "/policy-b.lst"
-	)
-	// A serves 20 rules including a domain only A knows; B serves 12 (>= 50%, so the
-	// shrink guard is not what decides anything here) including the protected one.
-	listA := append(domainList("a", 19), "stale-a-only.example.com")
-	listB := append(domainList("b", 11), "new-protected.example.com")
-
-	gate := newPolicyGate()
-	server := newGatedPolicyServer(gate, map[string][]string{pathA: listA, pathB: listB})
-	defer server.Close()
-	t.Cleanup(gate.releaseAll)
-
-	settingsA := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	settingsB := policySettingsForURL(t, "https://audit-b.example"+pathB)
-
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
-	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
+	settingsA, settingsB := ownershipConfigs()
 
 	withNameOwnedWANDevice(t, newNameRegistry())
 	svc := serviceForActivation(t)
@@ -120,39 +102,35 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 	// Load #1 is activation's own baseline prime; load #2 is the asynchronous Run
 	// baseline of the runtime that activation just registered, which is the one this
 	// regression freezes.
-	store := newGatedBaselineStore(auditedLKGStore(t, settingsA), 2)
+	store := newGatedBaselineStore(lkgStoreFor(t, settingsA), 2)
 	t.Cleanup(store.releaseHeld)
 
-	if err := svc.StartPolicyRouting(context.Background(), settingsA, store, string(settingsA.Preset)); err != nil {
-		t.Fatalf("activation of source A failed: %v", err)
+	if err := svc.StartPolicyRouting(context.Background(), settingsA, store); err != nil {
+		t.Fatalf("activation of configuration A failed: %v", err)
 	}
 	select {
 	case <-store.held:
-	case <-time.After(15 * time.Second):
-		t.Fatal("source A's Run never reached its baseline load; the held-baseline scenario did not run")
+	case <-time.After(20 * time.Second):
+		t.Fatal("configuration A's Run never reached its baseline load; the held-baseline scenario did not run")
 	}
 
-	// The operator saves source B while A's baseline preparation is frozen. B is
-	// published, takes write ownership and A's loop is cancelled.
+	// The operator saves configuration B while A's baseline preparation is frozen.
+	// B is published, takes write ownership and A's loop is cancelled.
 	//
 	// The commit count is sampled *before* the replacement starts, because the
 	// refresh it spawns may have committed before this test can look again.
 	commitsBeforeB := store.CommitCount()
-	if err := svc.StartPolicyRouting(context.Background(), settingsB, store, string(settingsB.Preset)); err != nil {
-		t.Fatalf("replacement with source B failed: %v", err)
+	if err := svc.StartPolicyRouting(context.Background(), settingsB, store); err != nil {
+		t.Fatalf("replacement with configuration B failed: %v", err)
 	}
-	// Wait for B's immediate refresh to have committed and be live. A refresh whose
-	// effective rules are unchanged keeps the generation identifier and refreshes
-	// only its source metadata, so that identifier is no longer a completion signal;
-	// the durable commit is. The replacement commits once (its synchronous update),
-	// and the refresh Run performs immediately afterwards commits once more whether
-	// it publishes a new generation or retains the incumbent one — and A contributes
-	// nothing here, because its Run is still frozen at the baseline load. Releasing
-	// the old baseline before this point would let B's own refresh mask a stale
+	// Wait for B's immediate refresh to have committed and be live. The durable
+	// commit is the completion signal: a refresh whose effective rules are unchanged
+	// keeps the generation identifier, so that identifier is not one. Releasing the
+	// old baseline before this point would let B's own refresh mask a stale
 	// republication and make the regression pass for the wrong reason.
 	const replacementCommits = 2
 	refreshedAt := commitsBeforeB + replacementCommits
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		gen, loadErr := store.Load(context.Background())
 		snap := svc.PolicyMatcher().Current()
@@ -161,8 +139,8 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("B's immediate refresh never committed (requests=%d, commits=%d, want at least %d, durable=%v)",
-				gate.count(pathB), store.CommitCount(), refreshedAt, gen != nil)
+			t.Fatalf("configuration B's immediate refresh never committed (commits=%d, want at least %d, durable=%v)",
+				store.CommitCount(), refreshedAt, gen != nil)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -171,12 +149,11 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 	store.releaseHeld()
 
 	// Bounded quiet window: a publication is immediate once the load returns, so if
-	// the superseded baseline were still allowed to publish it would do so here and
-	// stay until B's next scheduled refresh.
-	quietUntil := time.Now().Add(400 * time.Millisecond)
+	// the superseded baseline were still allowed to publish it would do so here.
+	quietUntil := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(quietUntil) {
-		if snap := svc.PolicyMatcher().Current(); snap != nil && snap.MatchDomain("stale-a-only.example.com") {
-			t.Fatalf("the superseded runtime republished its old baseline over the accepted policy (F678-06): live rules=%d include the retired source's rule", snap.DomainCount())
+		if snap := svc.PolicyMatcher().Current(); snap != nil && snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+			t.Fatalf("the superseded runtime republished its old baseline over the accepted policy (F678-06): live prefixes=%d include the retired configuration's prefix", snap.CIDRCount())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -190,15 +167,16 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 	if snap == nil {
 		t.Fatal("no live snapshot after the replacement")
 	}
-	if !snap.MatchDomain("new-protected.example.com") {
-		t.Fatalf("the accepted source's protected rule is not live (F678-06): %d rules", snap.DomainCount())
+	if !snap.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Fatalf("the accepted configuration's prefix is not live (F678-06): %d prefixes", snap.CIDRCount())
 	}
-	if snap.MatchDomain("stale-a-only.example.com") {
-		t.Fatal("the retired source's rule is live again: the superseded baseline was published (F678-06)")
+	if snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the retired configuration's prefix is live again: the superseded baseline was published (F678-06)")
 	}
-	if got := snap.DomainCount(); got != len(listB) {
-		t.Fatalf("live policy has %d rules, want the accepted source's %d (F678-06)", got, len(listB))
+	if got := snap.CIDRCount(); got != len(settingsB.ProxyExceptions) {
+		t.Fatalf("live policy has %d prefixes, want the accepted configuration's %d (F678-06)", got, len(settingsB.ProxyExceptions))
 	}
+
 	// Durable policy, reloaded from the store. Live and durable must name the same
 	// accepted generation; A's seeded last-known-good has a fixed generation id, so a
 	// republished baseline is recognisable here as well as by its rules.
@@ -207,23 +185,23 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 		t.Fatalf("reload the durable generation: %v", err)
 	}
 	if reloaded.ConfigHash != svc.policyRuntime().syncer.ConfigHash() {
-		t.Fatalf("durable generation does not belong to the accepted source: %s", reloaded.ConfigHash)
+		t.Fatalf("durable generation does not belong to the accepted configuration: %s", reloaded.ConfigHash)
 	}
 	if got, want := snap.Generation(), reloaded.GenerationID; got == "gen-audit-seed" || got != want {
 		t.Fatalf("live generation = %q, want the accepted durable generation %q (F678-06)", got, want)
 	}
-	if _, ok := reloaded.Domains["stale-a-only.example.com"]; ok {
-		t.Fatal("the durable generation contains the retired source's rule (F678-06)")
-	}
-	if _, ok := reloaded.Domains["new-protected.example.com"]; !ok {
-		t.Fatal("the durable generation lost the accepted source's protected rule (F678-06)")
+	for _, prefix := range reloaded.CIDRs {
+		if prefix == "203.0.113.0/24" {
+			t.Fatal("the durable generation contains the retired configuration's prefix (F678-06)")
+		}
 	}
 
-	// Runtime status and registered settings still describe the accepted source: a
-	// superseded generation must never be advertised.
+	// Runtime status and registered settings still describe the accepted
+	// configuration: a superseded generation must never be advertised.
 	status := svc.PolicyStatusSnapshot()
-	if status.DomainCount != len(listB) {
-		t.Fatalf("runtime status reports %d rules, want the accepted source's %d (F678-06)", status.DomainCount, len(listB))
+	if status.CIDRCount != len(settingsB.ProxyExceptions) {
+		t.Fatalf("runtime status reports %d prefixes, want the accepted configuration's %d (F678-06)",
+			status.CIDRCount, len(settingsB.ProxyExceptions))
 	}
 	if status.GenerationID == "gen-audit-seed" || status.GenerationID != reloaded.GenerationID {
 		t.Fatalf("runtime status advertises generation %q, want the accepted %q (F678-06)", status.GenerationID, reloaded.GenerationID)
@@ -235,17 +213,18 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 		t.Fatalf("runtime status is not enabled/ready after the replacement: %+v", status)
 	}
 	runtimeSettings := svc.policyRuntime().settings
-	if len(runtimeSettings.CustomURLs) != 1 || runtimeSettings.CustomURLs[0] != settingsB.CustomURLs[0] {
-		t.Fatalf("runtime settings identify %v, want the accepted source %v", runtimeSettings.CustomURLs, settingsB.CustomURLs)
+	if len(runtimeSettings.ProxyExceptions) != len(settingsB.ProxyExceptions) {
+		t.Fatalf("runtime settings identify %v, want the accepted configuration %v",
+			runtimeSettings.ProxyExceptions, settingsB.ProxyExceptions)
 	}
 
-	// Control: the accepted source can still sync and publish afterwards, so the
-	// fence refuses obsolete writes without freezing the live runtime.
+	// Control: the accepted configuration can still sync and publish afterwards, so
+	// the fence refuses obsolete writes without freezing the live runtime.
 	if _, err := svc.SyncPolicyNow(context.Background()); err != nil {
-		t.Fatalf("manual sync on the accepted source failed after the fence: %v", err)
+		t.Fatalf("manual sync on the accepted configuration failed after the fence: %v", err)
 	}
 	after := svc.PolicyMatcher().Current()
-	if after == nil || !after.MatchDomain("new-protected.example.com") {
-		t.Fatal("the accepted source's rules are gone after a manual sync")
+	if after == nil || !after.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Fatal("the accepted configuration's rules are gone after a manual sync")
 	}
 }

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "generation_id": "gen-pre957",
+  "version": 7,
+  "created_at": "0001-01-01T00:00:00Z",
+  "config_hash": "b1745c681abcef991a6aa25c619a490bd9fdc4aece97e31d42969cf02e25cedc",
+  "sources_meta": null,
+  "domains": {
+    "example.com": 2
+  },
+  "cidrs": [
+    "198.51.100.0/24"
+  ],
+  "domain_count": 1,
+  "cidr_count": 1,
+  "content_hash": "fdc8039b57485f31c966bb5f79cd317b1f1fca859c3da974e60b421a6ce75cfe"
+}

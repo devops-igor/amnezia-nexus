@@ -373,9 +373,7 @@ type returnSegRig struct {
 // them from observed DNS evidence.
 func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Addr, clients []*returnSegClient) *returnSegRig {
 	t.Helper()
-	rules, _, err := policy.Parse(context.Background(), strings.NewReader("blocked.example\n"), policy.Source{
-		ID: "returnseg", Format: policy.FormatDomains, BareDomainMode: policy.DomainModeExact,
-	}, policy.DefaultParseLimits())
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("203.0.113.0/24\n"), policy.DefaultParseLimits())
 	if err != nil {
 		t.Fatalf("policy rules: %v", err)
 	}

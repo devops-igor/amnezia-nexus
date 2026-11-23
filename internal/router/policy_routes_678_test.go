@@ -185,7 +185,7 @@ func TestPutPolicyRejectsInvalidWithoutOverwriting(t *testing.T) {
 
 	// Store a known-good record first (enabled=false so activation is a no-op).
 	good := policy.DefaultSettings()
-	good.Preset = policy.PresetGeoblock
+	good.ProxyExceptions = []string{"203.0.113.0/24"}
 	goodBody, err := json.Marshal(good)
 	if err != nil {
 		t.Fatalf("marshal good settings: %v", err)
@@ -201,30 +201,26 @@ func TestPutPolicyRejectsInvalidWithoutOverwriting(t *testing.T) {
 		name string
 		body map[string]any
 	}{
-		{"ssrf internal target", map[string]any{
-			"enabled": false, "preset": "custom",
-			"custom_urls": []string{"https://10.0.0.5/x.lst"}, "sync_interval_seconds": 3600,
+		{"domain line in the exception list", map[string]any{
+			"enabled": false, "proxy_exceptions": []string{"example.com"}, "sync_interval_seconds": 3600,
 		}},
-		{"cloud metadata target", map[string]any{
-			"enabled": false, "preset": "custom",
-			"custom_urls": []string{"https://169.254.169.254/latest/meta-data/"}, "sync_interval_seconds": 3600,
+		{"wildcard in the exception list", map[string]any{
+			"enabled": false, "proxy_exceptions": []string{"*.example.org"}, "sync_interval_seconds": 3600,
 		}},
-		{"http scheme", map[string]any{
-			"enabled": false, "preset": "custom",
-			"custom_urls": []string{"http://lists.example/x.lst"}, "sync_interval_seconds": 3600,
+		{"mistyped address in the exception list", map[string]any{
+			"enabled": false, "proxy_exceptions": []string{"203.0.113.999"}, "sync_interval_seconds": 3600,
+		}},
+		{"IPv6 in the exception list", map[string]any{
+			"enabled": false, "proxy_exceptions": []string{"2001:db8::/32"}, "sync_interval_seconds": 3600,
 		}},
 		{"interval below minimum", map[string]any{
-			"enabled": false, "preset": "geoblock", "sync_interval_seconds": 60,
+			"enabled": false, "sync_interval_seconds": 60,
 		}},
 		{"interval above maximum", map[string]any{
-			"enabled": false, "preset": "geoblock", "sync_interval_seconds": 60 * 60 * 48,
+			"enabled": false, "sync_interval_seconds": 60 * 60 * 48,
 		}},
-		{"unknown preset", map[string]any{
-			"enabled": false, "preset": "russia_outside", "sync_interval_seconds": 3600,
-		}},
-		{"preset mixed with custom urls", map[string]any{
-			"enabled": false, "preset": "geoblock",
-			"custom_urls": []string{"https://lists.example/x.lst"}, "sync_interval_seconds": 3600,
+		{"markup document as an inventory override", map[string]any{
+			"enabled": false, "inventory_override": []string{"<html><body>blocked</body></html>"}, "sync_interval_seconds": 3600,
 		}},
 	}
 
@@ -245,9 +241,9 @@ func TestPutPolicyRejectsInvalidWithoutOverwriting(t *testing.T) {
 			if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
 				t.Fatalf("read back stored settings: %v", err)
 			}
-			if stored.Preset != policy.PresetGeoblock {
-				t.Fatalf("rejected request overwrote stored preset: got %q, want %q (value %+v)",
-					stored.Preset, policy.PresetGeoblock, stored)
+			if len(stored.ProxyExceptions) != 1 || stored.ProxyExceptions[0] != "203.0.113.0/24" {
+				t.Fatalf("rejected request overwrote the stored exception list: got %v, want 203.0.113.0/24 (value %+v)",
+					stored.ProxyExceptions, stored)
 			}
 			if stored.Enabled {
 				t.Fatalf("rejected request enabled policy routing: %+v", stored)
@@ -264,7 +260,7 @@ func TestPolicySettingsSurviveRestart(t *testing.T) {
 	r := NewRouter(cfg, db, nil)
 
 	saved := policy.DefaultSettings()
-	saved.Preset = policy.PresetAntifilterDomains
+	saved.ProxyExceptions = []string{"198.51.100.0/24"}
 	saved.SyncInterval = int64(2 * time.Hour / time.Second)
 	body, err := json.Marshal(saved)
 	if err != nil {
@@ -285,8 +281,12 @@ func TestPolicySettingsSurviveRestart(t *testing.T) {
 		t.Fatalf("GET after restart = %d, want 200", wGet.Code)
 	}
 	out := decodeJSON(t, wGet)
-	if preset, _ := out["preset"].(string); preset != string(policy.PresetAntifilterDomains) {
-		t.Errorf("preset after restart = %q, want %q", preset, policy.PresetAntifilterDomains)
+	exceptions, _ := out["proxy_exceptions"].([]any)
+	if len(exceptions) != 1 {
+		t.Fatalf("proxy exceptions after restart = %v, want the saved entry", out["proxy_exceptions"])
+	}
+	if got, _ := exceptions[0].(string); got != "198.51.100.0/24" {
+		t.Errorf("proxy exception after restart = %q, want 198.51.100.0/24", got)
 	}
 	if interval, _ := out["sync_interval_seconds"].(float64); int64(interval) != int64(2*time.Hour/time.Second) {
 		t.Errorf("sync interval after restart = %v, want %d", out["sync_interval_seconds"], int64(2*time.Hour/time.Second))
@@ -304,7 +304,7 @@ func TestPutPolicyEnableFailsClosedWithoutDataPlane(t *testing.T) {
 
 	enable := policy.DefaultSettings()
 	enable.Enabled = true
-	enable.Preset = policy.PresetGeoblock
+	enable.ProxyExceptions = []string{"203.0.113.0/24"}
 	body, err := json.Marshal(enable)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -370,18 +370,18 @@ func TestSyncPolicyRespondsConflictWhenAlreadyRunning(t *testing.T) {
 	}
 
 	settings := policy.DefaultSettings()
-	settings.Preset = policy.PresetAntifilterDomains
+	settings.ProxyExceptions = []string{"198.51.100.0/24"}
 	syncCfg, err := settings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, policy.NewFileStore(t.TempDir()), syncCfg)
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), policy.NewFileStore(t.TempDir()), syncCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
 	syncer.SetActiveForTest(true)
 	t.Cleanup(func() { syncer.SetActiveForTest(false) })
-	vpnSvc.SetPolicySyncerForTest(syncer, string(settings.Preset))
+	vpnSvc.SetPolicySyncerForTest(syncer)
 
 	r := NewRouterWithDeps(handlers.Dependencies{Config: cfg, DB: db, VPNService: vpnSvc})
 

@@ -34,9 +34,13 @@ import (
 // this assignment's authorized edit set.
 
 var (
-	// ErrPolicyActivationNoRules indicates activation was requested but no policy
-	// snapshot could be published, so PBR must stay disabled.
-	ErrPolicyActivationNoRules = errors.New("vpn: policy activation requires a published non-empty policy snapshot")
+	// ErrPolicyActivationNoRules indicates activation was requested but the policy
+	// data path could not be brought up: no routing authority is installed, the
+	// stored last-known-good generation cannot be used, or no snapshot could be
+	// published. It is NOT a rule-count check — zero operator exceptions is a valid
+	// policy — so each wrap site names its own cause and the text is deliberately
+	// cause-neutral. The name is historical.
+	ErrPolicyActivationNoRules = errors.New("vpn: policy routing could not be activated")
 
 	policyRuntimeMu sync.RWMutex
 	policyRuntimes  = make(map[*Service]*policyRuntime)
@@ -77,10 +81,8 @@ const policyActivationTimeout = 2 * time.Minute
 type PolicyStatus struct {
 	Enabled      bool   `json:"enabled"`
 	Ready        bool   `json:"ready"`
-	Preset       string `json:"preset,omitempty"`
 	GenerationID string `json:"generation_id,omitempty"`
 	Version      uint64 `json:"version"`
-	DomainCount  int    `json:"domain_count"`
 	CIDRCount    int    `json:"cidr_count"`
 	LastSyncTime string `json:"last_sync_time,omitempty"`
 	LastSuccess  string `json:"last_success,omitempty"`
@@ -135,7 +137,6 @@ type policyRuntime struct {
 	syncer   *policy.Syncer
 	matcher  *policy.Matcher
 	settings policy.Settings
-	presetID string
 	cancel   context.CancelFunc
 }
 
@@ -176,7 +177,7 @@ func policyActivationInput(settings policy.Settings) (policy.SyncConfig, *policy
 // returned. Nothing durable is written here: the caller owns persisting the
 // operator's settings, so a failed activation cannot overwrite a previously
 // working configuration.
-func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settings, store policy.Store, presetID string) error {
+func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settings, store policy.Store) error {
 	if s == nil {
 		return errors.New("vpn: policy activation requires a service")
 	}
@@ -208,8 +209,24 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	// matcher and data path instead and let the sync publish the new rules into it
 	// atomically, so the change takes effect without interrupting traffic.
 	if live := s.policyRuntime(); live != nil && live.matcher != nil {
-		return s.updateLivePolicyRouting(ctx, live.matcher, store, cfg, settings, presetID)
+		return s.updateLivePolicyRouting(ctx, live.matcher, store, cfg, settings)
 	}
+	return s.activateFreshPolicyPath(ctx, store, cfg, settings, override)
+}
+
+// activateFreshPolicyPath brings up a policy data path for a service that has
+// none installed, and is the cold-start half of activation.
+//
+// It is one function because it is one contract: nothing may accept traffic until
+// a snapshot is published AND the routing authority is installed, and the
+// prerequisite that decides whether traffic can be classified is read before
+// anything is enabled. Splitting it would let a caller reach enablement with the
+// matcher published and no classifier, which is exactly the state the guards
+// refuse.
+//
+// The caller holds policyActivationMu, so activation and disable cannot interleave
+// inside it.
+func (s *Service) activateFreshPolicyPath(ctx context.Context, store policy.Store, cfg policy.SyncConfig, settings policy.Settings, override *policy.InventoryOverride) error {
 	matcher := policy.NewMatcher()
 	syncer, err := newPolicySyncer(matcher, store, cfg)
 	if err != nil {
@@ -217,11 +234,20 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	}
 	syncer.AttachOwnership(s.policyWriteOwner())
 
+	// The address classifier is the routing authority: it answers every
+	// destination the operator's exception list does not override. Building it can
+	// fail when a committed artifact is unusable, and newDestinationClassifier
+	// reports that failure and returns nil rather than a partially capable
+	// classifier — so this is the one place "the authority is installed" is
+	// decided, and the handshake below refuses activation without it.
+	classifier := newDestinationClassifier(override)
+
 	// Obtain a snapshot BEFORE the data path can accept traffic. A failure here is
-	// not fatal to the panel: PBR stays disabled and the operator sees the reason,
-	// which is the documented "missing initial rules prevents enablement with a
-	// useful error" behavior.
-	if err := ensureInitialSnapshot(ctx, syncer, store, matcher); err != nil {
+	// not fatal to the panel: PBR stays disabled and the operator sees the reason.
+	// The classifier is the routing authority, so it is what this handshake
+	// requires; a zero-rule snapshot is a valid override-free policy rather than a
+	// reason to refuse.
+	if err := ensureInitialSnapshot(ctx, syncer, store, matcher, classifier); err != nil {
 		return err
 	}
 
@@ -238,10 +264,11 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return fmt.Errorf("activate policy routing: %w", err)
 	}
 	s.SetPBRConfig(PBRConfig{
-		Enabled:           true,
-		HostWANIP:         hostWAN,
-		PolicyMatcher:     matcher,
-		InventoryOverride: override,
+		Enabled:               true,
+		HostWANIP:             hostWAN,
+		PolicyMatcher:         matcher,
+		InventoryOverride:     override,
+		DestinationClassifier: classifier,
 	})
 
 	if err := s.initPBR(ctx); err != nil {
@@ -252,7 +279,7 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return fmt.Errorf("activate policy routing: %w", err)
 	}
 
-	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	s.startPolicyLoop(ctx, syncer, matcher, settings)
 	s.clearPolicyActivationFailure()
 	return nil
 }
@@ -267,13 +294,30 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 //  1. syncs once into the live matcher, which publishes atomically — a sync
 //     failure keeps the previous snapshot (the syncer's own contract) and is
 //     reported rather than silently ignored;
-//  2. replaces the scheduling loop so the new interval/preset takes effect, and
+//  2. replaces the scheduling loop so the new interval takes effect, and
 //     only after the sync succeeded, so a failed update leaves the old loop
 //     running on the old rules.
 //
 // A refused update therefore leaves the previous working configuration intact and
 // in effect, which is what the admin PUT's rollback expects.
-func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig, settings policy.Settings, presetID string) error {
+func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig, settings policy.Settings) error {
+	// The routing authority is the destination classifier, and this path replaces
+	// it from the new record. Build the replacement BEFORE anything is published:
+	// an unusable committed artifact would otherwise install a nil classifier over
+	// a live data path, where every destination answers "uncovered", nothing can
+	// route DIRECT, and the operator's policy would silently become proxy-everything.
+	//
+	// A refused update therefore leaves the incumbent classifier, like the
+	// incumbent rules, still installed and still deciding.
+	override, err := settings.ParsedInventoryOverride()
+	if err != nil {
+		return fmt.Errorf("inventory override: %w", err)
+	}
+	classifier := newDestinationClassifier(override)
+	if classifier == nil {
+		return fmt.Errorf("%w: policy update cannot install the destination classifier", ErrPolicyActivationNoRules)
+	}
+
 	syncer, err := newPolicySyncer(matcher, store, cfg)
 	if err != nil {
 		return fmt.Errorf("policy syncer: %w", err)
@@ -284,7 +328,7 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	// succeeds, the incumbent's still-running syncs are refused at their commit.
 	syncer.AttachOwnership(s.policyWriteOwner())
 	// A save usually changes settings the policy snapshot does not carry — the
-	// upstream resolver list, the refresh interval — so its effective rules are
+	// refresh interval, the inventory override — so its effective rules are
 	// unchanged and the cycle must keep the published generation, which is what the
 	// forwarder's route caches key client DNS evidence on (#864). Adopting the
 	// durable generation is a read: it publishes nothing and commits nothing, so the
@@ -314,28 +358,20 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	// to the installed classifier, which is replaced rather than rebuilt. It is
 	// applied only after the sync succeeded: a refused update must leave the
 	// previous configuration, override included, in effect.
-	override, err := settings.ParsedInventoryOverride()
-	if err != nil {
-		return fmt.Errorf("inventory override: %w", err)
-	}
 	s.SetInventoryOverride(override)
 	// Only after the content is published does the schedule change, so a refused
 	// update leaves the previous loop running on the previous rules.
-	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	s.startPolicyLoop(ctx, syncer, matcher, settings)
 	return nil
 }
 
 // newPolicySyncer builds the syncer one activation/replacement uses.
 //
-// The fetcher is injected only through policyFetcherForTest, which production
-// leaves nil: a nil fetcher makes policy.NewSyncer build the hardened production
-// fetcher from the configured limits, exactly as before.
+// It fetches nothing: the routing authority is the destination classifier and the
+// operator's contribution is the local exception list, so a cycle only compiles
+// and publishes the rules the record already holds.
 func newPolicySyncer(matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig) (*policy.Syncer, error) {
-	var fetcher *policy.Fetcher
-	if policyFetcherForTest != nil {
-		fetcher = policyFetcherForTest(cfg.FetchLimits)
-	}
-	return policy.NewSyncer(matcher, fetcher, store, cfg)
+	return policy.NewSyncer(matcher, store, cfg)
 }
 
 // policyWriteOwner returns this service's write-ownership boundary, creating it
@@ -391,7 +427,7 @@ func (s *Service) retirePolicyWriteOwner() {
 // context; the long-running fetch schedule is stopped by explicit disable or
 // replacement (StopPolicyRouting / a later startPolicyLoop) and by service
 // shutdown (Service.Stop and rollbackStartup call StopPolicyRouting).
-func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, matcher *policy.Matcher, settings policy.Settings, presetID string) {
+func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, matcher *policy.Matcher, settings policy.Settings) {
 	runCtx, runCancel := context.WithCancel(context.WithoutCancel(ctx))
 	policyRuntimeMu.Lock()
 	old := policyRuntimes[s]
@@ -399,7 +435,6 @@ func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, ma
 		syncer:   syncer,
 		matcher:  matcher,
 		settings: settings,
-		presetID: presetID,
 		cancel:   runCancel,
 	}
 	policyRuntimeMu.Unlock()
@@ -639,11 +674,9 @@ func applySyncerStatus(status *PolicyStatus, runtime *policyRuntime) {
 	status.Ready = live.Ready
 	status.GenerationID = live.GenerationID
 	status.Version = live.Version
-	status.DomainCount = live.DomainCount
 	status.CIDRCount = live.CIDRCount
 	status.LastError = live.LastError
 	status.SourceStats = live.SourceStats
-	status.Preset = runtime.presetID
 	if !live.LastSyncTime.IsZero() {
 		status.LastSyncTime = live.LastSyncTime.UTC().Format(time.RFC3339)
 	}
@@ -673,7 +706,6 @@ func applyMatcherStatus(status *PolicyStatus, matcher *policy.Matcher) {
 	status.Ready = true
 	status.GenerationID = snap.Generation()
 	status.Version = snap.Version()
-	status.DomainCount = snap.DomainCount()
 	status.CIDRCount = snap.CIDRCount()
 	if status.SyncState == "disabled" {
 		status.SyncState = "synced"

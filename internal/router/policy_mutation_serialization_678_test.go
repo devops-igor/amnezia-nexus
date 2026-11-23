@@ -49,22 +49,23 @@ func seedMatchingPolicyStore(t *testing.T, dataDir string, settings policy.Setti
 		t.Fatalf("SyncConfig: %v", err)
 	}
 	store := policy.NewFileStore(filepath.Join(dataDir, "policy"))
-	probe, err := policy.NewSyncer(policy.NewMatcher(), nil, store, cfg)
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, cfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	meta := make(map[string]policy.SourceMeta, len(cfg.Sources))
-	for _, src := range cfg.Sources {
-		meta[src.ID] = policy.SourceMeta{ID: src.ID, URL: src.URL, RuleCount: 1}
+	// The seeded generation must be the record's own rules, so activation publishes
+	// the accepted configuration rather than falling back to something foreign.
+	prefixes := make([]string, 0, len(cfg.LocalRules.CIDRs))
+	for _, prefix := range cfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
 	}
 	gen := &policy.Generation{
 		SchemaVersion: policy.SchemaVersion,
 		GenerationID:  "gen-mutation-seed",
 		Version:       1,
 		ConfigHash:    probe.ConfigHash(),
-		SourcesMeta:   meta,
-		Domains:       map[string]uint32{"seed.example.com": 1},
-		DomainCount:   1,
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
 	}
 	if err := store.Commit(context.Background(), gen); err != nil {
 		t.Fatalf("seed last-known-good generation: %v", err)
@@ -90,8 +91,7 @@ func TestConcurrentPolicyPutsKeepSettingsAndRuntimeConsistent(t *testing.T) {
 
 	enabled := policy.DefaultSettings()
 	enabled.Enabled = true
-	enabled.Preset = policy.PresetCustom
-	enabled.CustomURLs = []string{"https://lists.example/policy.lst"}
+	enabled.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := enabled.Validate(); err != nil {
 		t.Fatalf("fixture settings are invalid: %v", err)
 	}

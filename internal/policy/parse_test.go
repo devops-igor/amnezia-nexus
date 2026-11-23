@@ -2,255 +2,131 @@ package policy
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
 	"testing"
 )
 
-func TestParse_DomainsPresetTolerant(t *testing.T) {
-	// Sample containing valid domains, comments, whitespace, BOM, IP literals, and a few malformed rows
-	input := "\xef\xbb\xbf# Header comment\n" +
-		"! Another comment\n" +
-		"; Semicolon comment\n" +
-		"// C-style comment\n" +
-		"\n" +
-		"example.com\n" +
-		"EXAMPLE.COM\n" + // duplicate
-		".google.com\n" +
-		"*.yahoo.com\n" +
-		"пример.рф\n" +
-		"198.51.100.7\n" + // IPv4 literal in domain list
-		"\"quoted-bad.ru\n" + // malformed line
-		"-bad-hyphen.com\n" + // malformed line
-		"ok.org\n"
+// The parser is address-only now, and its two acceptance modes are the whole
+// contract: a prefix list (the local exception list and the committed inventory)
+// and the mixed override body that reports its name lines as ignored.
 
-	src := Source{
-		ID:             "antifilter-domains",
-		URL:            "https://antifilter.download/list/domains.lst",
-		Format:         FormatDomains,
-		BareDomainMode: DomainModeInclusiveSuffix,
-		IsPreset:       true,
-	}
+func TestParseIPV4List(t *testing.T) {
+	body := strings.Join([]string{
+		"# comment",
+		"! another comment",
+		"203.0.113.0/24",
+		"198.51.100.7",
+		"203.0.113.0/24", // duplicate
+		"",
+	}, "\n")
 
-	limits := DefaultParseLimits()
-	limits.RejectionBudget = 0.5 // allow high fraction for this tiny fixture
-
-	rules, report, err := Parse(context.Background(), strings.NewReader(input), src, limits)
+	parsed, report, err := Parse(context.Background(), strings.NewReader(body), DefaultParseLimits())
 	if err != nil {
-		t.Fatalf("Parse error: %v", err)
+		t.Fatalf("Parse() = %v", err)
 	}
-
-	if report.Rejected != 2 {
-		t.Errorf("report.Rejected = %d, want 2", report.Rejected)
+	if len(parsed.CIDRs) != 2 {
+		t.Fatalf("prefixes = %d, want 2 after collapsing the duplicate", len(parsed.CIDRs))
+	}
+	if report.Accepted != 2 {
+		t.Errorf("Accepted = %d, want 2", report.Accepted)
 	}
 	if report.Duplicates != 1 {
-		t.Errorf("report.Duplicates = %d, want 1", report.Duplicates)
+		t.Errorf("Duplicates = %d, want 1", report.Duplicates)
 	}
-	// example.com, google.com, yahoo.com, xn--e1afmkfd.xn--p1ai, ok.org = 5 domains
-	if len(rules.Domains) != 5 {
-		t.Errorf("len(rules.Domains) = %d, want 5", len(rules.Domains))
+	if report.Rejected != 0 {
+		t.Errorf("Rejected = %d, want 0", report.Rejected)
 	}
-	// 198.51.100.7/32
-	if len(rules.CIDRs) != 1 {
-		t.Fatalf("len(rules.CIDRs) = %d, want 1", len(rules.CIDRs))
-	}
-	if rules.CIDRs[0].String() != "198.51.100.7/32" {
-		t.Errorf("CIDR = %s, want 198.51.100.7/32", rules.CIDRs[0].String())
-	}
-
-	// Verify domain flags
-	if f := rules.Domains["example.com"]; f != domainInclusiveSuffix {
-		t.Errorf("example.com flags = %d, want %d", f, domainInclusiveSuffix)
-	}
-	if f := rules.Domains["yahoo.com"]; f != domainDescendants {
-		t.Errorf("yahoo.com flags = %d, want %d", f, domainDescendants)
+	// A bare address is a /32 so the packet path matches it exactly.
+	if got := parsed.CIDRs[1].String(); got != "198.51.100.7/32" {
+		t.Errorf("bare address parsed as %q, want 198.51.100.7/32", got)
 	}
 }
 
-func TestParse_CustomStrictRejection(t *testing.T) {
-	input := "good.com\n\"bad.com\n"
-	src := Source{
-		ID:             "custom",
-		URL:            "https://custom.example.com/rules.lst",
-		Format:         FormatDomains,
-		BareDomainMode: DomainModeExact,
-		IsPreset:       false, // strict!
-	}
-
-	_, _, err := Parse(context.Background(), strings.NewReader(input), src, DefaultParseLimits())
-	if err == nil || !strings.Contains(err.Error(), "invalid domain rule") {
-		t.Fatalf("expected strict parse error on line 2, got %v", err)
-	}
-}
-
-func TestParse_RejectionBudgetExceeded(t *testing.T) {
-	input := "good.com\n\"bad1.com\n\"bad2.com\n\"bad3.com\n"
-	src := Source{
-		ID:             "preset",
-		URL:            "https://preset.example.com/rules.lst",
-		Format:         FormatDomains,
-		BareDomainMode: DomainModeInclusiveSuffix,
-		IsPreset:       true,
-	}
-
-	limits := DefaultParseLimits()
-	limits.RejectionBudget = 0.1 // 10% budget, input has 75% bad
-
-	_, _, err := Parse(context.Background(), strings.NewReader(input), src, limits)
-	if err == nil || !strings.Contains(err.Error(), "rejection budget exceeded") {
-		t.Fatalf("expected rejection budget exceeded error, got %v", err)
-	}
-}
-
-func TestParse_IPv4List(t *testing.T) {
-	input := "# Antifilter subnet list\n" +
-		"198.51.100.0/24\n" +
-		"203.0.113.128/25\n" +
-		"10.0.0.1\n" // bare ip treated as /32
-
-	src := Source{
-		ID:       "antifilter-subnets",
-		URL:      "https://antifilter.download/list/subnet.lst",
-		Format:   FormatIPv4,
-		IsPreset: true,
-	}
-
-	rules, report, err := Parse(context.Background(), strings.NewReader(input), src, DefaultParseLimits())
-	if err != nil {
-		t.Fatalf("Parse error: %v", err)
-	}
-
-	if report.Accepted != 3 {
-		t.Errorf("report.Accepted = %d, want 3", report.Accepted)
-	}
-	if len(rules.CIDRs) != 3 {
-		t.Fatalf("len(rules.CIDRs) = %d, want 3", len(rules.CIDRs))
-	}
-	if rules.CIDRs[2].String() != "10.0.0.1/32" {
-		t.Errorf("rules.CIDRs[2] = %s, want 10.0.0.1/32", rules.CIDRs[2].String())
-	}
-}
-
-func TestParse_MixedFormat(t *testing.T) {
-	input := "example.com\n" +
-		"192.168.1.0/24\n" +
-		"10.0.0.1\n" +
-		".suffix.com\n"
-
-	src := Source{
-		ID:             "mixed-feed",
-		URL:            "https://mixed.example.com/rules.lst",
-		Format:         FormatMixed,
-		BareDomainMode: DomainModeExact,
-		IsPreset:       true,
-	}
-
-	rules, report, err := Parse(context.Background(), strings.NewReader(input), src, DefaultParseLimits())
-	if err != nil {
-		t.Fatalf("Parse error: %v", err)
-	}
-
-	if report.Accepted != 4 {
-		t.Errorf("report.Accepted = %d, want 4", report.Accepted)
-	}
-	if len(rules.Domains) != 2 {
-		t.Errorf("len(rules.Domains) = %d, want 2", len(rules.Domains))
-	}
-	if len(rules.CIDRs) != 2 {
-		t.Errorf("len(rules.CIDRs) = %d, want 2", len(rules.CIDRs))
-	}
-}
-
-func TestParse_EmptyFeedError(t *testing.T) {
-	input := "# only comments\n\n   \n"
-	src := Source{
-		ID:       "empty-feed",
-		URL:      "https://empty.example.com/rules.lst",
-		Format:   FormatDomains,
-		IsPreset: true,
-	}
-
-	_, _, err := Parse(context.Background(), strings.NewReader(input), src, DefaultParseLimits())
-	if err == nil || !strings.Contains(err.Error(), "contained no valid rules") {
-		t.Fatalf("expected error for empty feed, got %v", err)
-	}
-	if !errors.Is(err, ErrNoValidRules) {
-		t.Errorf("expected errors.Is(err, ErrNoValidRules), got %v", err)
-	}
-}
-
-func TestParse_ZeroByteFeedError(t *testing.T) {
-	formats := []Format{FormatDomains, FormatIPv4, FormatMixed}
-	for _, fmtType := range formats {
-		t.Run(fmtType.String(), func(t *testing.T) {
-			src := Source{
-				ID:       "zero-byte-feed",
-				URL:      "https://empty.example.com/zero.lst",
-				Format:   fmtType,
-				IsPreset: true,
-			}
-
-			rules, report, err := Parse(context.Background(), strings.NewReader(""), src, DefaultParseLimits())
+func TestParseEmptyBodies(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty":         "",
+		"whitespace":    "   \n\n\t\n",
+		"only_comments": "# nothing here\n// nor here\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Parse(context.Background(), strings.NewReader(body), DefaultParseLimits())
 			if err == nil {
-				t.Fatalf("expected error for zero-byte feed, got nil")
+				t.Fatal("Parse() accepted a body with no rules")
 			}
-			if !errors.Is(err, ErrNoValidRules) {
-				t.Errorf("expected ErrNoValidRules, got %v", err)
-			}
-			if report.TotalLines != 0 || report.Accepted != 0 {
-				t.Errorf("expected 0 TotalLines and 0 Accepted, got %+v", report)
-			}
-			if len(rules.Domains) != 0 || len(rules.CIDRs) != 0 {
-				t.Errorf("expected 0 rules, got %d domains, %d cidrs", len(rules.Domains), len(rules.CIDRs))
+			if !strings.Contains(err.Error(), "no valid rules") {
+				t.Fatalf("Parse() = %v, want the empty-list reason", err)
 			}
 		})
 	}
 }
 
-func TestParse_LeadingMalformedRowsWithinBudget(t *testing.T) {
-	// Construct 1 malformed row followed by 999 valid domains
-	var sb strings.Builder
-	sb.WriteString("\"certr.ru\n") // Antifilter-style malformed leading line
-	for i := 0; i < 999; i++ {
-		fmt.Fprintf(&sb, "valid%d.example.com\n", i)
-	}
-	input := sb.String()
+// A strict body reports the offending line, which is what an operator pasting a
+// mistyped prefix needs to see.
+func TestParseStrictReportsTheOffendingLine(t *testing.T) {
+	limits := DefaultParseLimits()
+	limits.Strict = true
+	body := "203.0.113.0/24\nnot-a-prefix\n198.51.100.0/24\n"
 
-	// 1. Preset feed should tolerate leading malformed row because overall rejection rate is 1/1000 = 0.1% <= 0.5%
-	presetSrc := Source{
-		ID:             "preset-feed",
-		URL:            "https://preset.example.com/domains.lst",
-		Format:         FormatDomains,
-		BareDomainMode: DomainModeInclusiveSuffix,
-		IsPreset:       true,
+	_, _, err := Parse(context.Background(), strings.NewReader(body), limits)
+	if err == nil {
+		t.Fatal("a strict parse accepted a non-prefix line")
+	}
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("Parse() = %v, want the failing line number", err)
+	}
+	if !strings.Contains(err.Error(), "not-a-prefix") {
+		t.Fatalf("Parse() = %v, want the offending row quoted", err)
+	}
+}
+
+// A tolerant body that exceeds the rejection budget fails rather than publishing
+// a partly-applied list.
+func TestParseRejectionBudgetExceeded(t *testing.T) {
+	limits := DefaultParseLimits()
+	limits.MaxRejectedRows = 2
+	var b strings.Builder
+	b.WriteString("203.0.113.0/24\n")
+	for i := 0; i < 5; i++ {
+		b.WriteString("not-a-prefix\n")
 	}
 
-	rules, report, err := Parse(context.Background(), strings.NewReader(input), presetSrc, DefaultParseLimits())
+	_, _, err := Parse(context.Background(), strings.NewReader(b.String()), limits)
+	if err == nil {
+		t.Fatal("Parse() published a body past the rejection budget")
+	}
+	if !strings.Contains(err.Error(), "rejection budget exceeded") {
+		t.Fatalf("Parse() = %v, want the rejection budget reason", err)
+	}
+}
+
+// The override body accepts name lines and reports prefix rows; that is what
+// lets the record say "accepted but not applied here" instead of silently
+// dropping them.
+func TestParseAllowNonPrefixRowsKeepsPrefixes(t *testing.T) {
+	limits := DefaultParseLimits()
+	limits.AllowNonPrefixRows = true
+	body := "203.0.113.0/24\nexample.com\n198.51.100.0/24\n"
+
+	parsed, report, err := Parse(context.Background(), strings.NewReader(body), limits)
 	if err != nil {
-		t.Fatalf("expected preset feed to succeed despite leading malformed line, got: %v", err)
+		t.Fatalf("Parse() = %v", err)
 	}
-	if report.Rejected != 1 {
-		t.Errorf("report.Rejected = %d, want 1", report.Rejected)
+	if len(parsed.CIDRs) != 2 {
+		t.Fatalf("prefixes = %d, want 2", len(parsed.CIDRs))
 	}
-	if report.Accepted != 999 {
-		t.Errorf("report.Accepted = %d, want 999", report.Accepted)
+	if report.Rejected != 0 {
+		t.Errorf("Rejected = %d; a permitted name line is not a rejection", report.Rejected)
 	}
-	if len(rules.Domains) != 999 {
-		t.Errorf("len(rules.Domains) = %d, want 999", len(rules.Domains))
-	}
+}
 
-	// 2. Custom feed should reject immediately on line 1 (strict parsing)
-	customSrc := Source{
-		ID:             "custom-feed",
-		URL:            "https://custom.example.com/domains.lst",
-		Format:         FormatDomains,
-		BareDomainMode: DomainModeExact,
-		IsPreset:       false,
-	}
+// A body with name lines and no prefix yields nothing usable, which the caller
+// must be able to detect as "would override nothing".
+func TestParseAllowNonPrefixRowsWithNoPrefixIsEmpty(t *testing.T) {
+	limits := DefaultParseLimits()
+	limits.AllowNonPrefixRows = true
 
-	_, _, err = Parse(context.Background(), strings.NewReader(input), customSrc, DefaultParseLimits())
-	if err == nil || !strings.Contains(err.Error(), "invalid domain rule") {
-		t.Fatalf("expected strict custom feed to reject on line 1, got %v", err)
+	_, _, err := Parse(context.Background(), strings.NewReader("example.com\nexample.org\n"), limits)
+	if err == nil {
+		t.Fatal("Parse() accepted a body with names but no prefix")
 	}
 }

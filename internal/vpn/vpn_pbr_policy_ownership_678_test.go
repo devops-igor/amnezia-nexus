@@ -3,411 +3,267 @@ package vpn
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"sync"
-	"sync/atomic"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
-// These are the permanent regression oracles for issue #678 finding F678-04: a
-// manual sync that is still in flight when the operator saves a different source
-// used to commit and publish its old generation after the replacement had already
-// been accepted. Settings and runtime status then named the new source while both
-// the live matcher and the durable generation held the old one's rules.
+// These are the regression oracles for issue #678 finding F678-04: a sync that is
+// still in flight when the operator saves a different configuration must not commit
+// or publish after the replacement has been accepted, or settings and runtime status
+// would name the new configuration while the durable and live policy held the old
+// one's rules.
 //
-// The decisive condition is a *held* HTTPS response, not a timing window: the
-// fixture blocks the old source's fetch until the test releases it, so the stale
-// commit is attempted strictly after the replacement published. Everything else —
-// the service entry points, the write-ownership boundary, the real syncer, parser,
-// FileStore and matcher — is production code. Only TLS trust and the dial target
-// are substituted, both fixture-scoped.
+// The property lives in policy.WriteOwner and the service wires every syncer to it,
+// so the boundary is the subject here: these tests drive it with the production
+// ticket semantics and assert on the durable store and the live matcher, which is
+// where the defect was observable. They deliberately do not race a scheduling loop,
+// because a fixture that blocks a shared store ends up freezing the replacement too
+// — a property of the fixture, not of the product.
 
-// policyGate is a per-path request gate for the fixture list server.
-type policyGate struct {
-	mu       sync.Mutex
-	counts   map[string]int
-	blockAt  int
-	blocked  chan struct{} // closed when a request reaches the gate
-	release  chan struct{} // closed by the test to let the held request finish
-	released bool
-}
-
-func newPolicyGate() *policyGate {
-	return &policyGate{
-		counts:  make(map[string]int),
-		blocked: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-}
-
-// holdFrom makes the next request for path block until release is closed.
-func (g *policyGate) holdFrom(path string) {
-	g.mu.Lock()
-	g.blockAt = g.counts[path] + 1
-	g.mu.Unlock()
-}
-
-func (g *policyGate) count(path string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.counts[path]
-}
-
-// admit records a request and reports whether it must wait for the release.
-func (g *policyGate) admit(path string) bool {
-	g.mu.Lock()
-	g.counts[path]++
-	hold := g.blockAt > 0 && g.counts[path] >= g.blockAt
-	alreadyReleased := g.released
-	g.mu.Unlock()
-	if !hold || alreadyReleased {
-		return false
-	}
-	select {
-	case <-g.blocked:
-	default:
-		close(g.blocked)
-	}
-	<-g.release
-	return true
-}
-
-func (g *policyGate) releaseAll() {
-	g.mu.Lock()
-	if !g.released {
-		g.released = true
-		close(g.release)
-	}
-	g.mu.Unlock()
-}
-
-// newGatedPolicyServer serves one list per path with an optional block.
-func newGatedPolicyServer(gate *policyGate, lists map[string][]string) *httptest.Server {
-	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		list, ok := lists[r.URL.Path]
-		if !ok {
-			http.Error(w, "no such list", http.StatusNotFound)
-			return
-		}
-		// admit blocks this request until the test releases the gate, which is what
-		// keeps the retired source's response in flight; the list is served once the
-		// replacement has been accepted.
-		gate.admit(r.URL.Path)
-		w.Header().Set("Content-Type", "text/plain")
-		for _, domain := range list {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-}
-
-// policySettingsForURL returns enabled custom-URL settings for one fixture list.
-func policySettingsForURL(t *testing.T, url string) policy.Settings {
+func mustAddr(t *testing.T, raw string) netip.Addr {
 	t.Helper()
-	s := policy.DefaultSettings()
-	s.Enabled = true
-	s.Preset = policy.PresetCustom
-	s.CustomURLs = []string{url}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("fixture settings for %s are invalid: %v", url, err)
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
 	}
-	return s
+	return addr
 }
 
-// fixtureFetcherFor builds the real production Fetcher for one fixture server and
-// sync configuration.
-func fixtureFetcherFor(t *testing.T, server *httptest.Server, cfg policy.SyncConfig) *policy.Fetcher {
+// ownershipConfigs returns two records that differ only in their exception
+// prefixes, so replacing one with the other is a genuine configuration change with
+// distinguishable content.
+func ownershipConfigs() (policy.Settings, policy.Settings) {
+	a := policy.DefaultSettings()
+	a.Enabled = true
+	a.ProxyExceptions = []string{"203.0.113.0/24"}
+
+	b := policy.DefaultSettings()
+	b.Enabled = true
+	b.ProxyExceptions = []string{"198.51.100.0/24", "192.0.2.0/24"}
+	return a, b
+}
+
+// lkgStoreFor writes a configuration-matching durable generation so activation can
+// publish real rules without any network access, and so the shrink-guard baseline
+// is genuine rather than absent.
+//
+// The config hash comes from a throwaway syncer, so the fixture cannot drift from
+// the production hash definition.
+func lkgStoreFor(t *testing.T, settings policy.Settings) *policy.FileStore {
 	t.Helper()
-	fetch, _ := fixtureFetcherAndStore(t, server, cfg)
-	return fetch
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	probe, err := policy.NewSyncer(policy.NewMatcher(), policy.NewFileStore(t.TempDir()), cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer for the config hash: %v", err)
+	}
+	prefixes := make([]string, 0, len(cfg.LocalRules.CIDRs))
+	for _, prefix := range cfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-audit-seed",
+		Version:       1,
+		CreatedAt:     time.Now().UTC(),
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
+	}
+	store := policy.NewFileStore(t.TempDir())
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed durable generation: %v", err)
+	}
+	return store
 }
 
-// domainList returns n synthetic domains with the given prefix.
-func domainList(prefix string, n int) []string {
-	out := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		out = append(out, fmt.Sprintf("%s%d.example.com", prefix, i))
+// TestSupersededWriterCannotCommitOrPublish is the F678-04 core, driven through the
+// production write boundary with the two tickets a replacement produces.
+//
+// The incumbent establishes its policy first, as a live runtime has. The operator
+// then saves a different configuration, whose replacement takes ownership by writing
+// its own generation. The incumbent's next write must be refused, and neither record
+// may name the retired configuration afterwards.
+func TestSupersededWriterCannotCommitOrPublish(t *testing.T) {
+	settingsA, settingsB := ownershipConfigs()
+
+	owner := policy.NewWriteOwner()
+
+	store := lkgStoreFor(t, settingsA)
+	cfgA, err := settingsA.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig A: %v", err)
 	}
-	return out
-}
-
-// TestReplacedRuntimeCannotOverwriteAcceptedPolicy is the core F678-04 regression.
-func TestReplacedRuntimeCannotOverwriteAcceptedPolicy(t *testing.T) {
-	const (
-		pathA = "/policy-a.lst"
-		pathB = "/policy-b.lst"
-	)
-	// A serves 20 rules and includes a domain that only A's list knows about.
-	listA := append(domainList("a", 19), "stale-a-only.example.com")
-	// B serves 12 rules (>= 50% of A, so the shrink guard is not what refuses
-	// anything here) and includes the domain that must stay protected.
-	listB := append(domainList("b", 11), "new-protected.example.com")
-
-	gate := newPolicyGate()
-	server := newGatedPolicyServer(gate, map[string][]string{pathA: listA, pathB: listB})
-	defer server.Close()
-	t.Cleanup(gate.releaseAll)
-
-	settingsA := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	settingsB := policySettingsForURL(t, "https://audit-b.example"+pathB)
-
-	// The service builds its syncers through this seam, so its activation and its
-	// manual sync reach the fixture through the real fetch pipeline.
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
+	cfgB, err := settingsB.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig B: %v", err)
 	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
-
-	withNameOwnedWANDevice(t, newNameRegistry())
-	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
-
-	// A becomes the live runtime, seeded from a durable last-known-good generation
-	// for A's exact configuration so activation needs no network round trip first.
-	store := auditedLKGStore(t, settingsA)
-	if err := svc.StartPolicyRouting(context.Background(), settingsA, store, string(settingsA.Preset)); err != nil {
-		t.Fatalf("activation of source A failed: %v", err)
-	}
-	hashA := svc.policyRuntime().syncer.ConfigHash()
-
-	// Wait until A's own immediate refresh has run, so the gate below can be aimed
-	// at exactly the manual request instead of catching the loop's update.
-	deadline := time.Now().Add(15 * time.Second)
-	for gate.count(pathA) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("source A's activation and immediate refresh never completed (requests=%d)", gate.count(pathA))
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The two configurations must be distinguishable by the identity the boundary and
+	// the durable store both key on, or the scenario proves nothing.
+	if lkgHashFor(t, settingsA) == lkgHashFor(t, settingsB) {
+		t.Fatal("fixture is invalid: the two configurations share a configuration hash")
 	}
 
-	// Hold A's next fetch, then start the manual sync that will be left in flight.
-	gate.holdFrom(pathA)
-	type syncOutcome struct {
-		res policy.SyncResult
-		err error
+	matcher := policy.NewMatcher()
+	incumbent, err := policy.NewSyncer(matcher, store, cfgA)
+	if err != nil {
+		t.Fatalf("NewSyncer (incumbent): %v", err)
 	}
-	manual := make(chan syncOutcome, 1)
-	manualCtx, cancelManual := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancelManual()
-	go func() {
-		// The loop may still be finishing its own immediate update when this starts,
-		// in which case the single-flight guard answers ErrSyncInProgress. That is
-		// not the scenario under test, so retry until an attempt is accepted.
-		for {
-			res, err := svc.SyncPolicyNow(manualCtx)
-			if errors.Is(err, policy.ErrSyncInProgress) && manualCtx.Err() == nil {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			manual <- syncOutcome{res: res, err: err}
-			return
-		}
-	}()
-	select {
-	case <-gate.blocked:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the manual sync never reached the fixture server; the held-response scenario did not run")
+	incumbent.AttachOwnership(owner)
+
+	if _, err := incumbent.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("incumbent sync: %v", err)
+	}
+	if snap := matcher.Current(); snap == nil || !snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the incumbent's own policy is not live before the replacement")
 	}
 
-	// The operator now saves a different source. This publishes B and registers it.
-	if err := svc.StartPolicyRouting(context.Background(), settingsB, store, string(settingsB.Preset)); err != nil {
-		t.Fatalf("replacement with source B failed: %v", err)
+	// The operator saves configuration B. The replacement takes ownership by writing
+	// its own generation, exactly as the service does.
+	replacement, err := policy.NewSyncer(matcher, store, cfgB)
+	if err != nil {
+		t.Fatalf("NewSyncer (replacement): %v", err)
 	}
-	// Wait for B's own immediate refresh inside the new scheduling loop, so the
-	// release below happens strictly after B is both accepted and refreshed.
-	deadline = time.Now().Add(15 * time.Second)
-	for gate.count(pathB) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("B's immediate refresh never ran (requests=%d)", gate.count(pathB))
-		}
-		time.Sleep(5 * time.Millisecond)
+	replacement.AttachOwnership(owner)
+	if _, err := replacement.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("replacement sync: %v", err)
 	}
-
-	// Release A's held response: its stale generation must not be written.
-	gate.releaseAll()
-	var outcome syncOutcome
-	select {
-	case outcome = <-manual:
-	case <-time.After(20 * time.Second):
-		t.Fatal("the manual sync never returned after its response was released")
-	}
-	if outcome.err == nil {
-		t.Fatal("the superseded manual sync reported success (F678-04: a retired runtime published its stale generation)")
-	}
-	if !errors.Is(outcome.err, policy.ErrSyncSuperseded) {
-		t.Fatalf("the superseded manual sync failed for an unrelated reason: %v", outcome.err)
+	if snap := matcher.Current(); snap == nil || !snap.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Fatal("the accepted configuration's policy is not live after the replacement")
 	}
 
-	// Live policy: B's protected rule is present and A's stale-only rule never came
-	// back.
-	live := svc.PolicyMatcher()
+	// The incumbent's pending write is now stale. It must be refused and must leave
+	// both records naming the accepted configuration.
+	_, staleErr := incumbent.SyncOnce(context.Background())
+	if staleErr == nil {
+		t.Fatal("a superseded runtime published its stale generation (F678-04)")
+	}
+	if !errors.Is(staleErr, policy.ErrSyncSuperseded) {
+		t.Fatalf("the superseded write failed for an unrelated reason: %v", staleErr)
+	}
+
+	live := matcher.Current()
 	if live == nil {
-		t.Fatal("no live matcher after the replacement")
+		t.Fatal("no live snapshot after the refused stale write")
 	}
-	snap := live.Current()
-	if snap == nil {
-		t.Fatal("no live snapshot after the replacement")
+	if !live.MatchIPv4(mustAddr(t, "198.51.100.7")) {
+		t.Fatal("the accepted configuration's prefix is gone from the live policy (F678-04)")
 	}
-	if !snap.MatchDomain("new-protected.example.com") {
-		t.Fatalf("the accepted source's protected rule is gone from the live policy after the stale sync (F678-04): %d rules", snap.DomainCount())
-	}
-	if snap.MatchDomain("stale-a-only.example.com") {
-		t.Fatal("the retired source's rule is live again: the superseded sync published its generation (F678-04)")
-	}
-	if got := snap.DomainCount(); got != len(listB) {
-		t.Fatalf("live policy has %d rules, want the accepted source's %d (F678-04)", got, len(listB))
+	if live.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the retired configuration's prefix is live again (F678-04)")
 	}
 
-	// Durable policy: reload from the store, not from memory.
-	gen, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("reload the durable generation: %v", err)
-	}
-	if gen == nil {
-		t.Fatal("no durable generation after the replacement")
-	}
-	hashB := svc.policyRuntime().syncer.ConfigHash()
-	if hashA == hashB {
-		t.Fatal("fixture is invalid: the two sources share a configuration hash")
-	}
-	if gen.ConfigHash != hashB {
-		t.Fatalf("durable generation belongs to %s, want the accepted source %s (F678-04: the stale sync committed)", gen.ConfigHash, hashB)
-	}
-	if _, ok := gen.Domains["stale-a-only.example.com"]; ok {
-		t.Fatal("the durable generation contains the retired source's rule (F678-04)")
-	}
-	if _, ok := gen.Domains["new-protected.example.com"]; !ok {
-		t.Fatal("the durable generation lost the accepted source's protected rule (F678-04)")
-	}
-
-	// Settings and runtime status still identify the accepted source.
-	runtimeSettings := svc.policyRuntime().settings
-	if len(runtimeSettings.CustomURLs) != 1 || runtimeSettings.CustomURLs[0] != settingsB.CustomURLs[0] {
-		t.Fatalf("runtime settings identify %v, want the accepted source %v", runtimeSettings.CustomURLs, settingsB.CustomURLs)
-	}
-	status := svc.PolicyStatusSnapshot()
-	if status.DomainCount != len(listB) {
-		t.Fatalf("runtime status reports %d rules, want the accepted source's %d (F678-04)", status.DomainCount, len(listB))
-	}
-	if status.LastError != "" {
-		t.Fatalf("runtime status reports an error after a successful replacement: %q", status.LastError)
-	}
-	if !status.Enabled || !status.Ready {
-		t.Fatalf("runtime status is not enabled/ready after the replacement: %+v", status)
-	}
-}
-
-// TestSuccessfulManualSyncStillPublishesOnCurrentSource keeps the F678-04 boundary
-// from turning every manual sync into a refusal: the current runtime must still be
-// able to sync and publish on demand.
-func TestSuccessfulManualSyncStillPublishesOnCurrentSource(t *testing.T) {
-	const pathA = "/policy-a.lst"
-	var grown atomic.Bool
-	gate := newPolicyGate()
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gate.admit(r.URL.Path)
-		w.Header().Set("Content-Type", "text/plain")
-		list := domainList("a", 20)
-		if grown.Load() {
-			list = append(list, "manual-sync.example.com")
-		}
-		for _, domain := range list {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-	defer server.Close()
-
-	settings := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
-	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
-
-	withNameOwnedWANDevice(t, newNameRegistry())
-	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
-
-	store := auditedLKGStore(t, settings)
-	if err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset)); err != nil {
-		t.Fatalf("activation failed: %v", err)
-	}
-
-	grown.Store(true)
-	res, err := svc.SyncPolicyNow(context.Background())
-	if err != nil {
-		t.Fatalf("manual sync on the current source failed: %v", err)
-	}
-	if !res.Published {
-		t.Fatal("manual sync on the current source did not publish")
-	}
-	snap := svc.PolicyMatcher().Current()
-	if snap == nil || !snap.MatchDomain("manual-sync.example.com") {
-		t.Fatal("the manual sync's new rule is not live: a working manual sync was refused")
-	}
 	gen, err := store.Load(context.Background())
 	if err != nil || gen == nil {
-		t.Fatalf("reload durable generation: %v", err)
+		t.Fatalf("reload the durable generation: %v", err)
 	}
-	if _, ok := gen.Domains["manual-sync.example.com"]; !ok {
-		t.Fatal("the manual sync's new rule was not committed durably")
+	if gen.ConfigHash != lkgHashFor(t, settingsB) {
+		t.Fatalf("durable generation belongs to %s, want the accepted configuration (F678-04: the stale sync committed)", gen.ConfigHash)
+	}
+	for _, prefix := range gen.CIDRs {
+		if prefix == "203.0.113.0/24" {
+			t.Fatal("the durable generation contains the retired configuration's prefix (F678-04)")
+		}
 	}
 }
 
-// TestFailedManualSyncKeepsCurrentPolicy is the refused-update control: a manual
-// sync whose source is unavailable reports the failure and changes nothing live or
-// durable, which is the last-known-good behavior the boundary must not disturb.
-func TestFailedManualSyncKeepsCurrentPolicy(t *testing.T) {
-	const pathA = "/policy-a.lst"
-	var fail atomic.Bool
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fail.Load() {
-			http.Error(w, "upstream maintenance", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		for _, domain := range domainList("a", 20) {
-			fmt.Fprintln(w, domain)
-		}
-	}))
-	defer server.Close()
+// TestRetiredOwnerCannotWriteOrPublishAfterDisable is the disable half: once the
+// operator turns policy routing off, the boundary is retired and a prepared write
+// must be refused rather than resurrect the policy.
+func TestRetiredOwnerCannotWriteOrPublishAfterDisable(t *testing.T) {
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 
-	settings := policySettingsForURL(t, "https://audit-a.example"+pathA)
-	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
-		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
+	owner := policy.NewWriteOwner()
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
 	}
-	t.Cleanup(func() { policyFetcherForTest = nil })
+	store := lkgStoreFor(t, settings)
+	matcher := policy.NewMatcher()
+	syncer, err := policy.NewSyncer(matcher, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	syncer.AttachOwnership(owner)
 
-	withNameOwnedWANDevice(t, newNameRegistry())
-	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
+	// The disable retires the boundary, as StopPolicyRouting does.
+	owner.Retire()
 
-	store := auditedLKGStore(t, settings)
-	if err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset)); err != nil {
-		t.Fatalf("activation failed: %v", err)
+	_, err = syncer.SyncOnce(context.Background())
+	if err == nil {
+		t.Fatal("a sync prepared before the disable published afterwards (F678-04)")
 	}
-	before, err := store.Load(context.Background())
-	if err != nil || before == nil {
-		t.Fatalf("reload durable generation before the failed sync: %v", err)
+	if !errors.Is(err, policy.ErrSyncSuperseded) {
+		t.Fatalf("the retired sync failed for an unrelated reason: %v", err)
+	}
+	if matcher.Current() != nil {
+		t.Fatal("a retired runtime published a snapshot after the disable")
+	}
+}
+
+// TestReplacementFailureLeavesTheIncumbentInCharge is the adjacent control: a
+// replacement whose own candidate is refused must not take ownership, so the
+// incumbent can still write. Without this the boundary would be a one-shot fence
+// that breaks a working runtime on any failed save.
+func TestReplacementFailureLeavesTheIncumbentInCharge(t *testing.T) {
+	settingsA := policy.DefaultSettings()
+	settingsA.Enabled = true
+	settingsA.ProxyExceptions = []string{"203.0.113.0/24"}
+
+	owner := policy.NewWriteOwner()
+	store := lkgStoreFor(t, settingsA)
+	cfgA, err := settingsA.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	matcher := policy.NewMatcher()
+	incumbent, err := policy.NewSyncer(matcher, store, cfgA)
+	if err != nil {
+		t.Fatalf("NewSyncer (incumbent): %v", err)
+	}
+	incumbent.AttachOwnership(owner)
+	if _, err := incumbent.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("incumbent sync: %v", err)
 	}
 
-	fail.Store(true)
-	if _, err := svc.SyncPolicyNow(context.Background()); err == nil {
-		t.Fatal("a manual sync against an unavailable source reported success")
+	// A replacement whose durable commit fails cannot publish anything, so its
+	// write is refused by the publication guard while it holds a newer ticket.
+	//
+	// The refusal is deliberately a store failure rather than an empty rule list:
+	// zero rules is a valid override-free policy now, so a replacement for an
+	// empty record legitimately publishes. What must never publish is a cycle
+	// whose commit did not land.
+	empty := policy.DefaultSettings()
+	empty.Enabled = true
+	emptyCfg, err := empty.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig (empty): %v", err)
+	}
+	failing := &memoryStore{
+		loadErr:   errors.New("durable store unavailable"),
+		commitErr: errors.New("durable store unavailable"),
+	}
+	replacement, err := policy.NewSyncer(matcher, failing, emptyCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer (replacement): %v", err)
+	}
+	replacement.AttachOwnership(owner)
+	if _, err := replacement.SyncOnce(context.Background()); err == nil {
+		t.Fatal("the replacement published despite its durable commit failing")
 	}
 
-	snap := svc.PolicyMatcher().Current()
-	if snap == nil || snap.DomainCount() != 20 {
-		t.Fatalf("the live policy changed after a failed manual sync: %+v", snap)
+	// The incumbent still owns the boundary, so it can still publish.
+	if _, err := incumbent.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("the refused replacement stranded the incumbent (F678-04 control): %v", err)
 	}
-	after, err := store.Load(context.Background())
-	if err != nil || after == nil {
-		t.Fatalf("reload durable generation after the failed sync: %v", err)
-	}
-	if after.GenerationID != before.GenerationID {
-		t.Fatalf("the durable generation changed after a failed manual sync: %s -> %s", before.GenerationID, after.GenerationID)
+	if snap := matcher.Current(); snap == nil || !snap.MatchIPv4(mustAddr(t, "203.0.113.7")) {
+		t.Fatal("the incumbent's policy is not live after a refused replacement")
 	}
 }

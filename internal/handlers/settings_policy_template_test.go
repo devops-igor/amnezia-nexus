@@ -28,7 +28,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devops-igor/amnezia-nexus/internal/config"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/web"
@@ -43,17 +42,9 @@ var policySectionIDs = []string{
 	"policyAlert",
 	"policyStatusBadge",
 	"policy_enabled",
-	"policy_preset_aggregate",
-	"policy_preset_russia_inside",
-	"policy_preset_geoblock",
-	"policy_preset_antifilter_domains",
-	"policy_preset_antifilter_ipv4",
-	"policy_preset_custom",
-	"policyCustomUrlsGroup",
-	"policy_custom_urls",
+	"policy_proxy_exceptions",
 	"policySaveBtn",
 	"policySyncBtn",
-	"policyActivePreset",
 	"policyLastSuccess",
 	"policySyncState",
 	"policyRuleCount",
@@ -62,8 +53,6 @@ var policySectionIDs = []string{
 	"policyDirectBytes",
 	"policyProxyDrops",
 	"policyDirectDrops",
-	"policy_local_entries",
-	"policy_excluded_domains",
 	"policy_inventory_override",
 	"policyInventorySource",
 	"policyInventoryPrefixes",
@@ -75,7 +64,6 @@ var policySectionIDs = []string{
 	"policyCdnCount",
 	"policyCdnEntries",
 	"policyCdnNotice",
-	"policySourceStats",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -110,19 +98,30 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 			}
 		}
 		for _, token := range []string{
-			`name="policy_preset"`,
-			`value="aggregate"`,
-			`value="russia_inside"`,
-			`value="geoblock"`,
-			`value="antifilter_domains"`,
-			`value="antifilter_ipv4"`,
-			`value="custom"`,
+			`name="policy_enabled"`,
+			`name="policy_proxy_exceptions"`,
 			`type="submit"`,
 			`id="policySaveBtn"`,
 			`id="policySyncBtn"`,
 		} {
 			if !strings.Contains(adminBody, token) {
 				t.Errorf("admin settings page is missing %q", token)
+			}
+		}
+	})
+
+	// A visible control must do what it says, so the page offers exactly the two
+	// inputs that reach a packet decision and nothing that configures a source.
+	t.Run("NoSourceOrDomainControls", func(t *testing.T) {
+		for _, removed := range []string{
+			`name="policy_preset"`,
+			`name="policy_custom_urls"`,
+			`name="policy_excluded_domains"`,
+			`id="policyActivePreset"`,
+			`id="policySourceStats"`,
+		} {
+			if strings.Contains(adminBody, removed) {
+				t.Errorf("admin settings page still renders the removed control %q", removed)
 			}
 		}
 	})
@@ -152,28 +151,46 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 	})
 
 	t.Run("ControllerURLIsCacheBusted", func(t *testing.T) {
-		// /static/* is served with a 24-hour max-age. The controller must carry a
-		// version query, or a browser keeps the pre-update script and silently
+		// /static/* is served with a 24-hour max-age. The controller must carry an
+		// identity query, or a browser keeps the pre-update script and silently
 		// omits the newer form fields from the save payload.
-		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
-		if !strings.Contains(adminBody, versioned) {
-			t.Errorf("admin settings page does not load the versioned policy controller %q", versioned)
+		//
+		// The identity must follow the delivered bytes, not the release version: this
+		// change rewrote the controller without moving the release, so a
+		// ?v=<release> URL is exactly the URL the predecessor served and a returning
+		// browser would keep the incompatible script.
+		const controller = "/static/js/policy_routing.js"
+		src := ""
+		for _, candidate := range collectShellLinks(t, adminBody).scripts {
+			if path, _, _ := strings.Cut(candidate, "?"); path == controller {
+				src = candidate
+			}
 		}
-		if strings.Contains(adminBody, `src="/static/js/policy_routing.js"`) {
-			t.Error("admin settings page loads the unversioned policy controller; a cached script can omit new fields")
+		if src == "" {
+			t.Fatalf("admin settings page does not load %s at all", controller)
+		}
+		if !strings.Contains(src, "?v=") {
+			t.Errorf("admin settings page loads %q with no cache identity; a cached script can omit new fields", src)
+		}
+		if want := controller + "?v=" + deliveredAssetDigest(t, controller); src != want {
+			t.Errorf("admin settings page loads %q, want %q so the identity follows the delivered bytes", src, want)
+		}
+		if src == versionedAssetURL(controller) {
+			t.Errorf("admin settings page loads %q, which is the release-version URL the predecessor also "+
+				"served; a returning browser keeps the incompatible controller", src)
 		}
 	})
 
 	t.Run("ControllerLoadedOnlyForAdmins", func(t *testing.T) {
-		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
-		if !strings.Contains(adminBody, versioned) {
-			t.Errorf("admin settings page does not load the policy controller %q", versioned)
+		adminPrefix := fmt.Sprintf(`src="%s?v=`, "/static/js/policy_routing.js")
+		if !strings.Contains(adminBody, adminPrefix) {
+			t.Errorf("admin settings page does not load the policy controller (%q missing)", adminPrefix)
 		}
 		supportBody := renderSettingsPage(t, models.RoleSupport)
 		if strings.Contains(supportBody, `id="policyRoutingCard"`) {
 			t.Error("support operator received the admin-only policy section")
 		}
-		if strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) || strings.Contains(supportBody, versioned) {
+		if strings.Contains(supportBody, adminPrefix) || strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) {
 			t.Error("support operator's page loads the policy controller")
 		}
 	})
@@ -273,7 +290,7 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	for _, key := range []string{
 		"policy_load_failed", "policy_not_ready", "policy_saved", "policy_save_failed",
 		"policy_save_kept", "policy_sync_ok", "policy_sync_failed", "policy_sync_running",
-		"policy_never", "policy_none", "policy_rule_count_value", "policy_status_unknown",
+		"policy_never", "policy_none", "policy_status_unknown",
 		"policy_sync_state_disabled", "policy_sync_state_error",
 		"policy_sync_state_pending", "policy_sync_state_synced",
 		// Keys the inventory block formats at run time (issue #920). Their values

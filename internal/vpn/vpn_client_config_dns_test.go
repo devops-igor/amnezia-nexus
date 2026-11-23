@@ -61,10 +61,7 @@ func renderedProfileDNS() string {
 // profile must ignore.
 func newActivePBRConfig(t *testing.T) PBRConfig {
 	t.Helper()
-	rules, _, err := policy.Parse(context.Background(), strings.NewReader("198.51.200.0/24\n"), policy.Source{
-		ID:     "client-dns-cidrs",
-		Format: policy.FormatIPv4,
-	}, policy.DefaultParseLimits())
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("198.51.200.0/24\n"), policy.DefaultParseLimits())
 	if err != nil {
 		t.Fatalf("policy Parse: %v", err)
 	}

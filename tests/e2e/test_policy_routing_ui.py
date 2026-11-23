@@ -6,11 +6,17 @@ The section is rendered by ``web/templates/settings_policy.html`` and driven by
 started by ``scripts/run_e2e.sh`` — a panel-only deployment with no dataplane —
 so the refusals below are the server's genuine answers, not simulated ones.
 
+The section offers exactly the inputs that reach a packet decision: the master
+switch, the IPv4 PROXY exception list, the inventory override and the refresh
+interval. It has no source selection, so there is no preset to pick and no list
+URL to fetch; the operator's own addresses go in the exception list.
+
 Covered here:
-* saving a preset and finding it after a reload;
+* saving an exception-list entry and finding it after a reload;
 * a sync the panel cannot perform, reported with the server's own wording;
 * an enablement the server refuses, which must not stay visible as enabled;
-* a custom list URL the server rejects, surfaced inline;
+* a list entry that is not an IPv4 rule, rejected inline with the typed value
+  kept and nothing stored;
 * the admin-only boundary: a support operator gets no section and a 403 API;
 * CSRF: a mutating policy call without the token is rejected.
 
@@ -18,6 +24,7 @@ The suite is registered as ``hosted-panel`` in ``runner_map.toml``. It must not
 acquire a DEV-only dependency: no SSH, no provisioning and no dataplane.
 """
 
+import random
 import uuid
 
 import pytest
@@ -33,6 +40,11 @@ ALERT = "#policyAlert"
 SAVE_BTN = "#policySaveBtn"
 SYNC_BTN = "#policySyncBtn"
 ENABLE_TOGGLE = "#policy_enabled"
+# The exception list is the operator's only entry surface for a decision that
+# reaches a packet: every line is an IPv4 address or CIDR forced through PROXY
+# ahead of the classifier. It replaced the custom-URL field, so it is what the
+# list-shaped tests below drive.
+EXCEPTIONS = "#policy_proxy_exceptions"
 
 
 def _open_settings(page: Page, base_url: str) -> None:
@@ -53,7 +65,8 @@ def _stage_change(page: Page) -> None:
     real edit first. The entry is unique, so it is always a change.
     """
     if page.locator(SAVE_BTN).is_disabled():
-        page.fill("#policy_local_entries", f"e2e-{uuid.uuid4().hex[:8]}.example")
+        octets = (random.randint(1, 254) for _ in range(4))
+        page.fill(EXCEPTIONS, "10.{}.{}.{}".format(*octets))
     expect(page.locator(SAVE_BTN)).to_be_enabled()
 
 
@@ -90,39 +103,43 @@ def _set_policy_enabled(page: Page, enabled: bool) -> None:
 
 
 @pytest.mark.e2e
-def test_policy_preset_saves_and_survives_reload(
+def test_policy_exception_entry_saves_and_survives_reload(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """Selecting a preset persists across a full page reload."""
+    """An exception-list entry persists across a full page reload."""
     page = authenticated_page
     _open_settings(page, base_url)
 
-    page.check("#policy_preset_geoblock")
+    entry = "198.51.100.0/24"
+    page.fill(EXCEPTIONS, entry)
     response = _save(page)
     assert response.status == 200, f"save failed: {response.status} {response.text()[:200]}"
     body = response.json()
     assert body.get("status") == "ok"
-    assert body.get("preset") == "geoblock"
+    # The exception list is what was saved, and the preset/custom-URL shape is gone
+    # from the wire contract rather than merely from the markup.
+    assert body.get("proxy_exceptions") == [entry]
+    assert "preset" not in body and "custom_urls" not in body
 
     expect(page.locator(ALERT)).to_have_attribute("data-state", "success")
 
     page.reload()
     page.wait_for_load_state("networkidle")
     page.wait_for_selector(CARD, state="visible")
-    expect(page.locator("#policy_preset_geoblock")).to_be_checked()
+    # A refusal would restore the stored value; an acceptance rebases onto it, so
+    # this is the entry the server kept, not the text left behind in the box.
+    assert page.locator(EXCEPTIONS).input_value() == entry
     expect(page.locator(ENABLE_TOGGLE)).not_to_be_checked()
     expect(page.locator("#policyStatusBadge")).to_have_attribute("data-enabled", "false")
-    # The status block names the preset the server reports, not a local guess.
-    expect(page.locator("#policyActivePreset")).to_have_text("GeoBlock")
 
     # Independent read of the same contract through the API.
     stored = api_get(page, POLICY_ENDPOINT)
-    assert stored.get("preset") == "geoblock"
+    assert stored.get("proxy_exceptions") == [entry]
     assert stored.get("enabled") is False
     # The mutating endpoint kept its CSRF requirement.
     unguarded = page.request.put(
         f"{base_url}{POLICY_ENDPOINT}",
-        data={"enabled": False, "preset": "geoblock", "custom_urls": []},
+        data={"enabled": False, "proxy_exceptions": [entry]},
         headers={"Content-Type": "application/json"},
     )
     assert unguarded.status == 403, "policy PUT without a CSRF token must be rejected"
@@ -135,7 +152,7 @@ def test_policy_sync_failure_is_reported_with_the_server_reason(
     """A sync the panel cannot perform is reported truthfully, never as success."""
     page = authenticated_page
     _open_settings(page, base_url)
-    page.check("#policy_preset_geoblock")
+    page.fill(EXCEPTIONS, "198.51.100.0/24")
     assert _save(page).status == 200
 
     with page.expect_response(lambda r: r.url.endswith(SYNC_ENDPOINT)) as info:
@@ -163,7 +180,7 @@ def test_policy_rejected_enablement_is_not_shown_as_enabled(
     """An enablement the server refuses is not shown as running, and is not lost."""
     page = authenticated_page
     _open_settings(page, base_url)
-    page.check("#policy_preset_geoblock")
+    page.fill(EXCEPTIONS, "198.51.100.0/24")
     assert _save(page).status == 200
 
     _set_policy_enabled(page, True)
@@ -192,19 +209,25 @@ def test_policy_rejected_enablement_is_not_shown_as_enabled(
 
 
 @pytest.mark.e2e
-def test_policy_custom_url_validation_error_is_inline(
+def test_policy_exception_validation_error_is_inline(
     authenticated_page: Page, base_url: str
 ) -> None:
-    """A non-HTTPS list URL is refused by the server and shown in the banner."""
+    """A line that is not an IPv4 rule is refused by the server and shown inline.
+
+    The exception list replaced the custom-URL field, and it is an address set: the
+    packet path matches it against the destination, so a domain line would be
+    stored and never applied. The boundary therefore refuses it. A host name is
+    used rather than a mistyped address because it is the exact input an operator
+    migrating from the old domain list would paste.
+    """
     page = authenticated_page
     _open_settings(page, base_url)
 
-    page.check("#policy_preset_custom")
-    expect(page.locator("#policyCustomUrlsGroup")).to_be_visible()
-    page.fill("#policy_custom_urls", "http://insecure.example/domains.lst")
+    rejected = "not-an-address.example"
+    page.fill(EXCEPTIONS, rejected)
     response = _save(page)
     assert response.status == 400, (
-        "an http:// list URL must be refused server-side; "
+        "a domain line in an IPv4 exception list must be refused server-side; "
         f"got {response.status} {response.text()[:200]}"
     )
     detail = response.json().get("detail", "")
@@ -216,12 +239,12 @@ def test_policy_custom_url_validation_error_is_inline(
     # A refusal never stored the entry and never discards it either: the operator's
     # text stays in the box, the card stays marked unsaved, and the stored record
     # does not contain it.
-    assert (
-        page.locator("#policy_custom_urls").input_value() == "http://insecure.example/domains.lst"
-    )
+    assert page.locator(EXCEPTIONS).input_value() == rejected
     expect(page.locator(f"{CARD} [data-dirty]")).to_have_text("Unsaved changes")
     stored = api_get(page, POLICY_ENDPOINT)
-    assert "http://insecure.example/domains.lst" not in stored.get("custom_urls", [])
+    assert rejected not in stored.get("proxy_exceptions", [])
+    # The control the old test drove is gone, so it cannot be what was validated.
+    assert page.locator("#policy_custom_urls").count() == 0
 
 
 def _login_as(page: Page, base_url: str, username: str, password: str) -> None:

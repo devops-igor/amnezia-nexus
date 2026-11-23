@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// TestCache_ErrorHandling covers the fail-closed side of the loader. The positive
+// predecessor case lives in TestFileStoreLoadsPredecessorGeneration, and both must
+// hold: a reader that accepts everything is as broken as one that refuses an
+// upgrade.
 func TestCache_ErrorHandling(t *testing.T) {
 	tempDir := t.TempDir()
 	store := NewFileStore(tempDir)
@@ -40,7 +44,6 @@ func TestCache_ErrorHandling(t *testing.T) {
 		GenerationID:  "gen-1",
 		Version:       1,
 		CreatedAt:     time.Now().UTC(),
-		Domains:       map[string]uint32{"example.com": uint32(domainExact)},
 		CIDRs:         []string{"10.0.0.0/24"},
 	}
 	if err := store.Commit(ctx, goodGen); err != nil {
@@ -63,7 +66,6 @@ func TestCache_ErrorHandling(t *testing.T) {
 		"generation_id": "gen-1",
 		"version": 1,
 		"content_hash": "corrupted-hash",
-		"domains": {"example.com": 1},
 		"cidrs": ["10.0.0.0/24"]
 	}`)
 	if err := os.WriteFile(cachePath, corruptData, 0600); err != nil {
@@ -79,8 +81,7 @@ func TestCache_ErrorHandling(t *testing.T) {
 		t.Fatal("expected error on GenerationToSnapshot(nil)")
 	}
 	badCIDRGen := &Generation{
-		Domains: map[string]uint32{"example.com": 1},
-		CIDRs:   []string{"not-a-valid-cidr"},
+		CIDRs: []string{"not-a-valid-cidr"},
 	}
 	if _, err := GenerationToSnapshot(badCIDRGen); err == nil {
 		t.Fatal("expected error on bad CIDR in GenerationToSnapshot")

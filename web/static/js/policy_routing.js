@@ -173,13 +173,6 @@
         return parsed.toLocaleString(lang || undefined);
     }
 
-    function policyPresetLabel(preset) {
-        if (!preset) {
-            return policyText('policy_none');
-        }
-        return policyText('policy_preset_' + preset);
-    }
-
     // policySyncStateLabel translates the runtime's own sync_state token. The set
     // is closed (disabled/synced/pending/error); an unknown token is shown as
     // received rather than replaced by a guess.
@@ -190,35 +183,6 @@
         var key = 'policy_sync_state_' + state;
         var label = policyText(key);
         return label === key ? state : label;
-    }
-
-    function policySelectedPreset() {
-        var inputs = policyPresetInputs();
-        for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].checked) {
-                return inputs[i].value;
-            }
-        }
-        return '';
-    }
-
-    function policyPresetInputs() {
-        if (!root.document || typeof root.document.querySelectorAll !== 'function') {
-            return [];
-        }
-        var nodes = root.document.querySelectorAll('input[name="policy_preset"]');
-        return Array.prototype.slice.call(nodes);
-    }
-
-    function policyCustomURLs() {
-        var textarea = policyElement('policy_custom_urls');
-        if (!textarea || typeof textarea.value !== 'string') {
-            return [];
-        }
-        return textarea.value
-            .split('\n')
-            .map(function (line) { return line.trim(); })
-            .filter(function (line) { return line.length > 0; });
     }
 
     // setPolicyAlert reports into the card's own two regions, the same ones every
@@ -287,29 +251,9 @@
         }
     }
 
-    function updatePolicyCustomGroup() {
-        var group = policyElement('policyCustomUrlsGroup');
-        if (!group) {
-            return;
-        }
-        group.style.display = policySelectedPreset() === 'custom' ? 'block' : 'none';
-    }
-
-    function updatePolicyPresetHighlight() {
-        if (!root.document || typeof root.document.querySelectorAll !== 'function') {
-            return;
-        }
-        var selected = policySelectedPreset();
-        var rows = root.document.querySelectorAll('[data-policy-preset]');
-        Array.prototype.forEach.call(rows, function (row) {
-            var isSelected = row.getAttribute('data-policy-preset') === selected;
-            row.style.borderColor = isSelected ? 'var(--accent)' : 'var(--border-color)';
-        });
-    }
-
     // applyPolicyRecord populates the form from a server record. It is the only
-    // writer of the toggle and preset controls, so the displayed intent is always
-    // a record the server accepted.
+    // writer of the toggle and the exception list, so the displayed intent is
+    // always a record the server accepted.
     //
     // With keepForm the record is remembered as the last accepted one and the
     // fields are left as the operator has them. That is for a save whose answer
@@ -329,22 +273,12 @@
             enabled.checked = !!record.enabled;
         }
 
-        var urls = Array.isArray(record.custom_urls) ? record.custom_urls : [];
-        var textarea = policyElement('policy_custom_urls');
-        if (textarea) {
-            textarea.value = urls.join('\n');
+        var exceptions = Array.isArray(record.proxy_exceptions) ? record.proxy_exceptions : [];
+        var exceptionsTextarea = policyElement('policy_proxy_exceptions');
+        if (exceptionsTextarea) {
+            exceptionsTextarea.value = exceptions.join('\n');
         }
-        var local = Array.isArray(record.local_entries) ? record.local_entries : [];
-        var localTextarea = policyElement('policy_local_entries');
-        if (localTextarea) {
-            localTextarea.value = local.join('\n');
-        }
-        var excluded = Array.isArray(record.excluded_domains) ? record.excluded_domains : [];
-        var excludedTextarea = policyElement('policy_excluded_domains');
-        if (excludedTextarea) {
-            excludedTextarea.value = excluded.join('\n');
-        }
-        // The inventory override is a stored record field like the lists above: the
+        // The inventory override is a stored record field like the list above: the
         // textarea always shows what the server accepted, never a local guess.
         var override = Array.isArray(record.inventory_override) ? record.inventory_override : [];
         var overrideTextarea = policyElement('policy_inventory_override');
@@ -357,46 +291,9 @@
             interval.value = String(record.sync_interval_seconds);
         }
 
-        var selected = record.preset || '';
-        var inputs = policyPresetInputs();
-        for (var i = 0; i < inputs.length; i++) {
-            inputs[i].checked = inputs[i].value === selected;
-        }
-
-        updatePolicyCustomGroup();
-        updatePolicyPresetHighlight();
         if (root.SettingsCards) {
             root.SettingsCards.rebase('policyRoutingCard');
         }
-    }
-
-    function renderPolicySourceStats(snapshot) {
-        var container = policyElement('policySourceStats');
-        if (!container) {
-            return;
-        }
-        while (container.firstChild) {
-            container.removeChild(container.firstChild);
-        }
-        var stats = snapshot && snapshot.source_stats ? snapshot.source_stats : null;
-        var keys = stats ? Object.keys(stats).sort() : [];
-        if (keys.length === 0) {
-            var empty = document.createElement('span');
-            empty.className = 'text-muted';
-            empty.textContent = policyText('policy_sources_empty');
-            container.appendChild(empty);
-            return;
-        }
-        keys.forEach(function (id) {
-            var item = stats[id] || {};
-            var row = document.createElement('div');
-            row.style.padding = '2px 0';
-            row.textContent = id + ': ' + (item.accepted || 0) + ' accepted, '
-                + (item.excluded || 0) + ' ' + policyText('policy_source_excluded')
-                + (item.last_success ? ' · ' + item.last_success : '')
-                + (item.error ? ' — ' + item.error : '');
-            container.appendChild(row);
-        });
     }
 
     // renderPolicyInventory states which allocation inventory the classifier is
@@ -539,7 +436,53 @@
         setPolicyElementText('policyCdnNotice', renderPolicyCDNNotice(cdn));
     }
 
+    // renderPolicyRetirement states what the stored record held and this build
+    // could not carry. It is empty when the record carried nothing retired, so an
+    // ordinary prefix-only upgrade shows no warning at all.
+    //
+    // Without it an operator whose predecessor list held domain lines would see a
+    // shorter list than they saved and no explanation, which reads as lost
+    // configuration. The text names the retired entries themselves rather than only
+    // counting them, because the operator is the one who recognises what they wrote.
+    function renderPolicyRetirement(record) {
+        var notice = policyElement('policyLegacyNotice');
+        if (!notice) {
+            return;
+        }
+        var retired = record && record.retired ? record.retired : null;
+        if (!retired) {
+            notice.textContent = '';
+            return;
+        }
+        var parts = [];
+        var nonIPv4 = Array.isArray(retired.non_ipv4_entries) ? retired.non_ipv4_entries : [];
+        if (nonIPv4.length > 0) {
+            parts.push(policyText('policy_legacy_entries_retired')
+                .replace('{entries}', nonIPv4.join(', ')));
+        }
+        if (retired.source_selection) {
+            parts.push(policyText('policy_legacy_source_retired')
+                .replace('{source}', String(retired.source_selection)));
+        }
+        var customURLs = Number(retired.custom_url_count) || 0;
+        if (customURLs > 0) {
+            parts.push(policyText('policy_legacy_urls_retired')
+                .replace('{count}', String(customURLs)));
+        }
+        var excluded = Number(retired.excluded_domain_count) || 0;
+        if (excluded > 0) {
+            parts.push(policyText('policy_legacy_exclusions_retired')
+                .replace('{count}', String(excluded)));
+        }
+        notice.textContent = parts.join(' ');
+    }
+
+    // renderPolicyStatus renders the runtime block. What the stored record could not
+    // carry is rendered beside it by renderPolicyRetirement, because the two answer
+    // different questions: what is running, and what the operator's saved record
+    // used to hold.
     function renderPolicyStatus(record, status) {
+        renderPolicyRetirement(record);
         var snapshot = policyRuntimeSnapshot({ status: status });
         if (snapshot) {
             // The newest real observation is also what a failed recovery read keeps.
@@ -565,13 +508,6 @@
             }
         }
 
-        var preset = (snapshot && snapshot.preset) || (record && record.preset) || '';
-        var presetEl = policyElement('policyActivePreset');
-        if (presetEl) {
-            presetEl.textContent = policyPresetLabel(preset);
-        }
-
-        renderPolicySourceStats(snapshot);
         renderPolicyInventory(snapshot);
         renderPolicyCDNExclusions(snapshot);
 
@@ -588,11 +524,7 @@
         var ruleCountEl = policyElement('policyRuleCount');
         if (ruleCountEl) {
             if (snapshot) {
-                var domains = Number(snapshot.domain_count) || 0;
-                var cidrs = Number(snapshot.cidr_count) || 0;
-                ruleCountEl.textContent = policyText('policy_rule_count_value')
-                    .replace('{domains}', policyFormatCount(domains))
-                    .replace('{cidrs}', policyFormatCount(cidrs));
+                ruleCountEl.textContent = policyFormatCount(Number(snapshot.cidr_count) || 0);
             } else {
                 ruleCountEl.textContent = policyText('policy_none');
             }
@@ -673,20 +605,8 @@
         return policy;
     }
 
-    function policyLocalEntries() {
-        var textarea = policyElement('policy_local_entries');
-        if (!textarea || typeof textarea.value !== 'string') {
-            return [];
-        }
-        return textarea.value.split('\n').map(function (line) {
-            return line.trim();
-        }).filter(function (line) {
-            return line !== '';
-        });
-    }
-
-    function policyExcludedDomains() {
-        var textarea = policyElement('policy_excluded_domains');
+    function policyProxyExceptions() {
+        var textarea = policyElement('policy_proxy_exceptions');
         if (!textarea || typeof textarea.value !== 'string') {
             return [];
         }
@@ -713,16 +633,12 @@
     }
 
     function policySavePayload() {
-        var preset = policySelectedPreset();
         var enabledInput = policyElement('policy_enabled');
         var intervalInput = policyElement('policy_sync_interval');
         var interval = intervalInput ? Number(intervalInput.value) : NaN;
         return {
             enabled: !!(enabledInput && enabledInput.checked),
-            preset: preset,
-            custom_urls: preset === 'custom' ? policyCustomURLs() : [],
-            local_entries: policyLocalEntries(),
-            excluded_domains: policyExcludedDomains(),
+            proxy_exceptions: policyProxyExceptions(),
             inventory_override: policyInventoryOverride(),
             sync_interval_seconds: isFinite(interval) && interval > 0 ? interval : 0
         };
@@ -876,16 +792,6 @@
                 syncPolicy();
             });
         }
-
-        policyPresetInputs().forEach(function (input) {
-            input.addEventListener('change', function () {
-                updatePolicyCustomGroup();
-                updatePolicyPresetHighlight();
-            });
-        });
-
-        updatePolicyCustomGroup();
-        updatePolicyPresetHighlight();
 
         loadPolicySettings().catch(function (err) {
             // A failed initial read leaves the section read-only and says why: with

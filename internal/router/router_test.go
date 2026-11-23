@@ -38,6 +38,10 @@ func setupTestRouterDB(t *testing.T) (*database.DB, *config.Config) {
 		Host:        "127.0.0.1",
 		Port:        5000,
 		SecretKey:   testSecretKey,
+		// A test's durable policy store must live under its own temporary directory.
+		// Without this the handler falls back to a package-relative path and a test
+		// that activates policy routing writes into the source tree.
+		DataDir: tmpDir,
 	}
 
 	// Create an admin user so setup redirect does not block normal routes

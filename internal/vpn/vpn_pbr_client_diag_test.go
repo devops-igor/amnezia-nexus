@@ -42,7 +42,11 @@ type clientDiagFixture struct {
 	clientIP netip.Addr
 	example  netip.Addr
 	proxyIP  netip.Addr
-	peerKey  string
+	// exceptionPrefix is the operator PROXY exception the fixture publishes. The
+	// proxyIP destination is deliberately outside it, so the PROXY decision there
+	// comes from the classifier rather than from the operator rule.
+	exceptionPrefix string
+	peerKey         string
 	// directAddrs are the destinations this fixture's classifier routes DIRECT.
 	directAddrs map[netip.Addr]struct{}
 }
@@ -64,15 +68,14 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		clientIP: netip.MustParseAddr("10.100.0.10"),
 		example:  netip.MustParseAddr("93.184.216.34"),
 		proxyIP:  netip.MustParseAddr("93.184.216.99"),
-		peerKey:  "peer-client-diag",
+		// exceptionPrefix is the operator PROXY rule; proxyIP is the destination
+		// that must stay OUTSIDE it so the classifier decides it.
+		exceptionPrefix: "198.51.100.0/24",
+		peerKey:         "peer-client-diag",
 	}
 
 	matcher := policy.NewMatcher()
-	rules, _, err := policy.Parse(ctx, strings.NewReader("proxy.example\n"), policy.Source{
-		ID:             "diag-rules",
-		Format:         policy.FormatDomains,
-		BareDomainMode: policy.DomainModeExact,
-	}, policy.DefaultParseLimits())
+	rules, _, err := policy.Parse(ctx, strings.NewReader(f.exceptionPrefix+"\n"), policy.DefaultParseLimits())
 	if err != nil {
 		t.Fatalf("policy Parse: %v", err)
 	}

@@ -21,7 +21,16 @@ var (
 	ErrPBRMissingWANDevice = errors.New("vpn: pbr direct egress requires an attached WAN packet device")
 	// ErrPBRMissingPolicy indicates PBR cannot be enabled without a compiled policy matcher.
 	ErrPBRMissingPolicy = errors.New("vpn: pbr direct egress requires a policy matcher")
-	// ErrPBREmptyPolicy indicates PBR cannot be enabled with an empty or uncompiled policy snapshot.
+	// ErrPBRMissingClassifier indicates PBR cannot be enabled without the
+	// destination classifier that decides every destination the operator's
+	// exception list does not override. It is the routing authority: without it no
+	// destination can be classified as allocation-member, so nothing routes DIRECT
+	// and the operator's policy would be inert while the panel reported it on.
+	ErrPBRMissingClassifier = errors.New("vpn: pbr direct egress requires an installed destination classifier")
+	// ErrPBREmptyPolicy indicates PBR was asked to compile a snapshot from source
+	// rules that produced none. It is retained for the source-compiling startup
+	// path; activation from the operator record no longer depends on the rule
+	// count, because a zero-rule snapshot is a valid override-free policy.
 	ErrPBREmptyPolicy = errors.New("vpn: pbr direct egress requires a non-empty policy snapshot")
 )
 
@@ -36,10 +45,37 @@ type PBRConfig struct {
 	// on top of the committed allocation inventory. Nil keeps the shipped set as
 	// the only authority, which is the behavior when no override is configured.
 	InventoryOverride *policy.InventoryOverride
+	// DestinationClassifier is the address classifier activation installs: the
+	// routing authority that answers every destination the operator's exception
+	// list does not override (forwarder/routing_decision.go, rows 3 to 5).
+	//
+	// It is a field rather than something ConfigurePBR derives on its own so the
+	// prerequisite check can confirm the authority is present before anything is
+	// installed. Nil means no routing authority, which is a different state from
+	// "the operator configured no overrides" and is the only one that may refuse
+	// activation.
+	DestinationClassifier forwarder.DestinationClassifier
 }
 
-// ValidatePBRPrerequisites checks that all required direct egress components are present
-// before PBR can be safely enabled. Fails closed if any prerequisite is missing.
+// ValidatePBRPrerequisites checks that all required direct egress components are
+// present before PBR can be safely enabled. Fails closed if any prerequisite is
+// missing.
+//
+// The last prerequisite is the routing authority, and it is deliberately NOT the
+// operator's rule count. The exception list is an override layer over the
+// destination classifier (forwarder/routing_decision.go), so a published snapshot
+// with zero rules is a valid configuration: rows 3 to 5 decide every destination
+// from the classifier. What must never activate is a data path with no
+// classifier: every destination then answers "uncovered", so the fail-safe proxy
+// default (row 5) takes all traffic, nothing can ever route DIRECT, and the policy
+// the operator enabled would be inert while the panel reported it as on. The
+// classifier is also what proves the committed inventory and ASN table are
+// readable, so its absence is the one state in which "activated" would not mean
+// "routing".
+//
+// So the matcher must be installed (a nil matcher means the snapshot was never
+// wired at all), and the classifier must be present. The rule count is not
+// consulted.
 func ValidatePBRPrerequisites(cfg PBRConfig) error {
 	if !cfg.Enabled {
 		return nil
@@ -53,9 +89,8 @@ func ValidatePBRPrerequisites(cfg PBRConfig) error {
 	if cfg.PolicyMatcher == nil {
 		return ErrPBRMissingPolicy
 	}
-	snap := cfg.PolicyMatcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
-		return ErrPBREmptyPolicy
+	if cfg.DestinationClassifier == nil {
+		return ErrPBRMissingClassifier
 	}
 	return nil
 }
@@ -136,6 +171,16 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		return nil
 	}
 
+	// The routing authority is built from the committed artifacts, so "is it
+	// present" is a fact about this build rather than about the operator's
+	// exception list. Callers that already built one from the operator record
+	// (StartPolicyRouting) supply it; otherwise it is built here from the
+	// registered inventory override. A nil result means the committed inventory or
+	// ASN table is unusable, which the prerequisite check below refuses.
+	if cfg.DestinationClassifier == nil {
+		cfg.DestinationClassifier = newDestinationClassifier(cfg.InventoryOverride)
+	}
+
 	// Validate prerequisites before enabling PBR
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
 		// A refused activation is a transition to disabled.
@@ -150,7 +195,10 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	s.forwarder.SetDirectEgress(dem)
 	s.forwarder.SetPolicyMatcher(cfg.PolicyMatcher)
-	s.forwarder.SetDestinationClassifier(newDestinationClassifier(cfg.InventoryOverride))
+	// Install exactly the classifier the prerequisite check just confirmed. An
+	// operator override is applied when the classifier is built, so configuration
+	// and installed authority cannot disagree.
+	s.forwarder.SetDestinationClassifier(cfg.DestinationClassifier)
 	// The recorded override and the installed classifier are written together:
 	// the status then describes the set the packet path is actually consulting,
 	// including while a later save is still being applied.
@@ -239,22 +287,8 @@ func initPBRPolicyMatcher(cfg *PBRConfig) error {
 			}
 			return fmt.Errorf("compile initial policy snapshot: %w", err)
 		}
-		if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
-			if cfg.WANDevice != nil {
-				_ = cfg.WANDevice.Close()
-			}
-			return ErrPBREmptyPolicy
-		}
 		matcher.Publish(snap)
 		cfg.PolicyMatcher = matcher
-		return nil
-	}
-	snap := cfg.PolicyMatcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
-		if cfg.WANDevice != nil {
-			_ = cfg.WANDevice.Close()
-		}
-		return ErrPBREmptyPolicy
 	}
 	return nil
 }
@@ -328,7 +362,7 @@ func (s *Service) TeardownPBR() error {
 	return nil
 }
 
-// newDestinationClassifier joins the two committed inputs the routing contract
+// buildDestinationClassifier joins the two committed inputs the routing contract
 // needs for a destination address (issue #918): the allocation inventory
 // answers "inside the Russian allocation" and the embedded ASN table answers
 // "known multi-region CDN".
@@ -344,7 +378,7 @@ func (s *Service) TeardownPBR() error {
 // swallowed, and the inventory's own status field already reports a broken
 // artifact to the operator — "the artifact is broken" and "no address is
 // Russian" must never look the same.
-func newDestinationClassifier(override *policy.InventoryOverride) forwarder.DestinationClassifier {
+func buildDestinationClassifier(override *policy.InventoryOverride) forwarder.DestinationClassifier {
 	inventory, err := policy.ShippedInventory()
 	if err != nil {
 		slog.Warn("Address classifier unavailable: committed allocation inventory is unusable", "err", err)
@@ -363,6 +397,14 @@ func newDestinationClassifier(override *policy.InventoryOverride) forwarder.Dest
 	return classifier
 }
 
+// newDestinationClassifier is the production classifier constructor, and the
+// substitution point tests use to model an unavailable committed artifact.
+//
+// Activation must refuse when this returns nil, so the refusal is only provable
+// against a classifier that is genuinely absent rather than one that failed a
+// check the test could satisfy. Same pattern as newProductionWANDevice.
+var newDestinationClassifier = buildDestinationClassifier
+
 // UpdatePolicySnapshot compiles and atomically publishes new policy sources.
 // If compilation or validation fails, it preserves the last valid compiled snapshot (HIGH 3).
 func (s *Service) UpdatePolicySnapshot(version uint64, genID string, sources []policy.SourceParsedRules) error {
@@ -379,7 +421,7 @@ func (s *Service) UpdatePolicySnapshot(version uint64, genID string, sources []p
 	if err != nil {
 		return fmt.Errorf("compile policy snapshot: %w (retaining existing snapshot)", err)
 	}
-	if newSnap.DomainCount() == 0 && newSnap.CIDRCount() == 0 {
+	if newSnap.CIDRCount() == 0 {
 		return errors.New("vpn: compiled snapshot contains no rules (retaining existing snapshot)")
 	}
 	pbrCfg.PolicyMatcher.Publish(newSnap)

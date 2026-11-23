@@ -224,11 +224,9 @@ func parseInventoryPrefixes(body []byte) ([]netip.Prefix, error) {
 		return nil, fmt.Errorf("%w: body looks like a markup or data document, not a zone file", ErrInventoryNotPrefixList)
 	}
 
-	// The strict, non-preset path is what makes "every line must be a prefix"
-	// true: for a non-preset source the parser reports the first offending line
-	// instead of applying a preset rejection budget.
-	src := Source{ID: "ru-inventory", Format: FormatIPv4, BareDomainMode: DomainModeExact}
-	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), src, DefaultParseLimits())
+	limits := DefaultParseLimits()
+	limits.Strict = true
+	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), limits)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInventoryNotPrefixList, err)
 	}

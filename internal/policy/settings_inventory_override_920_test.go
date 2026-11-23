@@ -20,7 +20,6 @@ import (
 func settingsWithOverride(t *testing.T, entries ...string) Settings {
 	t.Helper()
 	settings := Settings{
-		Preset:            PresetAggregate,
 		SyncInterval:      int64(DefaultSyncInterval.Seconds()),
 		InventoryOverride: entries,
 	}
@@ -127,7 +126,7 @@ func TestSettingsRejectsPrefixAndDomainWithANamedReason(t *testing.T) {
 // an empty override, because a consumer that treats the two as equal cannot tell
 // "nothing configured" from "configured to override nothing".
 func TestSettingsAbsentInventoryOverrideMeansShippedSetOnly(t *testing.T) {
-	settings := Settings{Preset: PresetAggregate, SyncInterval: int64(DefaultSyncInterval.Seconds())}
+	settings := Settings{SyncInterval: int64(DefaultSyncInterval.Seconds())}
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("settings without an override were rejected: %v", err)
 	}

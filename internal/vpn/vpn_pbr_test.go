@@ -12,6 +12,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 type mockPBRDevice struct {
@@ -81,24 +82,44 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 	snap, _ := policy.CompileSnapshot(1, "gen-1", []policy.SourceParsedRules{testSrc.ToSourceParsedRules()})
 	matcher.Publish(snap)
 
-	emptyMatcher := policy.NewMatcher()
-	emptySnap, _ := policy.CompileSnapshot(1, "gen-empty", []policy.SourceParsedRules{policy.NewMemorySource("empty", policy.ParsedRules{}).ToSourceParsedRules()})
-	emptyMatcher.Publish(emptySnap)
+	// The routing authority is the destination classifier. A matcher holding an
+	// empty snapshot is a valid override-free policy, so the two are configured
+	// independently here: the classifier is what the guard requires.
+	classifier := newDestinationClassifier(nil)
+	if classifier == nil {
+		t.Fatal("fixture: the committed classifier artifacts are unusable")
+	}
 
 	tests := []struct {
 		name    string
 		cfg     PBRConfig
 		wantErr error
 	}{
-		{name: "unspecified 0.0.0.0 host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("0.0.0.0"), WANDevice: dev, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
-		{name: "loopback host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("127.0.0.1"), WANDevice: dev, PolicyMatcher: matcher}, wantErr: ErrPBRMissingHostWAN},
-		{name: "missing WAN packet device", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: nil, PolicyMatcher: matcher}, wantErr: ErrPBRMissingWANDevice},
-		{name: "missing policy matcher", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: nil}, wantErr: ErrPBRMissingPolicy},
-		{name: "empty policy matcher rules", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: emptyMatcher}, wantErr: ErrPBREmptyPolicy},
+		{name: "unspecified 0.0.0.0 host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("0.0.0.0"), WANDevice: dev, PolicyMatcher: matcher, DestinationClassifier: classifier}, wantErr: ErrPBRMissingHostWAN},
+		{name: "loopback host WAN IP", cfg: PBRConfig{Enabled: true, HostWANIP: netip.MustParseAddr("127.0.0.1"), WANDevice: dev, PolicyMatcher: matcher, DestinationClassifier: classifier}, wantErr: ErrPBRMissingHostWAN},
+		{name: "missing WAN packet device", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: nil, PolicyMatcher: matcher, DestinationClassifier: classifier}, wantErr: ErrPBRMissingWANDevice},
+		{name: "missing policy matcher", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: nil, DestinationClassifier: classifier}, wantErr: ErrPBRMissingPolicy},
+		// The routing-authority guard: with no classifier every destination
+		// answers "uncovered", so nothing can route DIRECT and the enabled policy
+		// would be inert. This is the state the old rule-count guard was standing
+		// in for.
+		{name: "missing destination classifier", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, PolicyMatcher: matcher, DestinationClassifier: nil}, wantErr: ErrPBRMissingClassifier},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// ConfigurePBR builds a classifier when the config does not supply one,
+			// so the "no authority" case is modelled by making that constructor
+			// unavailable — the same state as an unreadable committed artifact.
+			restore := SetDestinationClassifierFactoryForTest(
+				func(*policy.InventoryOverride) forwarder.DestinationClassifier {
+					if tt.cfg.DestinationClassifier != nil {
+						return tt.cfg.DestinationClassifier
+					}
+					return nil
+				})
+			defer restore()
+
 			err := svc.ConfigurePBR(tt.cfg)
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tt.name)
@@ -111,6 +132,46 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 				t.Fatalf("service must remain disabled when prerequisite validation fails")
 			}
 		})
+	}
+}
+
+// TestService_PBRZeroRulesActivatesWithClassifier is the positive direction the
+// prerequisite guard must keep open: an empty override list is a valid policy
+// when the classifier is present, so activation must succeed and install the
+// authority.
+func TestService_PBRZeroRulesActivatesWithClassifier(t *testing.T) {
+	svc, err := NewVPNService(nil, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	emptyMatcher := policy.NewMatcher()
+	emptySnap, _ := policy.CompileSnapshot(1, "gen-empty", []policy.SourceParsedRules{
+		policy.NewMemorySource("local", policy.ParsedRules{}).ToSourceParsedRules()})
+	emptyMatcher.Publish(emptySnap)
+	if emptySnap.CIDRCount() != 0 {
+		t.Fatalf("fixture snapshot = %d rules, want 0", emptySnap.CIDRCount())
+	}
+
+	cfg := PBRConfig{
+		Enabled:       true,
+		HostWANIP:     netip.MustParseAddr("198.51.200.1"),
+		WANDevice:     &mockPBRDevice{},
+		PolicyMatcher: emptyMatcher,
+	}
+	if err := svc.ConfigurePBR(cfg); err != nil {
+		t.Fatalf("zero exceptions must activate when the classifier is installed: %v", err)
+	}
+	defer func() { _ = svc.TeardownPBR() }()
+
+	if !svc.PBREnabled() {
+		t.Fatal("PBR is off after activating a zero-exception policy")
+	}
+	if svc.forwarder.DestinationClassifier() == nil {
+		t.Fatal("no destination classifier installed, so nothing would classify a destination")
+	}
+	if got := emptyMatcher.Current().CIDRCount(); got != 0 {
+		t.Fatalf("published snapshot = %d rules, want 0: no sentinel CIDR may be invented", got)
 	}
 }
 
