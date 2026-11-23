@@ -837,3 +837,46 @@ td[data-backend-name]:focus-visible {
     color: var(--accent);
     flex-shrink: 0;
 }
+
+/* ===== Page button scale ===== */
+/* One size scale for the controls a page renders, in the two steps the Settings
+   page already uses: 40 px for a page-level action, 32 px for a compact one. The
+   natural height of a control differs with what it contains (an icon, a text-only
+   label, a link versus a button), which is what produced up to seven different
+   heights on one page. A floor with no vertical padding gives every control the
+   same height while still letting one grow when the text is enlarged or a
+   translation wraps. `.portal-page` marks the shell's content area, so a modal a
+   page owns is on the scale and the shell's own chrome (sidebar, mobile bars, the
+   language and confirm dialogs the shell renders) is not.
+
+   The rules live here because this sheet is the one the computed-style
+   differential already treats as holding rules the frozen reference never had:
+   tests/e2e/css_surface.py sets a selector aside only when it uses a class that
+   is new since that reference, and tests/test_css_reference_frozen.py requires
+   every other sheet to stay byte-identical in the compared view. */
+.portal-page .btn {
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    padding-block: 0;
+}
+
+.portal-page .btn-sm {
+    min-height: var(--space-xl);
+}
+
+/* An icon-only control is the compact step, and it stays square. The legacy rule
+   that sizes one at 30 px is overridden here rather than left off the scale; both
+   selectors have the same specificity, so this block comes after it. */
+.portal-page .btn-icon {
+    width: var(--space-xl);
+    height: var(--space-xl);
+    min-height: var(--space-xl);
+}
+
+/* The VPN health surface is tested for a 44 px interactive target
+   (web/vpn_health_acceptance_test.go), which outranks the page scale. Named
+   explicitly so a control that must meet the target keeps it. */
+.portal-page .vpn-diag-entry,
+.portal-page .vpn-issue-action,
+.portal-page .vpn-windows .btn {
+    min-block-size: 44px;
+}
