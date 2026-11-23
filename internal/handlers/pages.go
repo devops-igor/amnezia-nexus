@@ -20,8 +20,11 @@ func (h *Handlers) IndexPageHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	servers, _ := h.db.GetAllServers(ctx)
 
+	// Deployments this panel has ordered but not set up have no servers row, so the
+	// grid alone cannot show them; they are named here and rendered beside it.
 	_ = RenderTemplate(w, r, h.db, "index.html", map[string]any{
-		"servers": servers,
+		"servers":     servers,
+		"deployments": h.gigahostDeploymentsForServersPage(ctx, servers),
 	})
 }
 

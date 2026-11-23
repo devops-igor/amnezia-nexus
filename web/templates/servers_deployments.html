@@ -1,0 +1,46 @@
+{{- define "servers_deployments" -}}
+{{ if .deployments }}
+<!-- Deployments this panel has ordered that have no server row of their own: setup
+     has not registered one yet. The Servers grid is built from the servers table, so
+     without this section these deployments would be invisible. It renders even when
+     the grid is empty, which is exactly the state it exists for. The status shown is
+     the panel's recorded value, not a live provider check. -->
+<div class="server-deployments" style="margin-top: var(--space-xl);">
+    <h2 class="section-title" style="margin-bottom: var(--space-sm);">
+        <svg class="icon"><use href="#icon-server"></use></svg>
+        {{ _ "gigahost_settings_title" }}
+    </h2>
+    <p class="card-subtitle">{{ _ "gigahost_deployments_desc" }}</p>
+    <div class="server-grid" id="deploymentGrid">
+        {{ range $deployment := .deployments }}
+        <div class="card server-card" id="deployment-{{ $deployment.OrderID }}"
+             data-server-name="{{ $deployment.Name }}" data-server-host="{{ $deployment.Address }}">
+            <div class="server-meta">
+                <div class="server-icon">
+                    <svg class="icon" style="width:24px;height:24px;color:#fff;"><use href="#icon-server"></use></svg>
+                </div>
+                <div>
+                    <div class="server-name">{{ $deployment.Name }}</div>
+                    <div class="server-host">
+                        {{ if $deployment.Address }}<span>{{ $deployment.Address }}</span>{{ else }}{{ _ "gigahost_deployment_no_address" }}{{ end }}
+                    </div>
+                </div>
+            </div>
+
+            <div class="server-protocols">
+                <span class="badge {{ $deployment.BadgeClass }}">{{ $deployment.Status }}</span>
+            </div>
+
+            <p class="form-hint">{{ _ "gigahost_deployment_not_set_up" }}</p>
+
+            <div class="server-actions">
+                <a href="/settings#gigahostCard" class="btn btn-secondary btn-sm" style="flex:1">
+                    {{ _ "nav_settings" }}
+                </a>
+            </div>
+        </div>
+        {{ end }}
+    </div>
+</div>
+{{ end }}
+{{- end }}

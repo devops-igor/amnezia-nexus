@@ -243,6 +243,61 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
 `)
 }
 
+// TestGigahostOrderStatusDistinguishesQueuedFromDeploying pins the state this view could
+// not previously tell apart: an order the provider has accepted but not started is
+// `requested`, a different stage from `deploying`. Before this, both rendered as
+// "Requested -> Deploying -> Ready" with Deploying current, so two deployments in
+// different states were indistinguishable.
+func TestGigahostOrderStatusDistinguishesQueuedFromDeploying(t *testing.T) {
+	runGigahostOrderStatusScenario(t, "GIGAHOST_STATUS_QUEUED_OK", `
+
+ // Both orders are provider-confirmed; only the confirmed status differs.
+ orders = [
+   {order_id:'ord-queued', status:'pending'},
+   {order_id:'ord-working', status:'deploying'}
+ ];
+ observationByOrder = {
+   'ord-queued': {outcome:'confirmed', status:'pending'},
+   'ord-working': {outcome:'confirmed', status:'deploying'}
+ };
+ deployByOrder = { 'ord-queued': {}, 'ord-working': {} };
+ intents = []; backends = [];
+ await w.loadRecentOrders();
+
+ const stages = cells().map(c => c.getAttribute('data-stage'));
+ assert.deepEqual(stages, ['requested','deploying'],
+   'a queued order and a deploying order are different stages, got ' + JSON.stringify(stages));
+
+ // The chain they draw differs too: a queued order has not started deploying.
+ const chains = cells().map(c => Array.from(c.querySelectorAll('.gigahost-order-status-stage'))
+   .map(s => s.getAttribute('data-stage') + ':' + s.getAttribute('data-state')));
+ assert.deepEqual(chains[0], ['requested:current','deploying:pending','ready:pending'],
+   'a queued order must not claim it is deploying, got ' + JSON.stringify(chains[0]));
+ assert.deepEqual(chains[1], ['requested:done','deploying:current','ready:pending']);
+
+ // The queued order is not drawn with the deploying badge, and its next action is to
+ // wait - never to set up a VPS that does not exist yet.
+ const badges = cells().map(c => c.querySelector('.gigahost-order-status-toggle').className);
+ assert.ok(badges[0] !== badges[1], 'queued and deploying must not share a badge');
+ cells().forEach(c => c.querySelector('.gigahost-order-status-toggle').click());
+ const queuedPanel = flat(cells()[0].querySelector('.gigahost-order-status-details'));
+ assert.match(queuedPanel, /gigahost_status_next_action_wait/);
+ assert.doesNotMatch(queuedPanel, /gigahost_status_next_action_approve_setup/,
+   'a queued order must not be advised to set up a deployment that has not started');
+
+ // The same stage comes from the ledger's own queued spellings when the provider was
+ // not read in this response, so the answer does not depend on which vocabulary spoke.
+ for (const ledgerStatus of ['pending_payment','waiting']) {
+   orders = [{order_id:'ord-ledger', status:ledgerStatus}];
+   observationByOrder = {};
+   deployByOrder = { 'ord-ledger': {} };
+   await w.loadRecentOrders();
+   assert.equal(cell().getAttribute('data-stage'), 'requested',
+     'ledger status ' + ledgerStatus + ' is a queued deployment');
+ }
+`)
+}
+
 // TestGigahostOrderStatusDetailsAreReadOnlyAndKeyboardAccessible pins the
 // interaction half of acceptance items 1 and 4: a native, Tab-reachable button
 // opens the read-only details, once per press, and opening them performs no

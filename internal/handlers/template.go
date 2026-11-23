@@ -116,6 +116,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 	// They are parsed with every layout page because a page resolves its includes
 	// at execution time, and a define that no page uses costs nothing.
 	layoutPartials := []string{
+		"servers_deployments.html",
 		"settings_policy.html",
 		"settings_policy_client.html",
 		"settings_notifications.html",

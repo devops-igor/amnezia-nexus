@@ -22,6 +22,12 @@
 const gigahostOrderStatusReadySpellings = ['ready', 'active'];
 const gigahostOrderStatusFailedSpellings = ['failed', 'error'];
 const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled', 'deleted'];
+// gigahostOrderStatusRequestedSpellings are the provider and ledger spellings for an
+// order that exists but whose deployment has not started yet. `requested` is a stage in
+// the progression below, so a queued order is not drawn as one already deploying: both
+// vocabularies spell "queued" differently from "deploying", and flattening them made two
+// different states render identically.
+const gigahostOrderStatusRequestedSpellings = ['pending', 'waiting', 'pending_payment', 'pending_order'];
 
 // gigahostOrderStatusStages are the provider stages an order passes through, in order.
 // VPN setup and backend health are separate axes, never drawn as stages.
@@ -87,12 +93,15 @@ function gigahostOrderStatusNow() {
 }
 
 /* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
- * stage. It reads no address: a VPS is ready only when the provider said so. */
+ * stage. It reads no address: a VPS is ready only when the provider said so, and an
+ * order the provider has accepted without starting is still `requested` rather than
+ * `deploying`, because those are different facts for the operator. */
 function gigahostOrderStatusProviderStage(status) {
     const s = String(status || '').trim().toLowerCase();
     if (gigahostOrderStatusReadySpellings.indexOf(s) !== -1) return 'ready';
     if (gigahostOrderStatusFailedSpellings.indexOf(s) !== -1) return 'failed';
     if (gigahostOrderStatusCancelledSpellings.indexOf(s) !== -1) return 'cancelled';
+    if (gigahostOrderStatusRequestedSpellings.indexOf(s) !== -1) return 'requested';
     if (s === 'unknown' || s === '') return 'unknown';
     return 'deploying';
 }
@@ -195,14 +204,16 @@ function gigahostOrderStatusHealthState(health) {
 
 /* gigahostOrderStatusNextAction names the one thing an operator can do next for
  * this state. It never names a step the current stage forbids, so a provider that
- * has not finished deploying is always "wait", whatever else is recorded.
+ * has not finished deploying is always "wait", whatever else is recorded - a queued
+ * order's remaining action is likewise to wait, not to set up a VPS that does not
+ * exist yet.
  *
  * The setup axis is only consulted once the provider side is settled, and an
  * unreadable setup or health axis yields no advice rather than a guess. */
 function gigahostOrderStatusNextAction(model) {
     if (model.stage === 'unknown') return 'gigahost_status_next_action_check_provider';
     if (model.stage === 'cancelled') return 'gigahost_status_next_action_none';
-    if (model.stage === 'deploying') return 'gigahost_status_next_action_wait';
+    if (model.stage === 'requested' || model.stage === 'deploying') return 'gigahost_status_next_action_wait';
     if (model.stage === 'failed' || model.setup === 'failed') return 'gigahost_status_next_action_retry';
     return gigahostOrderStatusSettledNextAction(model);
 }

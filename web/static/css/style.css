@@ -3933,3 +3933,16 @@ td[data-backend-name]:focus-visible {
         scroll-behavior: smooth;
     }
 }
+
+/* Gigahost deployment progression.
+ *
+ * Each step carries its own state in data-state: done, current or pending. Only the
+ * attributes carried that fact, so a queued deployment and a deploying one drew the
+ * same three labels and the operator could not see which step was in flight. These
+ * rules express the state that is already there; they add none of their own, and they
+ * change no colour, so badge contrast is untouched. */
+.gigahost-order-status-stage[data-state="current"] {
+    font-weight: 700;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
