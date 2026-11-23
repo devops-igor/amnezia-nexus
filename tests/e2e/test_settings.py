@@ -1,13 +1,22 @@
 """E2E tests for settings page and API."""
 
 import re
-from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page
 
 from tests.e2e import contrast
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
+from tests.e2e.settings_surface import (
+    APPROVED_SPACING,
+    LONE_LAST_CARD_GROUPS,
+    SETTINGS_GROUP_IDS,
+    SETTINGS_LAYOUT_CASES,
+    SETTINGS_PROBE,
+    geometry,
+    rows,
+    token_px,
+)
 
 
 @pytest.mark.e2e
@@ -336,107 +345,16 @@ def test_upstream_status_ui(authenticated_page: Page, base_url: str) -> None:
     assert check_btn.is_visible()
 
 
-# --- Settings layout, checked against expectations derived from the design tokens
-# and the app shell, never from web/static/css/settings.css. A wrong value in that
-# sheet (a different gap, a different breakpoint, rows that stop stretching) has to
-# fail here without anyone editing an expectation.
-#
-# Measured on the pinned Chromium: two 551 px tracks at 1440 and two 343 px tracks
-# at 1024, a 24 px gap and paired cards of exactly equal height. A vertical
-# scrollbar shrinks clientWidth and the same rules then measure 548/340, so the
-# expectation is computed from clientWidth instead of being pinned to one
-# browser's viewport box.
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-TOKENS_CSS = REPO_ROOT / "web" / "static" / "css" / "tokens.css"
-
-# The approved spacing values these expectations are derived from. Pinned so a
-# retuned scale is a visible edit here rather than a silent change of meaning.
-APPROVED_SPACING = {
-    "space-sm": 8,
-    "space-md": 16,
-    "space-lg": 24,
-    "space-xl": 32,
-    "sidebar-width": 250,
-}
-
-
-def _token_px(name: str) -> float:
-    match = re.search(rf"--{re.escape(name)}:\s*([\d.]+)px;", TOKENS_CSS.read_text(encoding="utf-8"))
-    assert match, f"token --{name} not found in tokens.css"
-    return float(match.group(1))
-
-
-# Viewport width, expected columns. 1023 and 1024 straddle the min-width
-# breakpoint, 390 and 320 are the phone cases the issue names.
-SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (1023, 1), (390, 1), (320, 1)]
-SETTINGS_PROBE = """() => {
-  const de = document.documentElement;
-  const main = document.querySelector('.app-main');
-  const ms = getComputedStyle(main);
-  const grids = [...document.querySelectorAll('.settings-grid')].map(grid => {
-    const gs = getComputedStyle(grid);
-    const cards = [...grid.children].filter(c => c.classList.contains('settings-section-card')).map(c => {
-      const r = c.getBoundingClientRect();
-      return {id: c.id, left: r.left, right: r.right, top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, width: r.width, height: r.height};
-    });
-    const parent = grid.closest('.settings-group');
-    return {
-      id: parent ? parent.id : null,
-      columnGap: gs.columnGap, rowGap: gs.rowGap,
-      tracks: gs.gridTemplateColumns.split(' ').map(parseFloat),
-      gridWidth: grid.getBoundingClientRect().width,
-      cards,
-    };
-  });
-  return {
-    clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
-    mainWidth: main.getBoundingClientRect().width,
-    mainMaxWidth: parseFloat(ms.maxWidth),
-    mainPadding: [parseFloat(ms.paddingLeft), parseFloat(ms.paddingRight)],
-    grids,
-  };
-}"""
-
-# The four groups the accepted information architecture puts on the page, in DOM
-# order. The enumeration reads them from the page and compares, so a group that
-# loses its grid fails here instead of reducing what is checked.
-SETTINGS_GROUP_IDS = ["group-portal", "group-notifications", "group-network", "group-system"]
-
-
-def _rows(cards: list[dict]) -> list[list[dict]]:
-    rows: dict[float, list[dict]] = {}
-    for card in cards:
-        rows.setdefault(round(card["top"], 1), []).append(card)
-    return [rows[top] for top in sorted(rows)]
-
-
-def _geometry(client: float, columns: int, max_width: float) -> dict[str, float]:
-    """Content width and track width of a columns-wide grid inside the app shell.
-
-    Derived from the shell and the spacing scale, never from settings.css: from
-    1024 px the sidebar is in flow and the main column is padded by --space-xl,
-    below it the sidebar is off-canvas and the padding is --space-md.
-    """
-    gap = _token_px("space-lg")
-    sidebar = _token_px("sidebar-width") if columns == 2 else 0.0
-    padding = _token_px("space-xl") if columns == 2 else _token_px("space-md")
-    main = min(client - sidebar, max_width)
-    content = main - 2 * padding
-    return {
-        "gap": gap,
-        "main": main,
-        "padding": padding,
-        "content": content,
-        "track": (content - gap * (columns - 1)) / columns,
-    }
+# The layout and navigation expectations, the page probes and the token reader live
+# in tests.e2e.settings_surface: the navigation suite uses the same probe, so a
+# second copy here would let the two disagree about what the page must look like.
 
 
 @pytest.mark.e2e
 def test_spacing_scale_is_the_approved_one() -> None:
     """The token values the layout expectations are derived from."""
     for name, px in APPROVED_SPACING.items():
-        assert _token_px(name) == px, f"--{name} is no longer {px}px: review the layout expectations"
+        assert token_px(name) == px, f"--{name} is no longer {px}px: review the layout expectations"
 
 
 @pytest.mark.e2e
@@ -455,7 +373,7 @@ def test_settings_layout_matches_token_derived_geometry(
     probe = page.evaluate(SETTINGS_PROBE)
 
     client = probe["clientWidth"]
-    expected = _geometry(client, columns, probe["mainMaxWidth"])
+    expected = geometry(client, columns, probe["mainMaxWidth"])
     gap = expected["gap"]
     expected_track = expected["track"]
 
@@ -486,7 +404,7 @@ def test_settings_layout_matches_token_derived_geometry(
         for track in grid["tracks"]:
             assert abs(track - expected_track) <= 1, (track, expected_track, grid)
 
-        rows = _rows(grid["cards"])
+        rows = rows(grid["cards"])
         assert rows, grid
         for row in rows:
             # No row leaves an unused track: a row holds its cards at the track
@@ -520,12 +438,6 @@ def test_settings_layout_matches_token_derived_geometry(
         assert spanning >= 3, spanning
 
 
-# The groups whose last row holds one card, which is what the span rule exists
-# for: Network policy's two cards span by design, and System ends on the backup
-# card after one pair. The other two groups end on a pair.
-LONE_LAST_CARD_GROUPS = ["group-network", "group-system"]
-
-
 @pytest.mark.e2e
 @pytest.mark.parametrize("width,columns", [(1440, 2), (1024, 2), (1023, 1)])
 def test_settings_last_row_leaves_no_unused_track(
@@ -540,12 +452,12 @@ def test_settings_last_row_leaves_no_unused_track(
         "document.querySelectorAll('.settings-section-card').length >= 11"
     )
     probe = page.evaluate(SETTINGS_PROBE)
-    expected = _geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
+    expected = geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
 
     assert [grid["id"] for grid in probe["grids"]] == SETTINGS_GROUP_IDS, probe
 
     for grid in probe["grids"]:
-        rows = _rows(grid["cards"])
+        rows = rows(grid["cards"])
         # No row may leave an unused track: its cards plus the gaps between them
         # fill the grid's content box. A lone card that does not span leaves a
         # whole track empty.
@@ -587,8 +499,8 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
     page.wait_for_load_state("networkidle")
     page.locator("#upstreamCheckBtn").wait_for(state="visible")
 
-    large = _token_px("space-xl") + _token_px("space-sm")
-    small = _token_px("space-xl")
+    large = token_px("space-xl") + token_px("space-sm")
+    small = token_px("space-xl")
     # The recorded scale: 40 px and 32 px, built from the pinned tokens above.
     assert (large, small) == (40, 32)
     expected = {
@@ -1171,96 +1083,3 @@ def test_settings_late_save_does_not_take_focus_and_restores_lost_focus(
         )
 
 
-# The sub-navigation is an anchor list, so these cases check the three properties
-# an anchor cannot state by itself: which group is current, where focus goes when
-# a link is followed, and whether the bar is stuck to the top. The probes read the
-# rendered page, so a nav that lost a target fails here rather than in review.
-SETTINGS_NAV_PROBE = """() => {
-  const de = document.documentElement;
-  const nav = document.querySelector('.app-main nav');
-  if (!nav) return {nav: null};
-  const links = [...nav.querySelectorAll('a')].map(a => {
-    const r = a.getBoundingClientRect();
-    return {href: a.getAttribute('href'), text: (a.textContent || '').trim(),
-            current: a.getAttribute('aria-current'),
-            width: r.width, height: r.height, left: r.left, right: r.right};
-  });
-  const r = nav.getBoundingClientRect();
-  return {
-    label: nav.getAttribute('aria-label') || '',
-    links,
-    navTop: r.top, navHeight: r.height,
-    clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
-    activeId: document.activeElement ? document.activeElement.id : '',
-    activeTag: document.activeElement ? document.activeElement.tagName : '',
-    currentHref: (document.querySelector('[aria-current="true"]') || {}).getAttribute
-      ? document.querySelector('[aria-current="true"]').getAttribute('href') : null,
-    currentCount: document.querySelectorAll('[aria-current="true"]').length,
-  };
-}"""
-
-
-@pytest.mark.e2e
-@pytest.mark.parametrize("width,sticky", [(1440, True), (390, False)])
-def test_settings_subnav_names_and_moves_between_groups(
-    authenticated_page: Page, base_url: str, width: int, sticky: bool
-) -> None:
-    """The sub-navigation names every group, marks the one in view and hands focus over."""
-    page = authenticated_page
-    page.set_viewport_size({"width": width, "height": 900})
-    page.goto(f"{base_url}/settings")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_function("document.querySelectorAll('.settings-group').length === 4")
-
-    probe = page.evaluate(SETTINGS_NAV_PROBE)
-    assert probe["nav"] is not None, probe
-    assert probe["label"].strip(), probe
-    assert len(probe["links"]) == 4, probe
-    for link in probe["links"]:
-        assert link["href"].startswith("#"), link
-        assert page.evaluate("sel => !!document.querySelector(sel)", link["href"]), link
-        assert link["text"], link
-        if width == 390:
-            # A wrapped row still yields 40 px targets that stay inside the viewport.
-            assert link["height"] >= 40, link
-            assert link["width"] > 0, link
-            assert link["right"] <= probe["clientWidth"] + 0.5, link
-    if width == 390:
-        assert probe["scrollWidth"] == probe["clientWidth"], probe
-
-    # At the top of the page the first group is the current one, exactly once.
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_function(
-        "document.querySelectorAll('[aria-current=\"true\"]').length === 1"
-    )
-    assert (
-        page.evaluate(
-            "() => document.querySelector('[aria-current=\"true\"]').getAttribute('href')"
-        )
-        == "#group-portal"
-    )
-
-    # Following a link moves focus into the group it names, and the state follows.
-    page.click("a[href='#group-network']")
-    page.wait_for_function(
-        "document.activeElement && document.activeElement.id === 'group-network-title'"
-    )
-    page.wait_for_function(
-        "document.querySelectorAll('[aria-current=\"true\"]').length === 1"
-    )
-    after = page.evaluate(SETTINGS_NAV_PROBE)
-    assert after["activeTag"] == "H2", after
-    assert after["currentHref"] == "#group-network", after
-
-    # Stuck to the top from the width where the sidebar is in flow, and scrolled
-    # away below it: a third sticky band would eat a phone's viewport.
-    page.evaluate("window.scrollTo(0, 1200)")
-    page.wait_for_function("Math.abs(window.scrollY - 1200) < 2")
-    page.wait_for_timeout(200)
-    nav_top = page.evaluate(
-        "() => document.querySelector('.app-main nav').getBoundingClientRect().top"
-    )
-    if sticky:
-        assert abs(nav_top) < 1, nav_top
-    else:
-        assert nav_top < 0, nav_top
