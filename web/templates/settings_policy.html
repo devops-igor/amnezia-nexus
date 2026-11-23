@@ -16,7 +16,7 @@
     <div class="settings-card-header settings-card-header-split">
         <div class="settings-inline">
             <svg class="icon"><use href="#icon-globe"></use></svg>
-            <h2 class="card-title">{{ _ "policy_title" }}</h2>
+            <h3 class="card-title">{{ _ "policy_title" }}</h3>
             {{ template "settings_dirty" . }}
         </div>
         <span id="policyStatusBadge" class="badge badge-secondary">{{ _ "policy_status_disabled" }}</span>
@@ -68,7 +68,7 @@
         </div>
     </form>
 
-    <div class="divider">{{ _ "policy_status_title" }}</div>
+    <h4 class="settings-subheading">{{ _ "policy_status_title" }}</h4>
 
     <div class="info-card-grid">
         <div class="info-card-item">
@@ -85,7 +85,7 @@
         </div>
     </div>
 
-    <div class="divider settings-divider">{{ _ "policy_inventory_title" }}</div>
+    <h4 class="settings-subheading">{{ _ "policy_inventory_title" }}</h4>
 
     <div class="info-card-grid">
         <div class="info-card-item">
@@ -111,7 +111,7 @@
     </div>
     <p class="form-hint" id="policyInventoryNotice"></p>
 
-    <div class="divider settings-divider">{{ _ "policy_cdn_title" }}</div>
+    <h4 class="settings-subheading">{{ _ "policy_cdn_title" }}</h4>
 
     <div class="info-card-grid">
         <div class="info-card-item">
@@ -132,7 +132,7 @@
         <span class="form-hint" id="policyLastError">-</span>
     </div>
 
-    <div class="divider settings-divider">{{ _ "policy_counters_title" }}</div>
+    <h4 class="settings-subheading">{{ _ "policy_counters_title" }}</h4>
 
     <div class="info-card-grid">
         <div class="info-card-item">

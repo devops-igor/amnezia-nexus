@@ -4,7 +4,7 @@
             <div class="settings-card-header settings-card-header-split">
                 <div class="settings-inline">
                     <svg class="icon"><use href="#icon-cloud"></use></svg>
-                    <h2 class="card-title">{{ _ "gigahost_settings_title" }}</h2>
+                    <h3 class="card-title">{{ _ "gigahost_settings_title" }}</h3>
                     {{ template "settings_dirty" . }}
                 </div>
             </div>
@@ -27,7 +27,7 @@
                 <div class="settings-subsection-header">
                     <div class="settings-inline">
                         <svg class="icon"><use href="#icon-server"></use></svg>
-                        <h3 class="settings-subsection-title">{{ _ "deploy_vps_title" }}</h3>
+                        <h4 class="settings-subsection-title">{{ _ "deploy_vps_title" }}</h4>
                     </div>
                     <button type="button" class="btn btn-secondary btn-sm" id="btnRefreshCatalog" aria-label="{{ _ "deploy_vps_refresh_catalog" }}" title="{{ _ "deploy_vps_refresh_catalog" }}">
                         <svg class="icon"><use href="#icon-activity"></use></svg>
@@ -70,7 +70,7 @@
 
                 <!-- Recent Orders Display -->
                 <div class="settings-subsection settings-subsection-spaced">
-                    <h3 class="settings-list-title">{{ _ "deploy_vps_recent_orders" }}</h3>
+                    <h4 class="settings-list-title">{{ _ "deploy_vps_recent_orders" }}</h4>
                     <div id="recentOrdersContainer" class="settings-list">
                         <span class="text-muted">...</span>
                     </div>
@@ -80,7 +80,7 @@
                      panel itself, so they are shown even when the ordering browser
                      is long closed. The original browser is not the source of truth. -->
                 <div class="settings-subsection settings-subsection-spaced">
-                    <h3 class="settings-list-title">{{ _ "setup_intents_title" }}</h3>
+                    <h4 class="settings-list-title">{{ _ "setup_intents_title" }}</h4>
                     <p class="form-hint mb-sm">{{ _ "setup_intents_desc" }}</p>
                     <div id="setupIntentsContainer" class="settings-list">
                         <span class="text-muted">...</span>

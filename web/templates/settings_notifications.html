@@ -4,7 +4,7 @@
         <div class="card settings-section-card" id="notificationsCard" data-settings-card="notifications">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-send"></use></svg>
-                <h2 class="card-title">{{ _ "notifications_title" }}</h2>
+                <h3 class="card-title">{{ _ "notifications_title" }}</h3>
                 {{ template "settings_dirty" . }}
             </div>
             <form id="notificationSettingsForm">
@@ -84,7 +84,7 @@
             {{ template "settings_feedback" . }}
             <p class="form-hint mt-sm" id="notificationTestResult"></p>
             <div class="settings-subsection settings-subsection-spaced" data-dirty-ignore>
-                <h3 class="settings-list-title">{{ _ "notifications_history_title" }}</h3>
+                <h4 class="settings-list-title">{{ _ "notifications_history_title" }}</h4>
                 <p class="form-hint mb-sm">{{ _ "notifications_history_hint" }}</p>
                 <div id="notificationHistory" class="settings-list">
                     <span class="text-muted">{{ _ "loading" }}</span>

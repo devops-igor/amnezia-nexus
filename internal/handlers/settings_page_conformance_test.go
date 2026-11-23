@@ -6,9 +6,9 @@ package handlers
 // describe the document rather than the template source:
 //
 //   - one h1 for the page, and a heading outline that never skips a level;
-//   - the cards are children of one grid (or the full-width cards that follow
-//     it), the stylesheet makes that grid one column and two stretched columns
+//   - the stylesheet makes a group's grid one column and two stretched columns
 //     from 1024px, and no settings template carries an inline style attribute;
+//     the grouping itself is asserted in settings_page_groups_test.go;
 //   - every card category toggle carries an id and a name, and the icon-only
 //     catalog refresh button carries an accessible name in every locale;
 //   - the fields that start collapsed use the hidden attribute, which the page
@@ -116,39 +116,6 @@ func TestSettingsPageHeadingOutline(t *testing.T) {
 				prev = l
 			}
 		})
-	}
-}
-
-func TestSettingsPageCardsShareOneGrid(t *testing.T) {
-	doc := parseSettingsDocument(t, renderSettingsPage(t, models.RoleAdmin))
-
-	grids := 0
-	cards := 0
-	var gridRoot *html.Node
-	walkLive(doc, func(n *html.Node) {
-		if cls, _ := attr(n, "class"); containsClass(cls, "settings-grid") {
-			grids++
-			gridRoot = n
-		}
-		if cls, _ := attr(n, "class"); containsClass(cls, "settings-section-card") {
-			cards++
-			// A card is either a direct child of the grid, or one of the
-			// full-width standalone cards that follow it in the page content.
-			// Anything else is a wrapper column pairing cards of unrelated height.
-			p := n.Parent
-			inGrid := p != nil && hasClass(p, "settings-grid")
-			followsGrid := p != nil && gridRoot != nil && p == gridRoot.Parent
-			if !inGrid && !followsGrid {
-				id, _ := attr(n, "id")
-				t.Errorf("card %q sits in a wrapper that is neither the grid nor the page content", id)
-			}
-		}
-	})
-	if grids != 1 {
-		t.Errorf("found %d .settings-grid containers, want 1", grids)
-	}
-	if cards < 9 {
-		t.Errorf("found %d settings cards, want the full admin set", cards)
 	}
 }
 
@@ -380,6 +347,12 @@ func TestSettingsPageNewKeysExistInEveryLocale(t *testing.T) {
 		"deploy_vps_refresh_catalog", "upstream_releases_link",
 		// The per-card save model (#888).
 		"settings_unsaved", "settings_applies_now", "settings_save_read_failed", "settings_test_saves_first",
+		// The grouped page and its in-page navigation.
+		"settings_nav_label",
+		"settings_group_portal", "settings_group_portal_desc",
+		"settings_group_notifications", "settings_group_notifications_desc",
+		"settings_group_network", "settings_group_network_desc",
+		"settings_group_system", "settings_group_system_desc",
 	}
 	for _, locale := range []string{"en", "ru", "fr", "zh", "fa"} {
 		raw, err := web.TranslationsFS.ReadFile("translations/" + locale + ".json")

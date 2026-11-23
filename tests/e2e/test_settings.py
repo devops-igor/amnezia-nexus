@@ -371,26 +371,37 @@ def _token_px(name: str) -> float:
 # breakpoint, 390 and 320 are the phone cases the issue names.
 SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (1023, 1), (390, 1), (320, 1)]
 SETTINGS_PROBE = """() => {
-  const grid = document.querySelector('.settings-grid');
-  const gs = getComputedStyle(grid);
+  const de = document.documentElement;
   const main = document.querySelector('.app-main');
   const ms = getComputedStyle(main);
-  const cards = [...grid.children].filter(c => c.classList.contains('settings-section-card')).map(c => {
-    const r = c.getBoundingClientRect();
-    return {left: r.left, right: r.right, top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, width: r.width, height: r.height};
+  const grids = [...document.querySelectorAll('.settings-grid')].map(grid => {
+    const gs = getComputedStyle(grid);
+    const cards = [...grid.children].filter(c => c.classList.contains('settings-section-card')).map(c => {
+      const r = c.getBoundingClientRect();
+      return {id: c.id, left: r.left, right: r.right, top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, width: r.width, height: r.height};
+    });
+    const parent = grid.closest('.settings-group');
+    return {
+      id: parent ? parent.id : null,
+      columnGap: gs.columnGap, rowGap: gs.rowGap,
+      tracks: gs.gridTemplateColumns.split(' ').map(parseFloat),
+      gridWidth: grid.getBoundingClientRect().width,
+      cards,
+    };
   });
-  const de = document.documentElement;
   return {
     clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
-    columnGap: gs.columnGap, rowGap: gs.rowGap,
-    tracks: gs.gridTemplateColumns.split(' ').map(parseFloat),
-    gridWidth: grid.getBoundingClientRect().width,
     mainWidth: main.getBoundingClientRect().width,
     mainMaxWidth: parseFloat(ms.maxWidth),
     mainPadding: [parseFloat(ms.paddingLeft), parseFloat(ms.paddingRight)],
-    cards,
+    grids,
   };
 }"""
+
+# The four groups the accepted information architecture puts on the page, in DOM
+# order. The enumeration reads them from the page and compares, so a group that
+# loses its grid fails here instead of reducing what is checked.
+SETTINGS_GROUP_IDS = ["group-portal", "group-notifications", "group-network", "group-system"]
 
 
 def _rows(cards: list[dict]) -> list[list[dict]]:
@@ -433,13 +444,13 @@ def test_spacing_scale_is_the_approved_one() -> None:
 def test_settings_layout_matches_token_derived_geometry(
     authenticated_page: Page, base_url: str, width: int, columns: int
 ) -> None:
-    """Gap, track widths, breakpoint, row stretch and overflow from tokens and the shell."""
+    """Gap, track widths, breakpoint, row stretch and overflow, per group's grid."""
     page = authenticated_page
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+        "document.querySelectorAll('.settings-section-card').length >= 11"
     )
     probe = page.evaluate(SETTINGS_PROBE)
 
@@ -456,103 +467,109 @@ def test_settings_layout_matches_token_derived_geometry(
     # No document-level horizontal overflow.
     assert probe["scrollWidth"] == client, probe
 
-    # The grid fills the main column's content box and its gap is the approved
-    # token, in both directions.
-    assert abs(probe["gridWidth"] - expected["content"]) <= 1, probe
-    assert probe["columnGap"] == f"{gap:g}px", probe
-    assert probe["rowGap"] == f"{gap:g}px", probe
+    # Every group owns a grid, and each grid carries the same rules. A group that
+    # loses its grid is reported instead of quietly reducing what is measured.
+    assert [grid["id"] for grid in probe["grids"]] == SETTINGS_GROUP_IDS, probe
 
-    # One track per column, all of them equal and of the derived width.
-    assert len(probe["tracks"]) == columns, probe
-    assert len({round(track) for track in probe["tracks"]}) == 1, probe
-    for track in probe["tracks"]:
-        assert abs(track - expected_track) <= 1, (track, expected_track, probe)
+    paired = 0
+    spanning = 0
+    for grid in probe["grids"]:
+        # The grid fills the main column's content box and its gap is the approved
+        # token, in both directions.
+        assert abs(grid["gridWidth"] - expected["content"]) <= 1, grid
+        assert grid["columnGap"] == f"{gap:g}px", grid
+        assert grid["rowGap"] == f"{gap:g}px", grid
 
-    rows = _rows(probe["cards"])
-    if columns == 2:
-        # The nine admin cards make four full pairs and one lone card, so an
-        # all-single layout cannot pass this case vacuously.
-        paired = [row for row in rows if len(row) == 2]
-        assert len(paired) >= 4, rows
-        for row in paired:
-            left, right = sorted(row, key=lambda card: card["left"])
-            assert abs(left["width"] - expected_track) <= 1, (row, expected_track)
-            assert abs(right["width"] - expected_track) <= 1, (row, expected_track)
-            assert abs((right["left"] - left["right"]) - gap) <= 0.5, (row, gap)
-    else:
-        assert all(len(row) == 1 for row in rows), rows
+        # One track per column, all of them equal and of the derived width.
+        assert len(grid["tracks"]) == columns, grid
+        assert len({round(track) for track in grid["tracks"]}) == 1, grid
+        for track in grid["tracks"]:
+            assert abs(track - expected_track) <= 1, (track, expected_track, grid)
+
+        rows = _rows(grid["cards"])
+        assert rows, grid
         for row in rows:
-            assert abs(row[0]["width"] - expected_track) <= 1, (row, expected_track)
+            # No row leaves an unused track: a row holds its cards at the track
+            # width, or one card that spans the whole content box.
+            used = sum(card["width"] for card in row) + gap * (len(row) - 1)
+            assert abs(used - expected["content"]) <= 1, (grid["id"], row)
+            if len(row) == 1:
+                spanning += 1
+                assert abs(row[0]["width"] - expected["content"]) <= 1, (grid["id"], row)
+            else:
+                paired += 1
+                left, right = sorted(row, key=lambda card: card["left"])
+                assert abs(left["width"] - expected_track) <= 1, (row, expected_track)
+                assert abs(right["width"] - expected_track) <= 1, (row, expected_track)
+                assert abs((right["left"] - left["right"]) - gap) <= 0.5, (row, gap)
 
-    # Rows stretch: cards that share a row have the same height.
-    for row in rows:
-        heights = [card["height"] for card in row]
-        assert max(heights) - min(heights) < 0.5, heights
+        # Rows stretch: cards that share a row have the same height.
+        for row in rows:
+            heights = [card["height"] for card in row]
+            assert max(heights) - min(heights) < 0.5, heights
 
-    # Consecutive rows are one gap apart.
-    for upper, lower in zip(rows, rows[1:]):
-        distance = lower[0]["top"] - max(card["bottom"] for card in upper)
-        assert abs(distance - gap) <= 0.5, (distance, gap)
+        # Consecutive rows are one gap apart.
+        for upper, lower in zip(rows, rows[1:]):
+            distance = lower[0]["top"] - max(card["bottom"] for card in upper)
+            assert abs(distance - gap) <= 0.5, (grid["id"], distance, gap)
+
+    if columns == 2:
+        # The cases are not vacuous: the page still has paired rows and rows that
+        # hold one full-width card.
+        assert paired >= 4, paired
+        assert spanning >= 3, spanning
 
 
-# Where an unused track showed up: nine admin cards leave one card alone in the
-# fifth row, and it sat beside half a grid of nothing. A Support session does not
-# get the admin-only Gigahost card, so its grid has eight children and ends on a
-# pair. Both shapes are checked at the two-column widths, plus the single-column
-# width where a stray span would create an implicit second track.
-UNPAIRED_ROW_CASES = [(1440, 2, 9), (1024, 2, 9), (1440, 2, 8), (1024, 2, 8), (1023, 1, 9)]
+# The groups whose last row holds one card, which is what the span rule exists
+# for: Network policy's two cards span by design, and System ends on the backup
+# card after one pair. The other two groups end on a pair.
+LONE_LAST_CARD_GROUPS = ["group-network", "group-system"]
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("width,columns,cards", UNPAIRED_ROW_CASES)
+@pytest.mark.parametrize("width,columns", [(1440, 2), (1024, 2), (1023, 1)])
 def test_settings_last_row_leaves_no_unused_track(
-    authenticated_page: Page, base_url: str, width: int, columns: int, cards: int
+    authenticated_page: Page, base_url: str, width: int, columns: int
 ) -> None:
-    """Every row fills the grid: a lone final card spans it, a pair does not."""
+    """Every row fills its grid: a lone final card spans it, a pair does not."""
     page = authenticated_page
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+        "document.querySelectorAll('.settings-section-card').length >= 11"
     )
-    if cards == 8:
-        # The Gigahost card is the only admin-only card, so a Support session's grid
-        # has eight children. Removing it here reproduces that shape in one page.
-        page.evaluate("() => document.getElementById('gigahostCard').remove()")
-        page.wait_for_function(
-            "document.querySelectorAll('.settings-grid > .settings-section-card').length === 8"
-        )
     probe = page.evaluate(SETTINGS_PROBE)
     expected = _geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
 
-    assert len(probe["cards"]) == cards, probe
-    assert len(probe["tracks"]) == columns, probe
-    rows = _rows(probe["cards"])
+    assert [grid["id"] for grid in probe["grids"]] == SETTINGS_GROUP_IDS, probe
 
-    # No row may leave an unused track: its cards plus the gaps between them fill
-    # the grid's content box. A lone card that does not span leaves a whole track.
-    for index, row in enumerate(rows):
-        used = sum(card["width"] for card in row) + expected["gap"] * (len(row) - 1)
-        assert (
-            abs(used - expected["content"]) <= 1
-        ), f"row {index} has {len(row)} card(s) using {used}px of {expected['content']}px"
+    for grid in probe["grids"]:
+        rows = _rows(grid["cards"])
+        # No row may leave an unused track: its cards plus the gaps between them
+        # fill the grid's content box. A lone card that does not span leaves a
+        # whole track empty.
+        for index, row in enumerate(rows):
+            used = sum(card["width"] for card in row) + expected["gap"] * (len(row) - 1)
+            assert (
+                abs(used - expected["content"]) <= 1
+            ), f"{grid['id']} row {index} has {len(row)} card(s) using {used}px of {expected['content']}px"
 
-    last = rows[-1]
-    if columns == 2 and cards % 2 == 1:
-        # The unpaired final card takes both tracks, so the row is a single
-        # full-width card and not a card plus an empty cell.
-        assert len(last) == 1, rows
-        assert abs(last[0]["width"] - expected["content"]) <= 1, (last, expected["content"])
-    elif columns == 2:
-        # An even count ends on a pair: the span rule must not misfire.
-        assert len(last) == 2, rows
-        for card in last:
-            assert abs(card["width"] - expected["track"]) <= 1, (last, expected["track"])
-    else:
-        # One column: no implicit second track from the span rule, one card per row.
-        assert len(probe["tracks"]) == 1, probe
-        assert all(len(row) == 1 for row in rows), rows
+        last = rows[-1]
+        if columns == 2:
+            if grid["id"] in LONE_LAST_CARD_GROUPS:
+                # The unpaired final card takes both tracks, so the row is a single
+                # full-width card and not a card plus an empty cell.
+                assert len(last) == 1, (grid["id"], rows)
+                assert abs(last[0]["width"] - expected["content"]) <= 1, (grid["id"], last)
+            else:
+                # An even count ends on a pair: the span rule must not misfire.
+                assert len(last) == 2, (grid["id"], rows)
+                for card in last:
+                    assert abs(card["width"] - expected["track"]) <= 1, (grid["id"], last)
+        else:
+            # One column: no implicit second track from the span rule.
+            assert all(len(row) == 1 for row in rows), (grid["id"], rows)
 
 
 @pytest.mark.e2e
@@ -846,6 +863,10 @@ FOCUS_CONTROLS = [
     ("#notificationSaveBtn", "#notificationSaveBtn"),
     ("#repoLink-amneziawg-go", "#repoLink-amneziawg-go"),
     ("#captcha_enabled", "#captcha_enabled + .switch-slider"),
+    # The sub-navigation links share the .btn rule; they are listed because they
+    # are the page's new interactive surface and a nav link with no visible focus
+    # would leave the keyboard path without a marker.
+    ("a.settings-subnav-link", "a.settings-subnav-link"),
 ]
 NO_TRANSITIONS = "*, *::before, *::after { transition: none !important; animation: none !important; }"
 FOCUS_PROBE = """([focusSel, outlineSel]) => {
@@ -870,7 +891,7 @@ def _open_settings(page: Page, base_url: str, theme: str) -> None:
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+        "document.querySelectorAll('.settings-section-card').length >= 11"
     )
     page.add_style_tag(content=NO_TRANSITIONS)
     page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
@@ -1148,3 +1169,98 @@ def test_settings_late_save_does_not_take_focus_and_restores_lost_focus(
             {k: original.get(k, {}) for k in ("appearance", "captcha", "ssl", "limits", "telegram")},
             csrf_token,
         )
+
+
+# The sub-navigation is an anchor list, so these cases check the three properties
+# an anchor cannot state by itself: which group is current, where focus goes when
+# a link is followed, and whether the bar is stuck to the top. The probes read the
+# rendered page, so a nav that lost a target fails here rather than in review.
+SETTINGS_NAV_PROBE = """() => {
+  const de = document.documentElement;
+  const nav = document.querySelector('.app-main nav');
+  if (!nav) return {nav: null};
+  const links = [...nav.querySelectorAll('a')].map(a => {
+    const r = a.getBoundingClientRect();
+    return {href: a.getAttribute('href'), text: (a.textContent || '').trim(),
+            current: a.getAttribute('aria-current'),
+            width: r.width, height: r.height, left: r.left, right: r.right};
+  });
+  const r = nav.getBoundingClientRect();
+  return {
+    label: nav.getAttribute('aria-label') || '',
+    links,
+    navTop: r.top, navHeight: r.height,
+    clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
+    activeId: document.activeElement ? document.activeElement.id : '',
+    activeTag: document.activeElement ? document.activeElement.tagName : '',
+    currentHref: (document.querySelector('[aria-current="true"]') || {}).getAttribute
+      ? document.querySelector('[aria-current="true"]').getAttribute('href') : null,
+    currentCount: document.querySelectorAll('[aria-current="true"]').length,
+  };
+}"""
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,sticky", [(1440, True), (390, False)])
+def test_settings_subnav_names_and_moves_between_groups(
+    authenticated_page: Page, base_url: str, width: int, sticky: bool
+) -> None:
+    """The sub-navigation names every group, marks the one in view and hands focus over."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function("document.querySelectorAll('.settings-group').length === 4")
+
+    probe = page.evaluate(SETTINGS_NAV_PROBE)
+    assert probe["nav"] is not None, probe
+    assert probe["label"].strip(), probe
+    assert len(probe["links"]) == 4, probe
+    for link in probe["links"]:
+        assert link["href"].startswith("#"), link
+        assert page.evaluate("sel => !!document.querySelector(sel)", link["href"]), link
+        assert link["text"], link
+        if width == 390:
+            # A wrapped row still yields 40 px targets that stay inside the viewport.
+            assert link["height"] >= 40, link
+            assert link["width"] > 0, link
+            assert link["right"] <= probe["clientWidth"] + 0.5, link
+    if width == 390:
+        assert probe["scrollWidth"] == probe["clientWidth"], probe
+
+    # At the top of the page the first group is the current one, exactly once.
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_function(
+        "document.querySelectorAll('[aria-current=\"true\"]').length === 1"
+    )
+    assert (
+        page.evaluate(
+            "() => document.querySelector('[aria-current=\"true\"]').getAttribute('href')"
+        )
+        == "#group-portal"
+    )
+
+    # Following a link moves focus into the group it names, and the state follows.
+    page.click("a[href='#group-network']")
+    page.wait_for_function(
+        "document.activeElement && document.activeElement.id === 'group-network-title'"
+    )
+    page.wait_for_function(
+        "document.querySelectorAll('[aria-current=\"true\"]').length === 1"
+    )
+    after = page.evaluate(SETTINGS_NAV_PROBE)
+    assert after["activeTag"] == "H2", after
+    assert after["currentHref"] == "#group-network", after
+
+    # Stuck to the top from the width where the sidebar is in flow, and scrolled
+    # away below it: a third sticky band would eat a phone's viewport.
+    page.evaluate("window.scrollTo(0, 1200)")
+    page.wait_for_function("Math.abs(window.scrollY - 1200) < 2")
+    page.wait_for_timeout(200)
+    nav_top = page.evaluate(
+        "() => document.querySelector('.app-main nav').getBoundingClientRect().top"
+    )
+    if sticky:
+        assert abs(nav_top) < 1, nav_top
+    else:
+        assert nav_top < 0, nav_top

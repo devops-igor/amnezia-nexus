@@ -1057,5 +1057,14 @@
   "vpn_issue_session_id": "Session {id}",
   "vpn_issue_entity_missing_session": "Cette session ne figure plus dans la liste actuelle.",
   "vpn_issue_entity_missing_backend": "Ce backend ne figure plus dans la liste actuelle.",
-  "vpn_diag_write_stalls_window": "{count} blocages d’écriture récents sur les {window} dernières"
+  "vpn_diag_write_stalls_window": "{count} blocages d’écriture récents sur les {window} dernières",
+  "settings_nav_label": "Sections des paramètres",
+  "settings_group_portal": "Portail",
+  "settings_group_portal_desc": "L'apparence du panneau pour les utilisateurs, la façon dont ils y accèdent et à qui il est ouvert.",
+  "settings_group_notifications": "Alertes",
+  "settings_group_notifications_desc": "Où le panneau envoie ses alertes et ce qu'il a déjà envoyé.",
+  "settings_group_network": "Politique réseau",
+  "settings_group_network_desc": "Comment le trafic des clients quitte l'hôte et comment inspecter les décisions prises pour un client.",
+  "settings_group_system": "Système",
+  "settings_group_system_desc": "Ce sur quoi ce panneau s'exécute, quel fournisseur il peut solliciter et comment ses données sont enregistrées."
 }

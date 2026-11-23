@@ -311,8 +311,12 @@
 }
 
 /* ===== Standalone settings cards ===== */
+/* The two policy cards carry dense tables and were full width on the ungrouped
+   page; inside their group's grid they keep that width instead of being paired
+   into two narrow columns. A grid item's own margin would misalign the pair, so
+   the spacing comes from the grid's gap. */
 .settings-card-stacked {
-    margin-top: var(--space-lg);
+    grid-column: 1 / -1;
 }
 
 .settings-button-row {
@@ -445,4 +449,103 @@
    browser's own [hidden] styling, so the hidden state is stated here as well. */
 .settings-section-card .cell-detail[hidden] {
     display: none;
+}
+
+/* ===== Groups and in-page navigation ===== */
+/* One <section> per group, each owning its own grid. The grid rules above are
+   untouched, so the measured column geometry and the equal-height pairing are
+   exactly the ones already verified; a group boundary simply cannot pair a card
+   from one group with a card from another. */
+.settings-group {
+    display: block;
+    scroll-margin-top: 76px;
+}
+
+.settings-group-title {
+    margin: 0;
+    font-size: 1.125rem;
+    font-weight: 600;
+}
+
+.settings-group > .card-subtitle {
+    margin: 0 0 var(--space-lg);
+}
+
+/* One step more than the gap the grids use inside a group, so the boundary
+   between two groups is visible. */
+.settings-group + .settings-group {
+    margin-top: var(--space-xl);
+}
+
+/* A named sub-area inside a long card is a heading, so a screen-reader user can
+   skim it. The rule keeps the divider's line and label. */
+.settings-subheading {
+    margin: var(--space-md) 0 0;
+    padding-top: var(--space-xs);
+    border-top: 1px solid var(--border-color);
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* The sub-navigation is a plain list of anchors: it works with script off, and
+   the controller adds only the current-group indication and the focus handoff. */
+.settings-subnav {
+    margin-bottom: var(--space-lg);
+}
+
+.settings-subnav-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+/* 40 px is the section-level step of the button scale. A long translation wraps
+   instead of being clipped by the .btn nowrap default. */
+.settings-subnav-link {
+    height: 40px;
+    white-space: normal;
+    text-align: start;
+    color: var(--text-secondary);
+}
+
+.settings-subnav-link:hover {
+    background: rgba(99, 102, 241, 0.08);
+    color: var(--text-primary);
+}
+
+/* The current group is stated with a border as well as a colour, so the state is
+   never carried by colour alone. */
+.settings-subnav-link[aria-current="true"] {
+    color: var(--text-primary);
+    border-block-end: 2px solid var(--accent);
+}
+
+/* From the width where the sidebar is in flow the nav stays at the top of the
+   viewport, so a group can be reached from anywhere on a long page. Below it the
+   shell already spends 60 px on a sticky top bar and 60 px on a bottom bar. */
+@media (min-width: 1024px) {
+    .settings-subnav {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        padding-block: var(--space-sm);
+        border-bottom: 1px solid var(--border-color);
+        background: var(--bg-primary);
+    }
+
+    .settings-group {
+        scroll-margin-top: 88px;
+    }
+}
+
+/* Smooth scrolling only on a page that has the sub-navigation, and never when the
+   reader asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+    :root:has(.settings-subnav) {
+        scroll-behavior: smooth;
+    }
 }

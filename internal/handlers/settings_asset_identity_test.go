@@ -46,6 +46,7 @@ import (
 
 // settingsSurfaceControllers are the controllers the settings surface loads.
 var settingsSurfaceControllers = []string{
+	"/static/js/settings_nav.js",
 	"/static/js/settings_cards.js",
 	"/static/js/settings_save.js",
 	"/static/js/notifications_settings.js",

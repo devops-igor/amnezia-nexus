@@ -4,7 +4,7 @@
     <div class="settings-card-header settings-card-header-split">
         <div class="settings-inline">
             <svg class="icon"><use href="#icon-users"></use></svg>
-            <h2 class="card-title">{{ _ "policy_client_title" }}</h2>
+            <h3 class="card-title">{{ _ "policy_client_title" }}</h3>
         </div>
         <button type="button" class="btn btn-secondary" id="policyClientRefreshBtn">
             <svg class="icon"><use href="#icon-refresh"></use></svg>
@@ -35,7 +35,7 @@
     </div>
 
     <div id="policyClientResult" hidden>
-        <div class="divider">{{ _ "policy_client_selection_label" }}</div>
+        <h4 class="settings-subheading">{{ _ "policy_client_selection_label" }}</h4>
         <div class="info-card-grid">
             <div class="info-card-item">
                 <span class="info-card-label">{{ _ "policy_client_field_session" }}</span>
@@ -62,10 +62,10 @@
         </div>
         <p class="form-hint" id="policyClientFilterFoot" hidden></p>
 
-        <div class="divider">{{ _ "policy_client_flows_label" }}</div>
+        <h4 class="settings-subheading" id="policyClientFlowsLabel">{{ _ "policy_client_flows_label" }}</h4>
         <p class="form-hint">{{ _ "policy_client_flows_hint" }}</p>
         <div class="table-container">
-            <table class="data-table">
+            <table class="data-table" aria-labelledby="policyClientFlowsLabel">
                 <thead>
                     <tr>
                         <th scope="col">{{ _ "policy_client_column_protocol" }}</th>
@@ -79,16 +79,16 @@
         </div>
         <p class="form-hint" id="policyClientFlowFoot" hidden></p>
 
-        <div class="divider">{{ _ "policy_client_limits_label" }}</div>
+        <h4 class="settings-subheading">{{ _ "policy_client_limits_label" }}</h4>
         <p class="form-hint">{{ _ "policy_client_not_covered_label" }}</p>
         <ul class="form-hint settings-bullets" id="policyClientNotCovered"></ul>
         <p class="form-hint">{{ _ "policy_client_limitations_label" }}</p>
         <ul class="form-hint settings-bullets" id="policyClientLimitations"></ul>
 
-        <div class="divider">{{ _ "policy_client_drops_label" }}</div>
+        <h4 class="settings-subheading" id="policyClientDropsLabel">{{ _ "policy_client_drops_label" }}</h4>
         <p class="form-hint">{{ _ "policy_client_drops_hint" }}</p>
         <div class="table-container">
-            <table>
+            <table aria-labelledby="policyClientDropsLabel">
                 <thead>
                     <tr>
                         <th scope="col">{{ _ "policy_client_column_drop_reason" }}</th>
