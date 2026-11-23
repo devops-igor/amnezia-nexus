@@ -876,11 +876,14 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     )
     forwarder_card = page.locator("#vpn-forwarder-card")
 
+    # Expected order comes from issue #955 (DESIGN_HANDOVER_R1.md, "Design and template
+    # scope"): VPN Health moves immediately below the page heading, before the overview grid
+    # and the troubleshooting tables.
     sections = [
+        ("forwarder-card", forwarder_card),
         ("stats-grid", stats_grid),
         ("backends-card", backends_card),
         ("sessions-card", sessions_card),
-        ("forwarder-card", forwarder_card),
     ]
 
     boxes = []
