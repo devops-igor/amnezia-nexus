@@ -383,11 +383,13 @@ func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 		"refused before either list applies",
 		// The DIRECT hint names what can supersede a DIRECT listing.
 		"Prefixes on this DIRECT list route direct unless",
-		"an entry on the PROXY list, a CDN exclusion, or a flow that cannot use direct egress",
+		"an entry on the PROXY list, a CDN exclusion, or a non-TCP/UDP flow",
 		"prohibited or internal destinations are always refused",
 		"changes apply to new connections only",
-		// The notice under both controls names which list it means.
+		// The notice under both controls names which list it means, and its DIRECT
+		// sentence excludes the PROXY list because that rule is checked first.
 		"A destination on the PROXY list uses PROXY",
+		"not on the PROXY list goes DIRECT",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the rendered policy section does not carry %q", want)
