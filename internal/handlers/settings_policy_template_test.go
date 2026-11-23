@@ -31,6 +31,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/web"
 )
 
@@ -384,12 +385,13 @@ func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 		// The DIRECT hint names what can supersede a DIRECT listing.
 		"Prefixes on this DIRECT list route direct unless",
 		"an entry on the PROXY list, a CDN exclusion, or a non-TCP/UDP flow",
-		"prohibited or internal destinations are always refused",
+		"prohibited, internal and invalid destinations are refused before any list applies",
 		"changes apply to new connections only",
-		// The notice under both controls names which list it means, and its DIRECT
-		// sentence excludes the PROXY list because that rule is checked first.
+		// The notice under both controls names which list it means, and states the
+		// same guard and transport limit as the hints rather than a bare promise.
 		"A destination on the PROXY list uses PROXY",
-		"not on the PROXY list goes DIRECT",
+		"an allocation match outside the CDN exclusion set uses DIRECT unless",
+		"or the flow is not TCP or UDP",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the rendered policy section does not carry %q", want)
@@ -448,13 +450,14 @@ func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 	}
 }
 
-// TestPolicyExamplesDoNotContradictEachOther pins the two example placeholders
-// apart. The DIRECT list is not absolute: an entry on the PROXY list wins over it,
-// so an address shown as "goes direct" must not also be shown as "goes through
-// PROXY" — otherwise the page states a contradiction before the operator has
-// edited anything. Both examples are parsed the way the handlers parse them: a
-// bare address is a /32.
-func TestPolicyExamplesDoNotContradictEachOther(t *testing.T) {
+// TestPolicyPlaceholderExamplesDoNotImplyAnImpossibleRoute pins the two example
+// placeholders. They may be syntax examples or real routable values, but they must
+// never be destinations the router refuses on either list: the previous round
+// shipped TEST-NET ranges, and ValidateDirectDestination refuses those, so the
+// placeholder promised a routing outcome that could never happen. An entry that is
+// not an address at all has to match the documented shape instead, so a typo cannot
+// pass as a "syntax example".
+func TestPolicyPlaceholderExamplesDoNotImplyAnImpossibleRoute(t *testing.T) {
 	raw, err := web.TranslationsFS.ReadFile("translations/en.json")
 	if err != nil {
 		t.Fatalf("read en.json: %v", err)
@@ -464,36 +467,43 @@ func TestPolicyExamplesDoNotContradictEachOther(t *testing.T) {
 		t.Fatalf("decode en.json: %v", err)
 	}
 
-	parse := func(key string) []netip.Prefix {
-		var out []netip.Prefix
+	maskShape := regexp.MustCompile(`^x\.x\.x\.x(/[0-9]{1,2})?$`)
+	lastAddr := func(p netip.Prefix) netip.Addr {
+		a := p.Masked().Addr().As4()
+		for i := p.Bits(); i < 32; i++ {
+			a[i/8] |= 1 << (7 - uint(i%8))
+		}
+		return netip.AddrFrom4(a)
+	}
+
+	checked := 0
+	for _, key := range []string{"policy_proxy_exceptions_placeholder", "policy_inventory_override_placeholder"} {
 		for _, line := range strings.Split(dict[key], "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
-			if p, err := netip.ParsePrefix(line); err == nil {
-				out = append(out, p.Masked())
-				continue
-			}
-			addr, err := netip.ParseAddr(line)
+			checked++
+			prefix, err := netip.ParsePrefix(line)
 			if err != nil {
-				t.Fatalf("%s: %q is neither a prefix nor an address: %v", key, line, err)
+				addr, addrErr := netip.ParseAddr(line)
+				if addrErr != nil {
+					if !maskShape.MatchString(line) {
+						t.Errorf("%s: %q is neither an address, a prefix, nor the documented x.x.x.x shape", key, line)
+					}
+					continue
+				}
+				prefix = netip.PrefixFrom(addr, addr.BitLen())
 			}
-			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+			// First and last address cover every refused range in the list, so a
+			// prefix that would be refused anywhere inside it is caught here.
+			if forwarder.IsProhibitedIPv4Destination(prefix.Masked().Addr()) ||
+				forwarder.IsProhibitedIPv4Destination(lastAddr(prefix)) {
+				t.Errorf("%s: %q is a destination the router refuses on either list", key, line)
+			}
 		}
-		if len(out) == 0 {
-			t.Fatalf("%s has no example entries, so nothing was compared", key)
-		}
-		return out
 	}
-
-	proxy := parse("policy_proxy_exceptions_placeholder")
-	direct := parse("policy_inventory_override_placeholder")
-	for _, p := range proxy {
-		for _, d := range direct {
-			if p.Overlaps(d) {
-				t.Errorf("the examples contradict each other: %s is shown as PROXY and as DIRECT (%s)", p, d)
-			}
-		}
+	if checked < 3 {
+		t.Fatalf("found only %d example entries; the extraction is wrong", checked)
 	}
 }
