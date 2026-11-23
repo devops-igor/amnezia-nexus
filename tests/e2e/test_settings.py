@@ -404,9 +404,12 @@ def test_settings_layout_matches_token_derived_geometry(
         for track in grid["tracks"]:
             assert abs(track - expected_track) <= 1, (track, expected_track, grid)
 
-        rows = rows(grid["cards"])
-        assert rows, grid
-        for row in rows:
+        # The helper is imported as `rows`, so the local must not carry that name:
+        # `rows = rows(...)` makes Python treat the right-hand name as local and
+        # raise UnboundLocalError before the call happens.
+        grid_rows = rows(grid["cards"])
+        assert grid_rows, grid
+        for row in grid_rows:
             # No row leaves an unused track: a row holds its cards at the track
             # width, or one card that spans the whole content box.
             used = sum(card["width"] for card in row) + gap * (len(row) - 1)
@@ -422,12 +425,12 @@ def test_settings_layout_matches_token_derived_geometry(
                 assert abs((right["left"] - left["right"]) - gap) <= 0.5, (row, gap)
 
         # Rows stretch: cards that share a row have the same height.
-        for row in rows:
+        for row in grid_rows:
             heights = [card["height"] for card in row]
             assert max(heights) - min(heights) < 0.5, heights
 
         # Consecutive rows are one gap apart.
-        for upper, lower in zip(rows, rows[1:]):
+        for upper, lower in zip(grid_rows, grid_rows[1:]):
             distance = lower[0]["top"] - max(card["bottom"] for card in upper)
             assert abs(distance - gap) <= 0.5, (grid["id"], distance, gap)
 
@@ -457,31 +460,31 @@ def test_settings_last_row_leaves_no_unused_track(
     assert [grid["id"] for grid in probe["grids"]] == SETTINGS_GROUP_IDS, probe
 
     for grid in probe["grids"]:
-        rows = rows(grid["cards"])
+        grid_rows = rows(grid["cards"])
         # No row may leave an unused track: its cards plus the gaps between them
         # fill the grid's content box. A lone card that does not span leaves a
         # whole track empty.
-        for index, row in enumerate(rows):
+        for index, row in enumerate(grid_rows):
             used = sum(card["width"] for card in row) + expected["gap"] * (len(row) - 1)
             assert (
                 abs(used - expected["content"]) <= 1
             ), f"{grid['id']} row {index} has {len(row)} card(s) using {used}px of {expected['content']}px"
 
-        last = rows[-1]
+        last = grid_rows[-1]
         if columns == 2:
             if grid["id"] in LONE_LAST_CARD_GROUPS:
                 # The unpaired final card takes both tracks, so the row is a single
                 # full-width card and not a card plus an empty cell.
-                assert len(last) == 1, (grid["id"], rows)
+                assert len(last) == 1, (grid["id"], grid_rows)
                 assert abs(last[0]["width"] - expected["content"]) <= 1, (grid["id"], last)
             else:
                 # An even count ends on a pair: the span rule must not misfire.
-                assert len(last) == 2, (grid["id"], rows)
+                assert len(last) == 2, (grid["id"], grid_rows)
                 for card in last:
                     assert abs(card["width"] - expected["track"]) <= 1, (grid["id"], last)
         else:
             # One column: no implicit second track from the span rule.
-            assert all(len(row) == 1 for row in rows), (grid["id"], rows)
+            assert all(len(row) == 1 for row in grid_rows), (grid["id"], grid_rows)
 
 
 @pytest.mark.e2e

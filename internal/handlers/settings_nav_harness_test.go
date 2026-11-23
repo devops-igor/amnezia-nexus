@@ -95,6 +95,24 @@ if (doc.querySelector('a[href="#group-portal"]').hasAttribute('aria-current')) {
   throw new Error('the previous group stayed marked');
 }
 
+// Activating a link marks its group at once, before the page has travelled there.
+// The marker must follow the reader's choice rather than the pixels the scroll has
+// not reached: otherwise the previous group stays marked for the whole animation,
+// which is what a browser test saw when it read the state mid-scroll.
+setTops({'group-portal': 0, 'group-notifications': 1200, 'group-network': 2600, 'group-system': 3800});
+scroll();
+await until(() => marked().length === 1 && marked()[0] === '#group-portal', 'the reset mark', 2000);
+doc.querySelector('a[href="#group-network"]').click();
+if (marked().length !== 1 || marked()[0] !== '#group-network') {
+  throw new Error('activating a link left the marker on ' + marked().join(',') +
+    ' while the page had not scrolled to it');
+}
+
+// Once the page has arrived, the geometry agrees and the marker is unchanged.
+setTops({'group-portal': -2400, 'group-notifications': -1200, 'group-network': 88, 'group-system': 900});
+scroll();
+await until(() => marked().length === 1 && marked()[0] === '#group-network', 'the arrival mark', 2000);
+
 // Following a link moves focus to the group's own heading, not to the next link.
 const network = doc.querySelector('a[href="#group-network"]');
 network.click();
