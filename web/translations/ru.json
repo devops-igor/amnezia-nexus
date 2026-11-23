@@ -723,7 +723,7 @@
   "deploy_vps_placement_out_of_stock": "Нет в наличии в этом дата-центре",
   "deploy_vps_placement_choice_cleared": "Выбранный ранее дата-центр больше недоступен",
   "deploy_vps_confirm_title": "Подтвердите заказ",
-  "deploy_vps_confirm_body": "План: {plan} · Регион: {region} · Дата-центр: {datacenter} · Операционная система: {os} · Стоимость: {cost}",
+  "deploy_vps_confirm_body": "\u041f\u043b\u0430\u043d: {plan} \u00b7 \u0420\u0435\u0433\u0438\u043e\u043d: {region} \u00b7 \u0414\u0430\u0442\u0430-\u0446\u0435\u043d\u0442\u0440: {datacenter} \u00b7 \u041e\u043f\u0435\u0440\u0430\u0446\u0438\u043e\u043d\u043d\u0430\u044f \u0441\u0438\u0441\u0442\u0435\u043c\u0430: {os}\n\u0421\u0442\u043e\u0438\u043c\u043e\u0441\u0442\u044c: {cost}",
   "deploy_vps_cost_hourly": "{rate} {currency}/ч",
   "deploy_vps_cost_ceiling": "максимум {ceiling} {currency}/мес",
   "deploy_vps_cost_unknown": "провайдер не указал цену",

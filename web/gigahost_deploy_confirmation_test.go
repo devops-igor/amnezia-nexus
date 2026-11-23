@@ -222,6 +222,11 @@ async function ready() {
   assert.equal(asked[0].confirmText, DICT.deploy_vps_btn, 'the confirming control names the action');
   assert.equal(asked[0].confirmVariant, 'primary', 'a purchase is confirmed as a primary action, not a danger');
   assert.equal(message, %s, 'the confirmation must name plan, region, image and the provider quote');
+  // The price sits on its own line so a narrow dialog wraps it instead of
+  // squeezing it behind the other facts.
+  assert.equal(message.split('\n').length, 2, 'the price must sit on its own line');
+  assert.ok(message.split('\n')[1].indexOf('90') !== -1,
+    'the second line must carry the provider quote: ' + message.split('\n')[1]);
   decide(false);
   await cancelled;
   await tick();

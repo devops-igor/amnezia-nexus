@@ -148,6 +148,121 @@ def test_deploy_vps_confirms_plan_region_image_and_cost(
         page.unroute("**/api/admin/hosting/gigahost/order")
 
 
+# --- The narrow opening position ---------------------------------------------
+# At 390px the shell's fixed top bar and the bottom-docked dialog leave a strip in
+# which the confirmed controls have to be visible, and the price has to be
+# rendered in full inside the dialog.
+
+NARROW_PROBE = """() => {
+  const box = el => {
+    const r = el.getBoundingClientRect();
+    return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width),
+            h: Math.round(r.height), bottom: Math.round(r.bottom), right: Math.round(r.right)};
+  };
+  const inter = (a, b) => {
+    const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+    const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+    return w > 0 && h > 0;
+  };
+  const bar = document.querySelector('.mobile-topbar');
+  const backdrop = document.getElementById('nexusConfirmModal');
+  const dialog = backdrop.querySelector('.modal');
+  const body = document.getElementById('nexusConfirmBody');
+  const barBox = bar ? box(bar) : null;
+  const dialogBox = box(dialog);
+  const fields = ['deployPlanSelect', 'deployRegionSelect', 'deployPlacementSelect', 'deployOSSelect']
+    .map(id => document.getElementById(id))
+    .filter(Boolean)
+    .map(el => ({id: el.id, box: box(el)}));
+  // The price is the text after the line break: its own rendered box, so a wrap is
+  // distinguishable from a clip.
+  const node = body.firstChild;
+  const raw = node && node.nodeValue ? node.nodeValue : '';
+  const at = raw.indexOf(String.fromCharCode(10));
+  let price = null;
+  if (at !== -1) {
+    const range = document.createRange();
+    range.setStart(node, at + 1);
+    range.setEnd(node, raw.length);
+    const r = range.getBoundingClientRect();
+    const lh = parseFloat(getComputedStyle(body).lineHeight) || 0;
+    price = {
+      text: raw.slice(at + 1),
+      x: Math.round(r.x), w: Math.round(r.width), right: Math.round(r.right),
+      lines: lh ? Math.max(1, Math.round(r.height / lh)) : 0,
+      bodyRight: Math.round(body.getBoundingClientRect().right),
+    };
+  }
+  return {
+    viewport: {w: window.innerWidth, h: window.innerHeight},
+    topbar: barBox,
+    dialog: dialogBox,
+    fields,
+    underBar: barBox ? fields.filter(f => inter(f.box, barBox)).map(f => f.id) : [],
+    underDialog: fields.filter(f => inter(f.box, dialogBox)).map(f => f.id),
+    price,
+    body: {clientWidth: body.clientWidth, scrollWidth: body.scrollWidth,
+           clientHeight: body.clientHeight, scrollHeight: body.scrollHeight,
+           text: body.textContent},
+  };
+}"""
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_deploy_confirmation_keeps_the_confirmed_controls_clear_at_narrow_width(
+    authenticated_page: Page, base_url: str, theme: str
+) -> None:
+    """Opening from the narrow position leaves the plan and its price readable.
+
+    The form is scrolled so the plan field sits at the very top, which is the
+    position where the shell's top bar used to clip it. Opening the confirmation
+    must leave all four selectors between that bar and the dialog, and the price
+    must render in full inside the dialog, wrapping instead of being cut.
+    """
+    page = authenticated_page
+    orders: list = []
+    try:
+        _deploy_form(page, base_url, orders)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+        page.locator("#deployPlanSelect").evaluate(
+            """el => {
+                // Deterministic positioning for the test: the page scrolls smoothly,
+                // which would still be animating when the dialog opens.
+                const root = document.documentElement;
+                const previous = root.style.scrollBehavior;
+                root.style.scrollBehavior = 'auto';
+                el.scrollIntoView(true);
+                root.style.scrollBehavior = previous;
+            }"""
+        )
+        page.wait_for_timeout(150)
+
+        page.locator("#btnDeployVPS").click()
+        page.locator("#nexusConfirmModal.active").wait_for(state="visible")
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('nexusConfirmModal')).opacity === '1'"
+        )
+        probe = page.evaluate(NARROW_PROBE)
+
+        assert probe["topbar"], "the mobile top bar is missing"
+        assert len(probe["fields"]) == 4, probe["fields"]
+        assert probe["underBar"] == [], (probe["topbar"], probe["fields"])
+        assert probe["underDialog"] == [], (probe["dialog"], probe["fields"])
+
+        price = probe["price"]
+        assert price, probe["body"]
+        assert "max 90 NOK/mo" in price["text"], price
+        assert price["right"] <= price["bodyRight"] + 1, (price, probe["body"])
+        assert price["lines"] >= 1, price
+        assert probe["body"]["scrollWidth"] <= probe["body"]["clientWidth"] + 1, probe["body"]
+        assert orders == [], "opening the confirmation sent an order"
+    finally:
+        page.unroute("**/api/admin/hosting/gigahost/catalog**")
+        page.unroute("**/api/admin/hosting/gigahost/order")
+
+
 # --- What the operator can compare while the confirmation is open ------------
 # The confirmation's job is to be checked against the form, so the backdrop must
 # not hide it and the dialog must not sit on the selectors. Both are geometry and

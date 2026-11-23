@@ -292,6 +292,10 @@
     padding: var(--space-md);
 }
 [data-theme="light"] #nexusConfirmModal { background: rgba(15, 23, 42, 0.18); }
+/* The summary's first line lists plan, region, datacenter and image; the price
+   follows on its own line and may wrap across several, so the figure being
+   agreed to is never clipped at a narrow width. */
+#nexusConfirmBody { white-space: pre-line; }
 /* The danger fill is a tint of the hue, so the hue as text misses 4.5:1 on it
    (3.38:1 light, 4.42:1 dark); these tones keep it red and readable. */
 #nexusConfirmModal .btn-danger { color: #fb7185; }

@@ -723,7 +723,7 @@
   "deploy_vps_placement_out_of_stock": "در این دیتاسنتر موجود نیست",
   "deploy_vps_placement_choice_cleared": "انتخاب قبلی دیتاسنتر دیگر در دسترس نیست",
   "deploy_vps_confirm_title": "تأیید سفارش",
-  "deploy_vps_confirm_body": "پلن: {plan} · منطقه: {region} · دیتاسنتر: {datacenter} · سیستم عامل: {os} · هزینه: {cost}",
+  "deploy_vps_confirm_body": "\u067e\u0644\u0646: {plan} \u00b7 \u0645\u0646\u0637\u0642\u0647: {region} \u00b7 \u062f\u06cc\u062a\u0627\u0633\u0646\u062a\u0631: {datacenter} \u00b7 \u0633\u06cc\u0633\u062a\u0645 \u0639\u0627\u0645\u0644: {os}\n\u0647\u0632\u06cc\u0646\u0647: {cost}",
   "deploy_vps_cost_hourly": "{rate} {currency} در ساعت",
   "deploy_vps_cost_ceiling": "حداکثر {ceiling} {currency} در ماه",
   "deploy_vps_cost_unknown": "ارائه‌دهنده قیمتی اعلام نکرده است",

@@ -723,7 +723,7 @@
   "deploy_vps_placement_out_of_stock": "En rupture de stock dans ce datacenter",
   "deploy_vps_placement_choice_cleared": "Le datacenter précédemment choisi n'est plus disponible",
   "deploy_vps_confirm_title": "Confirmer la commande",
-  "deploy_vps_confirm_body": "Offre : {plan} · Région : {region} · Datacenter : {datacenter} · Système d'exploitation : {os} · Coût : {cost}",
+  "deploy_vps_confirm_body": "Offre : {plan} \u00b7 R\u00e9gion : {region} \u00b7 Datacenter : {datacenter} \u00b7 Syst\u00e8me d'exploitation : {os}\nCo\u00fbt : {cost}",
   "deploy_vps_cost_hourly": "{rate} {currency}/h",
   "deploy_vps_cost_ceiling": "max. {ceiling} {currency}/mois",
   "deploy_vps_cost_unknown": "aucun prix indiqué par le fournisseur",

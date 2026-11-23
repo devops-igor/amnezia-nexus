@@ -237,6 +237,27 @@
         return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
     }
 
+    // revealDeploySelection puts the first control the confirmation names below the
+    // fixed mobile top bar, so the plan it is checked against is not clipped by the
+    // shell when the dialog opens. On a viewport where that control is already clear
+    // (no top bar, or it sits below one) it moves nothing. The settings page scrolls
+    // smoothly; an animated scroll would still be running when the dialog freezes the
+    // page, so this one is applied instantly.
+    function revealDeploySelection() {
+        if (!deployPlanSelect || typeof deployPlanSelect.getBoundingClientRect !== 'function') return;
+        const bar = document.querySelector('.mobile-topbar');
+        if (!bar || typeof window.scrollBy !== 'function') return;
+        const margin = 8;
+        const covered = bar.getBoundingClientRect().bottom + margin
+            - deployPlanSelect.getBoundingClientRect().top;
+        if (covered <= 0) return;
+        const root = document.documentElement;
+        const previous = root.style.scrollBehavior;
+        root.style.scrollBehavior = 'auto';
+        window.scrollBy(0, -covered);
+        root.style.scrollBehavior = previous;
+    }
+
     // deployCostText renders the provider's own price facts for the confirmation:
     // the hourly rate it charges and the monthly ceiling it documents. A plan the
     // provider quoted no rate for says so instead of reading as a free order; no
@@ -467,6 +488,11 @@
         // order. Cancelling returns here: nothing is sent, nothing is disabled and
         // the form keeps every selection.
         if (deployConfirmationOpen) return;
+        // The confirmation is checked against the form, so the first control it
+        // names is brought clear of the fixed top bar before the dialog opens (the
+        // dialog itself docks to the bottom edge). Nothing moves when that control
+        // is already fully visible.
+        revealDeploySelection();
         deployConfirmationOpen = true;
         let confirmed = false;
         try {
