@@ -39,10 +39,10 @@ type gigahostDeploymentRow struct {
 	Name string
 	// Status is the recorded state, verbatim. It is the panel's own record, so it is
 	// shown as recorded rather than translated into a second vocabulary that could
-	// disagree with the status view in Settings.
+	// disagree with the status view in Settings. It is evidence beside the card's state
+	// label, not the label itself: a deployment with no setup request is not in use,
+	// whatever the provider last said about it.
 	Status string
-	// BadgeClass is the existing badge vocabulary, chosen from the same status.
-	BadgeClass string
 	// Address is the provider-assigned address, empty until one exists.
 	Address string
 }
@@ -72,11 +72,10 @@ func gigahostDeploymentsForServers(orders []models.GigahostOrder, servers []mode
 			status = "unknown"
 		}
 		rows = append(rows, gigahostDeploymentRow{
-			OrderID:    order.OrderID,
-			Name:       "Gigahost-" + order.OrderID,
-			Status:     status,
-			BadgeClass: gigahostDeploymentBadgeClass(status),
-			Address:    strings.TrimSpace(order.AssignedIP),
+			OrderID: order.OrderID,
+			Name:    "Gigahost-" + order.OrderID,
+			Status:  status,
+			Address: strings.TrimSpace(order.AssignedIP),
 		})
 	}
 	return rows
@@ -126,22 +125,6 @@ func gigahostDeploymentGone(status string) bool {
 		}
 	}
 	return false
-}
-
-// gigahostDeploymentBadgeClass maps the recorded status onto the existing badge
-// vocabulary. An unrecognized status is neutral, never green: a state this page does not
-// understand must not look settled.
-func gigahostDeploymentBadgeClass(status string) string {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "ready", "active":
-		return "badge-success"
-	case "failed", "error", "unavailable", "cancelled", "canceled", "deleted", "terminated": //nolint:misspell // provider spellings
-		return "badge-danger"
-	case "", "unknown":
-		return "badge-secondary"
-	default:
-		return "badge-info"
-	}
 }
 
 // gigahostDeploymentsForServersPage reads the ledger for the Servers page.

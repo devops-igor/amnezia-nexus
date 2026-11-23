@@ -298,6 +298,65 @@ func TestGigahostOrderStatusDistinguishesQueuedFromDeploying(t *testing.T) {
 `)
 }
 
+// TestGigahostOrderStatusExposesTheCurrentStepToAssistiveTechnology pins the review's
+// accessibility finding: bold and underline are visual only, and the collapsed button's
+// name was the same three words for queued, deploying and ready. The step in flight must
+// be in the accessibility tree and in the name, with no second visible label added.
+func TestGigahostOrderStatusExposesTheCurrentStepToAssistiveTechnology(t *testing.T) {
+	runGigahostOrderStatusScenario(t, "GIGAHOST_STATUS_A11Y_OK", `
+
+ orders = [
+   {order_id:'ord-q', status:'pending'},
+   {order_id:'ord-w', status:'deploying'},
+   {order_id:'ord-r', status:'ready', assigned_ip:'198.51.100.50'}
+ ];
+ observationByOrder = {
+   'ord-q': {outcome:'confirmed', status:'pending'},
+   'ord-w': {outcome:'confirmed', status:'deploying'},
+   'ord-r': {outcome:'confirmed', status:'ready'}
+ };
+ deployByOrder = { 'ord-q': {}, 'ord-w': {}, 'ord-r': {} };
+ intents = []; backends = [];
+ await w.loadRecentOrders();
+
+ // Exactly one step is exposed as the current one in each row, and it is the row's own.
+ const rows = cells().map(c => {
+   const toggle = c.querySelector('.gigahost-order-status-toggle');
+   const marked = [...toggle.querySelectorAll('[aria-current]')];
+   return {
+     label: toggle.getAttribute('aria-label'),
+     marked: marked.map(n => n.textContent),
+     markedValues: marked.map(n => n.getAttribute('aria-current'))
+   };
+ });
+ // The harness translates identity-style, so the labels are the keys themselves.
+ assert.deepEqual(rows.map(r => r.marked),
+   [['gigahost_status_stage_requested'], ['gigahost_status_stage_deploying'], ['gigahost_status_stage_ready']],
+   'each row must mark its own step current, got ' + JSON.stringify(rows.map(r => r.marked)));
+ rows.forEach(r => assert.deepEqual(r.markedValues, ['step'], 'aria-current must be "step"'));
+
+ // The accessible name distinguishes the three rows and still contains the visible text.
+ const names = rows.map(r => r.label);
+ assert.equal(new Set(names).size, 3,
+   'the collapsed name must differ per state, got ' + JSON.stringify(names));
+ rows.forEach((r, i) => {
+   const visible = cells()[i].querySelector('.gigahost-order-status-toggle').textContent;
+   assert.ok(r.label && r.label.indexOf(visible) === 0,
+     'the name must start with the visible progression (label in name), got ' + JSON.stringify(r.label));
+   assert.ok(r.label.indexOf('gigahost_status_current_step') !== -1,
+     'the name must announce which step is current, got ' + JSON.stringify(r.label));
+ });
+
+ // The details panel is unchanged, and the disclosure still announces its state.
+ const firstToggle = toggle();
+ assert.equal(firstToggle.getAttribute('aria-expanded'), 'false');
+ firstToggle.click();
+ assert.equal(firstToggle.getAttribute('aria-expanded'), 'true');
+ const panel = flat(cells()[0].querySelector('.gigahost-order-status-details'));
+ assert.match(panel, /gigahost_status_stage_requested/);
+`)
+}
+
 // TestGigahostOrderStatusDetailsAreReadOnlyAndKeyboardAccessible pins the
 // interaction half of acceptance items 1 and 4: a native, Tab-reachable button
 // opens the read-only details, once per press, and opening them performs no

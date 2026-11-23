@@ -32,6 +32,22 @@ func insertServersPageOrder(t *testing.T, db *database.DB, order models.Gigahost
 	}
 }
 
+// deploymentCard returns one deployment card's markup. Assertions about the card are
+// made on this slice: the page chrome carries a badge-success of its own (the sidebar's
+// ADMIN badge), so a whole-body check could pass or fail for the wrong reason.
+func deploymentCard(t *testing.T, body, orderID string) string {
+	t.Helper()
+	start := strings.Index(body, `id="deployment-`+orderID+`"`)
+	if start < 0 {
+		t.Fatalf("deployment card %q is missing from the Servers page", orderID)
+	}
+	card := body[start:]
+	if end := strings.Index(card, "</section>"); end >= 0 {
+		card = card[:end]
+	}
+	return card
+}
+
 // renderServersPage renders the admin dashboard through the real handler and template.
 func renderServersPage(t *testing.T, h *Handlers) string {
 	t.Helper()
@@ -77,13 +93,18 @@ func TestServersPageListsDeploymentWithoutSetupRequest(t *testing.T) {
 	if !strings.Contains(body, `data-server-host=""`) {
 		t.Fatalf("the deployment card is not wired into the server search attributes")
 	}
-	// The recorded state is shown, and it is shown as what it is: a status with no
-	// address yet, which is why the deployment cannot carry traffic.
-	if !strings.Contains(body, ">deploying</span>") {
-		t.Fatalf("the deployment card does not show its recorded state")
+	// The state label states the deployment's situation, not the provider's: no setup has
+	// run, so it cannot carry traffic, and the badge must not read as a usable server.
+	card := deploymentCard(t, body, "ord_970_awaiting_setup")
+	if !strings.Contains(card, `>Not set up</span>`) {
+		t.Fatalf("the deployment card does not carry its not-set-up state label")
 	}
-	if !strings.Contains(body, "badge-info") {
-		t.Fatalf("an in-flight deployment must not render with a settled badge")
+	if !strings.Contains(card, "badge-secondary") || strings.Contains(card, "badge-success") {
+		t.Fatalf("an unset-up deployment must not carry a badge that reads as usable")
+	}
+	// The recorded provider state stays visible as the panel's own record.
+	if !strings.Contains(card, "Recorded state: deploying") {
+		t.Fatalf("the deployment card does not show its recorded state")
 	}
 }
 
@@ -172,34 +193,44 @@ func TestGigahostDeploymentsForServers(t *testing.T) {
 	if rows[0].Name != "Gigahost-ord_unregistered" {
 		t.Fatalf("unexpected card name %q", rows[0].Name)
 	}
-	if rows[1].BadgeClass != "badge-danger" {
-		t.Fatalf("a failed deployment must render as a failure, got %q", rows[1].BadgeClass)
+	if rows[1].Status != "failed" {
+		t.Fatalf("a failed deployment keeps its recorded state, got %q", rows[1].Status)
 	}
-	// An empty recorded status is not a state: it is shown as unknown, never as a
-	// blank or a settled badge.
-	if rows[2].Status != "unknown" || rows[2].BadgeClass != "badge-secondary" {
-		t.Fatalf("a blank recorded status must read as unknown, got %q/%q", rows[2].Status, rows[2].BadgeClass)
+	// An empty recorded status is not a state: it is shown as unknown, never as blank.
+	if rows[2].Status != "unknown" {
+		t.Fatalf("a blank recorded status must read as unknown, got %q", rows[2].Status)
 	}
 }
 
-// TestGigahostDeploymentBadgeClass pins that an unrecognised state is never green: it is
-// neutral, so a state this page does not understand cannot look settled.
-func TestGigahostDeploymentBadgeClass(t *testing.T) {
-	cases := map[string]string{
-		"ready":         "badge-success",
-		"active":        "badge-success",
-		"failed":        "badge-danger",
-		"cancelled":     "badge-danger",
-		"deploying":     "badge-info",
-		"pending":       "badge-info",
-		"":              "badge-secondary",
-		"unknown":       "badge-secondary",
-		"something_new": "badge-info",
-		"  READY  ":     "badge-success",
+// TestServersPageNeverPresentsAnUnsetUpDeploymentAsUsable pins the design review's
+// finding: a deployment whose provider status is "active" still has no panel server, so
+// the card must not carry a green, active-sounding badge. The recorded state stays
+// visible as a scoped fact, which is what keeps issue 970's "state visible" acceptance.
+func TestServersPageNeverPresentsAnUnsetUpDeploymentAsUsable(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	insertServersPageOrder(t, db, models.GigahostOrder{
+		OrderID:    "ord_970_active_no_setup",
+		Status:     "active",
+		AssignedIP: "198.51.100.62",
+		PlanID:     1,
+		RegionID:   1,
+	})
+
+	body := renderServersPage(t, h)
+
+	card := deploymentCard(t, body, "ord_970_active_no_setup")
+	if !strings.Contains(card, `>Not set up</span>`) {
+		t.Fatalf("the card's state label must say the deployment is not set up")
 	}
-	for status, want := range cases {
-		if got := gigahostDeploymentBadgeClass(status); got != want {
-			t.Fatalf("status %q: badge class %q, want %q", status, got, want)
-		}
+	if strings.Contains(card, "badge-success") {
+		t.Fatalf("a deployment with no setup request must not carry a success badge")
+	}
+	// The provider's own word survives as the panel's record, never as the label.
+	if !strings.Contains(card, "Recorded state: active") {
+		t.Fatalf("the recorded provider state must still be visible, scoped as a record")
+	}
+	// And the provider's word never stands alone as a badge label.
+	if strings.Contains(card, ">active</span>") || strings.Contains(card, ">ACTIVE</span>") {
+		t.Fatalf("the recorded word must not be rendered as the card's own badge label")
 	}
 }

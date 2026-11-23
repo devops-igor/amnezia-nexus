@@ -550,21 +550,75 @@
     }
 }
 
-/* Gigahost deployment progression: the state marker of the status widget.
+/* Gigahost recent-orders rows: layout and the progression marker.
  *
- * Each step carries its own state in data-state: done, current or pending. Only the
- * attributes carried that fact, so a queued deployment and a deploying one drew the
- * same three labels and the operator could not see which step was in flight. The rule
- * expresses the state that is already there; it adds none of its own, and it changes no
- * colour, so badge contrast is untouched.
+ * These rules belong to this sheet because the widget is part of the Settings surface
+ * and is rendered nowhere else, which is the same reason the flows-table cell disclosure
+ * is defined here. Card-scoped like its neighbours, and every class they name is listed
+ * in the offline guard's Settings surface set, because the frozen reference predates the
+ * widget.
  *
- * It belongs to this sheet because the widget is part of the Settings surface and is
- * rendered nowhere else, which is the same reason the flows-table cell disclosure is
- * defined here. Card-scoped like its neighbours, so it cannot reach a status widget
- * outside a Settings card, and the class is named in the offline guard's Settings
- * surface set, because the frozen reference predates it. */
+ * The row is an identity on the left and the status strip plus its actions on the right.
+ * Neither side may widen the card: the ready row's actions used to run past it at
+ * 1440 px, and at 390 px the strip pushed the current step off-screen. Both sides wrap,
+ * and below 600 px they stack, so the strip always has the card's full width to use. */
+.settings-section-card .gigahost-order-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-xs) var(--space-md);
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.settings-section-card .gigahost-order-identity {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* The status strip and the actions that state allows travel together and wrap as one
+   unit, so an action never lands outside the card because the strip took the width. */
+.settings-section-card .gigahost-order-state {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.settings-section-card .gigahost-order-status {
+    min-width: 0;
+    max-width: 100%;
+}
+
+/* One badge, whose steps wrap rather than run past the card. A step that is marked
+   current stays whole on its line, so the operator always sees where the deployment is. */
+.settings-section-card .gigahost-order-status-toggle {
+    display: inline-flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: 2px;
+    max-width: 100%;
+    white-space: normal;
+    font-size: 0.75rem;
+}
+
 .settings-section-card .gigahost-order-status-stage[data-state="current"] {
     font-weight: 700;
     text-decoration: underline;
     text-underline-offset: 2px;
+}
+
+@media (max-width: 600px) {
+    .settings-section-card .gigahost-order-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .settings-section-card .gigahost-order-state {
+        justify-content: flex-start;
+    }
 }

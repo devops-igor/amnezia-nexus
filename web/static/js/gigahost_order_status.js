@@ -201,7 +201,6 @@ function gigahostOrderStatusCell(order, context) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'badge gigahost-order-status-toggle ' + gigahostOrderStatusBadgeClass(model.stage);
-    toggle.style.fontSize = '0.75rem';
     toggle.setAttribute('aria-expanded', 'false');
     toggle.setAttribute('aria-controls', detailsID);
     model.chain.forEach((entry, index) => {
@@ -210,9 +209,21 @@ function gigahostOrderStatusCell(order, context) {
         part.className = 'gigahost-order-status-stage';
         part.setAttribute('data-stage', entry.stage);
         part.setAttribute('data-state', entry.state);
+        // Bold and underline are visual only: they cannot tell a screen reader which
+        // step is in flight, and every row's collapsed name was otherwise the same
+        // three words. The state is exposed here, in the accessibility tree, and the
+        // button's name below says it in words.
+        if (entry.state === 'current') part.setAttribute('aria-current', 'step');
         part.textContent = _('gigahost_status_stage_' + entry.stage);
         toggle.appendChild(part);
     });
+    // The name carries the visible progression followed by the step in flight, so the
+    // visible text is still part of the name (label-in-name) and the current step is
+    // announced. No second visible label is added.
+    if (model.chain.some((entry) => entry.state === 'current')) {
+        toggle.setAttribute('aria-label', toggle.textContent + '. ' +
+            _('gigahost_status_current_step') + ': ' + _('gigahost_status_stage_' + model.stage));
+    }
 
     const panel = gigahostOrderStatusPanel(model);
     panel.id = detailsID;
@@ -595,14 +606,12 @@ async function readGigahostOrderDeploy(orderId, signal) {
  * readiness from setup and backend health. */
 function gigahostOrderStatusRow(order, context) {
     const row = document.createElement('div');
+    // Layout is owned by settings.css (.gigahost-order-row and its two sides), so the
+    // row wraps instead of widening the card. Markup here only decides what the row says.
     row.className = 'gigahost-order-row';
-    row.style.display = 'flex';
-    row.style.justifyContent = 'space-between';
-    row.style.alignItems = 'center';
-    row.style.padding = '6px 0';
-    row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
 
     const left = document.createElement('div');
+    left.className = 'gigahost-order-identity';
     const idSpan = document.createElement('span');
     idSpan.style.fontFamily = 'monospace';
     idSpan.style.fontWeight = '600';
@@ -619,9 +628,7 @@ function gigahostOrderStatusRow(order, context) {
     }
 
     const right = document.createElement('div');
-    right.style.display = 'flex';
-    right.style.alignItems = 'center';
-    right.style.gap = '6px';
+    right.className = 'gigahost-order-state';
     right.appendChild(gigahostOrderStatusCell(order, context));
 
     if (order.status === 'failed') {
