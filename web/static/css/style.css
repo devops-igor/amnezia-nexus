@@ -3887,10 +3887,20 @@ td[data-backend-name]:focus-visible {
     list-style: none;
 }
 
-/* 40 px is the section-level step of the button scale. A long translation wraps
-   instead of being clipped by the .btn nowrap default. */
+/* A navigation link is not a button: at rest it paints no fill and no border, so
+   the row reads as navigation rather than four chips. The 40 px target, the
+   label typography and the start alignment were carried by the button classes
+   and are re-established here; the visible focus ring comes from the shared
+   :focus-visible rule in base.css. A long translation wraps instead of being
+   clipped. */
 .settings-subnav-link {
-    height: 40px;
+    display: inline-flex;
+    align-items: center;
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    padding-inline: var(--space-sm);
+    border-radius: var(--radius-md);
+    font-size: 0.875rem;
+    font-weight: 600;
     white-space: normal;
     text-align: start;
     color: var(--text-secondary);

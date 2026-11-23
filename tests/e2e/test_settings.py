@@ -778,9 +778,11 @@ FOCUS_CONTROLS = [
     ("#notificationSaveBtn", "#notificationSaveBtn"),
     ("#repoLink-amneziawg-go", "#repoLink-amneziawg-go"),
     ("#captcha_enabled", "#captcha_enabled + .switch-slider"),
-    # The sub-navigation links share the .btn rule; they are listed because they
-    # are the page's new interactive surface and a nav link with no visible focus
-    # would leave the keyboard path without a marker.
+    # The sub-navigation links are the page's new interactive surface; they are
+    # listed because a nav link with no visible focus would leave the keyboard
+    # path without a marker. They get their ring from the shared :focus-visible
+    # rule, not from a button rule, so this reads the computed outline on the
+    # link itself.
     ("a.settings-subnav-link", "a.settings-subnav-link"),
 ]
 NO_TRANSITIONS = "*, *::before, *::after { transition: none !important; animation: none !important; }"

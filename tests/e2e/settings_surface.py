@@ -117,8 +117,15 @@ SETTINGS_NAV_PROBE = """() => {
   const r = nav ? nav.getBoundingClientRect() : null;
   const links = nav ? [...nav.querySelectorAll('a')].map(a => {
     const lr = a.getBoundingClientRect();
+    // The resting paint of the link itself: a navigation link that kept a
+    // filled background or a full border box would read as a button, so the
+    // suite states the value it must have rather than trusting the sheet.
+    const s = getComputedStyle(a);
     return {href: a.getAttribute('href'), text: (a.textContent || '').trim(),
             current: a.getAttribute('aria-current'),
+            background: s.backgroundColor,
+            borders: {top: s.borderTopWidth, right: s.borderRightWidth,
+                      bottom: s.borderBottomWidth, left: s.borderLeftWidth},
             width: lr.width, height: lr.height, left: lr.left, right: lr.right};
   }) : [];
   const current = document.querySelector('[aria-current="true"]');

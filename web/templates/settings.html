@@ -9,15 +9,18 @@
      list of anchors, so it works without script; the controller adds only the
      current-group indication and the focus handoff. Each group is a landmark
      with a stable id, which is what a link points at. A group that does not
-     render for this role contributes no link, so no link is ever a dead end. */}}
+     render for this role contributes no link, so no link is ever a dead end.
+     The links carry no button class: they are navigation, so the settings
+     stylesheet owns their size, alignment and states, and none of them paints
+     a fill or a border at rest. */}}
 <nav class="settings-subnav" id="settingsSubnav" aria-label="{{ _ "settings_nav_label" }}">
     <ul class="settings-subnav-list">
-        <li><a class="btn btn-secondary settings-subnav-link" href="#group-portal">{{ _ "settings_group_portal" }}</a></li>
-        <li><a class="btn btn-secondary settings-subnav-link" href="#group-notifications">{{ _ "settings_group_notifications" }}</a></li>
+        <li><a class="settings-subnav-link" href="#group-portal">{{ _ "settings_group_portal" }}</a></li>
+        <li><a class="settings-subnav-link" href="#group-notifications">{{ _ "settings_group_notifications" }}</a></li>
         {{ if is_admin .current_user }}
-        <li><a class="btn btn-secondary settings-subnav-link" href="#group-network">{{ _ "settings_group_network" }}</a></li>
+        <li><a class="settings-subnav-link" href="#group-network">{{ _ "settings_group_network" }}</a></li>
         {{ end }}
-        <li><a class="btn btn-secondary settings-subnav-link" href="#group-system">{{ _ "settings_group_system" }}</a></li>
+        <li><a class="settings-subnav-link" href="#group-system">{{ _ "settings_group_system" }}</a></li>
     </ul>
 </nav>
 

@@ -39,9 +39,18 @@ def test_settings_subnav_names_and_moves_between_groups(
         assert link["href"].startswith("#"), link
         assert page.evaluate("sel => !!document.querySelector(sel)", link["href"]), link
         assert link["text"], link
+        # The link is navigation, not a filled control: nothing paints a fill,
+        # no side carries a border, and the only border is the current group's
+        # 2 px accent underline. A reintroduced button surface fails here.
+        assert link["background"] in ("rgba(0, 0, 0, 0)", "transparent"), link
+        for side in ("top", "right", "left"):
+            assert link["borders"][side] == "0px", link
+        underline = "2px" if link["current"] == "true" else "0px"
+        assert link["borders"]["bottom"] == underline, link
+        # The 40 px target holds at both widths; at 390 it must also stay fully
+        # inside the viewport, because the row wraps instead of clipping.
+        assert link["height"] >= 40, link
         if width == 390:
-            # A wrapped row still yields 40 px targets that stay inside the viewport.
-            assert link["height"] >= 40, link
             assert link["width"] > 0, link
             assert link["right"] <= probe["clientWidth"] + 0.5, link
     if width == 390:
