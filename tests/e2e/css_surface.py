@@ -35,6 +35,10 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "settings-choice", "settings-choice-hint", "settings-choice-title",
     "settings-cluster", "settings-divider", "settings-field-label",
     "settings-field-pair", "settings-fieldset", "settings-flush",
+    # The Gigahost status widget's progression step: its rule marks which step is in
+    # flight, and the reference predates the widget. Settings-only, so it is named
+    # here rather than with the VPN surface.
+    "gigahost-order-status-stage",
     "settings-grid", "settings-group", "settings-group-title", "settings-inline",
     "settings-list",
     "settings-list-title", "settings-loading", "settings-notice",
