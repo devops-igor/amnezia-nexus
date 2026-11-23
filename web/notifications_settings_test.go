@@ -134,6 +134,7 @@ w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
 let resolveRead;
 const readGate = new Promise(resolve => { resolveRead = resolve; });
 const posts = [];
+const historyUrls = [];
 const settingsAnswer = {
   enabled:true, url:'https://gotify.example.test', app_token_set:true,
   min_severity:'warning', cooldown_seconds:30, max_attempts:4,
@@ -143,6 +144,7 @@ w.API = {
   get: async url => {
     if (url.indexOf('/api/notifications/settings') === 0) return readGate;
     if (url.indexOf('/api/notifications/history') === 0) {
+      historyUrls.push(url);
       return {events:[{event:{summary:'<img src=x onerror=evil()>',severity:'warning',category:'server_health',occurred_at:'2026-11-17T10:00:00Z'},
         delivery:{status:'sent',last_error:''}}]};
     }
@@ -182,6 +184,11 @@ w.eval(%s);
   const history = w.document.getElementById('notificationHistory');
   assert.ok(history.textContent.indexOf('<img src=x onerror=evil()>') !== -1);
   assert.equal(history.querySelector('img'), null);
+
+  // The panel shows the most recent five, and asks for exactly five: the
+  // endpoint's own default is larger, so the number has to come from here.
+  assert.ok(historyUrls.length >= 1, 'the history panel must ask for events');
+  historyUrls.forEach(url => assert.equal(url, '/api/notifications/history?limit=5', url));
 
   // Saving posts the visible policy and leaves the token blank to preserve it.
   const saved = await ui.save(true);

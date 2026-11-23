@@ -366,3 +366,73 @@ func TestPolicySectionRenderingDoesNotLeakIntoOtherPages(t *testing.T) {
 		t.Error("policy section leaked into a page that does not include it")
 	}
 }
+
+// TestPolicyControlsCarryTheRenamedLabels pins the two renamed control labels and
+// their shortened descriptions, because they are operator-facing names for the
+// routing each control forces: "Always PROXY" and "Always DIRECT" say what the
+// list does, where the old names described an internal concept. The retired
+// clearing note is asserted absent from the dictionaries: one line per control is
+// the point of the shortening, and that sentence now lives in the second half of
+// the inventory line.
+func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
+	page := renderSettingsPage(t, models.RoleAdmin)
+	for _, want := range []string{
+		"Always PROXY (IPv4)",
+		"Always DIRECT (IPv4)",
+		"Addresses listed here always take PROXY",
+		"Prefixes listed here always route DIRECT",
+		"prohibited or internal destination",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the rendered policy section does not carry %q", want)
+		}
+	}
+	for _, gone := range []string{
+		"PROXY exceptions (IPv4)",
+		"Address inventory override",
+		"Clearing this field changes new routing decisions only",
+	} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the rendered policy section still carries the retired text %q", gone)
+		}
+	}
+
+	// The same four keys exist in all five bundles, the non-English ones are real
+	// translations rather than copies, and the retired note is gone everywhere.
+	keys := []string{
+		"policy_proxy_exceptions_label", "policy_proxy_exceptions_hint",
+		"policy_inventory_override_label", "policy_inventory_override_hint",
+	}
+	var english map[string]string
+	for _, locale := range []string{"en", "ru", "fr", "zh", "fa"} {
+		raw, err := web.TranslationsFS.ReadFile("translations/" + locale + ".json")
+		if err != nil {
+			t.Fatalf("read %s.json: %v", locale, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(raw, &dict); err != nil {
+			t.Fatalf("decode %s.json: %v", locale, err)
+		}
+		if locale == "en" {
+			english = dict
+		}
+		for _, key := range keys {
+			value := strings.TrimSpace(dict[key])
+			if value == "" {
+				t.Errorf("%s.json has no %q", locale, key)
+				continue
+			}
+			if locale != "en" && value == english[key] {
+				t.Errorf("%s.json %q is the English text", locale, key)
+			}
+		}
+		if _, ok := dict["policy_inventory_override_clear_hint"]; ok {
+			t.Errorf("%s.json still carries the retired clear-field note", locale)
+		}
+	}
+	if english["policy_proxy_exceptions_label"] != "Always PROXY (IPv4)" ||
+		english["policy_inventory_override_label"] != "Always DIRECT (IPv4)" {
+		t.Errorf("the English labels are %q / %q, want the renamed controls",
+			english["policy_proxy_exceptions_label"], english["policy_inventory_override_label"])
+	}
+}
