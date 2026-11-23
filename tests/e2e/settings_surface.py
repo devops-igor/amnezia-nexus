@@ -110,23 +110,28 @@ def geometry(client: float, columns: int, max_width: float) -> dict[str, float]:
 SETTINGS_NAV_PROBE = """() => {
   const de = document.documentElement;
   const nav = document.querySelector('.app-main nav');
-  if (!nav) return {nav: null};
-  const links = [...nav.querySelectorAll('a')].map(a => {
-    const r = a.getBoundingClientRect();
+  // Every field is reported on both paths. Absence is navPresent === false, never a
+  // different object: a probe that returns a second shape for the failing case turns
+  // the assertion that should report "there is no navigation" into a KeyError, which
+  // is a fault in the oracle rather than a statement about the page.
+  const r = nav ? nav.getBoundingClientRect() : null;
+  const links = nav ? [...nav.querySelectorAll('a')].map(a => {
+    const lr = a.getBoundingClientRect();
     return {href: a.getAttribute('href'), text: (a.textContent || '').trim(),
             current: a.getAttribute('aria-current'),
-            width: r.width, height: r.height, left: r.left, right: r.right};
-  });
-  const r = nav.getBoundingClientRect();
+            width: lr.width, height: lr.height, left: lr.left, right: lr.right};
+  }) : [];
+  const current = document.querySelector('[aria-current="true"]');
+  const active = document.activeElement;
   return {
-    label: nav.getAttribute('aria-label') || '',
+    navPresent: !!nav,
+    label: nav ? (nav.getAttribute('aria-label') || '') : '',
     links,
-    navTop: r.top, navHeight: r.height,
+    navTop: r ? r.top : null, navHeight: r ? r.height : null,
     clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
-    activeId: document.activeElement ? document.activeElement.id : '',
-    activeTag: document.activeElement ? document.activeElement.tagName : '',
-    currentHref: (document.querySelector('[aria-current="true"]') || {}).getAttribute
-      ? document.querySelector('[aria-current="true"]').getAttribute('href') : null,
+    activeId: active ? (active.id || '') : '',
+    activeTag: active ? active.tagName : '',
+    currentHref: current ? current.getAttribute('href') : null,
     currentCount: document.querySelectorAll('[aria-current="true"]').length,
   };
 }"""

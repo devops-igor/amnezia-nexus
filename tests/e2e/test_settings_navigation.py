@@ -29,7 +29,10 @@ def test_settings_subnav_names_and_moves_between_groups(
     page.wait_for_function("document.querySelectorAll('.settings-group').length === 4")
 
     probe = page.evaluate(SETTINGS_NAV_PROBE)
-    assert probe["nav"] is not None, probe
+    # Presence first, and positively: the probe reports it on every path, so this is
+    # the assertion that names a missing navigation instead of raising KeyError on the
+    # fields below, which only exist when there is one.
+    assert probe["navPresent"] is True, probe
     assert probe["label"].strip(), probe
     assert len(probe["links"]) == 4, probe
     for link in probe["links"]:
