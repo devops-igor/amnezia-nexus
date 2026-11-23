@@ -311,6 +311,35 @@ func TestSettingsPageControlsHaveAccessibleNames(t *testing.T) {
 			t.Errorf("release link #%s has no aria-label", id)
 		}
 	}
+
+	// A fieldset legend names the group, not the control inside it. The policy
+	// exceptions textarea is named by that same visible legend, so the name a
+	// screen reader announces is the label the operator can see.
+	exceptions := elementByID(doc, "policy_proxy_exceptions")
+	if exceptions == nil {
+		t.Fatal("the policy exceptions textarea is missing")
+	}
+	if name := referencedName(doc, exceptions); name == "" {
+		t.Errorf("the policy exceptions textarea has no accessible name (attrs: %v)", exceptions.Attr)
+	}
+}
+
+// referencedName resolves the name a control gets from aria-labelledby, falling
+// back to aria-label. A dangling reference resolves to "", which is the failure
+// this reports: an id that names an element the page does not render names
+// nothing.
+func referencedName(doc, n *html.Node) string {
+	if ids, ok := attr(n, "aria-labelledby"); ok {
+		var parts []string
+		for _, id := range strings.Fields(ids) {
+			if ref := elementByID(doc, id); ref != nil {
+				parts = append(parts, strings.TrimSpace(textOf(ref)))
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, " "))
+	}
+	label, _ := attr(n, "aria-label")
+	return strings.TrimSpace(label)
 }
 
 func enclosingLabel(n *html.Node) *html.Node {
@@ -345,6 +374,9 @@ func TestSettingsPageCollapsedFieldsUseHiddenAttribute(t *testing.T) {
 func TestSettingsPageNewKeysExistInEveryLocale(t *testing.T) {
 	keys := []string{
 		"deploy_vps_refresh_catalog", "upstream_releases_link",
+		// The Deploy VPS confirmation of a paid action (#972).
+		"deploy_vps_confirm_title", "deploy_vps_confirm_body",
+		"deploy_vps_cost_hourly", "deploy_vps_cost_ceiling", "deploy_vps_cost_unknown",
 		// The per-card save model (#888).
 		"settings_unsaved", "settings_applies_now", "settings_save_read_failed", "settings_test_saves_first",
 		// The grouped page and its in-page navigation.

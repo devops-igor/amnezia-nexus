@@ -1028,6 +1028,28 @@ button:focus-visible,
     background: currentColor;
 }
 
+/* The four status hues are tuned for the dark canvas. On the light one the same
+   values drop below the 4.5:1 threshold for badge-sized text (success 2.35:1,
+   warn 2.02:1, info 2.56:1), so the light theme paints the badge text in a
+   darker shade of the same hue. The dark theme keeps its colours, and the hue --
+   which is what carries the meaning -- is unchanged in both. */
+[data-theme="light"] .badge-success {
+    color: #046c4e;
+}
+
+[data-theme="light"] .badge-warn,
+[data-theme="light"] .badge-warning {
+    color: #92400e;
+}
+
+[data-theme="light"] .badge-danger {
+    color: #be123c;
+}
+
+[data-theme="light"] .badge-info {
+    color: #0369a1;
+}
+
 /* ===== Form Elements ===== */
 .form-group {
     margin-bottom: var(--space-md);

@@ -18,7 +18,9 @@
             title: _('restore_backup'),
             message: _('restore_confirm'),
             confirmText: _('restore_backup'),
-            confirmVariant: 'warning'
+            // A restore overwrites the current data and restarts the panel, so the
+            // confirming control carries the destructive variant, not a warning.
+            confirmVariant: 'danger'
         });
 
         if (!confirmed) {
@@ -154,6 +156,11 @@
 
     let cachedPlans = [];
 
+    // A confirmation the operator has not answered yet blocks a second request, so
+    // two rapid presses cannot become two orders. It is not a button state: the
+    // form stays exactly as it was while the dialog is open.
+    let deployConfirmationOpen = false;
+
     // The rule lives in the module so it cannot drift between rebuilds and choice.
     const deploymentPlacementIntent = placementNewIntent();
 
@@ -228,6 +235,41 @@
         if (p.monthly_ceiling_nok > 0) price.push('max ' + p.monthly_ceiling_nok + ' ' + currency + '/mo');
         const spec = parts.join(', ');
         return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
+    }
+
+    // deployCostText renders the provider's own price facts for the confirmation:
+    // the hourly rate it charges and the monthly ceiling it documents. A plan the
+    // provider quoted no rate for says so instead of reading as a free order; no
+    // figure here is computed, converted or capped by the page.
+    function deployCostText(plan) {
+        const currency = plan.currency || 'NOK';
+        const parts = [];
+        if (plan.hourly_rate_nok > 0) {
+            parts.push(_('deploy_vps_cost_hourly')
+                .replace('{rate}', plan.hourly_rate_nok)
+                .replace('{currency}', currency));
+        }
+        if (plan.monthly_ceiling_nok > 0) {
+            parts.push(_('deploy_vps_cost_ceiling')
+                .replace('{ceiling}', plan.monthly_ceiling_nok)
+                .replace('{currency}', currency));
+        }
+        return parts.length ? parts.join(', ') : _('deploy_vps_cost_unknown');
+    }
+
+    // deployOrderMessage names the four facts the operator approves: the plan, the
+    // region and image the selectors are showing, and the cost. The names are read
+    // from the same options the payload's ids came from, so the summary cannot
+    // describe a different selection than the one being ordered.
+    function deployOrderMessage(plan) {
+        const selectedText = select => (select && select.selectedIndex >= 0)
+            ? select.options[select.selectedIndex].textContent
+            : '';
+        return _('deploy_vps_confirm_body')
+            .replace('{plan}', plan.name || '')
+            .replace('{region}', selectedText(deployRegionSelect))
+            .replace('{os}', selectedText(deployOSSelect))
+            .replace('{cost}', deployCostText(plan));
     }
 
     // appendDeployOption adds one disabled-by-default placeholder option, used
@@ -416,6 +458,26 @@
             UI.toast(_('deploy_vps_select_required'), 'error');
             return;
         }
+
+        // A paid action is confirmed before the request leaves the page. The
+        // summary is built from the values the payload below already carries and
+        // the labels the operator is looking at, so it cannot describe a different
+        // order. Cancelling returns here: nothing is sent, nothing is disabled and
+        // the form keeps every selection.
+        if (deployConfirmationOpen) return;
+        deployConfirmationOpen = true;
+        let confirmed = false;
+        try {
+            confirmed = await UI.confirm({
+                title: _('deploy_vps_confirm_title'),
+                message: deployOrderMessage(plan),
+                confirmText: _('deploy_vps_btn'),
+                confirmVariant: 'primary'
+            });
+        } finally {
+            deployConfirmationOpen = false;
+        }
+        if (!confirmed) return;
 
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
