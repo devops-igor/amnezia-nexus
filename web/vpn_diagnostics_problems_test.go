@@ -54,31 +54,31 @@ vpnRenderForwarderHealth({
 	}
 });
 
-// Assert Summary Header Counts
-const summaryHeader = el('vpn-fwd-summary-header');
-assert(summaryHeader, 'summary header element must exist');
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when problems exist');
-assert(summaryHeader.textContent.includes('2 active problems'), 'must show 2 active problems');
-assert(summaryHeader.textContent.includes('1 affected users'), 'must show 1 unique affected user');
-assert(summaryHeader.textContent.includes('2 client configs'), 'must show 2 unique affected client configs');
-assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must have badge styling');
+// The old separate summary strip is folded into one counts line under the summary.
+const summaryCounts = el('vpn-fwd-problem-counts');
+assert(summaryCounts, 'folded problem counts element must exist');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible when problems exist');
+assert(summaryCounts.textContent.includes('2 active problems'), 'must show 2 active problems');
+assert(summaryCounts.textContent.includes('1 affected users'), 'must show 1 unique affected user');
+assert(summaryCounts.textContent.includes('2 client configs'), 'must show 2 unique affected client configs');
 
 // Assert Problem Card Onset Timestamps
 const problemList = el('vpn-fwd-problem-list');
 assert.strictEqual(problemList.children.length, 2, 'must render 2 problem cards');
 
+// Rows sort critical-first, so the CRITICAL problem (12:35) is row 0.
 const card0 = problemList.children[0];
-assert(card0.className.includes('problem-card'), 'card 0 must have problem-card class');
+assert(card0.className.includes('vpn-issue'), 'card 0 must have the issue row class');
 assert(card0.textContent.includes('Onset:'), 'card 0 must render onset label');
-assert(card0.textContent.includes('2026-10-07 12:30:00 UTC'), 'card 0 must render first_observed timestamp');
-assert(card0.textContent.includes('Config: alice-phone'));
+assert(card0.textContent.includes('2026-10-07 12:35:00 UTC'), 'card 0 must render its first_observed timestamp');
+assert(card0.textContent.includes('Config: alice-laptop'));
 assert(card0.textContent.includes('User: alice'));
 
 const card1 = problemList.children[1];
-assert(card1.className.includes('problem-card'), 'card 1 must have problem-card class');
+assert(card1.className.includes('vpn-issue'), 'card 1 must have the issue row class');
 assert(card1.textContent.includes('Onset:'), 'card 1 must render onset label');
-assert(card1.textContent.includes('2026-10-07 12:35:00 UTC'), 'card 1 must render first_observed timestamp');
-assert(card1.textContent.includes('Config: alice-laptop'));
+assert(card1.textContent.includes('2026-10-07 12:30:00 UTC'), 'card 1 must render its first_observed timestamp');
+assert(card1.textContent.includes('Config: alice-phone'));
 assert(card1.textContent.includes('User: alice'));
 
 // 2. Nominal forwarder (0 problems): summary header must be hidden, nominal green badge rendered
@@ -92,15 +92,12 @@ vpnRenderForwarderHealth({
 	backends: { healthy_count: 2, total_count: 2 }
 });
 
-assert.strictEqual(summaryHeader.style.display, 'none', 'summary header must be hidden when healthy (0 problems)');
-assert.strictEqual(problemList.children.length, 1);
-const greenBadge = problemList.children[0];
-assert(greenBadge.className.includes('badge-success'), 'nominal summary must have badge-success class');
-assert(greenBadge.textContent.includes('No active problems detected'), 'nominal green badge text must show when 0 problems');
+assert.strictEqual(summaryCounts.hidden, true, 'counts line is hidden when healthy (0 problems)');
+assert.strictEqual(problemList.children.length, 0, 'healthy renders no problem rows and no nominal banner');
 
 // 3. Unavailable forwarder: summary header must be hidden
 vpnRenderForwarderHealth(null);
-assert.strictEqual(summaryHeader.style.display, 'none', 'summary header must be hidden when unavailable');
+assert.strictEqual(summaryCounts.hidden, true, 'counts line is hidden when unavailable');
 
 // 4. Degraded forwarder with generic conditions but empty actionable_problems: summary header must display active problems count from conditions
 vpnRenderForwarderHealth({
@@ -117,11 +114,10 @@ vpnRenderForwarderHealth({
 	}
 });
 
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when conditions exist during degradation');
-assert(summaryHeader.textContent.includes('3 active problems'), 'summary header must show 3 active problems from conditions');
-assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
-assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
-assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible for conditions');
+assert(summaryCounts.textContent.includes('3 active problems'), 'counts show 3 active problems from conditions');
+assert(!summaryCounts.textContent.includes('affected users'), 'no affected-user claim when no actionable problem names a user');
+assert(!summaryCounts.textContent.includes('client configs'), 'no client-config claim when no actionable problem names a config');
 
 // 5. Critical forwarder with 1 condition and missing actionable_problems: summary header fallback
 vpnRenderForwarderHealth({
@@ -134,10 +130,8 @@ vpnRenderForwarderHealth({
 		]
 	}
 });
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when critical with condition');
-assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem from condition');
-assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
-assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible for a critical condition');
+assert(summaryCounts.textContent.includes('1 active problems'), 'counts show 1 active problem from the condition');
 
 // 6. Warning-only condition with empty actionable_problems: summary header must display active problems count
 vpnRenderForwarderHealth({
@@ -151,10 +145,8 @@ vpnRenderForwarderHealth({
 		actionable_problems: []
 	}
 });
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed when warning condition exists');
-assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem from warning condition');
-assert(summaryHeader.textContent.includes('0 affected users'), 'affected users count must be 0 in conditions fallback');
-assert(summaryHeader.textContent.includes('0 client configs'), 'affected client configs count must be 0 in conditions fallback');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible for a warning condition');
+assert(summaryCounts.textContent.includes('1 active problems'), 'counts show 1 active problem from the warning condition');
 `
 
 	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
@@ -205,32 +197,32 @@ vpnRenderForwarderHealth({
 	}
 });
 
-// 1. Assert Summary Header Counts both classes of problems
-const summaryHeader = el('vpn-fwd-summary-header');
-assert(summaryHeader, 'summary header element must exist');
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
-assert(summaryHeader.textContent.includes('2 active problems'), 'summary header must count both classes: 1 actionable + 1 condition = 2 active problems');
-assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must count 1 affected user from actionable problem');
-assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must count 1 client config from actionable problem');
+// 1. Folded counts cover both classes of problem.
+const summaryCounts = el('vpn-fwd-problem-counts');
+assert(summaryCounts, 'folded problem counts element must exist');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible');
+assert(summaryCounts.textContent.includes('2 active problems'), 'counts both classes: 1 actionable + 1 condition = 2 active problems');
+assert(summaryCounts.textContent.includes('1 affected users'), 'counts 1 affected user from the actionable problem');
+assert(summaryCounts.textContent.includes('1 client configs'), 'counts 1 client config from the actionable problem');
 
 // 2. Assert Both Problem Cards are rendered in #vpn-fwd-problem-list
 const problemList = el('vpn-fwd-problem-list');
 assert.strictEqual(problemList.children.length, 2, 'problem list must render both problem cards');
 
+// Rows are sorted critical-first, so the critical problem is row 0.
 const card0 = problemList.children[0];
-assert(card0.className.includes('problem-card'), 'card 0 must have problem-card class');
-assert.strictEqual(card0.children[0].textContent, 'Degraded', 'card 0 severity must be Degraded');
-assert.strictEqual(card0.children[1].textContent, 'Return queue full drops (5 recent) for 10.8.0.2');
-assert(card0.textContent.includes('User: alice'));
-assert(card0.textContent.includes('Config: alice-phone'));
-assert(card0.textContent.includes('IP: 10.8.0.2'));
-assert(card0.textContent.includes('2.5 drops/s'));
+assert(card0.className.includes('vpn-issue'), 'card 0 must have the issue row class');
+assert.strictEqual(card0.getAttribute('data-severity'), 'critical', 'rows sort critical first');
+assert(card0.textContent.includes('No healthy backends available to route traffic'), 'card 0 carries the explanation');
 
 const card1 = problemList.children[1];
-assert(card1.className.includes('problem-card'), 'card 1 must have problem-card class');
-assert.strictEqual(card1.children[0].textContent, 'Critical', 'card 1 severity must be Critical');
-assert.strictEqual(card1.children[1].textContent, 'No healthy backends available to route traffic');
-assert(card1.textContent.includes('backend'));
+assert(card1.className.includes('vpn-issue'), 'card 1 must have the issue row class');
+assert(card1.textContent.includes('Degraded'), 'card 1 severity is Degraded');
+assert(card1.textContent.includes('Return queue full drops (5 recent) for 10.8.0.2'));
+assert(card1.textContent.includes('User: alice'));
+assert(card1.textContent.includes('Config: alice-phone'));
+assert(card1.textContent.includes('IP: 10.8.0.2'));
+assert(card1.textContent.includes('2.5 drops/s'));
 
 // 3. Deduplication: exact duplicate condition must not be rendered twice
 vpnRenderForwarderHealth({
@@ -255,7 +247,7 @@ vpnRenderForwarderHealth({
 	}
 });
 assert.strictEqual(problemList.children.length, 1, 'duplicate event must not render redundant card');
-assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must count 1 active problem when deduplicated');
+assert(el('vpn-fwd-problem-counts').textContent.includes('1 active problems'), 'counts line reports 1 active problem when deduplicated');
 `
 
 	script := vpnDiagnosticsHealthScript(t, tmplStr, assertions)
@@ -307,20 +299,19 @@ vpnRenderForwarderHealth({
 	}
 });
 
-// 1. Assert Summary Header: displays 1 active problems • 1 affected users • 1 client configs
-const summaryHeader = el('vpn-fwd-summary-header');
-assert(summaryHeader, 'summary header element must exist');
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
-assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem');
-assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must show 1 affected user');
-assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must show 1 client config');
-assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+// 1. Folded counts: 1 active problem, 1 affected user, 1 client config.
+const summaryCounts = el('vpn-fwd-problem-counts');
+assert(summaryCounts, 'folded problem counts element must exist');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible');
+assert(summaryCounts.textContent.includes('1 active problems'), 'counts 1 active problem');
+assert(summaryCounts.textContent.includes('1 affected users'), 'counts 1 affected user');
+assert(summaryCounts.textContent.includes('1 client configs'), 'counts 1 client config');
 
 // 2. Assert Problem Card: rendered with user and connection metadata badges
 const problemList = el('vpn-fwd-problem-list');
 assert.strictEqual(problemList.children.length, 1, 'must render 1 problem card');
 const card = problemList.children[0];
-assert(card.className.includes('problem-card'), 'card must have problem-card class');
+assert(card.className.includes('vpn-issue'), 'card must have problem-card class');
 assert(card.textContent.includes('Upstream handshake stale'), 'card must render localized message');
 assert(card.textContent.includes('User: alice'), 'card must contain user badge');
 assert(card.textContent.includes('Config: alice-phone'), 'card must contain connection config badge');
@@ -395,15 +386,13 @@ const el = id => document.getElementById(id);
 
 vpnRenderForwarderHealth(%s);
 
-// Verify summary header displays matching non-zero user and config counts:
-// 1 active problems • 1 affected users • 1 client configs
-const summaryHeader = el('vpn-fwd-summary-header');
-assert(summaryHeader, 'summary header element must exist');
-assert.strictEqual(summaryHeader.style.display, 'block', 'summary header must be displayed');
-assert(summaryHeader.textContent.includes('1 active problems'), 'summary header must show 1 active problem');
-assert(summaryHeader.textContent.includes('1 affected users'), 'summary header must show 1 affected user');
-assert(summaryHeader.textContent.includes('1 client configs'), 'summary header must show 1 client config');
-assert(summaryHeader.innerHTML.includes('badge-warn'), 'summary header must retain badge styling');
+// Verify the folded counts line shows matching non-zero user and config counts.
+const summaryCounts = el('vpn-fwd-problem-counts');
+assert(summaryCounts, 'folded problem counts element must exist');
+assert.strictEqual(summaryCounts.hidden, false, 'counts line is visible');
+assert(summaryCounts.textContent.includes('1 active problems'), 'counts 1 active problem');
+assert(summaryCounts.textContent.includes('1 affected users'), 'counts 1 affected user');
+assert(summaryCounts.textContent.includes('1 client configs'), 'counts 1 client config');
 
 // Verify problem card renders with user and config badges
 const problemList = el('vpn-fwd-problem-list');
@@ -451,7 +440,7 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(routBadge.className, 'badge badge-success', 'consistent routing must have badge-success');
 assert.strictEqual(routBadge.textContent, _('vpn_fwd_consistent'), 'consistent routing badge text');
-assert.strictEqual(routAlerts.style.display, 'none', 'alerts hidden when consistent');
+assert.strictEqual(routAlerts.hidden, true, 'alerts hidden when consistent');
 
 // Case 2: Inconsistent with only WARNING routing condition (e.g. sparse return mismatch)
 // -> must render badge-warning and alert color var(--warning)
@@ -471,7 +460,7 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(routBadge.className, 'badge badge-warning', 'routing with only WARNING condition must use badge-warning');
 assert.strictEqual(routBadge.textContent, _('vpn_fwd_inconsistent'), 'inconsistent text preserved');
-assert.strictEqual(routAlerts.style.display, 'block', 'alerts displayed');
+assert.strictEqual(routAlerts.hidden, false, 'alerts displayed');
 assert.strictEqual(routAlerts.style.color, 'var(--warning)', 'alerts text must use var(--warning) for WARNING routing condition');
 assert.strictEqual(routAlerts.textContent, 'Return-direction ownership mismatch: 3 drops');
 

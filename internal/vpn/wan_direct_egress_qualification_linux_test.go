@@ -692,11 +692,7 @@ func (r *s4PeerReplies) packets(peerKey string) [][]byte {
 // matcher, the memory route cache, ConfigurePBR installing the DirectEgressManager
 // over the production WAN device, and a return path per peer.
 func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture) (*Service, *forwarder.DirectEgressManager, *s4PeerReplies, func(), error) {
-	rules, _, err := policy.Parse(context.Background(), strings.NewReader("blocked.example\n"), policy.Source{
-		ID:             "s4-qualification",
-		Format:         policy.FormatDomains,
-		BareDomainMode: policy.DomainModeExact,
-	}, policy.DefaultParseLimits())
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("203.0.113.0/24\n"), policy.DefaultParseLimits())
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("parse policy: %w", err)
 	}

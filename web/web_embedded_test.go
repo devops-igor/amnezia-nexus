@@ -701,8 +701,8 @@ func TestStyleCSSConcatenationParity(t *testing.T) {
 	}
 }
 
-// assetVersionAction is the only template action a stylesheet link may carry: the
-// release version used to bust a cached copy of the asset.
+// assetVersionAction is the template action that carries the release version in
+// a cache-busting query. It covers the assets a release changed.
 const assetVersionAction = "{{ .app_version }}"
 
 // versionedTemplateAsset is the src attribute a settings template must carry for
@@ -710,6 +710,21 @@ const assetVersionAction = "{{ .app_version }}"
 // outlives a release, so the attribute must name the release version.
 func versionedTemplateAsset(path string) string {
 	return `src="` + path + "?v=" + assetVersionAction + `"`
+}
+
+// stylesheetLinksOf reads the stylesheet links of one shell template as
+// (path, identity form) pairs, in document order. A stylesheet is identified by
+// the release version or by its own bytes; the render checks in this file only
+// need to know which, because the bytes are proved where the URLs are emitted.
+func stylesheetLinksOf(t *testing.T, src string) map[string]assetReferenceForm {
+	t.Helper()
+	links := map[string]assetReferenceForm{}
+	for path, form := range templateAssetForms(t, src) {
+		if path == "/static/css/vpn.css" || strings.HasSuffix(path, ".css") {
+			links[path] = form
+		}
+	}
+	return links
 }
 
 func TestStylesheetTemplateLoadOrder(t *testing.T) {
@@ -730,32 +745,62 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			firstIdx := strings.Index(cleanHTML, "/static/css/")
 			lastIdx := strings.LastIndex(cleanHTML, "/static/css/")
 			if firstIdx != -1 && lastIdx != -1 && firstIdx < lastIdx {
-				// The one action allowed between the links is the release version in
-				// the cache-busting query. Any other action (a conditional include, a
-				// range) could change which stylesheets load or in what order.
+				// The actions allowed between the links are the two cache
+				// identities: the release version, and the asset's own bytes.
+				// Any other action (a conditional include, a range) could change
+				// which stylesheets load or in what order.
 				linkSpan := strings.ReplaceAll(cleanHTML[firstIdx:lastIdx], assetVersionAction, "")
+				linkSpan = normalizeAssetActions(linkSpan)
 				if strings.Contains(linkSpan, "{{") {
 					t.Fatalf("%s contains Go template actions between stylesheet links", tmpl)
 				}
 			}
 
-			extractedOrder := extractActiveStylesheetOrder(string(data))
+			// Read the order from the tag the attribute parsers can see: the
+			// content-derived action is normalised first, so a stylesheet linked
+			// through it still appears in the sequence.
+			extractedOrder := extractActiveStylesheetOrder(normalizeAssetActions(string(data)))
 			if !slices.Equal(canonicalStylesheetOrder, extractedOrder) {
 				t.Fatalf("%s stylesheet link order mismatch:\n got:  %v\n want: %v", tmpl, extractedOrder, canonicalStylesheetOrder)
+			}
+
+			// Every stylesheet carries an identity, and the ones this change
+			// replaced carry the identity of their own bytes rather than the
+			// release version the predecessor also served.
+			links := stylesheetLinksOf(t, string(data))
+			for _, name := range canonicalStylesheetOrder {
+				path := "/static/css/" + name + ".css"
+				form, ok := links[path]
+				if !ok {
+					t.Errorf("%s does not link %s; the enumeration in this file and the template have diverged", tmpl, path)
+					continue
+				}
+				if form == refBare {
+					t.Errorf("%s links %s with no cache identity, so a browser keeps the predecessor copy", tmpl, path)
+				}
+			}
+			if form, ok := links["/static/css/vpn.css"]; ok && form != refAssetBytes {
+				t.Errorf("%s identifies vpn.css by %s; this delivery changed its bytes without moving the "+
+					"release, so it must be identified by the bytes themselves", tmpl, form)
 			}
 		})
 	}
 
-	t.Run("OnlyTheVersionActionIsAllowedBetweenLinks", func(t *testing.T) {
+	t.Run("OnlyTheCacheIdentityActionsAreAllowedBetweenLinks", func(t *testing.T) {
 		allowed := `<link href="/static/css/a.css?v={{ .app_version }}"><link href="/static/css/b.css?v={{ .app_version }}">`
 		if strings.Contains(strings.ReplaceAll(allowed, assetVersionAction, ""), "{{") {
-			t.Fatal("the version action should be the one permitted action")
+			t.Fatal("the version action should be one permitted action")
+		}
+		contentIdentity := `<link href="{{ asset_url "/static/css/a.css" }}"><link href="/static/css/b.css?v={{ .app_version }}">`
+		if strings.Contains(normalizeAssetActions(strings.ReplaceAll(contentIdentity, assetVersionAction, "")), "{{") {
+			t.Fatal("the content-derived action should be the other permitted action")
 		}
 		for _, other := range []string{
 			`<link href="/static/css/a.css?v={{ .other }}"><link href="/static/css/b.css">`,
 			`<link href="/static/css/a.css">{{ if .x }}<link href="/static/css/m.css">{{ end }}<link href="/static/css/b.css">`,
 		} {
-			if !strings.Contains(strings.ReplaceAll(other, assetVersionAction, ""), "{{") {
+			rejected := strings.ReplaceAll(other, assetVersionAction, "")
+			if !strings.Contains(normalizeAssetActions(rejected), "{{") {
 				t.Fatalf("a different action must still be rejected: %s", other)
 			}
 		}

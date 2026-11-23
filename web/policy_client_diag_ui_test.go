@@ -29,13 +29,12 @@ import (
 // helpers the page provides, so the fixture is the production markup.
 func clientDiagSectionHTMLForTest(t *testing.T) string {
 	t.Helper()
-	funcs := template.FuncMap{
+	funcs := withAssetURL(template.FuncMap{
 		"_": func(key string) string { return key },
 		"is_admin": func(any) bool {
 			return true
 		},
-		"asset_url": AssetURL,
-	}
+	})
 	tmpl, err := template.New("settings_policy_client.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy_client.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy_client.html: %v", err)

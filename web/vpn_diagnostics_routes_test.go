@@ -487,7 +487,7 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 	for _, expectedRussianHeader := range []string{
 		"Пользователь и устройство",
 		"Текущий трафик",
-		"Потеря пакетов",
+		"Сбросы dataplane",
 		"Диагностика подключений",
 		"Только с проблемами",
 	} {
@@ -721,11 +721,11 @@ w.eval(tablesCode);
             ]
         }
     });
-    const summaryHeader = w.document.getElementById('vpn-fwd-summary-header');
-    assert(summaryHeader, 'summary header must exist');
-    assert(summaryHeader.textContent.includes('2 client configs'), 'different connection_ids with common name default must count as 2 configs: ' + summaryHeader.textContent);
-    assert(summaryHeader.textContent.includes('2 affected users'), 'must count 2 affected users: ' + summaryHeader.textContent);
-    assert(summaryHeader.textContent.includes('2 active problems'), 'must count 2 active problems: ' + summaryHeader.textContent);
+    const summaryCounts = w.document.getElementById('vpn-fwd-problem-counts');
+    assert(summaryCounts, 'folded problem counts element must exist');
+    assert(summaryCounts.textContent.includes('2 client configs'), 'different connection_ids with common name default must count as 2 configs: ' + summaryCounts.textContent);
+    assert(summaryCounts.textContent.includes('2 affected users'), 'must count 2 affected users: ' + summaryCounts.textContent);
+    assert(summaryCounts.textContent.includes('2 active problems'), 'must count 2 active problems: ' + summaryCounts.textContent);
 
     console.log('PASS');
 })().catch(e => {

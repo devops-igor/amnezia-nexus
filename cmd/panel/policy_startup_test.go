@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -46,8 +47,7 @@ func newPolicyStartupFixture(t *testing.T) (*database.DB, *config.Config, policy
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://lists.example/policy.lst"}
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("fixture settings are invalid: %v", err)
 	}
@@ -57,6 +57,98 @@ func newPolicyStartupFixture(t *testing.T) (*database.DB, *config.Config, policy
 
 	cfg := &config.Config{DataDir: dir, VPNEnabled: true}
 	return db, cfg, settings
+}
+
+// TestStartupLoadsPredecessorRowAndKeepsItsIPv4Policy is the migration positive
+// control for the reader split.
+//
+// A row an earlier build wrote may hold domain lines beside prefixes, and it must
+// still load: refusing it would take the operator's working IPv4 policy down with an
+// inert entry, and could leave the panel unable to start. That leniency is now
+// confined to policy.DecodeStoredRecord, which is what this startup path calls, so
+// it is asserted here rather than inferred from the request path.
+//
+// The row is left byte-identical, and the decoded record still activates through the
+// real startup function: a forgiving load that published nothing would not be an
+// upgrade, only a different failure.
+func TestStartupLoadsPredecessorRowAndKeepsItsIPv4Policy(t *testing.T) {
+	dir := t.TempDir()
+	db, err := database.New(filepath.Join(dir, "panel.db"), policyStartupTestSecret)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const predecessor = `{"enabled":true,"preset":"aggregate",` +
+		`"local_entries":["203.0.113.0/24","example.com"],"sync_interval_seconds":3600}`
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, json.RawMessage(predecessor)); err != nil {
+		t.Fatalf("seed the predecessor row: %v", err)
+	}
+
+	loaded, err := loadPolicySettings(context.Background(), db)
+	if err != nil {
+		t.Fatalf("a predecessor row must load; failing here is the F957-04 defect: %v", err)
+	}
+	if !loaded.Enabled {
+		t.Error("the stored enabled flag did not survive the load")
+	}
+	if len(loaded.ProxyExceptions) != 1 || loaded.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("loaded exceptions = %v, want only the usable IPv4 prefix", loaded.ProxyExceptions)
+	}
+
+	// Reading the row is not a migration of the row: the operator's stored bytes are
+	// untouched, so nothing was silently destroyed on the way in.
+	raw, found, err := db.GetSettingRaw(context.Background(), policy.SettingsKey)
+	if err != nil || !found || !raw.Valid {
+		t.Fatalf("re-read the raw row: found=%v err=%v", found, err)
+	}
+	if raw.String != predecessor {
+		t.Fatalf("the stored row changed during the load:\n got %s\nwant %s", raw.String, predecessor)
+	}
+
+	// The upgrade path completes: the prefix this build kept still activates.
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+
+	syncCfg, err := loaded.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	store := policy.NewFileStore(filepath.Join(dir, "policy"))
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	prefixes := make([]string, 0, len(syncCfg.LocalRules.CIDRs))
+	for _, prefix := range syncCfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-predecessor-row",
+		Version:       1,
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed the policy snapshot: %v", err)
+	}
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	cfg := &config.Config{DataDir: dir, VPNEnabled: true}
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatalf("policy routing did not activate from the predecessor row's surviving prefix; status=%+v",
+			vpnSvc.PolicyStatusSnapshot())
+	}
 }
 
 // TestPersistedPolicyActivationFailureKeepsPanelUp is the P2-B regression: an
@@ -72,8 +164,8 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	}
 	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
 
-	// No last-known-good generation is seeded and the source cannot be reached, so
-	// activation is refused by the existing guards. Nothing is weakened for this.
+	// No last-known-good generation is seeded, so activation has nothing to publish
+	// and is refused by the existing guards. Nothing is weakened for this.
 	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
 		t.Fatalf("startup refused to continue after a policy activation failure, so the panel would exit (P2-B): %v", err)
 	}
@@ -92,8 +184,8 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
 		t.Fatalf("re-read the persisted policy record: %v", err)
 	}
-	if !stored.Enabled || stored.Preset != settings.Preset ||
-		len(stored.CustomURLs) != len(settings.CustomURLs) || stored.CustomURLs[0] != settings.CustomURLs[0] {
+	if !stored.Enabled || len(stored.ProxyExceptions) != len(settings.ProxyExceptions) ||
+		stored.ProxyExceptions[0] != settings.ProxyExceptions[0] {
 		t.Fatalf("the persisted record changed during a refused activation: %+v", stored)
 	}
 
@@ -105,8 +197,15 @@ func TestPersistedPolicyActivationFailureKeepsPanelUp(t *testing.T) {
 	if status.LastError == "" {
 		t.Fatal("status carries no reason after a refused startup activation, so the operator cannot diagnose it (P2-B)")
 	}
-	if !strings.Contains(status.LastError, "policy routing") || !strings.Contains(status.LastError, "activation") {
+	// The reason must name the activation and carry the producer's own detail, so
+	// the operator can act on it. Which prerequisite refused depends on the host, so
+	// the assertion is on the framing plus a non-empty cause rather than on one
+	// kernel message.
+	if !strings.Contains(status.LastError, "persisted policy routing could not be activated") {
 		t.Fatalf("status reason does not name the failed policy activation: %q", status.LastError)
+	}
+	if !strings.Contains(status.LastError, "activate policy routing") {
+		t.Fatalf("status reason does not carry the activation cause: %q", status.LastError)
 	}
 	if status.SyncState != "error" {
 		t.Fatalf("status sync_state = %q, want \"error\" for a refused activation", status.SyncState)
@@ -138,22 +237,21 @@ func TestPersistedPolicyActivationRecoversAfterRepair(t *testing.T) {
 		t.Fatalf("SyncConfig: %v", err)
 	}
 	store := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
-	probe, err := policy.NewSyncer(policy.NewMatcher(), nil, store, syncCfg)
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	meta := make(map[string]policy.SourceMeta, len(syncCfg.Sources))
-	for _, src := range syncCfg.Sources {
-		meta[src.ID] = policy.SourceMeta{ID: src.ID, URL: src.URL, RuleCount: 1}
+	prefixes := make([]string, 0, len(syncCfg.LocalRules.CIDRs))
+	for _, prefix := range syncCfg.LocalRules.CIDRs {
+		prefixes = append(prefixes, prefix.String())
 	}
 	gen := &policy.Generation{
 		SchemaVersion: policy.SchemaVersion,
 		GenerationID:  "gen-startup-repair",
 		Version:       1,
 		ConfigHash:    probe.ConfigHash(),
-		SourcesMeta:   meta,
-		Domains:       map[string]uint32{"seed.example.com": 1},
-		DomainCount:   1,
+		CIDRs:         prefixes,
+		CIDRCount:     len(prefixes),
 	}
 	if err := store.Commit(context.Background(), gen); err != nil {
 		t.Fatalf("seed the repaired policy snapshot: %v", err)
@@ -178,5 +276,143 @@ func TestPersistedPolicyActivationRecoversAfterRepair(t *testing.T) {
 	// which the status reports honestly.
 	if strings.Contains(status.LastError, "persisted policy routing could not be activated") {
 		t.Fatalf("the refused-activation reason is still advertised after a successful activation: %q", status.LastError)
+	}
+}
+
+// TestStartupActivatesEmptyExceptionList is the owner's upgrade scenario: an
+// installation that relied on the router's classifier rather than on any PROXY
+// exception restarts with an empty list.
+//
+// Zero exceptions is a valid configuration — the destination classifier is the
+// routing authority and the exception list is an optional override — so startup
+// must activate policy routing rather than refuse it, and the published snapshot
+// must hold no rule the operator did not supply.
+func TestStartupActivatesEmptyExceptionList(t *testing.T) {
+	db, cfg, _ := newPolicyStartupFixture(t)
+
+	// The persisted record an upgraded installation has: enabled, zero exceptions.
+	empty := policy.DefaultSettings()
+	empty.Enabled = true
+	empty.ProxyExceptions = nil
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("a zero-exception record must be valid: %v", err)
+	}
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, empty); err != nil {
+		t.Fatalf("persist the empty-exception record: %v", err)
+	}
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		// A refused activation is deliberately not a startup error, so any returned
+		// error here is a real failure of the startup path.
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatal("policy routing is off after restarting with zero exceptions; the classifier is the " +
+			"routing authority, so an empty override list must activate")
+	}
+	if vpnSvc.DestinationClassifierForTest() == nil {
+		t.Fatal("no destination classifier installed, so nothing would classify a destination")
+	}
+	matcher := vpnSvc.PolicyMatcher()
+	if matcher == nil {
+		t.Fatal("no policy matcher installed after activation")
+	}
+	snap := matcher.Current()
+	if snap == nil {
+		t.Fatal("no snapshot published after activation")
+	}
+	if got := snap.CIDRCount(); got != 0 {
+		t.Fatalf("published snapshot = %d rules, want 0: a restart must not invent a placeholder rule", got)
+	}
+	status := vpnSvc.PolicyStatusSnapshot()
+	if !status.Enabled || !status.Ready {
+		t.Fatalf("status does not report the activated policy routing: %+v", status)
+	}
+	if strings.Contains(status.LastError, "persisted policy routing could not be activated") {
+		t.Fatalf("startup recorded an activation failure for a valid zero-exception record: %q", status.LastError)
+	}
+}
+
+// TestStartupActivatesAfterClearingCommittedGeneration is the restart half of the
+// owner's upgrade scenario: an installation that cleared its final exception while
+// enabled has a durable generation with zero rules, and a restart must activate
+// from it.
+//
+// This is a distinct gate from the empty-record case above. Activation primes the
+// durable last-known-good generation into the matcher before the first sync, and a
+// zero-rule generation must be accepted as a valid baseline: it is the operator's
+// "no overrides" policy, not a corrupt record. Refusing it would make clearing the
+// list disable routing on the next restart.
+func TestStartupActivatesAfterClearingCommittedGeneration(t *testing.T) {
+	db, cfg, _ := newPolicyStartupFixture(t)
+
+	// The persisted record after the operator cleared the final exception.
+	empty := policy.DefaultSettings()
+	empty.Enabled = true
+	empty.ProxyExceptions = nil
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, empty); err != nil {
+		t.Fatalf("persist the cleared record: %v", err)
+	}
+
+	// The durable generation that the clearing save committed: a valid generation
+	// whose rule set is empty.
+	syncCfg, err := empty.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	if len(syncCfg.LocalRules.CIDRs) != 0 {
+		t.Fatalf("fixture derived %d rules, want 0", len(syncCfg.LocalRules.CIDRs))
+	}
+	store := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-cleared",
+		Version:       1,
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         nil,
+		CIDRCount:     0,
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("commit the cleared generation: %v", err)
+	}
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatal("policy routing is off after restarting from a cleared generation; clearing the final " +
+			"exception must not disable routing")
+	}
+	matcher := vpnSvc.PolicyMatcher()
+	if matcher == nil || matcher.Current() == nil {
+		t.Fatal("no snapshot published after activation")
+	}
+	if got := matcher.Current().CIDRCount(); got != 0 {
+		t.Fatalf("published snapshot = %d rules, want 0", got)
+	}
+	if vpnSvc.DestinationClassifierForTest() == nil {
+		t.Fatal("no destination classifier installed, so nothing would classify a destination")
 	}
 }

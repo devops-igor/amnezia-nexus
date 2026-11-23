@@ -37,68 +37,11 @@
         </div>
 
         <fieldset class="form-group settings-fieldset">
-            <legend class="form-label settings-flush">{{ _ "policy_preset_label" }}</legend>
-            <label data-policy-preset="aggregate" class="settings-choice">
-                <input type="radio" name="policy_preset" value="aggregate" id="policy_preset_aggregate">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_aggregate" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_aggregate_hint" }}</span>
-                </span>
-            </label>
-            <label data-policy-preset="russia_inside" class="settings-choice">
-                <input type="radio" name="policy_preset" value="russia_inside" id="policy_preset_russia_inside">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_russia_inside" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_russia_inside_hint" }}</span>
-                </span>
-            </label>
-            <label data-policy-preset="geoblock" class="settings-choice">
-                <input type="radio" name="policy_preset" value="geoblock" id="policy_preset_geoblock">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_geoblock" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_geoblock_hint" }}</span>
-                </span>
-            </label>
-            <label data-policy-preset="antifilter_domains" class="settings-choice">
-                <input type="radio" name="policy_preset" value="antifilter_domains" id="policy_preset_antifilter_domains">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_antifilter_domains" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_antifilter_domains_hint" }}</span>
-                </span>
-            </label>
-            <label data-policy-preset="antifilter_ipv4" class="settings-choice">
-                <input type="radio" name="policy_preset" value="antifilter_ipv4" id="policy_preset_antifilter_ipv4">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_antifilter_ipv4" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_antifilter_ipv4_hint" }}</span>
-                </span>
-            </label>
-            <label data-policy-preset="custom" class="settings-choice">
-                <input type="radio" name="policy_preset" value="custom" id="policy_preset_custom">
-                <span>
-                    <span class="settings-choice-title">{{ _ "policy_preset_custom" }}</span>
-                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_custom_hint" }}</span>
-                </span>
-            </label>
-            <p class="form-hint">{{ _ "policy_preset_unavailable_note" }}</p>
+            <legend class="form-label settings-flush">{{ _ "policy_proxy_exceptions_label" }}</legend>
+            <textarea class="form-input font-mono" id="policy_proxy_exceptions" name="policy_proxy_exceptions" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_proxy_exceptions_placeholder" }}" aria-describedby="policyProxyExceptionsHint"></textarea>
+            <p class="form-hint" id="policyProxyExceptionsHint">{{ _ "policy_proxy_exceptions_hint" }}</p>
+            <p class="form-hint" id="policyLegacyNotice" data-legacy-notice></p>
         </fieldset>
-
-        <div class="form-group" id="policyCustomUrlsGroup" hidden>
-            <label class="form-label" for="policy_custom_urls">{{ _ "policy_custom_urls_label" }}</label>
-            <textarea class="form-input font-mono" id="policy_custom_urls" name="policy_custom_urls" rows="3" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_custom_urls_placeholder" }}"></textarea>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label" for="policy_local_entries">{{ _ "policy_local_entries_label" }}</label>
-            <textarea class="form-input font-mono" id="policy_local_entries" name="policy_local_entries" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_local_entries_placeholder" }}"></textarea>
-            <p class="form-hint">{{ _ "policy_local_entries_hint" }}</p>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label" for="policy_excluded_domains">{{ _ "policy_excluded_domains_label" }}</label>
-            <textarea class="form-input font-mono" id="policy_excluded_domains" name="policy_excluded_domains" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_excluded_domains_placeholder" }}"></textarea>
-            <p class="form-hint">{{ _ "policy_excluded_domains_hint" }}</p>
-        </div>
 
         <div class="form-group">
             <label class="form-label" for="policy_inventory_override">{{ _ "policy_inventory_override_label" }}</label>
@@ -128,10 +71,6 @@
     <div class="divider">{{ _ "policy_status_title" }}</div>
 
     <div class="info-card-grid">
-        <div class="info-card-item">
-            <span class="info-card-label">{{ _ "policy_status_preset" }}</span>
-            <span class="info-card-value" id="policyActivePreset">-</span>
-        </div>
         <div class="info-card-item">
             <span class="info-card-label">{{ _ "policy_status_last_success" }}</span>
             <span class="info-card-value" id="policyLastSuccess">-</span>
@@ -189,11 +128,6 @@
     <p class="form-hint" id="policyCdnNotice"></p>
 
     <div class="form-group mt-md">
-        <span class="form-label">{{ _ "policy_sources_title" }}</span>
-        <div id="policySourceStats" class="settings-source-stats"><span class="text-muted">{{ _ "loading" }}</span></div>
-    </div>
-
-    <div class="form-group mt-md">
         <span class="form-label">{{ _ "policy_status_last_error" }}</span>
         <span class="form-hint" id="policyLastError">-</span>
     </div>
@@ -221,6 +155,6 @@
 
     <input type="hidden" id="policy_sync_interval" value="">
 </div>
-<script src="/static/js/policy_routing.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/policy_routing.js" }}"></script>
 {{ end }}
 {{ end }}

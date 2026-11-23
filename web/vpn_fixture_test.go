@@ -172,6 +172,10 @@ type VPNTestFixture struct {
 	PageJS           string
 	ParsedDOM        *xhtml.Node
 	MockFetches      map[string]string
+	// TablesJS is the real NexusTable controller, loaded only when a harness asks
+	// for it. It must be read separately because the fixture's own script list is
+	// the six VPN modules and tables.js ships in base.html's head.
+	TablesJS string
 }
 
 // JSDOMHarnessOptions configures a JSDOM evaluation harness.
@@ -181,7 +185,13 @@ type JSDOMHarnessOptions struct {
 	Direction        string
 	IncludeFakeClock bool
 	IncludeFetchMock bool
-	ExtraJS          string
+	// IncludeNexusTable installs the real tables.js before the companion modules,
+	// the position base.html gives it. Without it no NexusTable exists, so no row
+	// is ever hidden by a search term, a status filter or pagination: a test of a
+	// reveal that then asserted focus on a "visible" row would be asserting
+	// against a table that never hid anything.
+	IncludeNexusTable bool
+	ExtraJS           string
 }
 
 // NewVPNTestFixture initializes a VPN test fixture with loaded templates, styles, and parsed DOM.
@@ -280,6 +290,15 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	}
 	pageJS := string(pageBytes)
 
+	tablesBytes, err := readFixtureStaticAsset(staticFS, "static/js/tables.js")
+	if err != nil {
+		t.Fatalf("failed to read static tables asset %s: %v", "static/js/tables.js", err)
+	}
+	if len(strings.TrimSpace(string(tablesBytes))) == 0 {
+		t.Fatalf("failed to read static tables asset %s: %v", "static/js/tables.js", errors.New("empty content"))
+	}
+	tablesJS := string(tablesBytes)
+
 	return &VPNTestFixture{
 		t:                t,
 		NodePath:         nodePath,
@@ -291,6 +310,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 		ChartsJS:         chartsJS,
 		BackendsJS:       backendsJS,
 		PageJS:           pageJS,
+		TablesJS:         tablesJS,
 		ParsedDOM:        doc,
 		MockFetches:      make(map[string]string),
 	}
@@ -383,6 +403,18 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if htmlBody == "" {
 		htmlBody = f.TemplateHTML
 	}
+	tablesScript := ""
+	if opts.IncludeNexusTable {
+		if len(strings.TrimSpace(f.TablesJS)) == 0 {
+			f.t.Fatalf("failed to read static tables asset %s: %v", "js/tables.js", errors.New("empty content"))
+		}
+		// tables.js is a UMD module: under CommonJS it assigns module.exports and
+		// never touches the global object. In a script tag the module system is
+		// absent, so it takes the `root.NexusTable = NexusTable` branch. The tag is
+		// emitted literally instead of as an addScript argument so the wrapped
+		// global assignment below is not needed to fake that branch.
+		tablesScript = f.TablesJS
+	}
 	var b strings.Builder
 	b.WriteString(jsdomBootstrapSnippet + "\n")
 	if opts.IncludeFakeClock {
@@ -449,6 +481,7 @@ addScript(%q);
 addScript(%q);
 addScript(%q);
 addScript(%q);
+addScript(%q);
 ['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
     Object.defineProperty(w, prop, {
         get() { return w.eval(prop); },
@@ -456,7 +489,7 @@ addScript(%q);
         configurable: true
     });
 });
-`, docHTML, f.TranslationsJS(lang), f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
+`, docHTML, f.TranslationsJS(lang), tablesScript, f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -711,14 +744,14 @@ func vpnDiagnosticsTranslationsJS(t *testing.T, lang string) string {
 
 func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]string) string {
 	t.Helper()
-	parsed, err := template.New("vpn.html").Funcs(template.FuncMap{
+	parsed, err := template.New("vpn.html").Funcs(withAssetURL(template.FuncMap{
 		"_": func(key string) string {
 			if value, ok := dict[key]; ok {
 				return value
 			}
 			return key
 		},
-	}).Parse(source)
+	})).Parse(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,45 +763,115 @@ func vpnDiagnosticsRenderedHTML(t *testing.T, source string, dict map[string]str
 }
 
 func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
+	// Every relocated diagnostic value must keep its localized label, now as a
+	// <dt>/<dd> pair inside Advanced Diagnostics rather than a dense panel row.
 	fields := map[string]string{
-		"vpn-diag-throughput":     "vpn_fwd_kpi_throughput",
-		"vpn-diag-ewma5m":         "vpn_diag_avg_5m",
-		"vpn-diag-ewma1h":         "vpn_diag_avg_1h",
-		"vpn-diag-queue-occ":      "vpn_diag_occupancy",
-		"vpn-diag-queue-peak":     "vpn_forwarder_peak",
-		"vpn-diag-lat-max":        "vpn_diag_max_duration",
-		"vpn-diag-drops-client":   "vpn_diag_drops_outbound",
-		"vpn-diag-drops-return":   "vpn_diag_drops_inbound",
-		"vpn-diag-drops-total":    "vpn_diag_total_drop_rate",
-		"vpn-diag-engine-status":  "vpn_diag_engine",
-		"vpn-diag-hs-freshness":   "vpn_diag_handshake_freshness",
-		"vpn-diag-routing-counts": "vpn_diag_route_integrity",
-		"vpn-diag-res-cpu":        "vpn_diag_cpu_usage",
-		"vpn-diag-res-mem":        "vpn_diag_memory",
-		"vpn-diag-res-fd":         "vpn_diag_file_descriptors",
+		"vpn-diag-ewma5m":          "vpn_diag_avg_5m",
+		"vpn-diag-ewma1h":          "vpn_diag_avg_1h",
+		"vpn-diag-queue-occ":       "vpn_forwarder_queue",
+		"vpn-diag-queue-peak":      "vpn_forwarder_peak",
+		"vpn-diag-drops-client":    "vpn_diag_drops_outbound",
+		"vpn-diag-drops-return":    "vpn_diag_drops_inbound",
+		"vpn-diag-drops-total":     "vpn_diag_total_drop_rate",
+		"vpn-diag-engine-status":   "vpn_diag_engine",
+		"vpn-diag-hs-freshness":    "vpn_diag_handshake_freshness",
+		"vpn-diag-routing-counts":  "vpn_diag_route_integrity",
+		"vpn-diag-res-cpu":         "vpn_diag_cpu_usage",
+		"vpn-diag-res-mem":         "vpn_diag_memory",
+		"vpn-diag-res-fd":          "vpn_diag_file_descriptors",
+		"vpn-diag-lat-percentiles": "vpn_diag_forward_p95_recent",
+		// The four aggregate rows restored in round 3 must carry localized labels
+		// too, so a hardcoded English heading fails here in every non-English locale.
+		"vpn-diag-packet-rate":        "vpn_diag_packet_rate",
+		"vpn-diag-lat-max":            "vpn_diag_max_duration",
+		"vpn-diag-queue-dwell":        "vpn_diag_queue_above_50",
+		"vpn-diag-write-stalls-total": "vpn_diag_write_stalls_cumulative",
 	}
 	labels := make(map[string]string)
-	fieldPattern := regexp.MustCompile(`<div class="flex justify-between"><span class="text-muted">([^<]+)</span><span class="font-mono" id="([^"]+)"`)
+	fieldPattern := regexp.MustCompile(`<dt>([^<]+)</dt><dd[^>]*id="([^"]+)"`)
 	for _, match := range fieldPattern.FindAllStringSubmatch(rendered, -1) {
 		labels[match[2]] = html.UnescapeString(match[1])
 	}
+	// The throughput row labels itself by composing two existing members rather
+	// than a dedicated row key. Asserted as the composition, not the single key:
+	// the current / cumulative distinction has to stay explicit in every locale.
+	wantThroughputLabel := dict["vpn_fwd_kpi_throughput"] + " (" + dict["vpn_fwd_horizon_current"] + ")"
+	if labels["vpn-diag-throughput"] != wantThroughputLabel {
+		return fmt.Errorf("static label vpn-diag-throughput: got %q, want %q",
+			labels["vpn-diag-throughput"], wantThroughputLabel)
+	}
 	for id, key := range fields {
-		if labels[id] != dict[key]+":" {
-			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key]+":")
+		if labels[id] != dict[key] {
+			return fmt.Errorf("static label %s: got %q, want %q", id, labels[id], dict[key])
 		}
 	}
-	for id, key := range map[string]string{
-		"throughput": "vpn_fwd_kpi_throughput", "queue": "vpn_diag_queue_utilization",
-		"drops": "vpn_diag_drop_rate", "latency": "vpn_diag_latency_p95",
+
+	// Every chart caption must be localized, bound to ITS chart. A caption replaced
+	// by hardcoded English has to fail here; asserting only that the four signals are
+	// localized let that regression through.
+	captions := map[string]string{
+		"throughput": "vpn_fwd_kpi_throughput",
+		"drops":      "vpn_diag_drop_rate",
+		"latency":    "vpn_diag_latency_p95",
+		"queue":      "vpn_diag_queue_utilization",
+	}
+	captionPattern := regexp.MustCompile(`<figcaption class="vpn-chart-caption">\s*<span>([^<]+)</span>\s*<span id="vpn-chart-([a-z]+)-badges"`)
+	seenCaptions := make(map[string]bool)
+	for _, match := range captionPattern.FindAllStringSubmatch(rendered, -1) {
+		caption, chart := html.UnescapeString(match[1]), match[2]
+		key, ok := captions[chart]
+		if !ok {
+			return fmt.Errorf("unexpected chart caption for %s: %q", chart, caption)
+		}
+		if caption != dict[key] {
+			return fmt.Errorf("chart caption %s: got %q, want %q", chart, caption, dict[key])
+		}
+		seenCaptions[chart] = true
+	}
+	for chart := range captions {
+		if !seenCaptions[chart] {
+			return fmt.Errorf("chart %s has no localized caption in the rendered template", chart)
+		}
+	}
+
+	// The four signals must carry localized titles, and the health summary keeps its
+	// live-region semantics.
+	for _, signal := range []struct{ class, key string }{
+		{"backends", "vpn_signal_backends"},
+		{"sessions", "vpn_diag_active_sessions"},
+		{"throughput", "vpn_fwd_kpi_throughput"},
+		{"drops", "vpn_col_packet_loss"},
 	} {
-		pattern := regexp.MustCompile(`<div style="font-size: 0.75rem; color: var\(--text-muted\);">([^<]+)</div>\s*<div id="vpn-chart-` + id + `-badges"`)
+		pattern := regexp.MustCompile(`data-signal="` + signal.class + `">\s*<div class="stat-card-header">\s*<span class="stat-card-title">([^<]+)</span>`)
 		match := pattern.FindStringSubmatch(rendered)
-		expected := dict[key]
-		if len(match) != 2 || html.UnescapeString(match[1]) != expected {
-			return fmt.Errorf("static chart %s is not localized", id)
+		if len(match) != 2 || html.UnescapeString(match[1]) != dict[signal.key] {
+			return fmt.Errorf("signal %s title is not localized", signal.class)
 		}
 	}
-	if !strings.Contains(rendered, "<details><summary>"+html.EscapeString(dict["vpn_diag_loss_backend_history"])+"</summary>") {
+
+	// The health summary must live inside the polite atomic live region, and that
+	// region must also contain the problem announcement. Asserting the semantic
+	// containment rather than one exact attribute string keeps this true when the
+	// region's wrapper changes.
+	liveRegion := regexp.MustCompile(`<div class="vpn-health-live" id="vpn-fwd-health-live" role="status" aria-atomic="true">([\s\S]*?)</div>`)
+	live := liveRegion.FindStringSubmatch(rendered)
+	if len(live) != 2 {
+		return errors.New("the health block must expose one polite atomic live region")
+	}
+	if !strings.Contains(live[1], `id="vpn-fwd-headline-summary"`) {
+		return errors.New("the health summary must be inside the live region")
+	}
+	if !strings.Contains(live[1], `id="vpn-fwd-problem-announcement"`) {
+		return errors.New("the problem announcement must be inside the live region")
+	}
+	if !strings.Contains(rendered, `id="vpn-advanced-entry"`) {
+		return errors.New("Advanced Diagnostics entry is missing")
+	}
+	if !strings.Contains(rendered, html.EscapeString(dict["vpn_diagnostics_traffic"])) {
+		return errors.New("traffic section heading is not localized")
+	}
+	if !strings.Contains(rendered, "<summary>\n                <span>"+html.EscapeString(dict["vpn_diag_loss_backend_history"])) &&
+		!strings.Contains(rendered, html.EscapeString(dict["vpn_diag_loss_backend_history"])) {
 		return errors.New("history details heading is not localized")
 	}
 	return nil

@@ -49,22 +49,22 @@ const fixture={forwarder_available:true,forwarder_queue_capacity:100,listener_ru
  historical_series:{window_15m:[point]},peer_sync:{desired_peers:1,actual_peers:1,sync_failures:3,sync_failures_recent:2}};
 const original=JSON.stringify(fixture);
 vpnRenderForwarderHealth(fixture);
-assert.strictEqual(text('vpn-kpi-throughput'),E('vpn_diag_traffic_unavailable'),'traffic state');
-assert.strictEqual(text('vpn-diag-throughput'),E('vpn_diag_traffic_unavailable'));
-assert.strictEqual(text('vpn-kpi-packet-loss'),E('vpn_diag_with_cumulative',{value:E('vpn_diag_loss_unavailable'),count:12}),'unknown loss');
-assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_running')}),'engine running');
+assert.strictEqual(text('vpn-signal-throughput-value'),E('vpn_diag_not_measured'),'unmeasured throughput is localized text');
+assert.strictEqual(text('vpn-diag-throughput'),E('vpn_diag_traffic_unavailable'),'traffic state');
+assert.strictEqual(text('vpn-signal-drops-value'),E('vpn_diag_not_measured'),'unmeasured drop rate is localized text');
+assert(text('vpn-diag-engine-status').includes(E('vpn_diag_state_active')),'engine state is localized');
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (' + E('vpn_diag_state_active') + ') • VirtualTUN: ' + E('vpn_fwd_healthy'));
 assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_inconsistent'),'routing state');
 assert.strictEqual(text('vpn-diag-routing-alerts'),'Server detail','server detail unchanged');
 assert(text('vpn-diag-routing-counts').includes(E('vpn_diag_mismatch_drops',{count:4})));
-assert.strictEqual(text('vpn-kpi-backends'),E('vpn_diag_healthy_count',{healthy:1,enabled:2})+E('vpn_diag_disabled_count',{count:1}));
+assert.strictEqual(text('vpn-signal-backends-value').replace(/\s+/g,' ').trim(),'1 / 2','healthy-of-enabled survives localization');
+assert.strictEqual(text('vpn-signal-backends-sub'),E('vpn_signal_backends_enabled'));
 const backendRows=document.getElementById('vpn-diag-be-traffic').children;
 assert(backendRows[0].textContent.includes('Server < & "quote"> (' + E('vpn_diag_loss_unavailable') + ')') && backendRows[0].innerHTML==='','backend name uses text');
 assert(!backendRows[0].textContent.includes('Server Disabled'),'disabled backend is excluded');
-assert.strictEqual(text('vpn-kpi-slow-writes'),E('vpn_diag_slow_writes',{count:2,latency:E('vpn_diag_latency_unavailable')}));
-assert.strictEqual(document.getElementById('vpn-kpi-slow-writes').title,E('vpn_diag_slow_writes_title',{count:8,latency:'2.5'}));
-assert.strictEqual(text('vpn-diag-lat-percentiles'),E('vpn_diag_historical_percentiles',{p50:'1.5',p95:'2.5',p99:'3.5'}),'percentile interpolation');
-assert.strictEqual(text('vpn-diag-lat-max'),E('vpn_diag_historical_ms',{value:7}));
+// The visible percentile is the recent forward-write reservoir, gated on its own
+// sample count; the fixture carries p95_health_samples:0, so it is NOT measured.
+assert.strictEqual(text('vpn-diag-lat-percentiles'),E('vpn_diag_not_measured'),'unsampled percentile is not measured');
 function seriesLabel(id,label) {
  return document.getElementById(id).children.some(child=>child.textContent===label+' ('+vpnHistoryWindow+')');
 }
@@ -79,15 +79,22 @@ for (const [status,key,css] of [['HEALTHY','vpn_forwarder_healthy','badge-succes
  vpnRenderForwarderHealth(fixture);
  assert.strictEqual(text('vpn-fwd-status-text'),E(key),'authoritative severity '+status);
  assert(document.getElementById('vpn-fwd-status-badge').className.includes(css));
- const condition=document.getElementById('vpn-fwd-problem-list').children[0];
- assert.strictEqual(condition.children[0].textContent,E(key),'condition severity '+status);
- assert.strictEqual(condition.children[1].textContent,'Server condition < & >','server condition unchanged');
+ // HEALTHY carries no problem row at all; DEGRADED/CRITICAL must surface one.
+ const problemRows=document.getElementById('vpn-fwd-problem-list').children;
+ if (status === 'HEALTHY') {
+  assert.strictEqual(problemRows.length,0,'healthy renders no problem row');
+  assert.strictEqual(document.getElementById('vpn-fwd-problem-list').hidden,true);
+ } else {
+  const condition=problemRows[0];
+  assert(condition.textContent.includes(E(key)),'condition severity '+status);
+  assert(condition.textContent.includes('Server condition < & >'),'server condition unchanged');
+ }
  assert.strictEqual(fixture.health_assessment.status,status,'wire severity unchanged');
 }
 fixture.listener_running=false;fixture.routing_consistency.is_consistent=true;
 fixture.health_assessment={status:'HEALTHY',conditions:[]};
 vpnRenderForwarderHealth(fixture);
-assert.strictEqual(text('vpn-kpi-client-engine'),E('vpn_diag_engine_state',{state:E('vpn_stopped')}));
+assert(text('vpn-diag-engine-status').includes(E('vpn_diag_state_stopped')),'engine stopped state is localized');
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (' + E('vpn_diag_state_stopped') + ') • VirtualTUN: ' + E('vpn_fwd_healthy'));
 assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_consistent'));
 assert.strictEqual(text('vpn-fwd-headline-summary'),E('vpn_diag_summary_healthy'),'fallback summary');
@@ -107,7 +114,7 @@ vpnRenderForwarderHealth({forwarder_available:false});
 assert.strictEqual(vpnLastStatus,null);
 vpnToggleShowAllRoutes();vpnSetHistoryWindow('1h');
 assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_unavailable'),'unavailable remains localized');
-assert.strictEqual(text('vpn-kpi-throughput'),'-','no stale throughput');
+assert.strictEqual(text('vpn-signal-throughput-value'),E('vpn_diag_not_measured'),'no stale throughput');
 assert.strictEqual(document.getElementById('vpn-chart-reasons').children.length,0);
 fixture.rates={available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0};
 fixture.drop_categories={rates_available:true,total_drops:12,total_drop_rate_pps:0};
@@ -116,8 +123,9 @@ fixture.problem_routes[0].p95_write_samples=1;fixture.problem_routes[0].last_tra
 fixture.health_assessment={status:'HEALTHY',conditions:[]};
 vpnRenderForwarderHealth(fixture);
 assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_healthy'),'recovered localized healthy');
-assert.strictEqual(text('vpn-kpi-throughput'),'0 bps / 0.0 pps','measured zero differs from unknown');
-assert.strictEqual(text('vpn-kpi-packet-loss'),E('vpn_diag_with_cumulative',{value:'0.00 pps',count:12}));
+assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g,' ').trim(),'0 bps','measured zero differs from unknown');
+assert.strictEqual(text('vpn-signal-drops-value').replace(/\s+/g,' ').trim(),'0.00 drops/s','sampled zero drop rate stays numeric');
+assert(text('vpn-signal-drops-sub').includes('12'),'the cumulative count is reported separately');
 
 translations.no_data='<img src=x onerror=alert(1)> & "translated"';
 const emptySVG=vpnGenerateSparklineSVG([]);
@@ -214,12 +222,29 @@ func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
 			t.Fatalf("hardcoded static label escaped the rendered oracle: %v", err)
 		}
 	})
+	t.Run("HardcodedChartCaption", func(t *testing.T) {
+		// The shipped latency chart caption is a template translation call; replacing
+		// it with English must fail the oracle in every non-English dictionary.
+		before := `{{ _ "vpn_diag_latency_p95" }}`
+		if !strings.Contains(tmplHTML, before) {
+			t.Fatal("chart caption mutation target missing")
+		}
+		mutated := strings.Replace(tmplHTML, before, "Latency p95 (ms)", 1)
+		err := vpnDiagnosticsStaticOracle(vpnDiagnosticsRenderedHTML(t, mutated, dict), dict)
+		if err == nil || !strings.Contains(err.Error(), "chart caption latency") {
+			t.Fatalf("hardcoded chart caption escaped the rendered oracle: %v", err)
+		}
+	})
 	nodePath := fixture.RequireNode()
 	for _, mutation := range []struct{ name, before, after, failure string }{
-		{"HardcodedTrafficState", "rates.available !== true ? _('vpn_diag_traffic_unavailable')", "rates.available !== true ? 'Traffic unavailable'", "traffic state"},
-		{"WrongAuthoritativeSeverity", "statusText.textContent = _('vpn_forwarder_degraded');", "statusText.textContent = _('vpn_forwarder_warning');", "authoritative severity DEGRADED"},
+		// A hardcoded English rate state must fail the localized oracle.
+		{"HardcodedTrafficState", "dThroughput.textContent = r.available !== true ? _('vpn_diag_traffic_unavailable') :", "dThroughput.textContent = r.available !== true ? 'Traffic unavailable' :", "traffic state"},
+		// The authoritative DEGRADED label must not be replaced by another locale key.
+		{"WrongAuthoritativeSeverity", "label = _('vpn_forwarder_degraded');", "label = _('vpn_forwarder_warning');", "authoritative severity DEGRADED"},
 		{"HardcodedHistoryLabel", "_(lossLabels[key])", "'return queue full'", "known loss label"},
-		{"BrokenPercentileInterpolation", `/\{([a-z0-9_]+)\}/g`, `/\{([a-z_]+)\}/g`, "percentile interpolation"},
+		// A not-measured percentile must never become a numeric zero: mutating the
+		// sample gate to a truthy write_total check must fail the oracle.
+		{"PercentileGateAcceptsNoSamples", "if (samples > 0 && Number.isFinite(p95)) {", "if (fl.write_total > 0 && Number.isFinite(p95) || true) {", "unsampled percentile is not measured"},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
 			if !strings.Contains(companionScripts, mutation.before) {
@@ -459,17 +484,23 @@ const condition = {
 };
 render([condition]);
 const row = document.getElementById('vpn-fwd-problem-list').children[0];
-assert.strictEqual(row.children[0].textContent, _('vpn_forwarder_degraded'), 'condition severity badge');
-assert.strictEqual(row.children[1].textContent, _(CONDITION_KEY),
+// The row nests severity, title and entity inside the copy block; assert the
+// rendered text rather than a brittle child index.
+// Row shape: [copy{severity, title, entity}] [action]. The DOM mock has no
+// querySelector, so address the title by its structural position.
+const rowTitle = () => row.children[0].children[1].textContent;
+assert(row.textContent.includes(_('vpn_forwarder_degraded')), 'condition severity label');
+assert.strictEqual(rowTitle(), _(CONDITION_KEY),
 	'condition text must come from the locale dictionary, not the serialized message');
-observed.push('severity_from_dict=' + (row.children[0].textContent === _('vpn_forwarder_degraded')),
-	'message_from_dict=' + (row.children[1].textContent === _(CONDITION_KEY)));
+observed.push('severity_from_dict=' + row.textContent.includes(_('vpn_forwarder_degraded')),
+	'message_from_dict=' + (rowTitle() === _(CONDITION_KEY)));
 // An unresolvable message_key falls back to the serialized message.
 render([{category: 'drops', severity: 'DEGRADED', message_key: 'vpn_diag_condition_future_key', message: 'Server fallback < & >'}]);
-observed.push('fallback=' + (document.getElementById('vpn-fwd-problem-list').children[0].children[1].textContent === 'Server fallback < & >'));
+const fallbackRow = document.getElementById('vpn-fwd-problem-list').children[0];
+observed.push('fallback=' + fallbackRow.textContent.includes('Server fallback < & >'));
 // A condition without message_key keeps the legacy rendering.
 render([{category: 'drops', severity: 'DEGRADED', message: 'Legacy server text'}]);
-observed.push('legacy=' + (document.getElementById('vpn-fwd-problem-list').children[0].children[1].textContent === 'Legacy server text'));
+observed.push('legacy=' + document.getElementById('vpn-fwd-problem-list').children[0].textContent.includes('Legacy server text'));
 console.log('RESULT ' + JSON.stringify(observed));
 `
 }

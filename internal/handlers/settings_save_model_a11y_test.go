@@ -139,14 +139,14 @@ const nodes = liveNodes('policyRoutingCard');
 const roles = () => [nodes.status.getAttribute('role'), nodes.error.getAttribute('role')];
 assert.deepEqual(roles(), ['status', 'alert']);
 
-type('policy_local_entries', 'corp.example');
+type('policy_proxy_exceptions', '203.0.113.0/24');
 card('policyRoutingCard').querySelector('[data-commit]').click();
 await until(() => nodes.status.textContent.trim() !== '', 'the policy success');
 assert.equal(nodes.error.textContent.trim(), '', 'a success must not write the alert region');
 assert.deepEqual(roles(), ['status', 'alert'], 'roles do not change with the outcome');
 
 policyDouble.refuse = true;
-type('policy_local_entries', 'other.example');
+type('policy_proxy_exceptions', '192.0.2.0/24');
 card('policyRoutingCard').querySelector('[data-commit]').click();
 await until(() => nodes.error.textContent.trim() !== '', 'the policy refusal');
 assert.equal(nodes.status.textContent.trim(), '', 'a refusal must clear the success region');
@@ -175,7 +175,7 @@ const edits = {
   telegramCard: () => type('telegram_chat_id', '-100busy'),
   gigahostCard: () => type('gigahost_api_key', 'flux_live_busy_key_0123456789'),
   notificationsCard: () => type('notifications_cooldown', '45'),
-  policyRoutingCard: () => type('policy_local_entries', 'busy.example')
+  policyRoutingCard: () => type('policy_proxy_exceptions', '203.0.113.0/24')
 };
 const holds = {
   default: u => String(u).indexOf('/api/settings/save') === 0,

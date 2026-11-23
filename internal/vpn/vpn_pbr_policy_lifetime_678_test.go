@@ -2,13 +2,9 @@ package vpn
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,46 +18,17 @@ import (
 // through the same decisive condition the counterexample used, but now asserts
 // the required behavior instead of the defect.
 //
-// Only two seams are substituted anywhere below: the WAN PacketDevice (a
-// single-owner name registry standing in for TUNSETIFF, so no /dev/net/tun is
-// needed) and, for the restart/fetch scenario, the fetcher's TLS-trust and
-// dial functions pointing at a local TLS fixture. Everything else — the shipped
-// middleware, the lifecycle mutexes, the real Syncer/Matcher/FileStore, the real
-// SQLite settings table and the real parser — is production code.
+// Only the WAN PacketDevice is substituted anywhere below: a single-owner name
+// registry stands in for TUNSETIFF, so no /dev/net/tun is needed. Everything else —
+// the shipped middleware, the lifecycle mutexes, the real Syncer/Matcher/FileStore,
+// the real SQLite settings table and the real parser — is production code.
 
-// auditedLKGStore writes a source-matching on-disk last-known-good generation so
-// activation can publish real rules without any network fetch, and so the
-// shrink-guard baseline is genuine rather than absent.
+// auditedLKGStore writes a configuration-matching on-disk last-known-good generation
+// so activation can publish real rules, and so the shrink-guard baseline is genuine
+// rather than absent.
 func auditedLKGStore(t *testing.T, settings policy.Settings) *policy.FileStore {
 	t.Helper()
-	cfg, err := settings.SyncConfig()
-	if err != nil {
-		t.Fatalf("SyncConfig: %v", err)
-	}
-	hash := sha256.New()
-	domains := make(map[string]uint32, 20)
-	meta := make(map[string]policy.SourceMeta, len(cfg.Sources))
-	for i := 0; i < 20; i++ {
-		domains[fmt.Sprintf("seeded%d.example.com", i)] = 1
-	}
-	for _, src := range cfg.Sources {
-		fmt.Fprintf(hash, "%s:%s:%d:%d:%v\n", src.ID, src.URL, src.Format, src.BareDomainMode, src.IsPreset)
-		meta[src.ID] = policy.SourceMeta{ID: src.ID, URL: src.URL, RuleCount: len(domains)}
-	}
-	gen := &policy.Generation{
-		SchemaVersion: policy.SchemaVersion,
-		GenerationID:  "gen-audit-seed",
-		Version:       1,
-		ConfigHash:    hex.EncodeToString(hash.Sum(nil)),
-		SourcesMeta:   meta,
-		Domains:       domains,
-		DomainCount:   len(domains),
-	}
-	store := policy.NewFileStore(t.TempDir())
-	if err := store.Commit(context.Background(), gen); err != nil {
-		t.Fatalf("seed last-known-good generation: %v", err)
-	}
-	return store
+	return lkgStoreFor(t, settings)
 }
 
 // TestSuccessfulActivationKeepsPolicySyncerAlive is the F678-01 regression.
@@ -80,14 +47,13 @@ func TestSuccessfulActivationKeepsPolicySyncerAlive(t *testing.T) {
 	reg := newNameRegistry()
 	withNameOwnedWANDevice(t, reg)
 	svc := serviceForActivation(t)
-	t.Cleanup(svc.StopPolicyRouting)
-
 	settings := repeatedEnableSettings(t)
 	store := auditedLKGStore(t, settings)
+	t.Cleanup(svc.StopPolicyRouting)
 
 	var activationErr error
 	wrapped := middleware.OperationTimeout(time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		activationErr = svc.StartPolicyRouting(r.Context(), settings, store, string(settings.Preset))
+		activationErr = svc.StartPolicyRouting(r.Context(), settings, store)
 		w.WriteHeader(http.StatusOK)
 	}))
 	wrapped.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPut, "/api/vpn/policy", nil))
@@ -105,32 +71,39 @@ func TestSuccessfulActivationKeepsPolicySyncerAlive(t *testing.T) {
 	// sets closed=true, after which every SyncPolicyNow call is refused forever.
 	// A regression can also show as a call that never gets served, because the
 	// request channel has no reader any more. Probing with a short per-call
-	// deadline detects both: a closed syncer is refused at once, a dead loop
-	// times out, and a live loop answers (here with the fixture's content
-	// failure, since the source is a deliberately unreachable .invalid host).
+	// deadline detects both: a closed syncer is refused at once, a dead loop times
+	// out, and a live loop serves the request and answers it.
 	deadline := time.Now().Add(5 * time.Second)
-	var observed error
+	var (
+		observed policy.SyncResult
+		liveErr  error
+		answered bool
+	)
 	for time.Now().Before(deadline) {
 		callCtx, callCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, observed = svc.SyncPolicyNow(callCtx)
+		observed, liveErr = svc.SyncPolicyNow(callCtx)
 		callCancel()
-		if errors.Is(observed, policy.ErrSyncerClosed) {
+		if errors.Is(liveErr, policy.ErrSyncerClosed) {
 			t.Fatalf("successful enable closed its policy syncer when the HTTP request returned (F678-01): SyncPolicyNow=%v while PBR reports enabled=%t; periodic refresh and manual sync are dead until a process restart",
-				observed, svc.PBREnabled())
+				liveErr, svc.PBREnabled())
 		}
-		if observed != nil && !errors.Is(observed, context.DeadlineExceeded) {
-			break // a real answer from the live syncer: stop probing
+		if !errors.Is(liveErr, context.DeadlineExceeded) {
+			answered = true
+			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if errors.Is(observed, context.DeadlineExceeded) {
+	if !answered {
 		t.Fatalf("on-demand sync after a successful enable never completed (F678-01): the scheduling loop is not serving requests any more")
 	}
-	if observed == nil {
-		t.Fatalf("fixture source unexpectedly synced; expected a content failure from the unreachable .invalid host")
+	// The loop answered. The record holds publishable rules and fetches nothing, so
+	// the answer must be a publication: any error here means the live runtime could
+	// not do its job after the enabling request returned.
+	if liveErr != nil {
+		t.Fatalf("on-demand sync on a live runtime failed: %v", liveErr)
 	}
-	if !strings.Contains(observed.Error(), "fetch") {
-		t.Fatalf("on-demand sync failed for an unexpected reason (not a source fetch): %v", observed)
+	if !observed.Published && observed.GenerationID == "" {
+		t.Fatalf("on-demand sync on a live runtime produced no generation: %+v", observed)
 	}
 	if got := svc.PolicyStatusSnapshot().SyncState; got == "disabled" {
 		t.Fatalf("policy status reports %q while PBR is enabled", got)
@@ -149,7 +122,7 @@ func TestExplicitDisableStillStopsPolicySyncer(t *testing.T) {
 	svc := serviceForActivation(t)
 
 	settings := repeatedEnableSettings(t)
-	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings), string(settings.Preset)); err != nil {
+	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings)); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
 	assertFullyEnabled(t, svc, reg)
@@ -174,7 +147,7 @@ func TestServiceStopStopsPolicySyncer(t *testing.T) {
 	svc := serviceForActivation(t)
 
 	settings := repeatedEnableSettings(t)
-	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings), string(settings.Preset)); err != nil {
+	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings)); err != nil {
 		t.Fatalf("activation failed: %v", err)
 	}
 	if svc.policyRuntime() == nil {

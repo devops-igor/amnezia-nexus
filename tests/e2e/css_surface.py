@@ -1,4 +1,4 @@
-"""Which CSS belongs to the new Settings surface, and how to set it aside.
+"""Which CSS belongs to a surface the frozen reference never had, and how to set it aside.
 
 Deliberately free of Playwright imports so the offline suite can import it.
 
@@ -6,18 +6,24 @@ The computed-style differential compares the modular sheets with the frozen
 pre-split reference (fixtures/style.pre-505.css). That reference has to stay
 byte-identical: a rule copied into it from the sheet under test reads the same
 on both sides, so a wrong value in that rule could never show up as a
-difference. The Settings layout classes did not exist when the reference was
-cut, so they are named here and set aside on the modular side only. Their
+difference. Classes that did not exist when the reference was cut are named here
+and set aside on the modular side only, so they are never compared with a copy
+of themselves. What replaces that comparison differs by surface: the Settings
 values are checked in tests/e2e/test_settings.py against expectations derived
-from the design tokens, not against a copy of themselves.
+from the design tokens, and the VPN health values in the web package's tests
+(reduced-motion, RTL logical properties, 44px targets, and a ban on new global
+VPN custom properties).
 """
 from __future__ import annotations
 
 import re
 
-# Every class the modular sheets define that the frozen reference does not.
-# tests/test_css_reference_frozen.py fails if this set and that difference ever
-# disagree, so the exemption cannot grow or shrink without a visible edit.
+# Every class the Settings surface adds beyond the frozen reference.
+# tests/test_css_reference_frozen.py fails if SURFACE_CLASSES and that difference
+# ever disagree, so the exemption cannot grow or shrink without a visible edit.
+# Kept separate from VPN_SURFACE_CLASSES because the Settings sheet is only
+# allowed to hold Settings-surface selectors (see surface_violations): a legacy
+# selector sharing a rule with a VPN class must still be rejected there.
 SETTINGS_SURFACE_CLASSES = frozenset({
     "mb-md", "mb-sm", "mt-sm", "spinner-sm",
     # The per-client flows table's cell disclosure: the row keeps four cells and
@@ -44,6 +50,47 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "upstream-component-sep", "upstream-component-title", "upstream-footer",
 })
 
+# Every class the VPN health surface adds beyond the frozen reference. The
+# reference predates the health panel, the four-signal overview, the Advanced
+# Diagnostics disclosure and the configuration strip, so their selectors are not
+# in it. Named here so the differential sets them aside by name instead of
+# comparing them against a copy of themselves.
+VPN_SURFACE_CLASSES = frozenset({
+    "vpn-alerts", "vpn-backend-select", "vpn-card-head",
+    "vpn-chart", "vpn-chart-axis", "vpn-chart-body", "vpn-chart-caption",
+    "vpn-chart-grid", "vpn-chart-tooltip", "vpn-chevron",
+    "vpn-config", "vpn-config-body", "vpn-config-field", "vpn-config-grow",
+    "vpn-config-label",
+    "vpn-diag-entry", "vpn-diag-fold", "vpn-diag-header", "vpn-diag-heading",
+    "vpn-diag-section", "vpn-diagnostics",
+    "vpn-empty",
+    # Focus and scroll targets the page moves to programmatically. The reference
+    # has no such rule, so nothing here could be a copy of it.
+    "vpn-focus-target", "vpn-region-target",
+    "vpn-fold-actions", "vpn-fold-label",
+    "vpn-health", "vpn-health-copy", "vpn-health-counts", "vpn-health-head",
+    "vpn-health-live", "vpn-health-main", "vpn-health-summary",
+    "vpn-health-title",
+    "vpn-io-down", "vpn-io-up",
+    "vpn-issue", "vpn-issue-action", "vpn-issue-copy", "vpn-issue-entity",
+    "vpn-issue-list", "vpn-issue-severity", "vpn-issue-title",
+    "vpn-metrics", "vpn-modal-footer", "vpn-modal-hint",
+    # Renders the literal words "not measured" where a signal could not be read,
+    # so an absent window cannot be mistaken for a zero.
+    "vpn-not-measured",
+    "vpn-numeric", "vpn-overview", "vpn-page-title",
+    "vpn-route-table-region", "vpn-secondary", "vpn-signal-mismatch",
+    "vpn-signal-unit", "vpn-subsection", "vpn-table-card", "vpn-table-loading",
+    # Accessible-name sink for the problem announcement.
+    "vpn-visually-hidden",
+    "vpn-windows",
+})
+
+# Every class newly introduced beyond the frozen reference, whichever sheet holds
+# it. tests/test_css_reference_frozen.py asserts this equals the real difference
+# between the modular sheets and the reference, so it cannot be padded.
+SURFACE_CLASSES = SETTINGS_SURFACE_CLASSES | VPN_SURFACE_CLASSES
+
 # Rules that pair a legacy class with a Settings card and exist only to size or
 # place controls inside it. Named exactly, so no other legacy rule is set aside by
 # accident. The last one takes an empty unsaved badge out of the layout without
@@ -64,7 +111,9 @@ SETTINGS_SCOPED_OVERRIDES = frozenset({
 })
 
 # The three spacing utilities the Settings templates use. They live in vpn.css,
-# next to the legacy utilities, so they are removed by exact selector.
+# next to the legacy utilities. Kept as exact selectors so a regression that
+# makes one of them unreachable is reported as a missing utility rather than
+# silently absorbed by the broader surface sweep.
 SETTINGS_UTILITY_SELECTORS = frozenset({".mt-sm", ".mb-sm", ".mb-md"})
 
 _COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
@@ -116,16 +165,42 @@ def surface_violations(settings_css: str) -> list[str]:
     return bad
 
 
-def _drop_utility_rules(css: str) -> tuple[str, int]:
-    removed = 0
+def _split_selectors(head: str) -> list[str]:
+    """The individual selectors of a rule head, with comments removed.
+
+    A comment between rules is part of the head `_RULE_RE` captures, and comment
+    prose can contain a comma. Splitting the raw head would then turn a sentence
+    into a "selector" and drop the real one, so the comments go first.
+    """
+    return [part.strip() for part in strip_comments(head).split(",") if part.strip()]
+
+
+def _drop_surface(css: str, surface: frozenset[str] | set[str]) -> tuple[str, list[str]]:
+    """Set aside every selector of css that uses a class from surface.
+
+    A selector list is rewritten rather than deleted when only some of its
+    branches are new: `td[data-backend-name]:focus-visible` shares a rule with
+    `.vpn-focus-target:focus-visible`, and dropping the whole rule would take a
+    legacy selector out of the comparison with it. A rule whose every branch is
+    new is removed entirely. Bytes outside a rewritten rule are untouched.
+    """
+    removed: list[str] = []
 
     def repl(match: re.Match) -> str:
-        nonlocal removed
-        head = " ".join(match.group(1).split())
-        if head in SETTINGS_UTILITY_SELECTORS:
-            removed += 1
+        head, body = match.group(1), match.group(2)
+        if " ".join(strip_comments(head).split()).startswith("@"):
+            return match.group(0)
+        selectors = _split_selectors(head)
+        if not selectors:
+            return match.group(0)
+        is_surface = [bool(set(_CLASS_RE.findall(s)) & surface) for s in selectors]
+        if not any(is_surface):
+            return match.group(0)
+        removed.extend(s for s, new in zip(selectors, is_surface) if new)
+        kept = [s for s, new in zip(selectors, is_surface) if not new]
+        if not kept:
             return ""
-        return match.group(0)
+        return ", ".join(kept) + " {" + body + "}"
 
     return _RULE_RE.sub(repl, css), removed
 
@@ -133,16 +208,42 @@ def _drop_utility_rules(css: str) -> tuple[str, int]:
 def legacy_view(sheets: dict[str, str]) -> dict[str, str]:
     """The modular sheets as the frozen reference can be compared with them.
 
-    Removes exactly the Settings surface: the whole settings sheet and the three
-    named utilities in vpn.css. Every other byte is untouched, so the comparison
+    Removes the surfaces the reference never had: the whole settings sheet, and
+    every selector in the remaining sheets that uses one of SURFACE_CLASSES. A
+    sheet with no such selector is returned byte-identical, so the comparison
     still covers every legacy selector, including how legacy rules interact with
-    the elements the Settings templates render.
+    the elements the new templates render.
     """
-    out = {name: css for name, css in sheets.items() if name != "settings"}
-    if "vpn" in out:
-        out["vpn"], removed = _drop_utility_rules(out["vpn"])
-        if removed != len(SETTINGS_UTILITY_SELECTORS):
-            raise AssertionError(
-                f"expected to set aside {len(SETTINGS_UTILITY_SELECTORS)} utility rules in vpn.css, found {removed}"
-            )
+    out: dict[str, str] = {}
+    for name, css in sheets.items():
+        if name == "settings":
+            continue
+        view, removed = _drop_surface(css, SURFACE_CLASSES)
+        if name == "vpn":
+            missing = sorted(SETTINGS_UTILITY_SELECTORS - set(removed))
+            if missing:
+                raise AssertionError(
+                    "expected to set aside "
+                    f"{sorted(SETTINGS_UTILITY_SELECTORS)} in vpn.css, never found {missing}"
+                )
+        out[name] = view
     return out
+
+
+# The computed-style differential takes the sheets it compares from the shell
+# template's link list, not from a fixed list, so a link the parser cannot read
+# removes a sheet from the comparison instead of failing. A stylesheet identified
+# by its own bytes carries a quoted argument inside a quoted attribute, which is
+# not valid HTML until that action is resolved, so this module resolves it — and
+# it lives here, beside the rest of the Playwright-free surface logic, so the
+# offline suite can check the resolver without a browser.
+ASSET_URL_ACTION = re.compile(r'\{\{\s*asset_url\s+"(/static/css/[\w.-]+)"\s*\}\}')
+
+
+def resolve_asset_actions(html: str) -> str:
+    """Replace each content-derived stylesheet action with its path plus a sentinel.
+
+    The sentinel is deliberately not a version: it only keeps the tag parseable
+    and marks that the real identity comes from the stylesheet's bytes.
+    """
+    return ASSET_URL_ACTION.sub(r"\1?v=@asset-bytes@", html)

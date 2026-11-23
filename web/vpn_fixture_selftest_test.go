@@ -657,6 +657,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
 			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
 			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
+			"static/js/tables.js":              &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
 		switch mode {
 		case "missing_charts":
@@ -732,6 +733,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
 			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
 			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
+			"static/js/tables.js":              &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
 		fx := newVPNTestFixtureWithFS(t, validFS)
 		if fx == nil {

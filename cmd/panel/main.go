@@ -135,19 +135,44 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 // loadPolicySettings reads the persisted policy routing record. An absent row
 // yields the disabled default, which keeps existing and fresh installs on the
 // old all-proxy route.
+//
+// It reads through policy.DecodeStoredRecord, the migration reader: a record
+// written by an earlier build may legitimately hold domain lines this build has no
+// rule for, and that record still has to load, keeping its IPv4 prefixes, or the
+// panel could fail to start over content it cannot apply. What the record could
+// not carry is reported rather than dropped in silence.
+//
+// This leniency is specific to stored bytes. An incoming request goes through the
+// wire decoder and is refused whole when any entry is unusable.
 func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, error) {
 	settings := policy.DefaultSettings()
 	if db == nil {
 		return settings, nil
 	}
-	var stored policy.Settings
-	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
+	raw, found, err := db.GetSettingRaw(ctx, policy.SettingsKey)
+	if err != nil {
+		return settings, err
+	}
+	if !found || !raw.Valid || raw.String == "" {
+		return settings, nil
+	}
+	storedBytes := []byte(raw.String)
+	stored, err := policy.DecodeStoredRecord(storedBytes)
+	if err != nil {
 		return settings, err
 	}
 	// An absent row leaves the target untouched. A row that says nothing at all
 	// is the same fresh-install state, so both yield the disabled default.
 	if stored.IsZero() {
 		return settings, nil
+	}
+	// The retirement is logged where the record is actually loaded, so an operator
+	// reading startup logs learns why their exception list is shorter than what
+	// they saved under the predecessor representation.
+	if retirement := policy.ReviewStoredRecord(storedBytes); !retirement.Empty() {
+		slog.Warn("Stored policy routing record was written by an earlier build; "+
+			"its IPv4 exceptions are kept and the rest cannot be applied",
+			"retired", retirement.Summary())
 	}
 	return stored.Normalize(), nil
 }
@@ -193,18 +218,18 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 	}
 
 	policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
-	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
+	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore); startErr != nil {
 		// Fail closed on the data plane, not on the management plane: never start
 		// serving with PBR reported as on but not actually activated, but keep the
 		// panel reachable. Nothing here rewrites the stored record; the operator's
 		// intent stays available to repair through the API.
 		vpnSvc.ReportPolicyActivationFailure(fmt.Errorf("persisted policy routing could not be activated: %w", startErr))
 		slog.Error("Policy routing could not be activated from persisted settings; the panel starts with policy routing disabled",
-			"preset", string(policySettings.Preset), "err", startErr)
+			"err", startErr)
 		return nil
 	}
 	slog.Info("Policy routing activated from persisted settings",
-		"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+		"interval_seconds", policySettings.SyncInterval)
 	return nil
 }
 

@@ -15,9 +15,9 @@ import (
 // The override exists so an operator can correct or extend the shipped
 // allocation set without waiting for a release, which is what the epic agreed:
 // the committed artifact is the baseline and an operator-supplied set takes
-// precedence over it. It deliberately accepts the formats the panel already
-// speaks — FormatIPv4 and FormatMixed — so an operator can paste the same list
-// they would put in a custom source, rather than learning a second syntax.
+// precedence over it. It deliberately accepts the body an operator already pastes
+// — IPv4 prefixes, optionally with name lines it reports as ignored — so the
+// corpus needs no second syntax.
 //
 // Only prefixes participate in the inventory question. A mixed body may also
 // carry domain rules; they are proxy policy rules and say nothing about whether
@@ -58,29 +58,56 @@ func ParseInventoryOverride(body []byte) (*InventoryOverride, error) {
 		return nil, fmt.Errorf("%w: inventory override looks like a markup or data document, not a prefix list", ErrInventoryNotPrefixList)
 	}
 
-	src := Source{
-		ID:             "inventory-override",
-		Format:         FormatMixed,
-		BareDomainMode: DomainModeInclusiveSuffix,
-		IsPreset:       false,
-	}
 	if err := validateOverrideLines(body); err != nil {
 		return nil, err
 	}
-	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), src, DefaultParseLimits())
+	limits := DefaultParseLimits()
+	// A domain line is accepted by this record's contract and reported as ignored
+	// rather than rejected. validateOverrideLines has already refused every line
+	// that is neither a prefix nor a name, so what reaches the parser is exactly
+	// "prefixes plus names".
+	limits.AllowNonPrefixRows = true
+	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), limits)
 	if err != nil {
 		return nil, fmt.Errorf("inventory override: %w", err)
 	}
 	prefixes := distinctMaskedPrefixes(parsed.CIDRs)
+	// Lines the address parser did not accept but the body shape allows are
+	// domain lines. They say nothing about whether an ADDRESS is inside the
+	// allocation, so they are counted and reported as ignored rather than
+	// interpreted.
+	domainRules := countOverrideDomainLines(body)
 	if len(prefixes) == 0 {
 		return nil, fmt.Errorf("%w: inventory override carries %d domain rules and no IPv4 prefix, so it would override nothing",
-			ErrInventoryNotPrefixList, len(parsed.Domains))
+			ErrInventoryNotPrefixList, domainRules)
 	}
 	return &InventoryOverride{
 		prefixes:    prefixes,
-		domainRules: len(parsed.Domains),
+		domainRules: domainRules,
 		digest:      digestHex(body),
 	}, nil
+}
+
+// countOverrideDomainLines counts the non-comment lines of an override body that
+// are not IPv4 prefixes.
+//
+// validateOverrideLines has already refused every line that is neither a prefix
+// nor a name, so what remains here is exactly the domain lines. They are
+// deliberately not parsed into rules: nothing in this build matches a domain
+// against a packet, and counting them keeps the "accepted but not applied here"
+// report honest instead of silent.
+func countOverrideDomainLines(body []byte) int {
+	count := 0
+	for _, raw := range strings.Split(string(body), "\n") {
+		line := strings.TrimSpace(raw)
+		if isIgnoredLine(line) {
+			continue
+		}
+		if _, err := ParseIPv4Rule(line); err != nil {
+			count++
+		}
+	}
+	return count
 }
 
 // validateOverrideLines rejects an override line that is neither an IPv4 prefix

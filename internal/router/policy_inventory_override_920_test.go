@@ -37,15 +37,13 @@ func TestPolicyOverrideActivatesThroughTheSettingsAPI(t *testing.T) {
 
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://lists.example/policy.lst"}
+	settings.ProxyExceptions = []string{"203.0.113.0/24"}
 	settings.InventoryOverride = []string{"198.51.100.0/24"}
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("fixture settings are invalid: %v", err)
 	}
 	// Activation needs a published snapshot; the seeded generation matches this
-	// source configuration, so the (unreachable) first fetch is tolerated on the
-	// verified policy.
+	// configuration, so activation proceeds on the verified policy.
 	seedMatchingPolicyStore(t, cfg.DataDir, settings)
 
 	target := netip.MustParseAddr("198.51.100.7")
@@ -60,8 +58,7 @@ func TestPolicyOverrideActivatesThroughTheSettingsAPI(t *testing.T) {
 	r := NewRouterWithDeps(handlers.Dependencies{Config: cfg, DB: db, VPNService: vpnSvc})
 	payload, err := json.Marshal(map[string]any{
 		"enabled":               settings.Enabled,
-		"preset":                string(settings.Preset),
-		"custom_urls":           settings.CustomURLs,
+		"proxy_exceptions":      settings.ProxyExceptions,
 		"inventory_override":    settings.InventoryOverride,
 		"sync_interval_seconds": settings.SyncInterval,
 	})

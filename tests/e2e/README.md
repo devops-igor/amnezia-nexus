@@ -117,10 +117,11 @@ The diagnostics module uses the existing lifecycle fixture for read-only dashboa
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
-| `test_vpn_diagnostics.py` | 8 | Read-only forwarder dashboard, schema2 status/privacy/history and metrics histogram/authentication |
+| `test_vpn_diagnostics.py` | 11 | Read-only forwarder lifecycle, schema2 status/privacy/history, charts and metrics histogram/authentication |
+| `test_vpn_health_surface.py` | 3 | Problem-first health summary, the four overview signals and the Advanced Diagnostics disclosure |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
-**Total: 60 test functions across 11 lifecycle suites (4 in Stage 1, 4 in Stage 2, 52 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
+**Total: 73 test functions across 12 lifecycle suites (4 in Stage 1, 4 in Stage 2, 65 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
 
 ---
 
@@ -132,7 +133,7 @@ The DEV runner is a single self-hosted machine. A suite belongs on it only when 
 | --- | --- | --- |
 | Hosted, panel-only | `Hosted Browser E2E (panel-only, no DEV)` in `ci.yml` | `test_auth.py`, `test_settings.py` |
 | Hosted, static fixture | `CSS Differential` in `css-differential.yml` | `test_css_differential.py` |
-| Hosted lifecycle (ephemeral) | `Lifecycle E2E Verification` in `e2e-dev.yml` | `test_setup.py`, `test_onboard.py`, `test_users.py`, `test_connections.py`, `test_my_connections.py`, `test_multiprotocol_clients.py`, `test_share.py`, `test_servers.py`, `test_vpn_diagnostics.py`, `test_traffic.py`, `test_multiprotocol_server.py` |
+| Hosted lifecycle (ephemeral) | `Lifecycle E2E Verification` in `e2e-dev.yml` | `test_setup.py`, `test_onboard.py`, `test_users.py`, `test_connections.py`, `test_my_connections.py`, `test_multiprotocol_clients.py`, `test_share.py`, `test_servers.py`, `test_vpn_diagnostics.py`, `test_vpn_health_surface.py`, `test_traffic.py`, `test_multiprotocol_server.py` |
 
 The machine-readable version is [`runner_map.toml`](runner_map.toml), and [`tests/test_e2e_runner_map.py`](../../tests/test_e2e_runner_map.py) enforces it: every suite must be assigned exactly once, each runner must actually select the paths it claims, the DEV script may not also run a hosted suite, and a hosted suite may not acquire a live-only dependency (`E2E_SERVER_HOST`, `E2E_REQUIRE_DATAPLANE`, the provisioning or install-failure helpers).
 
@@ -197,10 +198,10 @@ The existing platform coverage matrix is retained below, with eight read-only di
 | `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
 | `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
 
-| `test_vpn_diagnostics.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn` (Forwarder Health Dashboard) | None (dashboard rendering) | GET (UI) |
-| `test_vpn_diagnostics.py` | `test_vpn_kpi_summary_bar` | `/vpn` (Forwarder Health Dashboard) | None (8 KPI cards rendering) | GET (UI) |
-| `test_vpn_diagnostics.py` | `test_vpn_diagnostic_panels` | `/vpn` (Forwarder Health Dashboard) | None (11 diagnostic panels rendering) | GET (UI) |
-| `test_vpn_diagnostics.py` | `test_vpn_sparklines_window_toggle` | `/vpn` (Interactive Trends) | None (15m/1h/6h/24h toggle interaction) | GET (UI) |
+| `test_vpn_health_surface.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn` (Forwarder Health Dashboard) | None (health banner and retired-tile absence) | GET (UI) |
+| `test_vpn_health_surface.py` | `test_vpn_overview_signals` | `/vpn` (Forwarder Health Dashboard) | `/api/vpn/status` | GET (UI) |
+| `test_vpn_health_surface.py` | `test_vpn_diagnostic_panels` | `/vpn` (Advanced Diagnostics) | `/api/vpn/status` | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_sparklines_window_toggle` | `/vpn` (Interactive Trends) | None (15m/1h/24h toggle interaction) | GET (UI) |
 | `test_vpn_diagnostics.py` | `test_vpn_problem_routes_toggle` | `/vpn` (Problem Routes Section) | None (Problem / all routes toggle) | GET (UI) |
 | `test_vpn_diagnostics.py` | `test_vpn_status_api` | None (Direct REST API) | `/api/vpn/status` | GET |
 | `test_vpn_diagnostics.py` | `test_vpn_metrics_api` | VPN API | `/api/vpn/metrics` | GET |

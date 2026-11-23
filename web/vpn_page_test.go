@@ -109,13 +109,28 @@ func TestVPNPageLoadDataSuccessAndState(t *testing.T) {
     const epElem = w.document.getElementById('vpn-public-endpoint');
     assert.strictEqual(epElem.textContent, 'vpn.custom.org:51820', 'public endpoint is trimmed');
 
-    // 3. Counter and statistics rendering
+    // 3. Counter and statistics rendering. #vpn-active-tunnels no longer exists:
+    // the Sessions signal shows the live session count and a route mismatch
+    // appears only when routing_consistency reports one. The cumulative Rx/Tx
+    // totals remain available inside Advanced Diagnostics.
     assert.strictEqual(w.document.getElementById('vpn-listen-port').textContent, '51820', 'port rendered');
     assert.strictEqual(w.document.getElementById('vpn-subnet').textContent, '198.51.100.0/24', 'subnet rendered');
-    assert.strictEqual(w.document.getElementById('vpn-sessions').textContent, '12', 'sessions counter rendered');
-    assert.strictEqual(w.document.getElementById('vpn-active-tunnels').textContent, '3', 'active tunnels rendered');
     assert.strictEqual(w.document.getElementById('vpn-rx').textContent, '1048576 B', 'rx bytes rendered');
     assert.strictEqual(w.document.getElementById('vpn-tx').textContent, '2097152 B', 'tx bytes rendered');
+    // The Sessions signal is owned by vpnRenderSignals (this test stubs the
+    // orchestrator), so assert it through the real signal renderer rather than the
+    // retired direct write.
+    w.vpnRenderSignals({
+        forwarder_available: true,
+        connected_sessions: 12,
+        active_tunnels: 3,
+        rx_bytes: 1048576,
+        tx_bytes: 2097152,
+        health_assessment: { status: 'HEALTHY', conditions: [] },
+        routing_consistency: { is_consistent: true, active_sessions_count: 12 }
+    });
+    assert.strictEqual(w.document.getElementById('vpn-sessions').textContent, '12', 'sessions signal rendered from the payload');
+    assert.strictEqual(w.document.getElementById('vpn-session-mismatch').hidden, true, 'no mismatch row without a reported mismatch');
 
     // 4. Delegated sub-component invocations
     assert.ok(forwarderStatus && forwarderStatus.forwarder_available === true, 'forwarder health called with status');
@@ -198,7 +213,16 @@ func TestVPNPageLoadDataConfigFailureFallback(t *testing.T) {
     assert.strictEqual(w.document.getElementById('vpn-subnet').textContent, '-', 'subnet fallback to -');
 
     // Assert status, forwarder health, backends, and sessions rendered normally
-    assert.strictEqual(w.document.getElementById('vpn-sessions').textContent, '12', 'sessions counter rendered');
+    // The Sessions signal is rendered by vpnRenderSignals (this test stubs the
+    // orchestrator); assert it through that renderer rather than the retired
+    // direct write.
+    w.vpnRenderSignals({
+        forwarder_available: true,
+        connected_sessions: 12,
+        health_assessment: { status: 'HEALTHY', conditions: [] },
+        routing_consistency: { is_consistent: true, active_sessions_count: 12 }
+    });
+    assert.strictEqual(w.document.getElementById('vpn-sessions').textContent, '12', 'sessions signal rendered');
     assert.ok(forwarderStatus && forwarderStatus.forwarder_available === true, 'forwarder health called with status');
     assert.ok(renderedSessionsList && renderedSessionsList.length === 1, 'sessions rendered despite config failure');
     assert.strictEqual(renderedSessionsList[0].username, 'alice', 'session payload preserved');
@@ -611,15 +635,20 @@ func TestVPNPageDelegatedEventListeners(t *testing.T) {
     assert.strictEqual(showAllRoutesToggled, 1, 'vpnToggleShowAllRoutes called on click');
     assert.strictEqual(routesEvt.defaultPrevented, true, 'show-all-routes click default prevented');
 
-    // 3. History window chips (6 buttons)
+    // 3. History window chips. #955 exposes the three practical ranges; the payload
+    // still carries the other windows, so an explicit request keeps working.
     const togglesContainer = w.document.getElementById('vpn-history-window-toggles');
     assert.ok(togglesContainer, '#vpn-history-window-toggles must exist');
     const chips = Array.from(togglesContainer.querySelectorAll('button[data-action="vpn-set-history-window"]'));
-    assert.strictEqual(chips.length, 6, 'expected 6 history window chips');
+    assert.strictEqual(chips.length, 3, 'expected 3 history window chips (15m/1h/24h)');
     for (const chip of chips) {
         chip.click();
     }
-    assert.deepStrictEqual(historyWindowsCalled, ['1m', '5m', '15m', '1h', '6h', '24h'], 'history window chips called with correct values');
+    assert.deepStrictEqual(historyWindowsCalled, ['15m', '1h', '24h'], 'history window chips called with correct values');
+    // Selection is exposed through aria-pressed as well as the class.
+    chips.forEach(chip => {
+        assert.ok(chip.getAttribute('aria-pressed') === 'true' || chip.getAttribute('aria-pressed') === 'false', 'range chip exposes aria-pressed');
+    });
 
     // 4. Modal close buttons (4 buttons across 2 modals)
     const addBackendModal = w.document.getElementById('addBackendModal');

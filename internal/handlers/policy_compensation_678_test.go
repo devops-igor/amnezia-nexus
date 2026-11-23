@@ -63,15 +63,14 @@ func TestRestorePolicySettingsWorksAfterRequestCancellation(t *testing.T) {
 	h := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, db: db}
 
 	previous := policy.DefaultSettings()
-	previous.Preset = policy.PresetGeoblock
+	previous.ProxyExceptions = []string{"203.0.113.0/24"}
 	if err := db.SetSetting(context.Background(), policy.SettingsKey, previous); err != nil {
 		t.Fatalf("seed previous: %v", err)
 	}
 
 	rejected := previous
 	rejected.Enabled = true
-	rejected.Preset = policy.PresetCustom
-	rejected.CustomURLs = []string{"https://rejected.example.invalid/list.lst"}
+	rejected.ProxyExceptions = []string{"203.0.113.0/24"}
 	storePolicySettings(t, db, rejected)
 
 	prevRec := previousPolicyRecord{settings: previous, present: true}
@@ -84,7 +83,7 @@ func TestRestorePolicySettingsWorksAfterRequestCancellation(t *testing.T) {
 	}
 
 	got := readPolicySettings(t, db)
-	if got.Enabled || got.Preset != policy.PresetGeoblock || len(got.CustomURLs) != 0 {
+	if got.Enabled || len(got.ProxyExceptions) != 1 || got.ProxyExceptions[0] != "203.0.113.0/24" {
 		t.Fatalf("rejected record was not compensated: %+v", got)
 	}
 }
@@ -100,18 +99,17 @@ func TestRestorePolicySettingsLeavesLaterAcceptedSaveIntact(t *testing.T) {
 	h := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, db: db}
 
 	previous := policy.DefaultSettings()
-	previous.Preset = policy.PresetGeoblock
+	previous.ProxyExceptions = []string{"203.0.113.0/24"}
 	storePolicySettings(t, db, previous)
 
 	written := previous
 	written.Enabled = true
-	written.Preset = policy.PresetCustom
-	written.CustomURLs = []string{"https://slow-request.example.invalid/list.lst"}
+	written.ProxyExceptions = []string{"203.0.113.0/24"}
 	storePolicySettings(t, db, written)
 
 	// A second, later save wins the race and is fully accepted.
 	later := previous
-	later.Preset = policy.PresetAntifilterDomains
+	later.ProxyExceptions = []string{"198.51.100.0/24"}
 	later.SyncInterval = int64(2 * time.Hour / time.Second)
 	storePolicySettings(t, db, later)
 
@@ -125,8 +123,8 @@ func TestRestorePolicySettingsLeavesLaterAcceptedSaveIntact(t *testing.T) {
 	}
 
 	got := readPolicySettings(t, db)
-	if got.Preset != policy.PresetAntifilterDomains {
-		t.Fatalf("later accepted save was clobbered by compensation: got preset %q, want %q", got.Preset, policy.PresetAntifilterDomains)
+	if len(got.ProxyExceptions) != 1 || got.ProxyExceptions[0] != "198.51.100.0/24" {
+		t.Fatalf("later accepted save was clobbered by compensation: got exceptions %v, want 198.51.100.0/24", got.ProxyExceptions)
 	}
 	if got.SyncInterval != later.SyncInterval {
 		t.Fatalf("later accepted save lost its interval: got %d, want %d", got.SyncInterval, later.SyncInterval)
@@ -142,8 +140,7 @@ func TestRestorePolicySettingsDeletesRowThatDidNotExist(t *testing.T) {
 
 	written := policy.DefaultSettings()
 	written.Enabled = true
-	written.Preset = policy.PresetCustom
-	written.CustomURLs = []string{"https://fresh-install.example.invalid/list.lst"}
+	written.ProxyExceptions = []string{"203.0.113.0/24"}
 	storePolicySettings(t, db, written)
 
 	if err := h.restorePolicySettings(context.Background(), previousPolicyRecord{}, written); err != nil {
@@ -178,7 +175,7 @@ func TestLoadPolicyRecordReportsPresence(t *testing.T) {
 	}
 
 	stored := policy.DefaultSettings()
-	stored.Preset = policy.PresetGeoblock
+	stored.ProxyExceptions = []string{"203.0.113.0/24"}
 	storePolicySettings(t, db, stored)
 
 	rec, err = h.loadPolicyRecord(context.Background())
@@ -188,8 +185,8 @@ func TestLoadPolicyRecordReportsPresence(t *testing.T) {
 	if !rec.present {
 		t.Fatal("stored policy record reported absent")
 	}
-	if rec.settings.Preset != policy.PresetGeoblock {
-		t.Fatalf("loaded preset %q, want %q", rec.settings.Preset, policy.PresetGeoblock)
+	if len(rec.settings.ProxyExceptions) != 1 || rec.settings.ProxyExceptions[0] != "203.0.113.0/24" {
+		t.Fatalf("loaded exceptions %v, want the stored entry", rec.settings.ProxyExceptions)
 	}
 }
 
@@ -205,13 +202,12 @@ func TestRollbackPolicySettingsRendersEachOutcome(t *testing.T) {
 		h := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, db: db}
 
 		previous := policy.DefaultSettings()
-		previous.Preset = policy.PresetGeoblock
+		previous.ProxyExceptions = []string{"203.0.113.0/24"}
 		storePolicySettings(t, db, previous)
 
 		written := previous
 		written.Enabled = true
-		written.Preset = policy.PresetCustom
-		written.CustomURLs = []string{"https://restored.example.invalid/x.lst"}
+		written.ProxyExceptions = []string{"203.0.113.0/24"}
 		storePolicySettings(t, db, written)
 
 		w := httptest.NewRecorder()
@@ -222,7 +218,7 @@ func TestRollbackPolicySettingsRendersEachOutcome(t *testing.T) {
 		if w.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("restored outcome = %d, want 422; body=%s", w.Code, w.Body.String())
 		}
-		if got := readPolicySettings(t, db); got.Preset != policy.PresetGeoblock {
+		if got := readPolicySettings(t, db); len(got.ProxyExceptions) != 1 || got.ProxyExceptions[0] != "203.0.113.0/24" {
 			t.Fatalf("previous record was not restored: %+v", got)
 		}
 	})
@@ -232,17 +228,16 @@ func TestRollbackPolicySettingsRendersEachOutcome(t *testing.T) {
 		h := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, db: db}
 
 		previous := policy.DefaultSettings()
-		previous.Preset = policy.PresetGeoblock
+		previous.ProxyExceptions = []string{"203.0.113.0/24"}
 		storePolicySettings(t, db, previous)
 
 		written := previous
 		written.Enabled = true
-		written.Preset = policy.PresetCustom
-		written.CustomURLs = []string{"https://superseded.example.invalid/x.lst"}
+		written.ProxyExceptions = []string{"203.0.113.0/24"}
 		storePolicySettings(t, db, written)
 
 		later := previous
-		later.Preset = policy.PresetAntifilterDomains
+		later.ProxyExceptions = []string{"198.51.100.0/24"}
 		storePolicySettings(t, db, later)
 
 		w := httptest.NewRecorder()
@@ -253,7 +248,7 @@ func TestRollbackPolicySettingsRendersEachOutcome(t *testing.T) {
 		if w.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("superseded outcome = %d, want 422; body=%s", w.Code, w.Body.String())
 		}
-		if got := readPolicySettings(t, db); got.Preset != policy.PresetAntifilterDomains {
+		if got := readPolicySettings(t, db); len(got.ProxyExceptions) != 1 || got.ProxyExceptions[0] != "198.51.100.0/24" {
 			t.Fatalf("later accepted save was clobbered: %+v", got)
 		}
 	})
@@ -264,8 +259,7 @@ func TestRollbackPolicySettingsRendersEachOutcome(t *testing.T) {
 
 		written := policy.DefaultSettings()
 		written.Enabled = true
-		written.Preset = policy.PresetCustom
-		written.CustomURLs = []string{"https://unrecoverable.example.invalid/x.lst"}
+		written.ProxyExceptions = []string{"203.0.113.0/24"}
 		storePolicySettings(t, db, written)
 
 		// Close the database so compensation cannot re-read or write. This is the

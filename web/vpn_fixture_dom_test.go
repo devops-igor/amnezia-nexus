@@ -157,105 +157,197 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		return errors.New("nil document")
 	}
 
-	// 1. Top-level KPI grid container (.stats-grid)
-	topGrid := findTopLevelStatsGrid(doc)
-	if topGrid == nil {
-		return errors.New("top-level .stats-grid container not found")
-	}
-
-	// 2. #vpnBackendsTable and closest enclosing outer .card
-	if count := countHTMLNodesByID(doc, "vpnBackendsTable"); count != 1 {
-		return fmt.Errorf("expected exactly 1 #vpnBackendsTable element, found %d", count)
-	}
-	backendsTable := findHTMLNodeByID(doc, "vpnBackendsTable")
-	if backendsTable == nil {
-		return errors.New("#vpnBackendsTable not found")
-	}
-	backendsCard := findClosestEnclosingCard(backendsTable)
-	if backendsCard == nil {
-		return errors.New("closest enclosing .card for #vpnBackendsTable not found")
-	}
-
-	// 3. #vpnSessionsTable and closest enclosing outer .card
-	if count := countHTMLNodesByID(doc, "vpnSessionsTable"); count != 1 {
-		return fmt.Errorf("expected exactly 1 #vpnSessionsTable element, found %d", count)
-	}
-	sessionsTable := findHTMLNodeByID(doc, "vpnSessionsTable")
-	if sessionsTable == nil {
-		return errors.New("#vpnSessionsTable not found")
-	}
-	sessionsCard := findClosestEnclosingCard(sessionsTable)
-	if sessionsCard == nil {
-		return errors.New("closest enclosing .card for #vpnSessionsTable not found")
-	}
-
-	// 4. #vpn-forwarder-card
+	// #955 layout: VPN Health first (the answer to "is it working"), then the
+	// four-signal overview, then Advanced Diagnostics, the configuration strip and
+	// finally the backend and session tables. The health panel is deliberately
+	// ABOVE the overview now, and the overview grid is the only .stats-grid on the
+	// page: a second one inside #vpn-forwarder-card is exactly what this issue
+	// removed.
 	if count := countHTMLNodesByID(doc, "vpn-forwarder-card"); count != 1 {
 		return fmt.Errorf("expected exactly 1 #vpn-forwarder-card element, found %d", count)
 	}
-	forwarderCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
-	if forwarderCard == nil {
+	healthCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
+	if healthCard == nil {
 		return errors.New("#vpn-forwarder-card not found")
 	}
+	if !hasHTMLClass(healthCard, "card") {
+		return errors.New("#vpn-forwarder-card must be a .card")
+	}
 
-	sections := []*xhtml.Node{topGrid, backendsCard, sessionsCard, forwarderCard}
-	sectionNames := []string{"stats-grid", "backends card", "sessions card", "vpn-forwarder-card"}
+	overview := findTopLevelStatsGrid(doc)
+	if overview == nil {
+		return errors.New("top-level .stats-grid container not found")
+	}
+	if isHTMLDescendant(overview, healthCard) || isHTMLDescendant(healthCard, overview) {
+		return errors.New("the overview grid and #vpn-forwarder-card must not be nested in each other")
+	}
 
-	// Assert distinct elements
-	for i := 0; i < len(sections); i++ {
-		for j := i + 1; j < len(sections); j++ {
-			if sections[i] == sections[j] {
-				return fmt.Errorf("sections %s and %s resolve to identical element", sectionNames[i], sectionNames[j])
+	// The health card must carry exactly the four signals, and no KPI tiles.
+	signals := findHTMLNodesByAttr(doc, "data-signal")
+	if len(signals) != 4 {
+		return fmt.Errorf("expected exactly 4 [data-signal] entries, found %d", len(signals))
+	}
+	for _, signal := range signals {
+		if !isHTMLDescendant(overview, signal) {
+			return errors.New("[data-signal] entry is not inside the overview grid")
+		}
+	}
+	if n := findHTMLNodeWithIDPrefix(doc, "vpn-kpi-"); n != nil {
+		return fmt.Errorf("obsolete KPI tile %q must not exist", getHTMLNodeAttr(n, "id"))
+	}
+	if inside := findHTMLElementByClassWithin(healthCard, "stats-grid"); inside != nil {
+		return errors.New("#vpn-forwarder-card must not contain a nested .stats-grid")
+	}
+
+	// Ordered page regions, each appearing exactly once.
+	type region struct {
+		id   string
+		name string
+	}
+	regions := []region{
+		{"vpn-diagnostics", "#vpn-diagnostics"},
+		{"vpn-configuration", "#vpn-configuration"},
+		{"vpnBackendsTable", "#vpnBackendsTable"},
+		{"vpnSessionsTable", "#vpnSessionsTable"},
+	}
+	nodes := []*xhtml.Node{healthCard, overview}
+	names := []string{"vpn-forwarder-card", "overview grid"}
+	for _, r := range regions {
+		if count := countHTMLNodesByID(doc, r.id); count != 1 {
+			return fmt.Errorf("expected exactly 1 %s element, found %d", r.name, count)
+		}
+		nodes = append(nodes, findHTMLNodeByID(doc, r.id))
+		names = append(names, r.name)
+	}
+
+	for i := 0; i < len(nodes); i++ {
+		for j := i + 1; j < len(nodes); j++ {
+			if nodes[i] == nodes[j] {
+				return fmt.Errorf("sections %s and %s resolve to identical element", names[i], names[j])
+			}
+			if isHTMLDescendant(nodes[i], nodes[j]) || isHTMLDescendant(nodes[j], nodes[i]) {
+				return fmt.Errorf("section %s is nested within / descendant of %s", names[i], names[j])
 			}
 		}
 	}
 
-	// Assert no section is a descendant of another
-	for i := 0; i < len(sections); i++ {
-		for j := 0; j < len(sections); j++ {
-			if i != j && isHTMLDescendant(sections[i], sections[j]) {
-				return fmt.Errorf("section %s is nested within / descendant of section %s", sectionNames[j], sectionNames[i])
-			}
+	// A table card must be the OUTERMOST card of its region: the backends table may
+	// not be nested inside another card that also holds the sessions table, because
+	// then one card owns two regions and the section order below would be measured
+	// through a shared ancestor instead of real page order.
+	for _, id := range []string{"vpnBackendsTable", "vpnSessionsTable"} {
+		node := findHTMLNodeByID(doc, id)
+		outer := findClosestEnclosingCard(node)
+		if outer == nil {
+			return fmt.Errorf("closest enclosing .card for #%s not found", id)
+		}
+		if inner := findHTMLElementByClassWithin(outer, "card"); inner != nil {
+			return fmt.Errorf("card owning #%s must not contain another .card", id)
 		}
 	}
 
-	// Assert all 4 section containers share the exact same immediate parent element
-	parent := topGrid.Parent
-	if parent == nil {
-		return errors.New("top-level .stats-grid has nil parent")
-	}
-	for i, s := range sections {
-		if s.Parent != parent {
-			return fmt.Errorf("section %s does not share immediate parent with stats-grid", sectionNames[i])
-		}
-	}
-
-	// Sibling index sequence in parent container strictly:
-	// stats-grid -> backends card -> sessions card -> vpn-forwarder-card
-	getSiblingIndex := func(target *xhtml.Node) int {
-		idx := 0
-		for c := parent.FirstChild; c != nil; c = c.NextSibling {
-			if c == target {
-				return idx
+	// Advanced Diagnostics must be ordered after the health card and overview, so
+	// a collapsed panel can never sit above the answer it belongs to.
+	order := documentOrder(doc)
+	index := func(n *xhtml.Node) int {
+		for i, candidate := range order {
+			if candidate == n {
+				return i
 			}
-			idx++
 		}
 		return -1
 	}
-
-	idxStats := getSiblingIndex(topGrid)
-	idxBackends := getSiblingIndex(backendsCard)
-	idxSessions := getSiblingIndex(sessionsCard)
-	idxForwarder := getSiblingIndex(forwarderCard)
-
-	if idxStats == -1 || idxBackends == -1 || idxSessions == -1 || idxForwarder == -1 {
-		return errors.New("failed to resolve sibling indices in immediate parent")
-	}
-
-	if !(idxStats < idxBackends && idxBackends < idxSessions && idxSessions < idxForwarder) {
-		return fmt.Errorf("invalid sibling order: stats-grid=%d, backends-card=%d, sessions-card=%d, vpn-forwarder-card=%d (expected stats < backends < sessions < forwarder)",
-			idxStats, idxBackends, idxSessions, idxForwarder)
+	for i := 1; i < len(nodes); i++ {
+		if index(nodes[i-1]) >= index(nodes[i]) {
+			return fmt.Errorf("invalid region order: %s must appear before %s", names[i-1], names[i])
+		}
 	}
 
 	return nil
+}
+
+// documentOrder returns every element node in document order.
+func documentOrder(root *xhtml.Node) []*xhtml.Node {
+	var out []*xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode {
+			out = append(out, n)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return out
+}
+
+// findHTMLNodesByAttr returns every element carrying the given attribute.
+func findHTMLNodesByAttr(root *xhtml.Node, attr string) []*xhtml.Node {
+	var out []*xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode {
+			for _, a := range n.Attr {
+				if a.Key == attr {
+					out = append(out, n)
+					break
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return out
+}
+
+// findHTMLNodeWithIDPrefix returns the first element whose id starts with prefix.
+func findHTMLNodeWithIDPrefix(root *xhtml.Node, prefix string) *xhtml.Node {
+	var found *xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil || found != nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.HasPrefix(getHTMLNodeAttr(n, "id"), prefix) {
+			found = n
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return found
+}
+
+// findHTMLElementByClassWithin returns the first element with the given class
+// inside root, or nil.
+func findHTMLElementByClassWithin(root *xhtml.Node, class string) *xhtml.Node {
+	var found *xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n == nil || found != nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && hasHTMLClass(n, class) {
+			found = n
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	for c := root.FirstChild; c != nil; c = c.NextSibling {
+		walk(c)
+	}
+	return found
 }

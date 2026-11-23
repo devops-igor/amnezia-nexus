@@ -12,54 +12,29 @@ import (
 )
 
 var (
-	// ErrNoValidRules indicates that the parsed feed yielded zero valid rules.
-	ErrNoValidRules = errors.New("feed contained no valid rules")
+	// ErrNoValidRules indicates that the parsed list yielded zero valid rules.
+	ErrNoValidRules = errors.New("list contained no valid rules")
 	// ErrEmptyFeed is an alias for ErrNoValidRules.
 	ErrEmptyFeed = ErrNoValidRules
 )
-
-// Format indicates whether a rule list source contains domains, IPv4 ranges, or mixed rules.
-type Format uint8
-
-const (
-	// FormatDomains parses domain names and converts IPv4 literals to /32 prefixes.
-	FormatDomains Format = iota + 1
-	// FormatIPv4 parses CIDR prefixes and bare IPv4 addresses.
-	FormatIPv4
-	// FormatMixed parses both IPv4 prefixes and domain rules.
-	FormatMixed
-)
-
-// String returns human-readable format name.
-func (f Format) String() string {
-	switch f {
-	case FormatDomains:
-		return "domains"
-	case FormatIPv4:
-		return "ipv4"
-	case FormatMixed:
-		return "mixed"
-	default:
-		return "unknown"
-	}
-}
-
-// Source identifies a rule list feed and its parsing configuration.
-type Source struct {
-	ID             string     `json:"id"`
-	URL            string     `json:"url"`
-	Format         Format     `json:"format"`
-	BareDomainMode DomainMode `json:"bare_domain_mode"`
-	IsPreset       bool       `json:"is_preset"`
-}
 
 // ParseLimits bounds list processing to prevent memory or CPU exhaustion.
 type ParseLimits struct {
 	MaxLines        int
 	MaxLineBytes    int
 	MaxRules        int
-	RejectionBudget float64 // Fraction of rejected rows allowed for built-in feeds (e.g. 0.005)
-	MaxRejectedRows int     // Absolute cap on rejected rows for built-in feeds (e.g. 10000)
+	RejectionBudget float64 // Fraction of rejected rows allowed (e.g. 0.005)
+	MaxRejectedRows int     // Absolute cap on rejected rows (e.g. 10000)
+	// Strict refuses the first row the parser cannot accept instead of applying
+	// the rejection budget. Operator-submitted bodies are strict: an override that
+	// half-applied would route some of the operator's addresses and not others,
+	// and that must be reported at the line rather than silently tolerated.
+	Strict bool
+	// AllowNonPrefixRows counts a row that is not an IPv4 prefix as ignored
+	// instead of rejected. The inventory override accepts a mixed body and
+	// reports its domain lines as "accepted but not applied here", which is a
+	// documented contract rather than tolerance of a malformed prefix.
+	AllowNonPrefixRows bool
 }
 
 // DefaultParseLimits returns recommended defaults for production operation.
@@ -73,7 +48,7 @@ func DefaultParseLimits() ParseLimits {
 	}
 }
 
-// ParseReport records accounting stats from parsing a rule feed.
+// ParseReport records accounting stats from parsing a list.
 type ParseReport struct {
 	TotalLines int `json:"total_lines"`
 	Accepted   int `json:"accepted"`
@@ -81,10 +56,14 @@ type ParseReport struct {
 	Rejected   int `json:"rejected"`
 }
 
-// ParsedRules holds the extracted domain map and CIDR prefixes.
+// ParsedRules holds the extracted IPv4 prefixes.
+//
+// It is deliberately an address-only structure. A domain-name rule never
+// determined a packet's route, and the routing authority is the destination
+// address classifier, so carrying names here would describe a policy input that
+// cannot be applied.
 type ParsedRules struct {
-	Domains map[string]domainFlags
-	CIDRs   []netip.Prefix
+	CIDRs []netip.Prefix
 }
 
 func isIgnoredLine(line string) bool {
@@ -95,83 +74,6 @@ func isIgnoredLine(line string) bool {
 		strings.HasPrefix(line, "!") ||
 		strings.HasPrefix(line, ";") ||
 		strings.HasPrefix(line, "//")
-}
-
-func recordDomainRule(base string, flags domainFlags, domains map[string]domainFlags, report *ParseReport) {
-	if existing, exists := domains[base]; exists {
-		if existing&flags == flags {
-			report.Duplicates++
-		} else {
-			domains[base] |= flags
-			report.Accepted++
-		}
-	} else {
-		domains[base] = flags
-		report.Accepted++
-	}
-}
-
-func checkRejectionBudget(lineNo int, line string, err error, src Source, limits ParseLimits, report *ParseReport) error {
-	report.Rejected++
-	if !src.IsPreset {
-		if src.Format == FormatDomains {
-			return fmt.Errorf("line %d: invalid domain rule %q: %w", lineNo, line, err)
-		}
-		if src.Format == FormatIPv4 {
-			return fmt.Errorf("line %d: invalid IPv4 rule %q: %w", lineNo, line, err)
-		}
-		return fmt.Errorf("line %d: invalid rule %q: %w", lineNo, line, err)
-	}
-	if limits.MaxRejectedRows > 0 && report.Rejected > limits.MaxRejectedRows {
-		return fmt.Errorf("rejection budget exceeded at line %d: %d rejected rows: %w", lineNo, report.Rejected, err)
-	}
-	return nil
-}
-
-func parseDomainsRow(line string, src Source, limits ParseLimits, domains map[string]domainFlags, cidrs *[]netip.Prefix, report *ParseReport) error {
-	base, flags, isIP, ip, ruleErr := ParseDomainRule(line, src.BareDomainMode)
-	if isIP {
-		*cidrs = append(*cidrs, netip.PrefixFrom(ip, 32))
-		report.Accepted++
-		return nil
-	}
-	if ruleErr != nil {
-		return checkRejectionBudget(report.TotalLines, line, ruleErr, src, limits, report)
-	}
-	recordDomainRule(base, flags, domains, report)
-	return nil
-}
-
-func parseIPv4Row(line string, src Source, limits ParseLimits, cidrs *[]netip.Prefix, report *ParseReport) error {
-	prefix, ruleErr := ParseIPv4Rule(line)
-	if ruleErr != nil {
-		return checkRejectionBudget(report.TotalLines, line, ruleErr, src, limits, report)
-	}
-	*cidrs = append(*cidrs, prefix)
-	report.Accepted++
-	return nil
-}
-
-func parseMixedRow(line string, src Source, limits ParseLimits, domains map[string]domainFlags, cidrs *[]netip.Prefix, report *ParseReport) error {
-	// Try IPv4 rule first
-	if prefix, ruleErr := ParseIPv4Rule(line); ruleErr == nil {
-		*cidrs = append(*cidrs, prefix)
-		report.Accepted++
-		return nil
-	}
-
-	// Try domain rule
-	base, flags, isIP, ip, ruleErr := ParseDomainRule(line, src.BareDomainMode)
-	if isIP {
-		*cidrs = append(*cidrs, netip.PrefixFrom(ip, 32))
-		report.Accepted++
-		return nil
-	}
-	if ruleErr != nil {
-		return checkRejectionBudget(report.TotalLines, line, ruleErr, src, limits, report)
-	}
-	recordDomainRule(base, flags, domains, report)
-	return nil
 }
 
 func normalizeParseLimits(limits ParseLimits) ParseLimits {
@@ -193,12 +95,11 @@ func normalizeParseLimits(limits ParseLimits) ParseLimits {
 	return limits
 }
 
-func checkPostParseLimits(src Source, limits ParseLimits, domains map[string]domainFlags, cidrs []netip.Prefix, report ParseReport) error {
-	if report.Accepted == 0 || (len(domains) == 0 && len(cidrs) == 0) {
+func checkPostParseLimits(limits ParseLimits, cidrs []netip.Prefix, report ParseReport) error {
+	if report.Accepted == 0 || len(cidrs) == 0 {
 		return ErrNoValidRules
 	}
-
-	if src.IsPreset && limits.RejectionBudget > 0 {
+	if limits.RejectionBudget > 0 && !limits.AllowNonPrefixRows {
 		totalDataRows := report.Accepted + report.Duplicates + report.Rejected
 		if totalDataRows > 0 && float64(report.Rejected)/float64(totalDataRows) > limits.RejectionBudget {
 			return fmt.Errorf("rejection budget exceeded: %d of %d data rows rejected (%.2f%% > %.2f%%)",
@@ -207,15 +108,18 @@ func checkPostParseLimits(src Source, limits ParseLimits, domains map[string]dom
 				limits.RejectionBudget*100)
 		}
 	}
-
-	if len(domains)+len(cidrs) > limits.MaxRules {
-		return fmt.Errorf("rule count %d exceeds maximum rule limit %d", len(domains)+len(cidrs), limits.MaxRules)
+	if len(cidrs) > limits.MaxRules {
+		return fmt.Errorf("rule count %d exceeds maximum rule limit %d", len(cidrs), limits.MaxRules)
 	}
 	return nil
 }
 
-// Parse reads list rules from r, validates and normalizes entries according to src configuration.
-func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (ParsedRules, ParseReport, error) {
+// Parse reads IPv4 prefixes from r and validates them.
+//
+// There is one accepted format: CIDR prefixes and bare IPv4 addresses, with
+// blank and comment lines ignored. The domain and mixed formats are gone
+// alongside the external list feeds that used them.
+func Parse(ctx context.Context, r io.Reader, limits ParseLimits) (ParsedRules, ParseReport, error) {
 	limits = normalizeParseLimits(limits)
 
 	bufReader := bufio.NewReader(r)
@@ -230,8 +134,8 @@ func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (Pa
 	scanner.Buffer(make([]byte, limits.MaxLineBytes), limits.MaxLineBytes)
 
 	report := ParseReport{}
-	domains := make(map[string]domainFlags)
 	cidrs := make([]netip.Prefix, 0)
+	seen := make(map[netip.Prefix]struct{}, 1024)
 
 	for scanner.Scan() {
 		report.TotalLines++
@@ -248,32 +152,40 @@ func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (Pa
 			continue
 		}
 
-		var rowErr error
-		switch src.Format {
-		case FormatDomains:
-			rowErr = parseDomainsRow(line, src, limits, domains, &cidrs, &report)
-		case FormatIPv4:
-			rowErr = parseIPv4Row(line, src, limits, &cidrs, &report)
-		case FormatMixed:
-			rowErr = parseMixedRow(line, src, limits, domains, &cidrs, &report)
-		default:
-			return ParsedRules{}, report, fmt.Errorf("unsupported source format: %d", src.Format)
+		prefix, ruleErr := ParseIPv4Rule(line)
+		if ruleErr != nil {
+			if limits.AllowNonPrefixRows {
+				// A non-prefix row is permitted by this body's contract and is
+				// reported separately by the caller, never as a rejection.
+				continue
+			}
+			report.Rejected++
+			if limits.Strict {
+				return ParsedRules{}, report, fmt.Errorf("line %d: invalid IPv4 rule %q: %w", report.TotalLines, line, ruleErr)
+			}
+			if limits.MaxRejectedRows > 0 && report.Rejected > limits.MaxRejectedRows {
+				return ParsedRules{}, report, fmt.Errorf(
+					"rejection budget exceeded: %d rejected rows, last at line %d: %q: %w",
+					report.Rejected, report.TotalLines, line, ruleErr)
+			}
+			continue
 		}
-		if rowErr != nil {
-			return ParsedRules{}, report, rowErr
+		if _, duplicate := seen[prefix]; duplicate {
+			report.Duplicates++
+			continue
 		}
+		seen[prefix] = struct{}{}
+		cidrs = append(cidrs, prefix)
+		report.Accepted++
 	}
 
 	if err := scanner.Err(); err != nil {
 		return ParsedRules{}, report, fmt.Errorf("scanner error during parse: %w", err)
 	}
 
-	if err := checkPostParseLimits(src, limits, domains, cidrs, report); err != nil {
+	if err := checkPostParseLimits(limits, cidrs, report); err != nil {
 		return ParsedRules{}, report, err
 	}
 
-	return ParsedRules{
-		Domains: domains,
-		CIDRs:   cidrs,
-	}, report, nil
+	return ParsedRules{CIDRs: cidrs}, report, nil
 }

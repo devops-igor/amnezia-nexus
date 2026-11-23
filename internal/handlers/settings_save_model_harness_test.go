@@ -81,9 +81,9 @@ const isPost = o => String((o && o.method) || 'GET').toUpperCase() === 'POST';
 const policyDouble = {
   refuse: false,
   puts: [],
-  record: {enabled: false, preset: 'geoblock', custom_urls: [], local_entries: [], excluded_domains: [],
+  record: {enabled: false, proxy_exceptions: [], inventory_override: [],
     sync_interval_seconds: 21600,
-    status: {enabled: false, preset: 'geoblock', sync_state: 'disabled'}}
+    status: {enabled: false, cidr_count: 0, sync_state: 'disabled'}}
 };
 const jsonResponse = (body, status) => new Response(JSON.stringify(body), {status: status || 200, headers: {'content-type': 'application/json'}});
 function policyAnswer(u, o) {
@@ -95,7 +95,7 @@ function policyAnswer(u, o) {
     const body = JSON.parse(o.body);
     policyDouble.puts.push(body);
     if (policyDouble.refuse) return jsonResponse({error: 'activation_failed', detail: 'direct egress is unavailable'}, 422);
-    policyDouble.record = Object.assign({}, policyDouble.record, body, {status: {enabled: body.enabled, preset: body.preset, sync_state: 'disabled'}});
+    policyDouble.record = Object.assign({}, policyDouble.record, body, {status: {enabled: body.enabled, sync_state: 'disabled'}});
     return jsonResponse(Object.assign({status: 'ok', policy_status: policyDouble.record.status}, policyDouble.record));
   }
   return jsonResponse(policyDouble.record);

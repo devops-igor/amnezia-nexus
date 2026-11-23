@@ -420,6 +420,10 @@
 
             if (!filterRoot) return;
 
+            // Remembered so a programmatic filter change can write the state back
+            // to the chips, which are the control the operator reads it from.
+            this.filterRootEl = filterRoot;
+
             // Handle dropdown <select>
             if (filterRoot.tagName === 'SELECT') {
                 filterRoot.addEventListener('change', (e) => {
@@ -504,8 +508,67 @@
         setFilter(status) {
             this.currentStatusFilter = (status || 'all').trim().toLowerCase();
             this.currentPage = 1;
+            this._syncFilterControl();
             this._applyFiltersAndSort();
             this._render();
+        }
+
+        /**
+         * Write the current status filter back to the control the operator reads
+         * it from. A programmatic change (setFilter, revealRow) that only updated
+         * currentStatusFilter left the chips still showing the previous choice, so
+         * the table's rows and its toolbar disagreed.
+         */
+        _syncFilterControl() {
+            const root = this.filterRootEl;
+            if (!root) return;
+            if (root.tagName === 'SELECT') {
+                root.value = this.currentStatusFilter;
+                return;
+            }
+            if (typeof root.querySelectorAll !== 'function') return;
+            const chips = root.querySelectorAll('.filter-chip, [data-status]');
+            Array.prototype.forEach.call(chips, (chip) => {
+                const status = (chip.getAttribute('data-status') || 'all').toLowerCase();
+                if (status === this.currentStatusFilter) chip.classList.add('active');
+                else chip.classList.remove('active');
+            });
+        }
+
+        /**
+         * Make one already-indexed row visible, whatever search term, status
+         * filter or page currently hides it, and report whether it now is.
+         *
+         * A caller that navigates focus to a row cannot know which of the three
+         * hides it, and the table is the only owner of that state. Clearing a
+         * filter is not enough on its own: a row can also sit on a page the table
+         * is not showing, so the page holding it is resolved AFTER the filters are
+         * cleared and the filtered/sorted list is rebuilt. The row's visibility is
+         * read from the row itself, not inferred from the state that was set.
+         */
+        revealRow(rowEl) {
+            if (!rowEl) return false;
+            const rec = this.rowRecords.find((candidate) => candidate.el === rowEl);
+            if (!rec) return false;
+
+            this.searchQuery = '';
+            if (this.searchInputEl) this.searchInputEl.value = '';
+            if (this.searchClearBtn) this.searchClearBtn.style.display = 'none';
+            this.currentStatusFilter = 'all';
+            this._syncFilterControl();
+
+            this._applyFiltersAndSort();
+            const position = this.filteredRecords.indexOf(rec);
+            if (position === -1) return false;
+            if (this.options.paginate) {
+                const pageSize = Math.max(1, parseInt(this.options.pageSize, 10) || 10);
+                this.currentPage = Math.floor(position / pageSize) + 1;
+            }
+            this._render();
+
+            // The row is the only witness: display:'' is set for the rows on the
+            // page the table resolved, and nothing else may stand in for reading it.
+            return rowEl.style.display !== 'none';
         }
 
         /**
