@@ -1028,31 +1028,15 @@ button:focus-visible,
     background: currentColor;
 }
 
-/* The four status hues are tuned for the dark canvas. On the light one the same
-   values drop below the 4.5:1 threshold for badge-sized text (success 2.35:1,
-   warn 2.02:1, info 2.56:1), so the light theme paints the badge text in a
-   darker shade of the same hue. The dark theme keeps its colours, and the hue --
-   which is what carries the meaning -- is unchanged in both.
-
-   Only the defined badge classes are overridden. The stylesheet has no
-   `.badge-warning` rule, so adding one here would have invented a surface the
-   frozen pre-split reference never had; a badge rendered with that name inherits
-   the theme's body text colour and already clears the threshold. */
-[data-theme="light"] .badge-success {
-    color: #046c4e;
-}
-
-[data-theme="light"] .badge-warn {
-    color: #92400e;
-}
-
-[data-theme="light"] .badge-danger {
-    color: #be123c;
-}
-
-[data-theme="light"] .badge-info {
-    color: #0369a1;
-}
+/* The status hues are tuned for the dark canvas; on the light one the same values
+   fall below 4.5:1 as badge text (success 2.35:1, warn 2.02:1, info 2.56:1), so the
+   light theme paints a darker tone of the same hue. Only the badge classes the
+   sheets define are overridden -- the renderers' `badge-warning` name has no rule
+   here, and styling it would add a surface the frozen reference never had. */
+[data-theme="light"] .badge-success { color: #046c4e; }
+[data-theme="light"] .badge-warn { color: #92400e; }
+[data-theme="light"] .badge-danger { color: #be123c; }
+[data-theme="light"] .badge-info { color: #0369a1; }
 
 /* ===== Form Elements ===== */
 .form-group {
@@ -1123,6 +1107,22 @@ button:focus-visible,
     color: var(--text-muted);
     margin-top: var(--space-xs);
 }
+
+/* The order confirmation is read beside the form it describes, so its backdrop
+   dims without blurring and the dialog docks to the bottom edge: the selectors sit
+   above the button that opened it, at any width. Behaviour is the shared modal's. */
+#nexusConfirmModal {
+    background: rgba(9, 10, 15, 0.32);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    align-items: flex-end;
+    padding: var(--space-md);
+}
+[data-theme="light"] #nexusConfirmModal { background: rgba(15, 23, 42, 0.18); }
+/* The danger fill is a tint of the hue, so the hue as text misses 4.5:1 on it
+   (3.38:1 light, 4.42:1 dark); these tones keep it red and readable. */
+#nexusConfirmModal .btn-danger { color: #fb7185; }
+[data-theme="light"] #nexusConfirmModal .btn-danger { color: #be123c; }
 
 /* ===== Modal ===== */
 .modal-backdrop {

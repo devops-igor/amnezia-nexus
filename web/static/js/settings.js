@@ -257,10 +257,11 @@
         return parts.length ? parts.join(', ') : _('deploy_vps_cost_unknown');
     }
 
-    // deployOrderMessage names the four facts the operator approves: the plan, the
-    // region and image the selectors are showing, and the cost. The names are read
-    // from the same options the payload's ids came from, so the summary cannot
-    // describe a different selection than the one being ordered.
+    // deployOrderMessage names the five facts the operator approves: the plan, the
+    // region and datacenter the selectors are showing, the image, and the cost. The
+    // names are read from the same options the payload's ids came from, so the
+    // summary cannot describe a different selection than the one being ordered. The
+    // datacenter option's own label already says when the provider chooses it.
     function deployOrderMessage(plan) {
         const selectedText = select => (select && select.selectedIndex >= 0)
             ? select.options[select.selectedIndex].textContent
@@ -268,6 +269,7 @@
         return _('deploy_vps_confirm_body')
             .replace('{plan}', plan.name || '')
             .replace('{region}', selectedText(deployRegionSelect))
+            .replace('{datacenter}', selectedText(deployPlacementSelect))
             .replace('{os}', selectedText(deployOSSelect))
             .replace('{cost}', deployCostText(plan));
     }

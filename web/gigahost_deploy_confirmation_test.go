@@ -34,6 +34,9 @@ func deployConfirmationTranslations(t *testing.T) map[string]string {
 	keys := []string{
 		"deploy_vps_confirm_title", "deploy_vps_confirm_body", "deploy_vps_cost_hourly",
 		"deploy_vps_cost_ceiling", "deploy_vps_cost_unknown", "deploy_vps_btn",
+		// The datacenter half of the summary is the placement selector's own label,
+		// so the region-managed wording is part of the expected message too.
+		"deploy_vps_placement_region",
 	}
 	for _, key := range keys {
 		if strings.TrimSpace(dict[key]) == "" {
@@ -44,6 +47,9 @@ func deployConfirmationTranslations(t *testing.T) map[string]string {
 		if !strings.Contains(dict[key], "{") {
 			t.Fatalf("%q carries no placeholder: %q", key, dict[key])
 		}
+	}
+	if !strings.Contains(dict["deploy_vps_confirm_body"], "{datacenter}") {
+		t.Fatalf("the confirmation body does not name the datacenter: %q", dict["deploy_vps_confirm_body"])
 	}
 	return dict
 }
@@ -70,12 +76,18 @@ func TestGigahostDeployVPSConfirmsBeforeOrdering(t *testing.T) {
 	ceiling := strings.NewReplacer("{ceiling}", "90", "{currency}", "NOK").
 		Replace(dict["deploy_vps_cost_ceiling"])
 	quotedMessage := strings.NewReplacer(
-		"{plan}", "Cloud 2", "{region}", "Norway (NO)", "{os}", "Debian 12",
-		"{cost}", hourly+", "+ceiling,
+		"{plan}", "Cloud 2", "{region}", "Norway (NO)", "{datacenter}", "DC1 - Sandefjord",
+		"{os}", "Debian 12", "{cost}", hourly+", "+ceiling,
 	).Replace(dict["deploy_vps_confirm_body"])
 	unquotedMessage := strings.NewReplacer(
-		"{plan}", "Unpriced 1", "{region}", "Norway (NO)", "{os}", "Debian 12",
+		"{plan}", "Unpriced 1", "{region}", "Norway (NO)",
+		"{datacenter}", dict["deploy_vps_placement_region"], "{os}", "Debian 12",
 		"{cost}", dict["deploy_vps_cost_unknown"],
+	).Replace(dict["deploy_vps_confirm_body"])
+	managedMessage := strings.NewReplacer(
+		"{plan}", "Cloud 2", "{region}", "Norway (NO)",
+		"{datacenter}", dict["deploy_vps_placement_region"], "{os}", "Debian 12",
+		"{cost}", hourly+", "+ceiling,
 	).Replace(dict["deploy_vps_confirm_body"])
 
 	pageEncoded, _ := json.Marshal(pageJS)
@@ -85,6 +97,7 @@ func TestGigahostDeployVPSConfirmsBeforeOrdering(t *testing.T) {
 	dictEncoded, _ := json.Marshal(dict)
 	quotedEncoded, _ := json.Marshal(quotedMessage)
 	unquotedEncoded, _ := json.Marshal(unquotedMessage)
+	managedEncoded, _ := json.Marshal(managedMessage)
 
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {runScripts:'outside-only'});
@@ -268,11 +281,31 @@ async function ready() {
   await tick();
   assert.equal(orderPosts().length, 2, 'the unpriced run was cancelled, so it must add no order');
 
+  // ---- the datacenter half of the summary follows the selector --------------
+  // The same plan ordered with the provider-chosen datacenter must say so, not
+  // repeat the pin: the summary is built from the option the payload reads.
+  planSel.value = '0'; fire(planSel);
+  regionSel.value = '1'; fire(regionSel);
+  osSel.value = '12'; fire(osSel);
+  const managedValue = placeSel.options[0].value;
+  placeSel.value = managedValue; fire(placeSel);
+  assert.equal(placeSel.value, managedValue,
+    'precondition: the provider-chosen datacenter is the selected one');
+  const managedRun = w.handleDeployVPS();
+  await tick();
+  assert.equal(asked.length, 5, 'the provider-chosen datacenter must still be confirmed');
+  assert.equal(asked[4].message, %s,
+    'the summary must name the provider-chosen datacenter instead of a pin');
+  decide(false);
+  await managedRun;
+  await tick();
+  assert.equal(orderPosts().length, 2, 'this run was cancelled, so it must add no order');
+
   console.log('GIGAHOST_DEPLOY_CONFIRMATION_OK');dom.window.close();
 })().catch(e => {console.error('CONFIRMATION_TEST_FAILED: ' + (e && e.stack || e)); process.exit(1);});
 `,
 		string(dictEncoded), string(idsEncoded), string(catalogStatusEncoded), string(moduleEncoded),
-		string(pageEncoded), string(quotedEncoded), string(unquotedEncoded))
+		string(pageEncoded), string(quotedEncoded), string(unquotedEncoded), string(managedEncoded))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_DEPLOY_CONFIRMATION_OK") {

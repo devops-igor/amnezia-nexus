@@ -8,7 +8,7 @@ from playwright.sync_api import Page
 from tests.e2e import contrast
 # The page probe and the hex reader are the settings suite's own, so the two files
 # cannot disagree about how the page is opened or how a colour is converted.
-from tests.e2e.test_settings import _hex, _open_settings, _rgb
+from tests.e2e.test_settings import _hex, _open_settings
 
 
 # --- Deploy VPS confirms before the order leaves the page --------------------
@@ -75,6 +75,7 @@ def _deploy_form(page: Page, base_url: str, orders: list) -> None:
         " return !!s && s.options.length > 0 && !s.disabled; }"
     )
     page.select_option("#deployRegionSelect", "1")
+    page.select_option("#deployPlacementSelect", "1")
     page.select_option("#deployOSSelect", "12")
     page.wait_for_function("() => !document.getElementById('btnDeployVPS').disabled")
 
@@ -92,7 +93,14 @@ def test_deploy_vps_confirms_plan_region_image_and_cost(
         page.locator("#btnDeployVPS").click()
         page.locator("#nexusConfirmModal.active").wait_for(state="visible")
         summary = page.locator("#nexusConfirmBody").inner_text()
-        for fact in ("Cloud 2", "Norway (NO)", "Debian 12", "0.14375 NOK/hr", "max 90 NOK/mo"):
+        for fact in (
+            "Cloud 2",
+            "Norway (NO)",
+            "DC1 - Sandefjord",
+            "Debian 12",
+            "0.14375 NOK/hr",
+            "max 90 NOK/mo",
+        ):
             assert fact in summary, (fact, summary)
         assert page.locator("#nexusConfirmTitle").inner_text().strip()
         assert page.locator("#nexusConfirmOkBtn").inner_text().strip()
@@ -135,6 +143,132 @@ def test_deploy_vps_confirms_plan_region_image_and_cost(
                 break
             page.wait_for_timeout(50)
         assert len(orders) == 1, f"a second press became a second order: {orders}"
+    finally:
+        page.unroute("**/api/admin/hosting/gigahost/catalog**")
+        page.unroute("**/api/admin/hosting/gigahost/order")
+
+
+# --- What the operator can compare while the confirmation is open ------------
+# The confirmation's job is to be checked against the form, so the backdrop must
+# not hide it and the dialog must not sit on the selectors. Both are geometry and
+# cascade facts, measured rather than eyeballed.
+
+CONTROL_FILL_PROBE = """(id) => {
+  const parse = s => {
+    const m = (s.match(/[\\d.]+/g) || []).map(Number);
+    return m.length < 3 ? [0, 0, 0, 0] : (m.length < 4 ? [m[0], m[1], m[2], 1] : m);
+  };
+  const over = (top, under) =>
+    [0, 1, 2].map(i => top[i] * top[3] + under[i] * (1 - top[3])).concat([1]);
+  const el = document.getElementById(id);
+  const layers = [];
+  for (let n = el; n; n = n.parentElement) {
+    const b = parse(getComputedStyle(n).backgroundColor);
+    if (b[3] > 0) layers.push(b);
+    if (b[3] === 1) break;
+  }
+  const fill = layers.reduceRight((acc, layer) => over(layer, acc), [255, 255, 255, 1]);
+  const rgb = c => 'rgb(' + c.slice(0, 3).map(Math.round).join(', ') + ')';
+  return {color: rgb(parse(getComputedStyle(el).color)), fill: rgb(fill)};
+}"""
+
+DIALOG_PROBE = """() => {
+  const parse = s => {
+    const m = (s.match(/[\\d.]+/g) || []).map(Number);
+    return m.length < 3 ? [0, 0, 0, 0] : (m.length < 4 ? [m[0], m[1], m[2], 1] : m);
+  };
+  const over = (top, under) =>
+    [0, 1, 2].map(i => top[i] * top[3] + under[i] * (1 - top[3])).concat([1]);
+  const surface = el => {
+    const layers = [];
+    for (let n = el; n; n = n.parentElement) {
+      const b = parse(getComputedStyle(n).backgroundColor);
+      if (b[3] > 0) layers.push(b);
+      if (b[3] === 1) break;
+    }
+    return layers.reduceRight((acc, layer) => over(layer, acc), [255, 255, 255, 1]);
+  };
+  const rgb = c => 'rgb(' + c.slice(0, 3).map(Math.round).join(', ') + ')';
+  const box = el => {
+    const r = el.getBoundingClientRect();
+    return {x: r.x, y: r.y, w: r.width, h: r.height};
+  };
+  const area = (a, b) => {
+    const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+    const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+    return w > 0 && h > 0 ? w * h : 0;
+  };
+  const backdrop = document.getElementById('nexusConfirmModal');
+  const dialog = backdrop.querySelector('.modal');
+  const veil = parse(getComputedStyle(backdrop).backgroundColor);
+  const dialogBox = box(dialog);
+  const fields = ['deployPlanSelect', 'deployRegionSelect', 'deployPlacementSelect', 'deployOSSelect']
+    .map(id => document.getElementById(id))
+    .filter(Boolean)
+    .map(el => ({
+      id: el.id,
+      text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].textContent.trim() : '',
+      overlap: Math.round(area(box(el), dialogBox)),
+    }));
+  // What a value behind the veil looks like on screen, for both channels.
+  const osSelect = document.getElementById('deployOSSelect');
+  const through = el => {
+    const c = parse(getComputedStyle(el).color);
+    const bg = surface(el);
+    const t = [veil[0] * veil[3] + c[0] * (1 - veil[3]),
+               veil[1] * veil[3] + c[1] * (1 - veil[3]),
+               veil[2] * veil[3] + c[2] * (1 - veil[3])];
+    const b = [veil[0] * veil[3] + bg[0] * (1 - veil[3]),
+               veil[1] * veil[3] + bg[1] * (1 - veil[3]),
+               veil[2] * veil[3] + bg[2] * (1 - veil[3])];
+    return {text: rgb(t), bg: rgb(b)};
+  };
+  return {
+    filter: getComputedStyle(backdrop).backdropFilter
+      || getComputedStyle(backdrop).webkitBackdropFilter || 'none',
+    veilAlpha: veil[3],
+    dialog: {x: Math.round(dialogBox.x), y: Math.round(dialogBox.y),
+             w: Math.round(dialogBox.w), h: Math.round(dialogBox.h)},
+    viewport: {w: window.innerWidth, h: window.innerHeight},
+    fields,
+    value: through(osSelect),
+    summary: document.getElementById('nexusConfirmBody').textContent,
+  };
+}"""
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("viewport", [(1440, 900), (390, 844)], ids=["wide", "narrow"])
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_deploy_confirmation_leaves_the_form_comparable(
+    authenticated_page: Page, base_url: str, viewport: tuple[int, int], theme: str
+) -> None:
+    """The dialog names the datacenter, dims but does not hide the form, and does
+    not sit on the selectors at either width."""
+    page = authenticated_page
+    orders: list = []
+    try:
+        _deploy_form(page, base_url, orders)
+        page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+        page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+        page.locator("#btnDeployVPS").scroll_into_view_if_needed()
+        page.locator("#btnDeployVPS").click()
+        page.locator("#nexusConfirmModal.active").wait_for(state="visible")
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('nexusConfirmModal')).opacity === '1'"
+        )
+        probe = page.evaluate(DIALOG_PROBE)
+
+        assert "DC1 - Sandefjord" in probe["summary"], probe["summary"]
+        assert probe["filter"] in ("none", ""), probe["filter"]
+        assert probe["veilAlpha"] <= 0.35, probe["veilAlpha"]
+        assert len(probe["fields"]) == 4, probe["fields"]
+        covered = [f for f in probe["fields"] if f["overlap"] > 0]
+        assert covered == [], (probe["dialog"], probe["viewport"], covered)
+
+        ratio = contrast.ratio(_hex(probe["value"]["text"]), _hex(probe["value"]["bg"]))
+        assert ratio >= contrast.AA_TEXT, (theme, probe["value"], f"{ratio:.2f}:1")
+        assert orders == [], "opening the confirmation sent an order"
     finally:
         page.unroute("**/api/admin/hosting/gigahost/catalog**")
         page.unroute("**/api/admin/hosting/gigahost/order")
@@ -231,11 +365,17 @@ def test_restore_confirmation_is_destructive_and_escape_cancels(
         assert "btn-danger" in ok_class.split(), ok_class
         assert "btn-warning" not in ok_class.split(), ok_class
         assert page.locator("#nexusConfirmOkBtn").inner_text().strip()
-        want_danger = _rgb(contrast.resolve("danger", contrast.theme_tokens(theme)))
-        painted = page.evaluate(
-            "() => getComputedStyle(document.getElementById('nexusConfirmOkBtn')).color"
-        )
-        assert painted == want_danger, (painted, want_danger)
+        cancel_class = page.locator("#nexusConfirmCancelBtn").get_attribute("class") or ""
+        assert "btn-secondary" in cancel_class.split(), cancel_class
+
+        # The destructive control must be readable on its own resting fill, and it
+        # must still be the red one beside the neutral cancel.
+        measured = page.evaluate(CONTROL_FILL_PROBE, "nexusConfirmOkBtn")
+        neutral = page.evaluate(CONTROL_FILL_PROBE, "nexusConfirmCancelBtn")
+        ratio = contrast.ratio(_hex(measured["color"]), _hex(measured["fill"]))
+        assert ratio >= contrast.AA_TEXT, (theme, measured, f"{ratio:.2f}:1")
+        assert measured["color"] != neutral["color"], (measured, neutral)
+        assert measured["fill"] != neutral["fill"], (measured, neutral)
         assert posts == [], "the restore request left the page before it was confirmed"
 
         page.keyboard.press("Escape")
