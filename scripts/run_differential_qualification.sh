@@ -21,6 +21,13 @@ if ! command -v go >/dev/null 2>&1; then
     fi
 fi
 
+# Build tags required by this repository's Go packages. The Makefile and the CI
+# workflows set them through GOFLAGS; a script that calls `go` directly must pass them
+# explicitly, because packages such as internal/vpn/tunnel/vless refuse to compile
+# without the tag (tags_guard.go). Without the tag every suite reports "[build failed]"
+# and executes zero cases.
+GO_BUILD_TAGS="with_utls"
+
 # Default options
 SUITE="all"
 SOAK_FULL=false
@@ -136,20 +143,71 @@ if [[ -z "$TIMEOUT" ]]; then
     fi
 fi
 
-# Build race flag
+# Race detector decision.
+#
+# `go test -race -run '^$'` links the race runtime and starts it, so it exercises the
+# host capability the suites need (ThreadSanitizer VMA ranges, cgo toolchain) without
+# executing a test case. Its exit status alone cannot tell "this host cannot run the
+# race detector" apart from "the code does not build", and reporting a build failure as a
+# host limitation silently removes race coverage from a host that supports it. Classify
+# the probe output instead, and refuse to continue on an unrecognised failure.
+RACE_UNSUPPORTED_MARKERS=(
+    "unsupported VMA range"
+    "requires cgo"
+    "-race is not supported"
+    "race detector is not supported"
+)
+
+# race_probe_marker prints the first known host-limitation marker found in the probe output.
+race_probe_marker() {
+    local probe_output="$1"
+    local marker
+    for marker in "${RACE_UNSUPPORTED_MARKERS[@]}"; do
+        if grep -F -q -- "$marker" <<<"$probe_output"; then
+            printf '%s' "$marker"
+            return 0
+        fi
+    done
+    return 1
+}
+
 RACE_FLAG=""
+RACE_PROBE_STATUS="not-requested"
 if [[ "$ENABLE_RACE" == "true" ]]; then
-    RACE_FLAG="-race"
-    # Pre-check if host architecture supports ThreadSanitizer (e.g. ARM64 39-bit VMA, missing CGO)
-    RACE_TEST_ERR="$(go test -race -run "^$" ./cmd/panel 2>&1 || true)"
-    if echo "$RACE_TEST_ERR" | grep -E -q "unsupported VMA range|requires cgo"; then
-        echo "NOTICE: Host environment does not support Go race detector: $(echo "$RACE_TEST_ERR" | tr '\n' ' ')"
-        echo "        Disabling -race for host environment (authoritative -race runs in CI on x86_64)."
-        RACE_FLAG=""
-    elif ! (go test -race -run "^$" ./cmd/panel >/dev/null 2>&1); then
-        echo "NOTICE: Go race detector pre-check failed. Disabling -race on host."
-        RACE_FLAG=""
+    if ! command -v go >/dev/null 2>&1; then
+        echo "ERROR: Go toolchain not found in PATH; cannot build or run the qualification suites." >&2
+        exit 1
     fi
+
+    RACE_PROBE_OUTPUT=""
+    RACE_PROBE_EXIT=0
+    RACE_PROBE_OUTPUT="$(go test -race -tags "$GO_BUILD_TAGS" -run '^$' -count=1 ./cmd/panel 2>&1)" || RACE_PROBE_EXIT=$?
+
+    if [[ "$RACE_PROBE_EXIT" -eq 0 ]]; then
+        RACE_FLAG="-race"
+        RACE_PROBE_STATUS="supported"
+        echo "==> Race detector probe: host supports -race; keeping -race enabled."
+    elif RACE_PROBE_MARKER="$(race_probe_marker "$RACE_PROBE_OUTPUT")"; then
+        RACE_PROBE_STATUS="host-unsupported: $RACE_PROBE_MARKER"
+        echo "NOTICE: Host environment does not support the Go race detector (matched: $RACE_PROBE_MARKER)."
+        echo "        Disabling -race for this host; authoritative -race runs in CI on x86_64."
+    else
+        RACE_PROBE_STATUS="probe-failed"
+        echo "ERROR: The Go race detector probe failed for a reason that is not a host limitation." >&2
+        echo "       Command: go test -race -tags $GO_BUILD_TAGS -run '^$' -count=1 ./cmd/panel" >&2
+        echo "       Exit status: $RACE_PROBE_EXIT" >&2
+        echo "       Output (last 200 lines):" >&2
+        printf '%s\n' "$RACE_PROBE_OUTPUT" | tail -n 200 >&2
+        echo "       Refusing to remove -race coverage silently. Fix the failure above, or rerun" >&2
+        echo "       with --no-race to turn the race detector off deliberately." >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "$RACE_FLAG" ]]; then
+    RACE_ENABLED="true"
+else
+    RACE_ENABLED="false"
 fi
 
 # Ensure output directory exists (resolve to absolute path if relative)
@@ -173,7 +231,8 @@ echo " Amnezia Nexus - Differential Qualification Runner"
 echo "===================================================================="
 echo " Suite:         $SUITE"
 echo " Soak Full:     $SOAK_FULL"
-echo " Race Detector: $ENABLE_RACE"
+echo " Build Tags:    $GO_BUILD_TAGS"
+echo " Race Detector: $ENABLE_RACE (probe: $RACE_PROBE_STATUS)"
 echo " Timeout:       $TIMEOUT"
 echo " Output Dir:    $OUTPUT_DIR"
 echo " Started At:    $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -202,8 +261,8 @@ run_test_step() {
         eval "export $env_extra"
     fi
 
-    # Execute go test serially
-    if (cd "$REPO_ROOT" && go test -v $RACE_FLAG -timeout "$TIMEOUT" ./internal/vpn -run "$pattern" -count=1); then
+    # Execute go test serially, with the repository's required build tags.
+    if (cd "$REPO_ROOT" && go test -v $RACE_FLAG -tags "$GO_BUILD_TAGS" -timeout "$TIMEOUT" ./internal/vpn -run "$pattern" -count=1); then
         local step_duration=$(( $(date +%s) - step_start ))
         echo "==> [PASS] Suite '$step_name' completed in ${step_duration}s"
         PASSED_SUITES+=("$step_name (${step_duration}s)")
@@ -326,7 +385,8 @@ cat > "$SUMMARY_FILE" << EOF
   "suite": "$SUITE",
   "soak_full": $SOAK_FULL,
   "race_requested": $ENABLE_RACE,
-  "race_enabled": $([[ -n "$RACE_FLAG" ]] && echo "true" || echo "false"),
+  "race_enabled": $RACE_ENABLED,
+  "race_probe": "$RACE_PROBE_STATUS",
   "total_duration_sec": $TOTAL_DURATION,
   "passed_suites": [$(printf '"%s",' "${PASSED_SUITES[@]}" | sed 's/,$//')],
   "failed_suites": [$(printf '"%s",' "${FAILED_SUITES[@]}" | sed 's/,$//')],

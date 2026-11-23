@@ -28,6 +28,13 @@ concurrency:
   group: differential-soak-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # The repository's Go packages require this build tag (a package without it fails to
+  # compile on purpose, see internal/vpn/tunnel/vless/tags_guard.go). The other CI
+  # workflows set it the same way; the qualification runner also passes it explicitly so
+  # a local invocation behaves identically.
+  GOFLAGS: -tags=with_utls
+
 jobs:
   differential-qualification:
     name: Differential Qualification (${{ github.event.inputs.suite || 'scheduled-soak-full' }})
