@@ -58,9 +58,9 @@ func SynthesizeActionableProblemsWithTracker(routes []forwarder.RouteInfo, sessi
 	return SynthesizeActionableProblemsAt(routes, sessions, observedAt, tracker)
 }
 
-// SynthesizeActionableProblemsWithHandshakes derives per-session/route actionable problem records
-// by correlating active routes, route pressure, active VPN sessions, and peer handshakes.
-func SynthesizeActionableProblemsWithHandshakes(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
+// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
+// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
+func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
 	if observedAt.IsZero() {
 		observedAt = time.Now().UTC()
 	}
@@ -69,7 +69,6 @@ func SynthesizeActionableProblemsWithHandshakes(routes []forwarder.RouteInfo, se
 		sess, hasSess := findSessionForRoute(r, sessions)
 		problems = append(problems, synthesizeRoutePressureProblems(r, sess, hasSess, observedAt)...)
 	}
-	problems = append(problems, synthesizeStaleHandshakeProblems(sessions, peerHandshakes, observedAt)...)
 
 	var tr *problemOnsetTracker
 	if len(tracker) > 0 && tracker[0] != nil {
@@ -107,12 +106,6 @@ func SynthesizeActionableProblemsWithHandshakes(routes []forwarder.RouteInfo, se
 
 	sortActionableProblems(problems)
 	return problems
-}
-
-// SynthesizeActionableProblemsAt derives per-session/route actionable problem records
-// relative to an explicit observation timestamp, optionally persisting onset via a tracker.
-func SynthesizeActionableProblemsAt(routes []forwarder.RouteInfo, sessions []Session, observedAt time.Time, tracker ...*problemOnsetTracker) []ActionableProblem {
-	return SynthesizeActionableProblemsWithHandshakes(routes, sessions, nil, observedAt, tracker...)
 }
 
 func findSessionForRoute(r forwarder.RouteInfo, sessions []Session) (Session, bool) {
@@ -205,39 +198,6 @@ func synthesizeUnroutableSessionProblems(routes []forwarder.RouteInfo, sessions 
 				MessageKey:     "vpn_problem_session_without_route",
 				UserID:         sess.UserID,
 				SessionID:      sess.ID,
-				ConnectionName: sess.ConnectionName,
-				AssignedIP:     sess.AssignedIP,
-				BackendID:      sess.BackendTunnelID,
-				FirstObserved:  observedAt,
-			})
-		}
-	}
-	return problems
-}
-
-func synthesizeStaleHandshakeProblems(sessions []Session, peerHandshakes map[string]time.Time, observedAt time.Time) []ActionableProblem {
-	if peerHandshakes == nil {
-		return nil
-	}
-	if observedAt.IsZero() {
-		observedAt = time.Now().UTC()
-	}
-	var problems []ActionableProblem
-	for _, sess := range sessions {
-		if sess.PeerPublicKey == "" {
-			continue
-		}
-		hs, ok := peerHandshakes[sess.PeerPublicKey]
-		if !ok || hs.IsZero() || observedAt.Sub(hs) > DefaultHealthThresholds.HandshakeStaleAge {
-			problems = append(problems, ActionableProblem{
-				Severity:       "WARNING",
-				Category:       "sessions",
-				Message:        fmt.Sprintf("Upstream handshake stale (> %s)", DefaultHealthThresholds.HandshakeStaleAge),
-				MessageKey:     "vpn_problem_stale_handshake",
-				SessionID:      sess.ID,
-				UserID:         sess.UserID,
-				Username:       sess.Username,
-				ConnectionID:   sess.ConnectionID,
 				ConnectionName: sess.ConnectionName,
 				AssignedIP:     sess.AssignedIP,
 				BackendID:      sess.BackendTunnelID,
@@ -421,12 +381,12 @@ func (s *Service) fetchPeerIdentityMappings(ctx context.Context, peerKeys []stri
 	return connByPeer, userByPeer
 }
 
-func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session, peerHandshakes map[string]time.Time) []ActionableProblem {
+func (s *Service) synthesizeActionableProblems(routes []forwarder.RouteInfo, sessions []Session) []ActionableProblem {
 	var tracker *problemOnsetTracker
 	if s != nil {
 		tracker = s.getProblemOnsetTracker()
 	}
-	problems := SynthesizeActionableProblemsWithHandshakes(routes, sessions, peerHandshakes, time.Now().UTC(), tracker)
+	problems := SynthesizeActionableProblemsAt(routes, sessions, time.Now().UTC(), tracker)
 	if len(problems) == 0 || s == nil || s.db == nil {
 		return problems
 	}

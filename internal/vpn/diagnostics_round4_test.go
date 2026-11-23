@@ -202,7 +202,7 @@ func TestPeerSyncDivergenceReachesHealthSurface(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conds := evaluatePeerSyncAndBackendConditions(divergenceAt(tc.age),
-				BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+				BackendsDiagnostics{})
 			var divergence []HealthCondition
 			for _, c := range conds {
 				if c.Category == "peer_sync" && strings.Contains(c.Message, "divergence") {
@@ -242,7 +242,7 @@ func divergenceAt(age time.Duration) *PeerSyncStatus {
 // the age is stated as unknown instead and the severity stays WARNING.
 func TestPeerSyncDivergenceWithNoReconcileYet(t *testing.T) {
 	ps := &PeerSyncStatus{DesiredPeers: 4, ActualPeers: 0}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	var divergence []HealthCondition
 	for _, c := range conds {
 		if c.Category == "peer_sync" && strings.Contains(c.Message, "divergence") {
@@ -265,7 +265,7 @@ func TestPeerSyncDivergenceWithNoReconcileYet(t *testing.T) {
 // counts are not a divergence regardless of how stale the last reconcile is.
 func TestPeerSyncConvergedReportsNoDivergence(t *testing.T) {
 	ps := &PeerSyncStatus{DesiredPeers: 12, ActualPeers: 12, LastSuccessfulReconcile: time.Now().UTC()}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	for _, c := range conds {
 		if strings.Contains(c.Message, "divergence") {
 			t.Errorf("converged peer counts must not emit a divergence condition, got %+v", conds)
@@ -307,7 +307,7 @@ func TestInvalidDurableRowsContributeToHealth(t *testing.T) {
 	if stats.InvalidRows < 2 {
 		t.Fatalf("precondition: the colliding rows must be reported invalid, got %+v", stats)
 	}
-	conds := evaluatePeerSyncAndBackendConditions(&stats, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(&stats, BackendsDiagnostics{})
 	if !hasCondition(conds, "peer_sync", "DEGRADED") {
 		t.Fatalf("invalid durable rows must degrade peer_sync health, got %+v", conds)
 	}
@@ -360,7 +360,7 @@ func TestInvalidDurableRowsClearWhenRepaired(t *testing.T) {
 	if broken.InvalidRows < 2 {
 		t.Fatalf("precondition: expected invalid rows before repair, got %+v", broken)
 	}
-	if !hasCondition(evaluatePeerSyncAndBackendConditions(&broken, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{}),
+	if !hasCondition(evaluatePeerSyncAndBackendConditions(&broken, BackendsDiagnostics{}),
 		"peer_sync", "DEGRADED") {
 		t.Fatal("precondition: invalid rows must degrade health before repair")
 	}
@@ -388,7 +388,7 @@ func TestInvalidDurableRowsClearWhenRepaired(t *testing.T) {
 	if repaired.InvalidRows != 0 {
 		t.Fatalf("repair must clear InvalidRows, got %+v", repaired)
 	}
-	conds := evaluatePeerSyncAndBackendConditions(&repaired, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(&repaired, BackendsDiagnostics{})
 	if hasCondition(conds, "peer_sync", "DEGRADED") {
 		t.Errorf("health must recover once the rows are repaired, got %+v", conds)
 	}
@@ -412,7 +412,7 @@ func TestLifetimeFailureCountersStillDoNotPinHealth(t *testing.T) {
 		SyncFailuresRecent:    0,
 		EnqueueFailuresRecent: 0,
 	}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	for _, c := range conds {
 		if c.Category == "peer_sync" && c.Severity == "DEGRADED" {
 			t.Errorf("lifetime counters must not degrade current health, got %+v", conds)

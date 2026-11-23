@@ -675,7 +675,6 @@
   "vpn_problem_write_stall": "Device write stall detected",
   "vpn_problem_write_errors": "Device write errors active",
   "vpn_problem_route_queue_pressure": "High queue pressure detected on forwarder route",
-  "vpn_problem_stale_handshake": "Upstream handshake stale",
   "vpn_chart_current": "Current",
   "vpn_chart_peak": "Peak",
   "vpn_chart_write": "Write",

@@ -366,15 +366,16 @@ func (d RoutingConsistencyDiagnostics) DirectionalOwnershipMismatchRatePPS() flo
 	return d.OwnershipMismatchRatePPS()
 }
 
-// HandshakeFreshnessDiagnostics aggregates peer handshake distribution.
+// HandshakeFreshnessDiagnostics aggregates peer handshake distribution. It is a
+// diagnostic measurement only: no health condition, severity or actionable
+// problem is derived from it (issue #964).
 type HandshakeFreshnessDiagnostics struct {
-	Under2mCount      int                  `json:"under_2m_count"`
-	Between2m5mCount  int                  `json:"between_2m_5m_count"`
-	Over5mCount       int                  `json:"over_5m_count"`
-	NeverCount        int                  `json:"never_count"`
-	TotalPeers        int                  `json:"total_peers"`
-	StaleLiveSessions []string             `json:"stale_live_sessions,omitempty"`
-	PeerHandshakes    map[string]time.Time `json:"-"`
+	Under2mCount      int      `json:"under_2m_count"`
+	Between2m5mCount  int      `json:"between_2m_5m_count"`
+	Over5mCount       int      `json:"over_5m_count"`
+	NeverCount        int      `json:"never_count"`
+	TotalPeers        int      `json:"total_peers"`
+	StaleLiveSessions []string `json:"stale_live_sessions,omitempty"`
 }
 
 // BackendTelemetryItem captures per-backend operational metrics.
@@ -700,7 +701,7 @@ func (s *Service) populateOperationalDiagnosticsFromInputs(status *Status, route
 	}
 
 	// 10. Centralized Rule-Based Health Assessment
-	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions, status.HandshakeFreshness.PeerHandshakes)
+	actionableProblems := s.synthesizeActionableProblems(routes, inputs.sessions)
 	status.HealthAssessment = EvaluateForwarderHealth(
 		status.ForwarderAvailable,
 		status.EngineRunning,

@@ -383,7 +383,7 @@ func TestB4PartialEnabledBackendFailureIsDegraded(t *testing.T) {
 			EnabledCount:     2,
 			HealthyCount:     1,
 			TotalCount:       2,
-		}, HandshakeFreshnessDiagnostics{})
+		})
 
 	cond := assertSingleCondition(t, conds, "backend")
 	if cond.Severity != "DEGRADED" {
@@ -441,7 +441,7 @@ func TestB4BackendFailureClassificationMatrix(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			conds := evaluatePeerSyncAndBackendConditions(nil, tc.backends, HandshakeFreshnessDiagnostics{})
+			conds := evaluatePeerSyncAndBackendConditions(nil, tc.backends)
 			got := conditionsIn(conds, "backend")
 			if tc.wantSev == "" {
 				if len(got) != 0 {
@@ -471,35 +471,36 @@ func TestB4BackendFailureClassificationMatrix(t *testing.T) {
 // B4 guard on the OTHER summarizer branch: genuinely advisory WARNING-only
 // conditions must still read HEALTHY. The fix is B4's condition severity, not
 // a blanket change to summarizeHealthConditions.
+//
+// A healthy fleet used to be able to reach this branch through a stale
+// upstream handshake, which produced a sessions/WARNING condition (#964). That
+// producer is gone, so this test no longer has a producer-side WARNING to lean
+// on; it keeps the fleet assertion and pins the summarizer branch directly.
 func TestB4WarningOnlyConditionsStillMapToHealthy(t *testing.T) {
 	conds := evaluatePeerSyncAndBackendConditions(nil,
-		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 2, HealthyCount: 2, TotalCount: 2},
-		HandshakeFreshnessDiagnostics{TotalPeers: 3, StaleLiveSessions: []string{"peer-a"}})
+		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 2, HealthyCount: 2, TotalCount: 2})
 
 	backend := conditionsIn(conds, "backend")
 	if len(backend) != 0 {
 		t.Fatalf("a fully healthy fleet must emit no backend condition: %+v", backend)
 	}
-	if !hasCondition(conds, "sessions", "WARNING") {
-		t.Fatalf("expected the stale-handshake WARNING: %+v", conds)
-	}
 	status, summary := summarizeHealthConditions(conds)
 	if status != HealthHealthy {
-		t.Fatalf("WARNING-only must still summarize to HEALTHY, got %s (%s)", status, summary)
+		t.Fatalf("a healthy fleet must summarize to HEALTHY, got %s (%s)", status, summary)
 	}
 
 	// Direct check of the summarizer branch itself, independent of any producer.
-	if st, _ := summarizeHealthConditions([]HealthCondition{
+	warnings := []HealthCondition{
 		{Category: "queue_pressure", Severity: "WARNING", Message: "advisory"},
 		{Category: "sessions", Severity: "WARNING", Message: "advisory too"},
-	}); st != HealthHealthy {
+	}
+	if st, _ := summarizeHealthConditions(warnings); st != HealthHealthy {
 		t.Fatalf("summarizer WARNING branch changed: %s", st)
 	}
 
 	// And a WARNING alongside a DEGRADED backend failure must not mask it.
-	mixed := append(conds, evaluatePeerSyncAndBackendConditions(nil,
-		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 2, HealthyCount: 1, TotalCount: 2},
-		HandshakeFreshnessDiagnostics{})...)
+	mixed := append(warnings, evaluatePeerSyncAndBackendConditions(nil,
+		BackendsDiagnostics{EligibilityKnown: true, EnabledCount: 2, HealthyCount: 1, TotalCount: 2})...)
 	if st, _ := summarizeHealthConditions(mixed); st != HealthDegraded {
 		t.Fatalf("a backend failure alongside warnings must read DEGRADED, got %s", st)
 	}
@@ -513,7 +514,7 @@ func TestB4ProductionFleetCollectorDistinguishesDisabledFromFailed(t *testing.T)
 	if diags.EligibilityKnown != true || diags.TotalCount != 0 {
 		t.Fatalf("empty fleet baseline changed: %+v", diags)
 	}
-	conds := evaluatePeerSyncAndBackendConditions(nil, diags, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(nil, diags)
 	if got := conditionsIn(conds, "backend"); len(got) != 1 || got[0].Severity != "CRITICAL" {
 		t.Fatalf("an empty fleet must stay CRITICAL: %+v", got)
 	}

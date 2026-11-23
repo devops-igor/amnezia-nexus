@@ -367,7 +367,7 @@ func TestPeerSyncFailuresRecoverToHealthy(t *testing.T) {
 	active.SyncFailures = 5
 	active.SyncFailuresRecent = 2
 	active.FailuresWindowSec = 1
-	conds := evaluatePeerSyncAndBackendConditions(&active, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(&active, BackendsDiagnostics{})
 	if !hasCondition(conds, "peer_sync", "DEGRADED") {
 		t.Fatalf("expected an active peer_sync DEGRADED condition, got %+v", conds)
 	}
@@ -375,7 +375,7 @@ func TestPeerSyncFailuresRecoverToHealthy(t *testing.T) {
 	// Recovered: cumulative stays non-zero, no recent delta, no condition.
 	recovered := ps
 	recovered.SyncFailures = 5
-	conds = evaluatePeerSyncAndBackendConditions(&recovered, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds = evaluatePeerSyncAndBackendConditions(&recovered, BackendsDiagnostics{})
 	if hasCondition(conds, "peer_sync", "DEGRADED") {
 		t.Errorf("lifetime SyncFailures must not degrade current health, got %+v", conds)
 	}

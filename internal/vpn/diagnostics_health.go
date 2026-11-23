@@ -7,6 +7,14 @@ import (
 )
 
 // EvaluateForwarderHealth applies deterministic rules to derive the overall dataplane health status.
+//
+// handshake is the handshake-freshness section of the status document. It is
+// accepted so callers pass the document through unchanged, and it is
+// deliberately NOT an input to any condition: handshake age is a diagnostic
+// measurement, not a fault, and an idle peer with an old handshake must never
+// move the summary severity or the overall status (issue #964). A
+// handshake-driven condition must not be reintroduced here;
+// TestStaleHandshakeHealthyFleetStaysHealthy fails if one is.
 func EvaluateForwarderHealth(
 	fwdAvailable bool,
 	engineRunning bool,
@@ -40,7 +48,7 @@ func EvaluateForwarderHealth(
 	conditions = append(conditions, evaluateQueueConditions(queue)...)
 	conditions = append(conditions, evaluateLatencyConditions(latency)...)
 	conditions = append(conditions, evaluateVirtualTUNAndDropConditions(vtun, drops, routing, queue.QueueDropRatePps)...)
-	conditions = append(conditions, evaluatePeerSyncAndBackendConditions(peerSync, backends, handshake)...)
+	conditions = append(conditions, evaluatePeerSyncAndBackendConditions(peerSync, backends)...)
 
 	status, summary := summarizeHealthConditions(conditions)
 
@@ -453,7 +461,7 @@ func peerSyncDivergenceCondition(peerSync *PeerSyncStatus, now time.Time) *Healt
 	}
 }
 
-func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends BackendsDiagnostics, handshake HandshakeFreshnessDiagnostics) []HealthCondition {
+func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends BackendsDiagnostics) []HealthCondition {
 	var conds []HealthCondition
 	now := time.Now()
 	if peerSync != nil {
@@ -580,15 +588,6 @@ func evaluatePeerSyncAndBackendConditions(peerSync *PeerSyncStatus, backends Bac
 		})
 	}
 
-	if len(handshake.StaleLiveSessions) > 0 {
-		conds = append(conds, HealthCondition{
-			Category:   "sessions",
-			Severity:   "WARNING",
-			MessageKey: "vpn_problem_stale_handshake",
-			Message: fmt.Sprintf("%d active live session(s) have stale upstream handshakes (> %s)",
-				len(handshake.StaleLiveSessions), DefaultHealthThresholds.HandshakeStaleAge),
-		})
-	}
 	return conds
 }
 

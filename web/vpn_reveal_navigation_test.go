@@ -105,12 +105,12 @@ w.vpnTableInstance = new w.NexusTable('#vpnBackendsTable', {
 });
 `
 
-// vpnRevealSessionsFixtureJS renders two sessions: one with a genuinely pressured
-// route, which the problems-only filter keeps, and one whose route looks clean. The
-// health assessment still reports a stale handshake for the second one, which is the
+// vpnRevealSessionsFixtureJS renders two sessions: one whose route is genuinely
+// pressured, which the problems-only filter keeps, and one whose route looks clean.
+// The health assessment still reports a problem for the second one, which is the
 // case the owner described: a real problem row whose session the filter hides. The
-// filter only inspects route pressure/drops/stalls, so it excludes a session the
-// problem set does report.
+// filter only inspects route pressure/drops/stalls, so it excludes a session whose
+// route carries no pressure even when the assessment reports a problem for it.
 //
 // The routes travel ON the health payload: vpnRenderForwarderHealth assigns that
 // payload to vpnLastStatus, which is the only place vpnFindRouteForSession reads. A
@@ -119,20 +119,20 @@ w.vpnTableInstance = new w.NexusTable('#vpnBackendsTable', {
 const vpnRevealSessionsFixtureJS = `
 const sessionRoutes = [
     { session_id: 'S-pressure', traffic: {}, has_pressure: true, queue_full_drops_recent: 4, write_errors_recent: 0, write_stalls_recent: 0 },
-    { session_id: 'S-stale', traffic: {}, queue_full_drops_recent: 0, write_errors_recent: 0, write_stalls_recent: 0 }
+    { session_id: 'S-quiet', traffic: {}, queue_full_drops_recent: 0, write_errors_recent: 0, write_stalls_recent: 0 }
 ];
 w.vpnLastSessions = { sessions: [
     { session_id: 'S-pressure', username: 'alice', status: 'connected', server_name: 'Alpha' },
-    { session_id: 'S-stale', username: 'bob', status: 'connected', server_name: 'Alpha' }
+    { session_id: 'S-quiet', username: 'bob', status: 'connected', server_name: 'Alpha' }
 ] };
 w.renderSessions(w.vpnLastSessions.sessions);
-function staleHandshakeProblem() {
+function queuePressureProblem() {
     w.vpnRenderForwarderHealth({
         forwarder_available: true,
         all_routes: sessionRoutes,
         health_assessment: {
             status: 'DEGRADED',
-            conditions: [{ severity: 'DEGRADED', category: 'routing', message: 'Upstream handshake stale', session_id: 'S-stale' }]
+            conditions: [{ severity: 'DEGRADED', category: 'routing', message: 'Return queue full drops (4 recent) for 10.8.0.4', session_id: 'S-quiet' }]
         }
     });
 }
@@ -301,7 +301,7 @@ func TestVPN955R9SessionProblemsOnlyReveal(t *testing.T) {
 (() => {
 const assert = require('assert');
 `+vpnRevealPreconditionsJS+vpnRevealSessionsFixtureJS+`
-staleHandshakeProblem();
+queuePressureProblem();
 const summary = d.getElementById('vpn-fwd-headline-summary');
 
 // PRE-CONDITION: the operator turned on problems-only. It does not hide rows; it
@@ -310,7 +310,7 @@ const summary = d.getElementById('vpn-fwd-headline-summary');
 // Turning the filter on through its own handler, so the state and the control agree.
 w.vpnToggleSessionsProblemFilter();
 assert.strictEqual(w.vpnSessionsFilterOnlyProblems, true, 'problems-only is on before Inspect');
-assert(!sessionRow('S-stale'), 'the target session has NO row while problems-only is on');
+assert(!sessionRow('S-quiet'), 'the target session has NO row while problems-only is on');
 assert(sessionRow('S-pressure'), 'while the session with a pressured route is still listed');
 assert.strictEqual(d.getElementById('vpn-fwd-problem-list').hidden, false, 'and a problem row is listed');
 
@@ -320,13 +320,13 @@ assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus starts away 
 inspectProblem();
 
 // OUTCOME: a row now exists, it is painted, and focus is on it.
-const tr = sessionRow('S-stale');
+const tr = sessionRow('S-quiet');
 assert(tr, 'Inspect produced a row for the session that exists in the data');
 const cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert(cell, 'the revealed row carries its action cell');
 assert.strictEqual(isVisible(cell), true, 'the revealed session cell is painted');
 assert.strictEqual(d.activeElement, cell, 'focus landed on the revealed session cell');
-assert.strictEqual(d.activeElement.getAttribute('data-session-id'), 'S-stale', 'and on the reported session');
+assert.strictEqual(d.activeElement.getAttribute('data-session-id'), 'S-quiet', 'and on the reported session');
 
 // The old code told the operator this session was gone. That statement is false.
 assert(!summary.textContent.includes('no longer in the current list'),
@@ -347,7 +347,7 @@ console.log('VPN955_R9_SESSION_REVEAL_OK');
 (() => {
 const assert = require('assert');
 `+vpnRevealPreconditionsJS+vpnRevealSessionsFixtureJS+`
-staleHandshakeProblem();
+queuePressureProblem();
 
 const btn = d.getElementById('vpn-sessions-toggle-problems-btn');
 const label = d.getElementById('vpn-sessions-toggle-problems-text');
@@ -357,7 +357,7 @@ w.vpnToggleSessionsProblemFilter();
 // PRE-CONDITION: the control shows the filter as ON.
 assert.strictEqual(w.vpnSessionsFilterOnlyProblems, true, 'problems-only is on');
 assert(btn.classList.contains('btn-primary'), 'the button reads as pressed while the filter is on');
-assert(!sessionRow('S-stale'), 'and the target row does not exist');
+assert(!sessionRow('S-quiet'), 'and the target row does not exist');
 const showAllLabel = label.textContent;
 
 inspectProblem();
@@ -370,8 +370,8 @@ assert.notStrictEqual(label.textContent, showAllLabel, 'the label changed with t
 
 // And the choice is genuinely cleared, not merely hidden: every session is listed
 // again, with the target among them and painted.
-assert(sessionRow('S-stale') && sessionRow('S-pressure'), 'both sessions are listed after the reveal');
-assert.strictEqual(isVisible(sessionRow('S-stale')), true, 'including the target, which is painted');
+assert(sessionRow('S-quiet') && sessionRow('S-pressure'), 'both sessions are listed after the reveal');
+assert.strictEqual(isVisible(sessionRow('S-quiet')), true, 'including the target, which is painted');
 console.log('VPN955_R9_SESSION_FILTER_DECISION_OK');
 })();
 `, "VPN955_R9_SESSION_FILTER_DECISION_OK")
@@ -382,21 +382,21 @@ console.log('VPN955_R9_SESSION_FILTER_DECISION_OK');
 (() => {
 const assert = require('assert');
 `+vpnRevealPreconditionsJS+vpnRevealSessionsFixtureJS+`
-staleHandshakeProblem();
+queuePressureProblem();
 
 // Turning the filter on through its own handler, so the state and the control agree.
 w.vpnToggleSessionsProblemFilter();
-assert(!sessionRow('S-stale'), 'PRE-CONDITION: the row does not exist');
+assert(!sessionRow('S-quiet'), 'PRE-CONDITION: the row does not exist');
 
 inspectProblem();
-const first = sessionRow('S-stale');
+const first = sessionRow('S-quiet');
 assert(first && first.classList.contains('row-expanded'), 'the first Inspect reveals and opens the detail');
 assert.strictEqual(isVisible(first.querySelector('[data-action="vpn-toggle-session"]')), true, 'the revealed row is painted');
 assert.strictEqual(d.activeElement, first.querySelector('[data-action="vpn-toggle-session"]'), 'the first Inspect focuses it');
 
 // A second Inspect must keep the detail open, not toggle it shut.
 inspectProblem();
-const second = sessionRow('S-stale');
+const second = sessionRow('S-quiet');
 assert(second, 'the row is still present after a second Inspect');
 assert(second.classList.contains('row-expanded'), 'a second Inspect keeps the drill-down open');
 assert.strictEqual(isVisible(second.querySelector('[data-action="vpn-toggle-session"]')), true, 'the row is still painted');
@@ -646,10 +646,10 @@ assert.strictEqual(isVisible(revealed.querySelector('[data-action="vpn-toggle-se
 			setup: `
 // Turning the filter on through its own handler, so the state and the control agree.
 w.vpnToggleSessionsProblemFilter();
-assert(!sessionRow('S-stale'), 'PRE-CONDITION: problems-only excludes the target session entirely');
-w.vpnRenderForwarderHealth({ forwarder_available: true, health_assessment: { status: 'DEGRADED', conditions: [{ severity: 'DEGRADED', category: 'routing', message: 'Upstream handshake stale', session_id: 'S-stale' }] } });
+assert(!sessionRow('S-quiet'), 'PRE-CONDITION: problems-only excludes the target session entirely');
+w.vpnRenderForwarderHealth({ forwarder_available: true, health_assessment: { status: 'DEGRADED', conditions: [{ severity: 'DEGRADED', category: 'routing', message: 'Return queue full drops (4 recent) for 10.8.0.4', session_id: 'S-quiet' }] } });
 inspectProblem();
-const tr = sessionRow('S-stale');
+const tr = sessionRow('S-quiet');
 assert(tr, 'a row exists for the session');
 assert.strictEqual(isVisible(tr.querySelector('[data-action="vpn-toggle-session"]')), true, 'and it is painted');
 assert(!d.getElementById('vpn-fwd-headline-summary').textContent.includes('no longer in the current list'),
