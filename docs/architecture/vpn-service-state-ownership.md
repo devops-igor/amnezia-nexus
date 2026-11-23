@@ -76,6 +76,7 @@ The table below audits every field in the `Service` struct (`internal/vpn/vpn.go
 | 58 | `diagDeltas` | `diagDeltaTrackers` | `s.diagRatesMu` | Initialized in `resetDiagnosticsGeneration`, sampling | In-memory deltas | Pure memory calculations. |
 | 59 | `historyStopCh` | `chan struct{}` | `s.mu.Lock` | Allocated under `s.mu.Lock` in `startRollingHistory()`, nil'd in `stopRollingHistory()` | In-memory worker lifecycle signal | Channel signaling only. |
 | 60 | `historyDoneCh` | `chan struct{}` | `s.mu.Lock` | Allocated under `s.mu.Lock` in `startRollingHistory()`, nil'd in `stopRollingHistory()` | In-memory worker lifecycle signal | Channel signaling only. |
+| 61 | `inventoryOverride` | `*policy.InventoryOverride` | `s.mu.Lock` | Nil at `NewVPNService`; set by `ConfigurePBR` (activation installs the accepted override) and by `SetInventoryOverride` (accepted save, and the disable path that keeps the record described) | In-memory immutable parsed override | Pure memory pointer to an immutable value. `SetInventoryOverride` rebuilds and installs the destination classifier while policy routing is on; construction reads only the embedded artifacts, so it performs no network, database or kernel I/O under `s.mu`. |
 | -- | `obfuscationMigrationMu` | `sync.Mutex` | Package-level mutex | `ensureObfuscationParams` in `NewVPNService` | In-memory initialization gate | Serializes first-start config migration across concurrent service constructors. Permits DB read/write. Disjoint from service instance locks. |
 
 ---

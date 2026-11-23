@@ -38,6 +38,7 @@ Find your task, open the package, read the contract, and run the validation befo
 | Server protocol operations | `internal/manager/` | Manager interfaces (`internal/manager/manager.go`) | Manager unit/mock tests; timeout and rollback behavior |
 | VPN sessions or backends | `internal/vpn/` | [VPN service state ownership](vpn-service-state-ownership.md) | State ownership contract; `go test -race ./internal/vpn/...`; multi-backend tests |
 | Dataplane and packet forwarding | `internal/vpn/forwarder/` | [Forwarder dataplane ownership](forwarder-dataplane-ownership.md) | Forwarder tests; queue/dwell tests |
+| Routing policy, destination classification, PROXY exceptions | `internal/policy/`, `internal/vpn/forwarder/routing_decision.go` | [Routing policy contract](routing-policy-contract.md) | `go test ./internal/policy/... ./internal/vpn/forwarder/...`; classifier and precedence tests |
 | Database records or migrations | `internal/database/` | Migration conventions (section 6) | Migration tests (`database_test.go`); upgrade compatibility |
 | Page behavior and UI | `web/templates/`, `web/static/js/` | [Frontend JavaScript contracts](frontend-javascript-contracts.md), [CSS contracts](css-contracts.md) | Node/jsdom tests (`web/*_test.go`); 5-locale i18n parity |
 
@@ -58,6 +59,24 @@ Find your task, open the package, read the contract, and run the validation befo
 | `internal/security/` | Password hashing, credential encryption, session encoding, and integrity helpers. Stdlib and crypto only. |
 | `internal/captcha/` | Captcha generation and verification, embedded captcha assets. Self-contained. |
 | `internal/geodb/` | Offline IPv4 ASN and country lookup table (`geodb.go`) over the embedded `ip2asn.bin.gz` asset, plus the multi-region CDN ASN table. Embedded asset and in-memory lookup only; no operational imports. |
+| `internal/policy/` | Policy-routing domain: the destination-address classifier (`classify.go`), the committed Russian IPv4 allocation inventory (`inventory.go`, `inventory/`), the operator exception list and inventory override with their settings record and predecessor reader (`settings.go`, `settings_legacy.go`, `inventory_override.go`), snapshot compilation and the compile-and-publish cycle (`parse.go`, `snapshot.go`, `sync.go`), the durable generation store (`cache.go`, `FileStore`), and the default upstream pair every generated client configuration renders its DNS servers from (`upstream.go`). Imports only the standard library and `internal/geodb`. |
+
+**Client DNS in a generated profile.** `policy.DefaultUpstreams()`
+(`internal/policy/upstream.go`) is the single definition of that default pair —
+AdGuard's public resolvers, `94.140.14.14` then `94.140.15.15`, on the plain
+transport — and the profile the panel generates for a user
+(`vpn.Service.renderClientConfigForConnection`, `internal/vpn/client_config.go`)
+renders its DNS servers from that function rather than from constants of its own.
+`defaultClientDNSServers()`
+(`internal/vpn/client_config.go`) derives the rendered pair: it keeps only the
+entries whose effective transport is `policy.TransportPlain`, takes the first two
+in order, and repeats the first address when only one plain entry exists.
+`awg.RenderClientConfig` (`internal/manager/awg/config.go`) writes a single
+`DNS =` line — one entry when the two slots are equal, otherwise both separated
+by a comma in the same order. The panel's own gateway address is never rendered.
+A profile is produced when a client downloads it, so a later change to the pair
+cannot rewrite a file a user already holds; the next generated profile carries
+the new value.
 
 ### 2.3 Persistence
 

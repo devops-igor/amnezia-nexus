@@ -182,6 +182,34 @@ it takes the same path as any other transport on that port.
 Per-flow records under policy routing are described in §3.1 and §3.2. The client
 diagnosis reads them from the forwarder; it reads no DNS history from it.
 
+### 2.1.4 Routing Decision Ownership
+
+The destination of a policy-routed client packet is classified by one pure
+function, `decideEgress` (`routing_decision.go`), and nowhere else. It has no side
+effects and reads no global state: `routeClientPBR` (`pumps.go`) reads every input
+once — the address-side prohibited verdict (`ValidateDirectDestination`), the
+published policy snapshot's address match, and the installed
+`DestinationClassifier`'s answer — and hands them over together, so the decision
+and the metadata recorded with it describe the same instant.
+
+- The contract's rows, their recorded reasons and what classification does not
+  mean are in [Routing policy contract](routing-policy-contract.md);
+  `routing_decision.go` is the specification and the code in one file.
+- The classifier is installed and removed with policy routing
+  (`SetDestinationClassifier` from `vpn.ConfigurePBR` / `TeardownPBR`), so a
+  disabled data path holds no stale classification. A nil classifier answers
+  "uncovered", which is the fail-safe proxy row.
+- An admission DROP row is refused before flow state exists and recorded in the
+  drop ledger by the producer (`drop_ledger.go`). A DIRECT dispatch the WAN path
+  refuses is recorded as a refusal with the producer's token, never re-decided as
+  PROXY — in the drop ledger when the refusal leaves no flow behind, and on the
+  flow's own `failed` outcome once the entry exists, so one refusal is not
+  reported twice (`drop_refusal.go`). A row 6 refusal that happens after the flow
+  entry exists therefore adds no ledger row.
+- The chosen route and the branch that chose it are written onto the flow once,
+  by the function that decided (`RecordFlowDecision`, `flow_evidence.go`), so a
+  reused 5-tuple cannot inherit another decision's explanation.
+
 
 ---
 
