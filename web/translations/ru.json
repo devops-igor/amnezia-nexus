@@ -1057,5 +1057,14 @@
   "vpn_issue_session_id": "Сессия {id}",
   "vpn_issue_entity_missing_session": "Этой сессии больше нет в текущем списке.",
   "vpn_issue_entity_missing_backend": "Этого бэкенда больше нет в текущем списке.",
-  "vpn_diag_write_stalls_window": "{count} недавних задержек записи за последние {window}"
+  "vpn_diag_write_stalls_window": "{count} недавних задержек записи за последние {window}",
+  "settings_nav_label": "Разделы настроек",
+  "settings_group_portal": "Портал",
+  "settings_group_portal_desc": "Как панель выглядит для пользователей, как они в неё попадают и кому она доступна.",
+  "settings_group_notifications": "Уведомления",
+  "settings_group_notifications_desc": "Куда панель отправляет оповещения и что она уже отправила.",
+  "settings_group_network": "Сетевая политика",
+  "settings_group_network_desc": "Как клиентский трафик покидает хост и как посмотреть решения по одному клиенту.",
+  "settings_group_system": "Система",
+  "settings_group_system_desc": "На чём работает панель, у какого провайдера можно заказать сервер и как сохраняются её данные."
 }

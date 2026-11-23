@@ -467,7 +467,10 @@ func TestDeliveredAssetURLMovesWithTheBytes(t *testing.T) {
 	const changed = "/static/js/tables.js"
 	const other = "/static/css/vpn.css"
 
-	root := deliveredStaticCopy(t, changed, other)
+	// base.html also loads the settings sheet through its own identity, so the
+	// root has to hold that asset as well. It is not one of the two URLs this
+	// check follows.
+	root := deliveredStaticCopy(t, changed, other, "/static/css/settings.css")
 	before := renderBaseShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, changed)
 	if beforeURL == "" {

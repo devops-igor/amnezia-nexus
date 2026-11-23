@@ -745,11 +745,20 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			firstIdx := strings.Index(cleanHTML, "/static/css/")
 			lastIdx := strings.LastIndex(cleanHTML, "/static/css/")
 			if firstIdx != -1 && lastIdx != -1 && firstIdx < lastIdx {
+				// The span ends at the end of the last stylesheet LINK, not at the
+				// path inside it. A link identified by its own bytes names that path
+				// inside a template action, so cutting the span at the last path
+				// occurrence would leave half an action in the span and report it as
+				// a stray conditional.
+				endIdx := lastIdx
+				if close := strings.Index(cleanHTML[lastIdx:], ">"); close >= 0 {
+					endIdx = lastIdx + close
+				}
 				// The actions allowed between the links are the two cache
 				// identities: the release version, and the asset's own bytes.
 				// Any other action (a conditional include, a range) could change
 				// which stylesheets load or in what order.
-				linkSpan := strings.ReplaceAll(cleanHTML[firstIdx:lastIdx], assetVersionAction, "")
+				linkSpan := strings.ReplaceAll(cleanHTML[firstIdx:endIdx], assetVersionAction, "")
 				linkSpan = normalizeAssetActions(linkSpan)
 				if strings.Contains(linkSpan, "{{") {
 					t.Fatalf("%s contains Go template actions between stylesheet links", tmpl)

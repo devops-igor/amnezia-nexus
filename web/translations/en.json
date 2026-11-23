@@ -1057,5 +1057,14 @@
   "vpn_issue_session_id": "Session {id}",
   "vpn_issue_entity_missing_session": "That session is no longer in the current list.",
   "vpn_issue_entity_missing_backend": "That backend is no longer in the current list.",
-  "vpn_diag_write_stalls_window": "{count} recent write stalls over the last {window}"
+  "vpn_diag_write_stalls_window": "{count} recent write stalls over the last {window}",
+  "settings_nav_label": "Settings sections",
+  "settings_group_portal": "Portal",
+  "settings_group_portal_desc": "How the panel looks to users, how they reach it, and who may use it.",
+  "settings_group_notifications": "Notifications",
+  "settings_group_notifications_desc": "Where the panel sends alerts, and what it has already sent.",
+  "settings_group_network": "Network policy",
+  "settings_group_network_desc": "How client traffic leaves the host, and how to inspect one client's decisions.",
+  "settings_group_system": "System",
+  "settings_group_system_desc": "What this panel runs on, which provider it can order from, and how its data is saved."
 }

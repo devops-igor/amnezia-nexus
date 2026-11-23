@@ -1057,5 +1057,14 @@
   "vpn_issue_session_id": "会话 {id}",
   "vpn_issue_entity_missing_session": "该会话已不在当前列表中。",
   "vpn_issue_entity_missing_backend": "该后端已不在当前列表中。",
-  "vpn_diag_write_stalls_window": "最近 {window} 内 {count} 次写入停顿"
+  "vpn_diag_write_stalls_window": "最近 {window} 内 {count} 次写入停顿",
+  "settings_nav_label": "设置分区",
+  "settings_group_portal": "门户",
+  "settings_group_portal_desc": "面板对用户的外观、用户的访问方式，以及谁可以使用它。",
+  "settings_group_notifications": "通知",
+  "settings_group_notifications_desc": "面板将告警发送到哪里，以及已经发送了什么。",
+  "settings_group_network": "网络策略",
+  "settings_group_network_desc": "客户端流量如何离开主机，以及如何查看单个客户端的决策。",
+  "settings_group_system": "系统",
+  "settings_group_system_desc": "此面板运行在什么之上、可以向哪个服务商下单，以及它的数据如何保存。"
 }

@@ -79,7 +79,10 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 		for _, token := range []string{
 			`src="` + controllerSrc + `"`,
 			`id="policyClientSelect"`,
-			`<table class="data-table">`,
+			// Each evidence table is named by the heading of its own sub-area, so
+			// the tag now also carries the reference to that heading.
+			`<table class="data-table" aria-labelledby="policyClientFlowsLabel">`,
+			`<table aria-labelledby="policyClientDropsLabel">`,
 			`scope="col"`,
 		} {
 			if !strings.Contains(adminBody, token) {

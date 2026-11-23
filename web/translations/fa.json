@@ -1057,5 +1057,14 @@
   "vpn_issue_session_id": "نشست {id}",
   "vpn_issue_entity_missing_session": "این نشست دیگر در فهرست کنونی نیست.",
   "vpn_issue_entity_missing_backend": "این بک‌اند دیگر در فهرست کنونی نیست.",
-  "vpn_diag_write_stalls_window": "{count} توقف نوشتن اخیر در {window} گذشته"
+  "vpn_diag_write_stalls_window": "{count} توقف نوشتن اخیر در {window} گذشته",
+  "settings_nav_label": "بخش‌های تنظیمات",
+  "settings_group_portal": "پورتال",
+  "settings_group_portal_desc": "ظاهر پنل برای کاربران، شیوهٔ ورود آنان، و اینکه چه کسانی می‌توانند از آن استفاده کنند.",
+  "settings_group_notifications": "اعلان‌ها",
+  "settings_group_notifications_desc": "پنل هشدارها را کجا می‌فرستد و تا کنون چه فرستاده است.",
+  "settings_group_network": "سیاست شبکه",
+  "settings_group_network_desc": "ترافیک کاربرها چگونه از میزبان خارج می‌شود و چگونه می‌توان تصمیم‌های یک کاربر را بررسی کرد.",
+  "settings_group_system": "سیستم",
+  "settings_group_system_desc": "این پنل بر چه چیزی اجرا می‌شود، از کدام ارائه‌دهنده می‌تواند سفارش دهد و داده‌هایش چگونه ذخیره می‌شود."
 }

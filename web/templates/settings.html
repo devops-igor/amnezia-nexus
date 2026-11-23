@@ -5,28 +5,66 @@
     {{ _ "settings_title" }}
 </h1>
 
-<div class="settings-grid">
-    {{ template "settings_appearance" . }}
+{{/* In-page navigation: one link per group, in document order. It is a plain
+     list of anchors, so it works without script; the controller adds only the
+     current-group indication and the focus handoff. Each group is a landmark
+     with a stable id, which is what a link points at. A group that does not
+     render for this role contributes no link, so no link is ever a dead end. */}}
+<nav class="settings-subnav" id="settingsSubnav" aria-label="{{ _ "settings_nav_label" }}">
+    <ul class="settings-subnav-list">
+        <li><a class="btn btn-secondary settings-subnav-link" href="#group-portal">{{ _ "settings_group_portal" }}</a></li>
+        <li><a class="btn btn-secondary settings-subnav-link" href="#group-notifications">{{ _ "settings_group_notifications" }}</a></li>
+        {{ if is_admin .current_user }}
+        <li><a class="btn btn-secondary settings-subnav-link" href="#group-network">{{ _ "settings_group_network" }}</a></li>
+        {{ end }}
+        <li><a class="btn btn-secondary settings-subnav-link" href="#group-system">{{ _ "settings_group_system" }}</a></li>
+    </ul>
+</nav>
 
-    {{ template "settings_captcha" . }}
+<section class="settings-group" id="group-portal" aria-labelledby="group-portal-title">
+    <h2 class="settings-group-title" id="group-portal-title" tabindex="-1">{{ _ "settings_group_portal" }}</h2>
+    <p class="card-subtitle">{{ _ "settings_group_portal_desc" }}</p>
+    <div class="settings-grid">
+        {{ template "settings_appearance" . }}
+        {{ template "settings_ssl" . }}
+        {{ template "settings_captcha" . }}
+        {{ template "settings_limits" . }}
+    </div>
+</section>
 
-    {{ template "settings_telegram" . }}
-    {{ template "settings_notifications" . }}
-    {{ template "settings_ssl" . }}
+<section class="settings-group" id="group-notifications" aria-labelledby="group-notifications-title">
+    <h2 class="settings-group-title" id="group-notifications-title" tabindex="-1">{{ _ "settings_group_notifications" }}</h2>
+    <p class="card-subtitle">{{ _ "settings_group_notifications_desc" }}</p>
+    <div class="settings-grid">
+        {{ template "settings_telegram" . }}
+        {{ template "settings_notifications" . }}
+    </div>
+</section>
 
-    {{ template "settings_limits" . }}
+{{ if is_admin .current_user }}
+<section class="settings-group" id="group-network" aria-labelledby="group-network-title">
+    <h2 class="settings-group-title" id="group-network-title" tabindex="-1">{{ _ "settings_group_network" }}</h2>
+    <p class="card-subtitle">{{ _ "settings_group_network_desc" }}</p>
+    <div class="settings-grid">
+        {{ template "settings_policy" . }}
+        {{ template "settings_policy_client" . }}
+    </div>
+</section>
+{{ end }}
 
-    {{ template "settings_backup" . }}
+<section class="settings-group" id="group-system" aria-labelledby="group-system-title">
+    <h2 class="settings-group-title" id="group-system-title" tabindex="-1">{{ _ "settings_group_system" }}</h2>
+    <p class="card-subtitle">{{ _ "settings_group_system_desc" }}</p>
+    <div class="settings-grid">
+        {{ template "settings_upstream_components" . }}
+        {{ if is_admin .current_user }}
+        {{ template "settings_gigahost" . }}
+        {{ end }}
+        {{ template "settings_backup" . }}
+    </div>
+</section>
 
-    {{ template "settings_upstream_components" . }}
-
-    {{ if is_admin .current_user }}
-    {{ template "settings_gigahost" . }}
-    {{ end }}
-</div>
-{{ template "settings_policy" . }}
-{{ template "settings_policy_client" . }}
-
+<script src="{{ asset_url "/static/js/settings_nav.js" }}"></script>
 <script src="/static/js/settings_cards.js?v={{ .app_version }}"></script>
 <script src="/static/js/settings_save.js?v={{ .app_version }}"></script>
 <script src="/static/js/notifications_settings.js?v={{ .app_version }}"></script>
