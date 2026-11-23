@@ -559,7 +559,7 @@ func TestPeerSyncDivergenceLifecycle(t *testing.T) {
 	if age := now.Sub(sync.status.DivergenceSince); age != 0 {
 		t.Fatalf("step 3: a freshly observed divergence must start at now, got age %s", age)
 	}
-	conds := evaluatePeerSyncAndBackendConditions(&sync.status, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(&sync.status, BackendsDiagnostics{})
 	for _, c := range conds {
 		if c.Category == "peer_sync" && strings.Contains(c.Message, "divergence") {
 			t.Fatalf("step 3: a 0s divergence must emit no condition, got %s: %q", c.Severity, c.Message)

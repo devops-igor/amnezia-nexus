@@ -217,9 +217,14 @@ type HealthThresholds struct {
 
 	// --- Session handshake freshness ---
 
-	// HandshakeStaleAge gates the stale-session WARNING: a live session
-	// whose last upstream handshake is older than this. Compared with >
-	// against now minus the session's handshake time.
+	// HandshakeStaleAge is the boundary used by the handshake-freshness
+	// diagnostic: it marks a live session whose last upstream handshake is
+	// older than this in stale_live_sessions. Compared with > against now
+	// minus the session's handshake time.
+	//
+	// It is a measurement boundary, NOT a health classification (#964): an
+	// idle peer with an old handshake is not a fault, so no condition,
+	// severity or actionable problem is derived from this value.
 	HandshakeStaleAge time.Duration
 
 	// --- Per-route problem reporting (collectProblemRoutes) ---

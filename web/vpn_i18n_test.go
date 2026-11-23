@@ -20,7 +20,6 @@ var (
 var knownDynamicVPNKeys = []string{
 	"vpn_status_active",
 	"vpn_problem_session_without_route",
-	"vpn_problem_stale_handshake",
 	"vpn_problem_route_queue_drops",
 	"vpn_problem_write_stall",
 	"vpn_problem_write_errors",

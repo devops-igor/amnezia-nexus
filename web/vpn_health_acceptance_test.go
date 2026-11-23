@@ -106,15 +106,16 @@ function closed() {
     return el('vpn-diagnostics').hidden !== false && el('vpn-advanced-entry').getAttribute('aria-expanded') !== 'true';
 }
 
-// WARNING: an active session with a stale upstream handshake.
+// WARNING: an active route whose queue is filling up.
 vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: {
         status: 'WARNING',
         actionable_problems: [{
             severity: 'WARNING',
-            message: 'Upstream handshake stale',
-            category: 'sessions',
+            message: 'Route queue pressure (92/100 queued) for 10.8.0.2',
+            message_key: 'vpn_problem_route_queue_pressure',
+            category: 'queue_pressure',
             session_id: 'S-016',
             username: 'alice',
             connection_name: 'alice-phone',
@@ -132,7 +133,7 @@ assert.strictEqual(list.hidden, false, 'problem list visible on warning');
 assert.strictEqual(list.children.length, 1);
 const row = list.children[0];
 assert(row.textContent.includes('Warning'), 'row carries severity text');
-assert(row.textContent.includes('Upstream handshake stale'), 'row carries a human explanation');
+assert(row.textContent.includes(_('vpn_problem_route_queue_pressure')), 'row carries a human explanation');
 assert(row.textContent.includes('alice'), 'row names the affected entity');
 assert(row.children.length === 2, 'row is [copy][action]');
 const action = row.children[1];

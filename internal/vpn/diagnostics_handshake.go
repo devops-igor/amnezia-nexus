@@ -41,7 +41,11 @@ func (inputs diagnosticsInputs) collectHandshakeDiagnostics() HandshakeFreshness
 		}
 	}
 
-	// Check active live sessions for stale handshakes (> 3 minutes)
+	// Check active live sessions for stale handshakes (older than
+	// DefaultHealthThresholds.HandshakeStaleAge). This is a diagnostic
+	// measurement, NOT a health classification (#964): an idle peer whose
+	// handshake has aged out is not a fault, so the value below never becomes a
+	// condition, severity or actionable problem.
 	if inputs.sessionMgr != nil {
 		activeSessions := inputs.sessions
 		for _, sess := range activeSessions {
@@ -64,6 +68,5 @@ func (inputs diagnosticsInputs) collectHandshakeDiagnostics() HandshakeFreshness
 	// of the masking scheme instead of the keys.
 	sort.Strings(diag.StaleLiveSessions)
 	redactKeySlice(diag.StaleLiveSessions)
-	diag.PeerHandshakes = peerHandshakes
 	return diag
 }

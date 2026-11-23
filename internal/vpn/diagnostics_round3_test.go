@@ -203,7 +203,7 @@ func TestUnresolvedPeerSyncFailureMessageIsBounded(t *testing.T) {
 		LastError:               long,
 		LastSuccessfulReconcile: time.Now().UTC(),
 	}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	if len(conds) != 1 {
 		t.Fatalf("expected exactly one condition, got %+v", conds)
 	}
@@ -223,7 +223,7 @@ func TestUnresolvedPeerSyncFailureMessageIsBounded(t *testing.T) {
 // would read as an infinitely stale reconcile.
 func TestPeerSyncNoSuccessfulReconcileYet(t *testing.T) {
 	ps := &PeerSyncStatus{LastError: "injected failure"}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	if len(conds) != 1 {
 		t.Fatalf("expected exactly one condition, got %+v", conds)
 	}
@@ -250,7 +250,7 @@ func TestLifetimePeerSyncFailuresWithoutUnresolvedErrorStayHealthy(t *testing.T)
 		SyncFailuresRecent:    0,
 		EnqueueFailuresRecent: 0,
 	}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	for _, c := range conds {
 		if c.Category == "peer_sync" && c.Severity == "DEGRADED" {
 			t.Errorf("lifetime counters with no unresolved reconcile failure must not degrade: %+v", conds)
@@ -270,7 +270,7 @@ func TestTransientEnqueueFailureDoesNotPinDegradedForever(t *testing.T) {
 		LastEnqueueError:      "database listener stopped",
 		EnqueueFailuresRecent: 0,
 	}
-	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{}, HandshakeFreshnessDiagnostics{})
+	conds := evaluatePeerSyncAndBackendConditions(ps, BackendsDiagnostics{})
 	for _, c := range conds {
 		if c.Category == "peer_sync" && c.Severity == "DEGRADED" {
 			t.Errorf("an uncleared LastEnqueueError must not pin DEGRADED forever: %+v", conds)
