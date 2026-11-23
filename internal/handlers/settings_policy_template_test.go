@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"regexp"
 	"strings"
 	"testing"
@@ -368,20 +369,25 @@ func TestPolicySectionRenderingDoesNotLeakIntoOtherPages(t *testing.T) {
 }
 
 // TestPolicyControlsCarryTheRenamedLabels pins the two renamed control labels and
-// their shortened descriptions, because they are operator-facing names for the
-// routing each control forces: "Always PROXY" and "Always DIRECT" say what the
-// list does, where the old names described an internal concept. The retired
-// clearing note is asserted absent from the dictionaries: one line per control is
-// the point of the shortening, and that sentence now lives in the second half of
-// the inventory line.
+// the text beside them, because these are operator-facing statements about which
+// rule wins: the copy has to agree with the accepted decision order in
+// internal/vpn/forwarder/routing_decision.go, not just with itself. The retired
+// texts are asserted absent from the dictionaries.
 func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 	page := renderSettingsPage(t, models.RoleAdmin)
 	for _, want := range []string{
 		"Always PROXY (IPv4)",
 		"Always DIRECT (IPv4)",
-		"Addresses listed here always take PROXY",
-		"Prefixes listed here always route DIRECT",
-		"prohibited or internal destination",
+		// The PROXY hint states the precedence and its own limit.
+		"Addresses on this PROXY list take precedence over the DIRECT list",
+		"refused before either list applies",
+		// The DIRECT hint names what can supersede a DIRECT listing.
+		"Prefixes on this DIRECT list route direct unless",
+		"an entry on the PROXY list, a CDN exclusion, or a flow that cannot use direct egress",
+		"prohibited or internal destinations are always refused",
+		"changes apply to new connections only",
+		// The notice under both controls names which list it means.
+		"A destination on the PROXY list uses PROXY",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the rendered policy section does not carry %q", want)
@@ -391,6 +397,9 @@ func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 		"PROXY exceptions (IPv4)",
 		"Address inventory override",
 		"Clearing this field changes new routing decisions only",
+		// One input deciding everything was the false claim this round removed.
+		"shipped allocation set decides everything else",
+		"observed through the gateway DNS",
 	} {
 		if strings.Contains(page, gone) {
 			t.Errorf("the rendered policy section still carries the retired text %q", gone)
@@ -434,5 +443,55 @@ func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
 		english["policy_inventory_override_label"] != "Always DIRECT (IPv4)" {
 		t.Errorf("the English labels are %q / %q, want the renamed controls",
 			english["policy_proxy_exceptions_label"], english["policy_inventory_override_label"])
+	}
+}
+
+// TestPolicyExamplesDoNotContradictEachOther pins the two example placeholders
+// apart. The DIRECT list is not absolute: an entry on the PROXY list wins over it,
+// so an address shown as "goes direct" must not also be shown as "goes through
+// PROXY" — otherwise the page states a contradiction before the operator has
+// edited anything. Both examples are parsed the way the handlers parse them: a
+// bare address is a /32.
+func TestPolicyExamplesDoNotContradictEachOther(t *testing.T) {
+	raw, err := web.TranslationsFS.ReadFile("translations/en.json")
+	if err != nil {
+		t.Fatalf("read en.json: %v", err)
+	}
+	var dict map[string]string
+	if err := json.Unmarshal(raw, &dict); err != nil {
+		t.Fatalf("decode en.json: %v", err)
+	}
+
+	parse := func(key string) []netip.Prefix {
+		var out []netip.Prefix
+		for _, line := range strings.Split(dict[key], "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if p, err := netip.ParsePrefix(line); err == nil {
+				out = append(out, p.Masked())
+				continue
+			}
+			addr, err := netip.ParseAddr(line)
+			if err != nil {
+				t.Fatalf("%s: %q is neither a prefix nor an address: %v", key, line, err)
+			}
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+		}
+		if len(out) == 0 {
+			t.Fatalf("%s has no example entries, so nothing was compared", key)
+		}
+		return out
+	}
+
+	proxy := parse("policy_proxy_exceptions_placeholder")
+	direct := parse("policy_inventory_override_placeholder")
+	for _, p := range proxy {
+		for _, d := range direct {
+			if p.Overlaps(d) {
+				t.Errorf("the examples contradict each other: %s is shown as PROXY and as DIRECT (%s)", p, d)
+			}
+		}
 	}
 }
