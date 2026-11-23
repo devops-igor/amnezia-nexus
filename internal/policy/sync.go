@@ -33,7 +33,10 @@ const (
 // There is no truncation/reduction knob. That guard belonged to a downloaded feed
 // whose list could arrive truncated; with every rule operator-supplied and
 // validated before it is stored, a shorter candidate list is a deliberate edit.
-// The cycle's remaining refusal is the zero-rule one.
+// That includes the shortest edit there is: an empty list is a deliberate clear,
+// so the cycle has no count-based refusal of any kind. The list is an override
+// layer over the classifier, and an override that overrides nothing is a valid
+// configuration rather than an absent policy.
 type SyncConfig struct {
 	LocalRules      ParsedRules   `json:"-"`
 	RefreshInterval time.Duration `json:"refresh_interval"`
@@ -114,10 +117,12 @@ type Syncer struct {
 
 // NewSyncer creates a new Syncer.
 //
-// A configuration that currently holds no rules is accepted: the record is valid
-// and the cycle that runs it reports the empty-policy refusal, which is the
-// operator-facing reason the VPN layer surfaces. Rejecting it here would replace
-// that reason with a constructor error and change where the refusal is owned.
+// A configuration that holds no rules is accepted, because it is valid: the
+// operator's exception list is an override over the destination classifier, and
+// enabling policy routing with no overrides still routes every packet — through
+// the classifier rather than through a rule. Whether the routing authority is
+// actually installed is a question about the data path, not about this record,
+// so it is answered by vpn.ValidatePBRPrerequisites at activation.
 func NewSyncer(m *Matcher, store Store, cfg SyncConfig) (*Syncer, error) {
 	if m == nil {
 		return nil, errors.New("matcher cannot be nil")
@@ -258,13 +263,17 @@ func (s *Syncer) nextVersion() uint64 {
 	return 1
 }
 
-// localSourceRules returns the operator's exception list as the cycle's single
-// rule source, and whether it holds anything at all.
-func (s *Syncer) localSourceRules() (SourceParsedRules, bool) {
-	if len(s.cfg.LocalRules.CIDRs) == 0 {
-		return SourceParsedRules{}, false
-	}
-	return SourceParsedRules{SourceID: localSourceID, Rules: s.cfg.LocalRules}, true
+// localSourceRuleSet returns the operator's exception list as the cycle's single
+// rule source.
+//
+// An empty list is a valid source. The exception list is an override layer over
+// the destination classifier, so a record that overrides nothing still routes
+// every packet — through the classifier rather than through a rule. Refusing to
+// publish it would make "no overrides" indistinguishable from "no routing
+// authority", which is the distinction activation is responsible for and this
+// cycle is not.
+func (s *Syncer) localSourceRuleSet() SourceParsedRules {
+	return SourceParsedRules{SourceID: localSourceID, Rules: s.cfg.LocalRules}
 }
 
 func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
@@ -276,12 +285,7 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	startTime := time.Now().UTC()
 	statsMap := make(map[string]SourceSyncStats)
 
-	local, hasLocal := s.localSourceRules()
-	if !hasLocal {
-		err := errors.New("cannot publish policy snapshot with zero rules")
-		s.recordFailure(err, statsMap, startTime)
-		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
-	}
+	local := s.localSourceRuleSet()
 	statsMap[localSourceID] = SourceSyncStats{
 		ID:          localSourceID,
 		Accepted:    len(local.Rules.CIDRs),
@@ -289,13 +293,6 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 		LastSuccess: startTime.UTC().Format(time.RFC3339),
 	}
 	sourceParsedList := []SourceParsedRules{local}
-
-	totalRules := len(local.Rules.CIDRs)
-	if totalRules == 0 {
-		err := errors.New("cannot publish policy snapshot with zero rules")
-		s.recordFailure(err, statsMap, startTime)
-		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
-	}
 
 	candidateCIDRs := canonicalPrefixStrings(local.Rules.CIDRs)
 	newVersion, genID, createdAt := s.candidateIdentity(startTime, candidateCIDRs, sourceParsedList)

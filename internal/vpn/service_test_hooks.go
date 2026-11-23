@@ -259,6 +259,22 @@ func SetWANDeviceFactoryForTest(fn func(name string) (forwarder.PacketDevice, er
 	return func() { newProductionWANDevice = previous }
 }
 
+// SetDestinationClassifierFactoryForTest substitutes the production address
+// classifier constructor and returns a function that restores it. A nil fn
+// restores the production constructor, so a caller can name "the real authority"
+// explicitly rather than relying on the previous value.
+//
+// It exists so a test can model a host whose committed routing authority is
+// unusable, which is the only state activation may refuse. Test-only.
+func SetDestinationClassifierFactoryForTest(fn func(*policy.InventoryOverride) forwarder.DestinationClassifier) func() {
+	previous := newDestinationClassifier
+	if fn == nil {
+		fn = buildDestinationClassifier
+	}
+	newDestinationClassifier = fn
+	return func() { newDestinationClassifier = previous }
+}
+
 // DestinationClassifierForTest exposes the address classifier installed on the
 // packet path, so a test in another package can assert what an activated data
 // path actually consults. Test-only.

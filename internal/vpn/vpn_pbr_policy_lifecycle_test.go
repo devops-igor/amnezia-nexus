@@ -33,6 +33,7 @@ type memoryStore struct {
 	mu        sync.Mutex
 	committed *policy.Generation
 	loadErr   error
+	commitErr error
 	commits   int
 }
 
@@ -45,9 +46,15 @@ func (m *memoryStore) Commit(_ context.Context, gen *policy.Generation) error {
 	gen.CIDRCount = len(gen.CIDRs)
 	stored := cloneGeneration(gen)
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A configured commit failure models a durable store that cannot accept the
+	// write. The candidate is not recorded, which is what makes "the cycle could
+	// not publish" observable rather than inferred.
+	if m.commitErr != nil {
+		return m.commitErr
+	}
 	m.commits++
 	m.committed = stored
-	m.mu.Unlock()
 	return nil
 }
 
@@ -286,14 +293,17 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 		t.Errorf("SyncState = %q, want %q", got.SyncState, "synced")
 	}
 
-	// 2. Syncer-backed path with a recorded failure: a record with no rules cannot
-	// publish, which is the failure the status must surface.
+	// 2. Syncer-backed path with a recorded failure: a cycle whose durable commit
+	// fails cannot publish, which is the failure the status must surface.
 	failingSettings := policy.DefaultSettings()
+	failingSettings.Enabled = true
+	failingSettings.ProxyExceptions = []string{"198.51.100.0/24"}
 	cfg, err := failingSettings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	syncer, err := policy.NewSyncer(policy.NewMatcher(), &memoryStore{}, cfg)
+	syncer, err := policy.NewSyncer(policy.NewMatcher(),
+		&memoryStore{commitErr: errors.New("durable store unavailable")}, cfg)
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
@@ -301,7 +311,7 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 	_, syncErr := syncer.SyncOnce(syncCtx)
 	cancel()
 	if syncErr == nil {
-		t.Fatal("a rule-less cycle reported success; the failure status below would be vacuous")
+		t.Fatal("a cycle whose commit failed reported success; the failure status below would be vacuous")
 	}
 
 	policyRuntimeMu.Lock()
@@ -463,7 +473,7 @@ func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	if err := ensureInitialSnapshot(context.Background(), syncer, &memoryStore{committed: gen}, usable); err != nil {
+	if err := ensureInitialSnapshot(context.Background(), syncer, &memoryStore{committed: gen}, usable, newDestinationClassifier(nil)); err != nil {
 		t.Fatalf("ensureInitialSnapshot rejected a record that publishes its own rules: %v", err)
 	}
 
@@ -478,7 +488,7 @@ func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	if err := ensureInitialSnapshot(context.Background(), emptySyncer, &memoryStore{loadErr: errors.New("no cache")}, empty); err == nil {
+	if err := ensureInitialSnapshot(context.Background(), emptySyncer, &memoryStore{loadErr: errors.New("no cache")}, empty, newDestinationClassifier(nil)); err == nil {
 		t.Fatal("ensureInitialSnapshot accepted an empty record with no usable store")
 	} else if !errors.Is(err, ErrPolicyActivationNoRules) {
 		t.Fatalf("expected ErrPolicyActivationNoRules, got: %v", err)

@@ -28,10 +28,11 @@ import (
 //   - Invalid settings are rejected; they never overwrite a last working
 //     configuration. Validation is pure so a handler can reject before writing.
 //
-// Runtime prerequisite gating (a published non-empty snapshot plus working
-// direct egress) is deliberately NOT re-implemented here. That contract lives in
-// vpn.ValidatePBRPrerequisites / ErrPBREmptyPolicy and the Syncer's zero-rule
-// guard, which stay the single owner of fail-closed enablement.
+// Runtime prerequisite gating is deliberately NOT re-implemented here. That
+// contract lives in vpn.ValidatePBRPrerequisites, which requires the installed
+// destination classifier — the routing authority — rather than a non-empty
+// snapshot: the exception list is an optional override, so an empty list is a
+// valid record and enablement depends on the authority being present.
 
 // SettingsKey is the settings-table key holding the persisted policy record.
 // The existing key/value settings table is sufficient: the issue asks for "a
@@ -296,8 +297,9 @@ func (s Settings) ParsedInventoryOverride() (*InventoryOverride, error) {
 // is an operator-supplied, fully validated replacement, so a candidate that holds
 // fewer prefixes than the last one is the edit the operator just asked for, not
 // evidence of a broken transfer. Refusing it made the page's only routing input
-// unable to apply a normal reduction. The zero-rule refusal is a different guard
-// and still owns "nothing to publish".
+// unable to apply a normal reduction. There is no rule-count refusal of any kind
+// here either: an empty list is the shortest deliberate edit, and the routing
+// authority is the destination classifier rather than the exception list.
 func (s Settings) SyncConfig() (SyncConfig, error) {
 	if err := s.Validate(); err != nil {
 		return SyncConfig{}, err

@@ -278,3 +278,141 @@ func TestPersistedPolicyActivationRecoversAfterRepair(t *testing.T) {
 		t.Fatalf("the refused-activation reason is still advertised after a successful activation: %q", status.LastError)
 	}
 }
+
+// TestStartupActivatesEmptyExceptionList is the owner's upgrade scenario: an
+// installation that relied on the router's classifier rather than on any PROXY
+// exception restarts with an empty list.
+//
+// Zero exceptions is a valid configuration — the destination classifier is the
+// routing authority and the exception list is an optional override — so startup
+// must activate policy routing rather than refuse it, and the published snapshot
+// must hold no rule the operator did not supply.
+func TestStartupActivatesEmptyExceptionList(t *testing.T) {
+	db, cfg, _ := newPolicyStartupFixture(t)
+
+	// The persisted record an upgraded installation has: enabled, zero exceptions.
+	empty := policy.DefaultSettings()
+	empty.Enabled = true
+	empty.ProxyExceptions = nil
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("a zero-exception record must be valid: %v", err)
+	}
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, empty); err != nil {
+		t.Fatalf("persist the empty-exception record: %v", err)
+	}
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		// A refused activation is deliberately not a startup error, so any returned
+		// error here is a real failure of the startup path.
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatal("policy routing is off after restarting with zero exceptions; the classifier is the " +
+			"routing authority, so an empty override list must activate")
+	}
+	if vpnSvc.DestinationClassifierForTest() == nil {
+		t.Fatal("no destination classifier installed, so nothing would classify a destination")
+	}
+	matcher := vpnSvc.PolicyMatcher()
+	if matcher == nil {
+		t.Fatal("no policy matcher installed after activation")
+	}
+	snap := matcher.Current()
+	if snap == nil {
+		t.Fatal("no snapshot published after activation")
+	}
+	if got := snap.CIDRCount(); got != 0 {
+		t.Fatalf("published snapshot = %d rules, want 0: a restart must not invent a placeholder rule", got)
+	}
+	status := vpnSvc.PolicyStatusSnapshot()
+	if !status.Enabled || !status.Ready {
+		t.Fatalf("status does not report the activated policy routing: %+v", status)
+	}
+	if strings.Contains(status.LastError, "persisted policy routing could not be activated") {
+		t.Fatalf("startup recorded an activation failure for a valid zero-exception record: %q", status.LastError)
+	}
+}
+
+// TestStartupActivatesAfterClearingCommittedGeneration is the restart half of the
+// owner's upgrade scenario: an installation that cleared its final exception while
+// enabled has a durable generation with zero rules, and a restart must activate
+// from it.
+//
+// This is a distinct gate from the empty-record case above. Activation primes the
+// durable last-known-good generation into the matcher before the first sync, and a
+// zero-rule generation must be accepted as a valid baseline: it is the operator's
+// "no overrides" policy, not a corrupt record. Refusing it would make clearing the
+// list disable routing on the next restart.
+func TestStartupActivatesAfterClearingCommittedGeneration(t *testing.T) {
+	db, cfg, _ := newPolicyStartupFixture(t)
+
+	// The persisted record after the operator cleared the final exception.
+	empty := policy.DefaultSettings()
+	empty.Enabled = true
+	empty.ProxyExceptions = nil
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, empty); err != nil {
+		t.Fatalf("persist the cleared record: %v", err)
+	}
+
+	// The durable generation that the clearing save committed: a valid generation
+	// whose rule set is empty.
+	syncCfg, err := empty.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	if len(syncCfg.LocalRules.CIDRs) != 0 {
+		t.Fatalf("fixture derived %d rules, want 0", len(syncCfg.LocalRules.CIDRs))
+	}
+	store := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
+	probe, err := policy.NewSyncer(policy.NewMatcher(), store, syncCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-cleared",
+		Version:       1,
+		ConfigHash:    probe.ConfigHash(),
+		CIDRs:         nil,
+		CIDRCount:     0,
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("commit the cleared generation: %v", err)
+	}
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+	t.Cleanup(vpn.SetWANDeviceFactoryForTest(func(string) (forwarder.PacketDevice, error) {
+		return policyStartupDevice{}, nil
+	}))
+
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		t.Fatalf("startup returned an error: %v", err)
+	}
+	if !vpnSvc.PBREnabled() {
+		t.Fatal("policy routing is off after restarting from a cleared generation; clearing the final " +
+			"exception must not disable routing")
+	}
+	matcher := vpnSvc.PolicyMatcher()
+	if matcher == nil || matcher.Current() == nil {
+		t.Fatal("no snapshot published after activation")
+	}
+	if got := matcher.Current().CIDRCount(); got != 0 {
+		t.Fatalf("published snapshot = %d rules, want 0", got)
+	}
+	if vpnSvc.DestinationClassifierForTest() == nil {
+		t.Fatal("no destination classifier installed, so nothing would classify a destination")
+	}
+}

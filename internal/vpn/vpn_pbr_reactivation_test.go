@@ -299,14 +299,15 @@ func TestRepeatedEnableFailureKeepsPreviousConfiguration(t *testing.T) {
 	firstEgress := svc.DirectEgress()
 
 	// A store that cannot load and a record with no rules: the update has no usable
-	// snapshot to publish.
-	broken := &memoryStore{loadErr: errors.New("durable store unavailable")}
+	// snapshot to publish. The refusal is the unreadable store, not the empty rule
+	// list, which is a valid override-free policy.
+	broken := &memoryStore{loadErr: errors.New("durable store unavailable"), commitErr: errors.New("durable store unavailable")}
 	unresolvable := repeatedEnableSettings(t)
 	unresolvable.ProxyExceptions = nil
 
 	err := activateOnce(svc, unresolvable, broken)
 	if err == nil {
-		t.Fatal("an update with no publishable snapshot must fail closed")
+		t.Fatal("an update whose durable commit cannot land must fail closed")
 	}
 	if !errors.Is(err, ErrPolicyActivationNoRules) {
 		t.Fatalf("update failure = %v, want ErrPolicyActivationNoRules so the API can explain it", err)

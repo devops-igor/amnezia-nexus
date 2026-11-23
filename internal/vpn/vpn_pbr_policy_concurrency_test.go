@@ -2,11 +2,13 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // This file covers the concurrency obligation the repair handover admitted was
@@ -293,22 +295,27 @@ func TestRepeatedUpdateAndDisableEndsConsistent(t *testing.T) {
 }
 
 // TestColdActivationRefusedLeavesNothingOwned is the negative control for the
-// disabled terminal state: when activation cannot publish anything at all, the
-// service must be fully disabled and must not hold the device name, so a later
-// start is not blocked by a phantom owner.
+// disabled terminal state: when activation cannot install the routing authority,
+// the service must be fully disabled and must not hold the device name, so a
+// later start is not blocked by a phantom owner.
+//
+// The refusal is the classifier being unavailable — not an empty rule set, which
+// is a valid override-free policy.
 func TestColdActivationRefusedLeavesNothingOwned(t *testing.T) {
 	reg := newNameRegistry()
 	withNameOwnedWANDevice(t, reg)
 	svc := serviceForActivation(t)
 	t.Cleanup(func() { svc.StopPolicyRouting() })
 
-	// A record with no rules and an empty store cannot publish anything, which is
-	// the cold-activation negative: nothing may be owned afterwards.
+	restore := SetDestinationClassifierFactoryForTest(
+		func(*policy.InventoryOverride) forwarder.DestinationClassifier { return nil })
+	defer restore()
+
 	settings := policy.DefaultSettings()
 	settings.Enabled = true
 	err := activateOnce(svc, settings, emptyStore{})
-	if err == nil {
-		t.Fatal("activation with no publishable snapshot must fail closed")
+	if !errors.Is(err, ErrPolicyActivationNoRules) {
+		t.Fatalf("activation with no routing authority must fail with ErrPolicyActivationNoRules, got: %v", err)
 	}
 	assertFullyDisabled(t, svc, reg)
 }

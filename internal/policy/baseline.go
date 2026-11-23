@@ -146,6 +146,11 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 // BaselineForeign means the generation is not rules for this configuration, so
 // the cycle publishes fresh content instead. An error is reserved for a
 // generation that matches the configuration but cannot be used.
+//
+// A zero-rule generation is a usable baseline, not an unusable one: it is the
+// operator's "no overrides" policy, and the classifier decides every destination.
+// Refusing it would make clearing the final exception disable routing on the next
+// restart, which is precisely the state this configuration is allowed to be in.
 func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineStatus, error) {
 	if gen.ConfigHash != s.computeConfigHash() {
 		return nil, BaselineForeign, nil
@@ -153,9 +158,6 @@ func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineSt
 	snap, err := GenerationToSnapshot(gen)
 	if err != nil {
 		return nil, BaselineAbsent, fmt.Errorf("stored policy generation cannot be compiled: %w", err)
-	}
-	if snap.CIDRCount() == 0 {
-		return nil, BaselineAbsent, errors.New("stored policy generation contains no rules")
 	}
 	return snap, BaselinePrimed, nil
 }

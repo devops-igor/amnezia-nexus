@@ -135,33 +135,97 @@ func TestPutPolicyClearingTheListIsPersistedNotReplaced(t *testing.T) {
 	}
 }
 
-// TestPutPolicyClearingWhileEnabledIsRefusedTruthfully is the enabled half of
-// F957-02. Emptying the list while policy routing is on cannot publish a snapshot,
-// so the runtime refuses enablement — and that refusal must reach the operator and
-// roll the record back. What must never happen is the defect's outcome: HTTP 200
-// with the predecessor entries silently reinstalled as if the clear had succeeded.
+// TestPutPolicyClearingWhileEnabledIsRefusedTruthfully used to assert that
+// emptying the exception list while enabled is refused. That encoded the same
+// conflation this round corrects: the list is an operator override over the
+// destination classifier, so removing the final override must not disable
+// routing.
+//
+// The replacement keeps both directions, because they are what distinguish "no
+// overrides" from "no routing authority":
+//
+//   - clearing the list while enabled succeeds, persists an empty list, and
+//     leaves routing active — every destination then takes the classifier's
+//     answer rather than a PROXY override;
+//   - the refusal path is still exercised, retargeted onto the real
+//     prerequisite: an activation that cannot install the classifier must reach
+//     the operator as a 422 and roll the record back, never as a 200 that
+//     silently reinstalled the predecessor list.
 func TestPutPolicyClearingWhileEnabledIsRefusedTruthfully(t *testing.T) {
-	h := newPolicyListFixture(t)
+	t.Run("clearing while enabled keeps routing active", func(t *testing.T) {
+		h := newPolicyListFixture(t)
 
-	activated := putPolicy(t, h, `{"enabled":true,"proxy_exceptions":["203.0.113.0/24"],"sync_interval_seconds":3600}`)
-	if activated.Code != http.StatusOK {
-		t.Fatalf("activating with one exception = %d, want 200; body=%s", activated.Code, activated.Body.String())
-	}
+		activated := putPolicy(t, h, `{"enabled":true,"proxy_exceptions":["203.0.113.0/24"],"sync_interval_seconds":3600}`)
+		if activated.Code != http.StatusOK {
+			t.Fatalf("activating with one exception = %d, want 200; body=%s", activated.Code, activated.Body.String())
+		}
+		if !policyMatcherCovers(t, h, "203.0.113.7") {
+			t.Fatal("the seeded exception does not route through the exception list; the clear below would prove nothing")
+		}
 
-	cleared := putPolicy(t, h, `{"enabled":true,"proxy_exceptions":[],"sync_interval_seconds":3600}`)
-	if cleared.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("clearing while enabled = %d, want the runtime's 422 refusal; body=%s. "+
-			"A success here means the old list was substituted for the one the operator submitted",
-			cleared.Code, cleared.Body.String())
-	}
-	// The compensation must leave the previously accepted record in place: the
-	// operator's earlier list is still what runs, and the refusal says so.
-	if got := storedExceptions(t, h); len(got) != 1 || got[0] != "203.0.113.0/24" {
-		t.Fatalf("durable list after the refused clear = %v, want the previously accepted entry restored", got)
-	}
-	if body := cleared.Body.String(); !strings.Contains(body, "activation_failed") {
-		t.Fatalf("refusal body = %s, want the activation failure the operator can act on", body)
-	}
+		cleared := putPolicy(t, h, `{"enabled":true,"proxy_exceptions":[],"sync_interval_seconds":3600}`)
+		if cleared.Code != http.StatusOK {
+			t.Fatalf("clearing while enabled = %d, want 200; body=%s. The exception list is an optional "+
+				"override, so removing the final entry must not be refused",
+				cleared.Code, cleared.Body.String())
+		}
+
+		// The durable row is what a restart activates from, so the clear must persist
+		// rather than the predecessor list being reinstalled behind a 200.
+		if got := storedExceptions(t, h); len(got) != 0 {
+			t.Fatalf("durable list after clearing = %v; the explicit empty array must persist, "+
+				"not be replaced by the stored entries", got)
+		}
+
+		// Routing must still be on, and the cleared prefix must now take the
+		// classifier's answer instead of a PROXY override.
+		if !h.vpnSvc.PBREnabled() {
+			t.Fatal("removing the final exception disabled routing; the classifier is the routing authority " +
+				"and an empty override list is a valid policy")
+		}
+		if policyMatcherCovers(t, h, "203.0.113.7") {
+			t.Fatal("the cleared prefix still matches the exception list, so the operator's clear did not reach the data plane")
+		}
+		if snap := h.vpnSvc.PolicyMatcher().Current(); snap == nil || snap.CIDRCount() != 0 {
+			t.Fatalf("published snapshot = %v, want an empty rule set: a placeholder or sentinel CIDR "+
+				"would be a rule the dataplane routes on that the operator never supplied", snap)
+		}
+	})
+
+	// The refusal direction, retargeted onto the classifier. With the routing
+	// authority unavailable, an enable must still fail — and must fail the way the
+	// old test proved: the operator learns the reason and the previously accepted
+	// record is restored, never silently kept under a success.
+	t.Run("activation refused when the classifier is unavailable", func(t *testing.T) {
+		h := newPolicyListFixture(t)
+
+		// Seed an accepted record first, so the rollback target is a real one.
+		seeded := putPolicy(t, h, `{"enabled":false,"proxy_exceptions":["203.0.113.0/24"],"sync_interval_seconds":3600}`)
+		if seeded.Code != http.StatusOK {
+			t.Fatalf("seeding = %d, want 200; body=%s", seeded.Code, seeded.Body.String())
+		}
+
+		restore := vpn.SetDestinationClassifierFactoryForTest(
+			func(*policy.InventoryOverride) forwarder.DestinationClassifier { return nil })
+		defer restore()
+
+		refused := putPolicy(t, h, `{"enabled":true,"proxy_exceptions":["203.0.113.0/24"],"sync_interval_seconds":3600}`)
+		if refused.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("enabling with no routing authority = %d, want 422; body=%s. A success here means "+
+				"the panel would report routing on while nothing could classify a destination",
+				refused.Code, refused.Body.String())
+		}
+		if body := refused.Body.String(); !strings.Contains(body, "activation_failed") {
+			t.Fatalf("refusal body = %s, want the activation failure the operator can act on", body)
+		}
+		// Routing must be off, and the record rolled back to the accepted value.
+		if h.vpnSvc.PBREnabled() {
+			t.Fatal("routing is active after a refused activation")
+		}
+		if got := storedExceptions(t, h); len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("durable list after the refused enable = %v, want the previously accepted entry restored", got)
+		}
+	})
 }
 
 // TestPutPolicyFromMixedPredecessorRowKeepsIPv4Policy is the F957-04 regression. A

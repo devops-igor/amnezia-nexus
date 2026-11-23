@@ -270,9 +270,17 @@ func TestSyncConfigUsesProductionBounds(t *testing.T) {
 	}
 }
 
-// A valid reduction of the operator's own list must reach the matcher, while the
-// zero-rule refusal must still fire. Both directions are asserted against the real
-// syncer and store, so neither can pass by the other's absence.
+// A valid reduction of the operator's own list must reach the matcher, and so
+// must the shortest reduction there is — an empty list.
+//
+// The exception list is an override over the destination classifier, not the
+// routing authority, so "no overrides" is a valid configuration and the cycle
+// publishes it. The zero-rule refusal this test used to assert has moved to the
+// place that can actually distinguish the two states: activation, which refuses
+// when the classifier is absent (vpn.ValidatePBRPrerequisites /
+// ensureInitialSnapshot). That negative direction is asserted there; here it is
+// asserted that the cycle has no count-based refusal left, because a cycle that
+// refused an empty list would keep the operator's clear from taking effect.
 func TestSyncerAcceptsExplicitShrinkAndStillRefusesZeroRules(t *testing.T) {
 	store := NewFileStore(t.TempDir())
 	matcher := NewMatcher()
@@ -305,7 +313,7 @@ func TestSyncerAcceptsExplicitShrinkAndStillRefusesZeroRules(t *testing.T) {
 	// publish, not be refused as a truncated download.
 	res, err := publish(t, "198.51.100.1")
 	if err != nil {
-		t.Fatalf("a valid reduction to one exception must publish; the only list guard left is the zero-rule one: %v", err)
+		t.Fatalf("a valid reduction to one exception must publish: %v", err)
 	}
 	if !res.Published {
 		t.Fatal("the reduction published nothing")
@@ -322,23 +330,23 @@ func TestSyncerAcceptsExplicitShrinkAndStillRefusesZeroRules(t *testing.T) {
 		}
 	}
 
-	// The negative control: an empty list is still refused, and the refusal must not
-	// disturb the one prefix that is live.
-	settings := DefaultSettings()
-	settings.Enabled = true
-	emptyCfg, err := settings.SyncConfig()
+	// The shortest reduction — clearing the list entirely — is the operator's
+	// deliberate edit too, and it must publish an empty snapshot rather than be
+	// refused. Every destination then takes the classifier's answer, which is the
+	// configuration a default install runs.
+	emptyRes, err := publish(t)
 	if err != nil {
-		t.Fatalf("SyncConfig for an empty list: %v", err)
+		t.Fatalf("an empty exception list must publish; the routing authority is the classifier, "+
+			"so zero overrides is a valid policy: %v", err)
 	}
-	emptySyncer, err := NewSyncer(matcher, store, emptyCfg)
-	if err != nil {
-		t.Fatalf("NewSyncer: %v", err)
+	if !emptyRes.Published {
+		t.Fatal("the empty list published nothing")
 	}
-	if _, err := emptySyncer.SyncOnce(context.Background()); err == nil {
-		t.Fatal("an empty exception list published a snapshot; the zero-rule refusal must still fire")
+	if got := matcher.Current().CIDRCount(); got != 0 {
+		t.Fatalf("published count after clearing = %d, want 0", got)
 	}
-	if got := matcher.Current().CIDRCount(); got != 1 {
-		t.Fatalf("live count after the refused empty publish = %d, want the surviving 1", got)
+	if matcher.Current().MatchIPv4(netip.MustParseAddr("198.51.100.1")) {
+		t.Fatal("a cleared exception still matches; the operator's clear did not take effect")
 	}
 }
 
@@ -591,7 +599,7 @@ func TestDecodeStoredRecordKeepsIPv4AndRetiresDomains(t *testing.T) {
 		t.Fatalf("domain-only list kept %v, want nothing applicable", empty.ProxyExceptions)
 	}
 	if err := empty.Validate(); err != nil {
-		t.Fatalf("the empty-for-this-build record must validate; the zero-rule refusal owns it: %v", err)
+		t.Fatalf("the empty-for-this-build record must validate; an empty override list is a valid policy: %v", err)
 	}
 	if got := ReviewStoredRecord([]byte(domainsOnly)).NonIPv4Entries; !slices.Equal(got, []string{"example.com"}) {
 		t.Errorf("retired entries for a domain-only list = %v, want [example.com]", got)

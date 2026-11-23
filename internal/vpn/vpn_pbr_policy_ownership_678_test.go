@@ -233,20 +233,30 @@ func TestReplacementFailureLeavesTheIncumbentInCharge(t *testing.T) {
 		t.Fatalf("incumbent sync: %v", err)
 	}
 
-	// A replacement for a record with no rules cannot publish anything, so its write
-	// is refused by the publication guard while it holds a newer ticket.
+	// A replacement whose durable commit fails cannot publish anything, so its
+	// write is refused by the publication guard while it holds a newer ticket.
+	//
+	// The refusal is deliberately a store failure rather than an empty rule list:
+	// zero rules is a valid override-free policy now, so a replacement for an
+	// empty record legitimately publishes. What must never publish is a cycle
+	// whose commit did not land.
 	empty := policy.DefaultSettings()
+	empty.Enabled = true
 	emptyCfg, err := empty.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig (empty): %v", err)
 	}
-	replacement, err := policy.NewSyncer(matcher, store, emptyCfg)
+	failing := &memoryStore{
+		loadErr:   errors.New("durable store unavailable"),
+		commitErr: errors.New("durable store unavailable"),
+	}
+	replacement, err := policy.NewSyncer(matcher, failing, emptyCfg)
 	if err != nil {
 		t.Fatalf("NewSyncer (replacement): %v", err)
 	}
 	replacement.AttachOwnership(owner)
 	if _, err := replacement.SyncOnce(context.Background()); err == nil {
-		t.Fatal("the replacement published despite having no rules")
+		t.Fatal("the replacement published despite its durable commit failing")
 	}
 
 	// The incumbent still owns the boundary, so it can still publish.

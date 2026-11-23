@@ -263,3 +263,144 @@ func cdnExclusionSampleAddr(t *testing.T) string {
 	}
 	return "193.176.179.1"
 }
+
+// zeroExceptionSnapshot compiles the snapshot a saved record with no PROXY
+// exception produces, so the fixture is the production derivation rather than a
+// hand-written empty value.
+func zeroExceptionSnapshot(t *testing.T) *policy.Snapshot {
+	t.Helper()
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
+	syncCfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig for the zero-exception record: %v", err)
+	}
+	if len(syncCfg.LocalRules.CIDRs) != 0 {
+		t.Fatalf("the zero-exception record derived %d prefixes, want 0", len(syncCfg.LocalRules.CIDRs))
+	}
+	snap, err := policy.CompileSnapshot(1, "gen-zero-exceptions", []policy.SourceParsedRules{
+		{SourceID: "local", Rules: syncCfg.LocalRules},
+	})
+	if err != nil {
+		t.Fatalf("CompileSnapshot: %v", err)
+	}
+	return snap
+}
+
+// TestZeroExceptionSnapshotIsDecidedEntirelyByTheClassifier is the default-install
+// oracle. A default install has no PROXY exceptions, so the published snapshot holds
+// no rule and the address classifier alone decides every destination.
+//
+// The dataplane half is what makes "activated" mean something: with an empty rule
+// set the operator-override branch (row 2) never fires, an allocation member still
+// goes DIRECT (row 4), an uncovered destination still takes the fail-safe proxy
+// default (row 5), and a prohibited destination is still dropped (row 1). A guard
+// that refused to publish an empty snapshot made this normal configuration
+// unreachable, which is the blocker this round corrects.
+func TestZeroExceptionSnapshotIsDecidedEntirelyByTheClassifier(t *testing.T) {
+	snap := zeroExceptionSnapshot(t)
+	if got := snap.CIDRCount(); got != 0 {
+		t.Fatalf("compiled snapshot holds %d rules, want 0: no placeholder may stand in for an empty list", got)
+	}
+	if snap.MatchIPv4(netip.MustParseAddr("213.180.204.186")) {
+		t.Fatal("an empty snapshot matched an allocation member, so the fixture does not model the default install")
+	}
+
+	t.Run("allocation member goes DIRECT", func(t *testing.T) {
+		fwd, dem, wanDev := setupForwarderWithPBR(t)
+		fwd.SetDestinationClassifier(installedClassifier(t))
+		matcher := policy.NewMatcher()
+		matcher.Publish(snap)
+		fwd.SetPolicyMatcher(matcher)
+
+		const (
+			peerKey   = "peer-zero-exception-direct"
+			sessionID = "s-zero-exception-direct"
+			clientIP  = "10.100.0.101"
+			backendID = int64(401)
+		)
+		capPath := newTestCaptureReturnPath()
+		fwd.RegisterSessionWithReturnPath(sessionID, "c-zero-exception-direct", peerKey, clientIP, backendID, capPath.path)
+
+		target := netip.MustParseAddr("213.180.204.186")
+		pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 42101, 443, 0x02, nil)
+		if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+			t.Fatalf("RouteClientToBackend: %v", err)
+		}
+		if got := len(wanDev.getPackets()); got != 1 {
+			t.Fatalf("an allocation member wrote %d direct packets with no exceptions configured, want 1: "+
+				"the classifier did not decide it", got)
+		}
+		if got := len(fwd.backendQueues[backendID]); got != 0 {
+			t.Fatalf("an allocation member queued %d proxy packets, want 0", got)
+		}
+		flow := recordedFlow(t, dem, sessionID, target)
+		if flow.Choice != EgressChoiceDirect || flow.DecisionReason != EgressReasonAllocationDirect {
+			t.Fatalf("flow = %v/%q, want DIRECT/%q from the classifier",
+				flow.Choice, flow.DecisionReason, EgressReasonAllocationDirect)
+		}
+	})
+
+	t.Run("uncovered destination keeps the fail-safe proxy default", func(t *testing.T) {
+		fwd, dem, wanDev := setupForwarderWithPBR(t)
+		fwd.SetDestinationClassifier(installedClassifier(t))
+		matcher := policy.NewMatcher()
+		matcher.Publish(snap)
+		fwd.SetPolicyMatcher(matcher)
+
+		const (
+			peerKey   = "peer-zero-exception-proxy"
+			sessionID = "s-zero-exception-proxy"
+			clientIP  = "10.100.0.102"
+			backendID = int64(402)
+		)
+		capPath := newTestCaptureReturnPath()
+		fwd.RegisterSessionWithReturnPath(sessionID, "c-zero-exception-proxy", peerKey, clientIP, backendID, capPath.path)
+
+		target := netip.MustParseAddr("45.33.32.156")
+		pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 42102, 443, 0x02, nil)
+		if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+			t.Fatalf("RouteClientToBackend: %v", err)
+		}
+		if got := len(wanDev.getPackets()); got != 0 {
+			t.Fatalf("an uncovered destination wrote %d direct packets, want 0", got)
+		}
+		if got := len(fwd.backendQueues[backendID]); got != 1 {
+			t.Fatalf("an uncovered destination queued %d proxy packets, want 1", got)
+		}
+		flow := recordedFlow(t, dem, sessionID, target)
+		if flow.Choice != EgressChoiceProxy || flow.DecisionReason != EgressReasonNoTrustedEvidence {
+			t.Fatalf("flow = %v/%q, want PROXY/%q",
+				flow.Choice, flow.DecisionReason, EgressReasonNoTrustedEvidence)
+		}
+	})
+
+	t.Run("prohibited destination is still dropped", func(t *testing.T) {
+		fwd, _, wanDev := setupForwarderWithPBR(t)
+		fwd.SetDestinationClassifier(installedClassifier(t))
+		matcher := policy.NewMatcher()
+		matcher.Publish(snap)
+		fwd.SetPolicyMatcher(matcher)
+
+		const (
+			peerKey   = "peer-zero-exception-prohibited"
+			sessionID = "s-zero-exception-prohibited"
+			clientIP  = "10.100.0.103"
+			backendID = int64(403)
+		)
+		capPath := newTestCaptureReturnPath()
+		fwd.RegisterSessionWithReturnPath(sessionID, "c-zero-exception-prohibited", peerKey, clientIP, backendID, capPath.path)
+
+		target := netip.MustParseAddr("169.254.169.254")
+		pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 42103, 443, 0x02, nil)
+		if err := fwd.RouteClientToBackend(peerKey, pkt); err == nil {
+			t.Fatalf("%s was not refused although it is a prohibited destination", target)
+		}
+		if got := len(wanDev.getPackets()); got != 0 {
+			t.Fatalf("a prohibited destination wrote %d direct packets, want 0", got)
+		}
+		if got := fwd.DirectDrops(); got == 0 {
+			t.Fatal("a prohibited destination was refused without being accounted as a drop")
+		}
+	})
+}

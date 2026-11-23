@@ -9,40 +9,84 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
-// TestPBR_ProhibitEmptyPolicy verifies that initPBR fails closed and returns
-// ErrPBREmptyPolicy when starting with zero or empty policy sources.
+// TestPBR_ProhibitEmptyPolicy used to assert that initPBR fails closed with
+// ErrPBREmptyPolicy when it is handed zero policy sources. That conflation is
+// what this round corrects: an empty operator override list is a valid policy
+// when the classifier (the routing authority) is present.
+//
+// The guard is retargeted onto the real prerequisite. initPBR must still refuse
+// when the routing authority cannot be built — modelled by making the classifier
+// constructor unavailable — because every destination would then answer
+// "uncovered", nothing could route DIRECT, and the enabled policy would be inert.
 func TestPBR_ProhibitEmptyPolicy(t *testing.T) {
-	db := setupTestDB(t)
-	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
-		c.PBREnabled = true
+	t.Run("refuses when the routing authority is unavailable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+			c.PBREnabled = true
+		})
+
+		// No committed classifier is available on this host: not "the operator
+		// configured no overrides", but "nothing can classify a destination".
+		restore := SetDestinationClassifierFactoryForTest(
+			func(*policy.InventoryOverride) forwarder.DestinationClassifier { return nil })
+		defer restore()
+
+		// An override-free matcher: the record publishes no rules, which is a
+		// valid policy precisely because the classifier is supposed to decide
+		// every destination. With the classifier unavailable, that is the state
+		// activation must refuse.
+		emptySrc := policy.NewMemorySource("local", policy.ParsedRules{})
+		svc.SetPBRConfig(PBRConfig{
+			HostWANIP:     netip.MustParseAddr("198.51.200.1"),
+			WANDevice:     &mockPBRDevice{},
+			PolicySources: []policy.SourceParsedRules{emptySrc.ToSourceParsedRules()},
+		})
+		err := svc.initPBR(context.Background())
+		if !errors.Is(err, ErrPBRMissingClassifier) {
+			t.Fatalf("expected ErrPBRMissingClassifier with no routing authority, got: %v", err)
+		}
+		if svc.PBREnabled() {
+			t.Fatal("PBR is enabled with no routing authority installed")
+		}
 	})
 
-	validWAN := netip.MustParseAddr("198.51.200.1")
-	dev := &mockPBRDevice{}
+	// The positive direction: zero sources is a valid override-free policy when
+	// the classifier is present, so initPBR must install the authority rather than
+	// refuse. A sentinel CIDR here would be a rule the dataplane routes on that
+	// the operator never supplied.
+	t.Run("activates an empty snapshot when the authority is present", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+			c.PBREnabled = true
+		})
+		defer func() { _ = svc.TeardownPBR() }()
 
-	// Case 1: No sources provided
-	svc.SetPBRConfig(PBRConfig{
-		HostWANIP: validWAN,
-		WANDevice: dev,
+		emptySrc := policy.NewMemorySource("local", policy.ParsedRules{})
+		svc.SetPBRConfig(PBRConfig{
+			HostWANIP:     netip.MustParseAddr("198.51.200.1"),
+			WANDevice:     &mockPBRDevice{},
+			PolicySources: []policy.SourceParsedRules{emptySrc.ToSourceParsedRules()},
+		})
+		if err := svc.initPBR(context.Background()); err != nil {
+			t.Fatalf("zero sources must activate when the classifier is installed: %v", err)
+		}
+		if !svc.PBREnabled() {
+			t.Fatal("PBR is off after activating a zero-source policy")
+		}
+		cfg := svc.getPBRConfig()
+		if cfg == nil || cfg.PolicyMatcher == nil {
+			t.Fatal("activation left no matcher installed")
+		}
+		if got := cfg.PolicyMatcher.Current().CIDRCount(); got != 0 {
+			t.Fatalf("published snapshot = %d rules, want 0: no sentinel CIDR may be invented", got)
+		}
+		if svc.forwarder.DestinationClassifier() == nil {
+			t.Fatal("no destination classifier installed, so nothing would classify a destination")
+		}
 	})
-	err := svc.initPBR(context.Background())
-	if !errors.Is(err, ErrPBREmptyPolicy) {
-		t.Fatalf("expected ErrPBREmptyPolicy for missing sources, got: %v", err)
-	}
-
-	// Case 2: Empty source (0 rules)
-	emptySrc := policy.NewMemorySource("empty", policy.ParsedRules{})
-	svc.SetPBRConfig(PBRConfig{
-		HostWANIP:     validWAN,
-		WANDevice:     dev,
-		PolicySources: []policy.SourceParsedRules{emptySrc.ToSourceParsedRules()},
-	})
-	err = svc.initPBR(context.Background())
-	if !errors.Is(err, ErrPBREmptyPolicy) {
-		t.Fatalf("expected ErrPBREmptyPolicy for empty sources, got: %v", err)
-	}
 }
 
 // TestPBR_UpdatePolicySnapshot_PreservesOnFailure verifies that UpdatePolicySnapshot

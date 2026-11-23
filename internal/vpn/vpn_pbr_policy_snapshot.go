@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // This file owns the snapshot ordering that makes policy activation fail closed:
@@ -19,19 +20,33 @@ import (
 // has its own contract and its own guard interactions, and because the ordering
 // here is the substance of #678 F678-03.
 
-// ensureInitialSnapshot guarantees the matcher holds a non-empty policy snapshot
-// before activation proceeds.
+// ensureInitialSnapshot guarantees activation has a routing authority before it
+// proceeds.
 //
-// Ordering is what makes this correct (#678 F678-03). The durable last-known-good
-// baseline is published into the matcher *first*, so the synchronous sync that
-// follows is evaluated against the previous rule count. Without that, a fresh
-// matcher has no previous count, the shrink guard has nothing to compare against,
-// and a complete-but-shortened upstream list is accepted as the first-ever
-// snapshot — overwriting both the live policy and the durable generation while
-// every other guard (transport, content-type, empty list) reports success.
+// The authority is the destination classifier, not the operator's exception list.
+// The snapshot holds the operator's PROXY overrides, and an override that names
+// nothing is a valid configuration: every destination then takes the classifier's
+// answer (rows 3 to 5 of the routing contract in forwarder/routing_decision.go).
+// So a published snapshot with zero rules is not an absent policy, and this
+// handshake must not refuse it.
 //
-// So the sequence is: prime baseline → one synchronous sync → settle → require
-// rules.
+// What it must still refuse is a data path with no routing authority at all:
+// every destination then answers "uncovered", the fail-safe proxy default takes
+// all traffic, nothing can route DIRECT, and the policy would be inert while the
+// panel reported it enabled. That is a question about the installed classifier,
+// not about the rule count, and it is answered here — before the first sync — by
+// the nil-classifier check at the top of this function.
+//
+// Ordering is what makes the rest correct (#678 F678-03). The durable
+// last-known-good baseline is published into the matcher *first*, so the
+// synchronous sync that follows is evaluated against the previous rule count.
+// Without that, a fresh matcher has no previous count, the shrink guard has
+// nothing to compare against, and a complete-but-shortened upstream list is
+// accepted as the first-ever snapshot — overwriting both the live policy and the
+// durable generation while every other guard reports success.
+//
+// So the sequence is: require authority → prime baseline → one synchronous sync
+// → settle.
 //   - baseline primed and the sync succeeds: the new generation was accepted
 //     against a real previous count, which is the ordinary refresh path.
 //   - baseline primed and the sync fails or is refused by a guard: the primed
@@ -43,10 +58,11 @@ import (
 //   - a durable generation that exists but cannot be used: refused explicitly
 //     rather than synced over, because that would destroy the last recoverable
 //     copy.
-//
-// If no rules are live at the end, activation is refused with an error an
-// operator can act on.
-func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher) error {
+func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher, classifier forwarder.DestinationClassifier) error {
+	if classifier == nil {
+		return fmt.Errorf("%w: no destination classifier is installed, so no destination could be classified", ErrPolicyActivationNoRules)
+	}
+
 	baseline, baselineErr := syncer.PrimeBaseline(ctx)
 	if baselineErr != nil {
 		// A stored generation that cannot be used is a distinct, actionable state:
@@ -63,15 +79,7 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()
 
-	if err := settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), baseline, syncRes, syncErr); err != nil {
-		return err
-	}
-
-	snap := matcher.Current()
-	if snap == nil || snap.CIDRCount() == 0 {
-		return ErrPolicyActivationNoRules
-	}
-	return nil
+	return settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), baseline, syncRes, syncErr)
 }
 
 // settleInitialSync decides what the first synchronous sync's outcome means for

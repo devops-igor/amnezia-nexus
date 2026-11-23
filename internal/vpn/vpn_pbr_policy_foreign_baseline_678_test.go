@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -21,6 +22,12 @@ import (
 
 // TestForeignBaselineIsNotAcceptedWhenThisConfigurationHasNoRules is the core
 // F678-05 regression in its shipped form.
+//
+// The foreign-baseline guard is not a rule-count guard: it refuses a stored
+// generation that belongs to a different configuration. Configuration B here has
+// zero exceptions, which is a valid policy, but its cycle cannot publish because
+// the store it is handed cannot be read — so A's generation is the only candidate
+// and publishing it would authorize traffic with rules B never selected.
 func TestForeignBaselineIsNotAcceptedWhenThisConfigurationHasNoRules(t *testing.T) {
 	// A has produced a valid durable generation.
 	settingsA := policy.DefaultSettings()
@@ -37,7 +44,10 @@ func TestForeignBaselineIsNotAcceptedWhenThisConfigurationHasNoRules(t *testing.
 		t.Fatalf("SyncConfig B: %v", err)
 	}
 	matcher := policy.NewMatcher()
-	syncerB, err := policy.NewSyncer(matcher, store, cfgB)
+	// The store refuses to commit B's (empty) cycle, which is what leaves A's
+	// generation as the only thing activation could fall back to.
+	unwritable := &memoryStore{loadErr: errors.New("no cached generation"), commitErr: errors.New("durable store unwritable")}
+	syncerB, err := policy.NewSyncer(matcher, unwritable, cfgB)
 	if err != nil {
 		t.Fatalf("NewSyncer (B): %v", err)
 	}
@@ -45,7 +55,7 @@ func TestForeignBaselineIsNotAcceptedWhenThisConfigurationHasNoRules(t *testing.
 		t.Fatal("fixture is invalid: the two configurations share a hash, so this is not a foreign baseline")
 	}
 
-	err = ensureInitialSnapshot(context.Background(), syncerB, store, matcher)
+	err = ensureInitialSnapshot(context.Background(), syncerB, store, matcher, newDestinationClassifier(nil))
 	if err == nil {
 		t.Fatal("activation succeeded although the selected configuration published nothing and the only stored generation was foreign (F678-05)")
 	}
@@ -97,7 +107,7 @@ func TestMatchingBaselineActivatesWithoutAnyCycleNeedingToPublish(t *testing.T) 
 		t.Fatalf("NewSyncer: %v", err)
 	}
 
-	if err := ensureInitialSnapshot(context.Background(), syncer, store, matcher); err != nil {
+	if err := ensureInitialSnapshot(context.Background(), syncer, store, matcher, newDestinationClassifier(nil)); err != nil {
 		t.Fatalf("activation refused the verified matching last-known-good policy: %v", err)
 	}
 	snap := matcher.Current()
@@ -132,7 +142,7 @@ func TestChangedConfigurationActivatesOnItsOwnRules(t *testing.T) {
 		t.Fatal("fixture is invalid: the two configurations share a configuration hash")
 	}
 
-	if err := ensureInitialSnapshot(context.Background(), syncerB, store, matcher); err != nil {
+	if err := ensureInitialSnapshot(context.Background(), syncerB, store, matcher, newDestinationClassifier(nil)); err != nil {
 		t.Fatalf("activation of a configuration with its own rules was refused: %v", err)
 	}
 	snap := matcher.Current()
