@@ -33,12 +33,6 @@
     // count. One pixel is below anything the eye can see and far below a group.
     var TOLERANCE = 1;
 
-    // How long the page must be quiet under a pending target before the marker
-    // returns to the geometry. The smooth scroll lasts a few hundred milliseconds
-    // and emits scroll events throughout; this only has to outlast a gap between
-    // them, and it is what releases a marker whose scroll was interrupted.
-    var SETTLE_IDLE = 250;
-
     function byId(doc, id) {
         return doc ? doc.getElementById(id) : null;
     }
@@ -66,32 +60,18 @@
         return current;
     }
 
-    // markLink writes aria-current on the link for one group and removes it from
-    // every other one, so the page never shows two current links. It returns
-    // whether a link for that group exists.
-    function markLink(doc, groupId) {
-        if (!byId(doc, 'settingsSubnav')) return false;
-        var href = '#' + groupId;
-        var found = false;
-        links(doc).forEach(function (link) {
-            if (link.getAttribute('href') === href) {
-                link.setAttribute('aria-current', 'true');
-                found = true;
-            } else {
-                link.removeAttribute('aria-current');
-            }
-        });
-        return found;
-    }
-
-    // mark writes aria-current for the group the geometry says is in view. It
-    // returns the id it marked, so a caller (or a test) can see what the page
-    // decided.
+    // mark writes aria-current on the matching link and removes it from every
+    // other one. It returns the id it marked, so a caller (or a test) can see
+    // what the page decided.
     function mark(doc) {
         if (!byId(doc, 'settingsSubnav')) return null;
         var current = currentGroup(doc);
         if (!current) return null;
-        markLink(doc, current.id);
+        var href = '#' + current.id;
+        links(doc).forEach(function (link) {
+            if (link.getAttribute('href') === href) link.setAttribute('aria-current', 'true');
+            else link.removeAttribute('aria-current');
+        });
         return current.id;
     }
 
@@ -115,60 +95,6 @@
         var nav = byId(doc, 'settingsSubnav');
         if (!nav) return;
 
-        // The group the reader asked for while the page is still travelling to it.
-        // Geometry cannot answer for that window: the anchor's scroll has not
-        // started when the click handler runs, and a smooth scroll passes through
-        // every group in between, so a marker driven by pixels alone reports the
-        // previous group (then the ones on the way) after the reader has already
-        // chosen. null means "geometry decides".
-        var pending = null;
-        var handBack = null;
-
-        function clearPending() {
-            pending = null;
-            if (handBack !== null) {
-                root.clearTimeout(handBack);
-                handBack = null;
-            }
-        }
-
-        // scheduleHandBack hands control back to the geometry shortly after the page
-        // stops scrolling under a pending target. It is what keeps the marker from
-        // being pinned to a group the reader scrolled away from: while the scroll
-        // runs, every event restarts it, and when the scroll stops the marker is
-        // recomputed once, from where the page actually is.
-        function scheduleHandBack() {
-            if (handBack !== null) root.clearTimeout(handBack);
-            handBack = root.setTimeout(function () {
-                handBack = null;
-                pending = null;
-                mark(doc);
-            }, SETTLE_IDLE);
-        }
-
-        function activate(groupId) {
-            if (!markLink(doc, groupId)) return;
-            pending = groupId;
-            scheduleHandBack();
-        }
-
-        // sync is what both the scroll and the hashchange paths use: while a target
-        // is pending and the page has not reached it, the marker stays on the group
-        // the reader chose; once it is reached, or the scroll stops, geometry decides.
-        function sync() {
-            if (pending) {
-                var group = byId(doc, pending);
-                var arrived = !group || group.getBoundingClientRect().top <= SETTLE + TOLERANCE;
-                if (!arrived) {
-                    markLink(doc, pending);
-                    scheduleHandBack();
-                    return;
-                }
-                clearPending();
-            }
-            mark(doc);
-        }
-
         nav.addEventListener('click', function (event) {
             var link = event.target && event.target.closest
                 ? event.target.closest('.settings-subnav-link')
@@ -179,13 +105,13 @@
             // The browser follows the anchor itself (so the jump and the URL stay
             // the browser's), and this adds the focus handoff the anchor lacks.
             focusGroup(doc, href.slice(1));
-            activate(href.slice(1));
+            mark(doc);
         });
 
         root.addEventListener('hashchange', function () {
             var id = (root.location.hash || '').slice(1);
             if (id) focusGroup(doc, id);
-            sync();
+            mark(doc);
         });
 
         // Scroll is throttled to one frame: the handler reads layout, and reading
@@ -196,7 +122,7 @@
             scheduled = true;
             var run = function () {
                 scheduled = false;
-                sync();
+                mark(doc);
             };
             if (typeof root.requestAnimationFrame === 'function') root.requestAnimationFrame(run);
             else root.setTimeout(run, 16);
@@ -208,7 +134,6 @@
     root.SettingsNav = {
         init: init,
         mark: mark,
-        markLink: markLink,
         currentGroup: currentGroup
     };
 

@@ -64,8 +64,18 @@ def test_settings_subnav_names_and_moves_between_groups(
     page.wait_for_function(
         "document.activeElement && document.activeElement.id === 'group-network-title'"
     )
+    # Wait for the requested group's OWN link to become the unique current link.
+    # Waiting on a count of current links is satisfied by the previous group's mark,
+    # so a click whose mark never moved would pass that wait and then fail on the
+    # assertion below for the wrong reason. This predicate names the group, so it
+    # waits for exactly the state the design requires - the marker moves once the
+    # group is in view, not before - and a marker that stays put never satisfies it.
     page.wait_for_function(
-        "document.querySelectorAll('[aria-current=\"true\"]').length === 1"
+        """() => {
+            const current = [...document.querySelectorAll('[aria-current="true"]')];
+            return current.length === 1
+                && current[0].getAttribute('href') === '#group-network';
+        }"""
     )
     after = page.evaluate(SETTINGS_NAV_PROBE)
     assert after["activeTag"] == "H2", after
