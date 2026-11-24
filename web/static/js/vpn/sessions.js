@@ -180,50 +180,29 @@ function vpnRenderSessionRow(s, route) {
     tdTraffic.setAttribute('data-sort-value', String(totalBps));
     tr.appendChild(tdTraffic);
 
-    // 4. Packet Loss cell
-    const tdLoss = document.createElement('td');
-    tdLoss.className = 'font-mono text-sm';
-    let dropRate = 0;
-    let drops = 0;
-    let recentDrops = 0;
-    if (route) {
-        dropRate = Number(route.queue_full_drop_rate_pps || 0);
-        drops = Number(route.drops !== undefined ? route.drops : (route.queue_full_drops || 0));
-        recentDrops = Number(route.queue_full_drops_recent || 0);
-        if (dropRate > 0 || recentDrops > 0) {
-            let dropText = '';
-            if (dropRate > 0) {
-                const lossFmt = _('vpn_fwd_loss_rate_format') || '%s drops/s (%d total)';
-                dropText = lossFmt.replace('%s', dropRate.toFixed(1)).replace('%d', drops);
-            } else {
-                const recentLabel = _('vpn_fwd_recent') || 'recent';
-                dropText = `${recentDrops} ${recentLabel} (${drops})`;
-            }
-            tdLoss.innerHTML = `<span class="text-danger font-weight-600">${dropText}</span>`;
-        } else if (drops > 0) {
-            tdLoss.textContent = String(drops);
-        } else {
-            tdLoss.textContent = '0';
-        }
+    // 4. Transferred cell — cumulative both-direction traffic this session has
+    // carried since its route started, from the forwarder rx_bytes/tx_bytes
+    // counters the status payload already delivers. A session with no counter
+    // snapshot reports the explicit not-measured state instead of a zero, so an
+    // unmeasured session cannot read as an idle one.
+    const tdTransferred = document.createElement('td');
+    const traffic = route && route.traffic ? route.traffic : null;
+    const hasTransferredTotals = !!traffic &&
+        traffic.rx_bytes !== undefined && traffic.rx_bytes !== null &&
+        traffic.tx_bytes !== undefined && traffic.tx_bytes !== null;
+    if (hasTransferredTotals) {
+        const transferredTotal = Number(traffic.rx_bytes || 0) + Number(traffic.tx_bytes || 0);
+        tdTransferred.className = 'font-mono text-sm';
+        tdTransferred.textContent = vpnFormatBytes(transferredTotal);
+        tdTransferred.setAttribute('data-sort-value', String(transferredTotal));
     } else {
-        tdLoss.textContent = '-';
+        tdTransferred.className = 'text-muted text-sm';
+        tdTransferred.textContent = _('vpn_diag_not_measured');
+        // Unknown traffic sorts below a measured zero, so it cannot be mistaken
+        // for the least-active session.
+        tdTransferred.setAttribute('data-sort-value', '-1');
     }
-    let sortLoss = 0;
-    if (route) {
-        if (dropRate > 0) {
-            // Tier 1: Active drop rate (millidrops/sec integer encoding to preserve decimal precision without float loss)
-            const scaledRate = Math.max(1, Math.round(dropRate * 1000));
-            sortLoss = 1e13 + Math.min(scaledRate, 999999999);
-        } else if (recentDrops > 0) {
-            // Tier 2: Recent drops with zero active drop rate
-            sortLoss = 1e10 + Math.min(recentDrops, 999999999);
-        } else if (drops > 0) {
-            // Tier 3: Historical lifetime drops with zero recent and zero active drops
-            sortLoss = Math.min(drops, 999999999);
-        }
-    }
-    tdLoss.setAttribute('data-sort-value', String(sortLoss));
-    tr.appendChild(tdLoss);
+    tr.appendChild(tdTransferred);
 
     // 5. Status cell
     const tdStatus = document.createElement('td');

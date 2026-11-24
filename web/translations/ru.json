@@ -652,6 +652,7 @@
   "vpn_diag_condition_backend_device_unattributed": "потери устройства бэкенда активны, но подробная атрибуция по направлениям недоступна",
   "vpn_col_user_device": "Пользователь и устройство",
   "vpn_col_live_traffic": "Текущий трафик",
+  "vpn_col_transferred": "Передано",
   "vpn_col_traffic": "Текущий трафик",
   "vpn_col_packet_loss": "Сбросы dataplane",
   "vpn_col_queue_pressure": "Нагрузка на очередь",

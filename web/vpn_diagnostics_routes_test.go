@@ -216,8 +216,8 @@ assert(row0.children[0].innerHTML.includes('vpn-expand-icon'), 'user cell must r
 assert.strictEqual(row0.children[1].textContent, 'Frankfurt-1', 'col 1 must render server name');
 assert(row0.children[2].textContent.includes('1.00 Mbps') && row0.children[2].textContent.includes('2.00 Mbps'), 'col 2 must render live traffic rates');
 assert.strictEqual(row0.children[2].getAttribute('data-sort-value'), '3000000', 'tdTraffic must carry numeric data-sort-value');
-assert.strictEqual(row0.children[3].textContent, '0', 'col 3 must render 0 drops');
-assert.strictEqual(row0.children[3].getAttribute('data-sort-value'), '0', 'tdLoss must carry numeric data-sort-value');
+assert.strictEqual(row0.children[3].textContent, '3.00 MB', 'col 3 must render the both-direction transferred total');
+assert.strictEqual(row0.children[3].getAttribute('data-sort-value'), '3145728', 'the transferred cell carries the raw byte total for sorting');
 assert(row0.children[4].textContent.includes('Active'), 'col 4 must render Active status badge');
 assert(row0.children[4].innerHTML.includes('badge-success'), 'col 4 must render badge-success for connected session');
 
@@ -227,10 +227,9 @@ assert.strictEqual(row1.children.length, 5, 'session row must have 5 columns');
 assert(row1.children[0].textContent.includes('bob'));
 assert.strictEqual(row1.children[1].textContent, 'Frankfurt-1');
 assert.strictEqual(row1.children[2].getAttribute('data-sort-value'), '600000');
-assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '10000000002400');
-assert(row1.children[3].innerHTML.includes('text-danger'), 'packet loss must be highlighted with text-danger');
-assert(row1.children[3].textContent.includes('2.4 drops/s'), 'loss rate column must render drop rate pps');
-assert(row1.children[3].textContent.includes('15'), 'drops count must be 15');
+assert.strictEqual(row1.children[3].textContent, '1.50 MB', 'col 3 sums both directions for bob');
+assert.strictEqual(row1.children[3].getAttribute('data-sort-value'), '1572864');
+assert(!/drops/i.test(row1.textContent), 'the row must not carry the forwarder drop counter any more');
 assert(row1.children[4].innerHTML.includes('badge-warn'), 'degraded route must reflect degraded status badge');
 assert(row1.children[4].textContent.includes('Degraded'), 'status text must show Degraded');
 
@@ -241,8 +240,8 @@ assert(row2.children[0].textContent.includes('charlie'));
 assert.strictEqual(row2.children[1].textContent, 'Frankfurt-2');
 assert.strictEqual(row2.children[2].textContent, '-', 'traffic must be dash when route is absent');
 assert.strictEqual(row2.children[2].getAttribute('data-sort-value'), '0');
-assert.strictEqual(row2.children[3].textContent, '-', 'loss must be dash when route is absent');
-assert.strictEqual(row2.children[3].getAttribute('data-sort-value'), '0');
+assert.strictEqual(row2.children[3].textContent, 'Not measured', 'a session with no forwarder counter reports the explicit not-measured state');
+assert.strictEqual(row2.children[3].getAttribute('data-sort-value'), '-1', 'unmeasured traffic sorts below a measured zero');
 assert(row2.children[4].textContent.includes('Unroutable'), 'active session without route must reflect unroutable status badge');
 assert(row2.children[4].innerHTML.includes('badge-warn'), 'unroutable session must have badge-warn');
 
@@ -251,9 +250,9 @@ const row3 = tbody.children[3];
 assert.strictEqual(row3.children.length, 5, 'session row must have 5 columns');
 assert(row3.children[0].textContent.includes('dan'));
 assert.strictEqual(row3.children[1].textContent, 'Frankfurt-1');
-assert.strictEqual(row3.children[3].textContent, '10', 'historical drops must render count');
-assert(!row3.children[3].innerHTML.includes('text-danger'), 'historical drops alone must NOT have text-danger styling');
-assert.strictEqual(row3.children[3].getAttribute('data-sort-value'), '10');
+assert.strictEqual(row3.children[3].textContent, '3.00 MB', 'historical drops do not displace the transferred total');
+assert.strictEqual(row3.children[3].getAttribute('data-sort-value'), '3145728');
+assert(!/drops/i.test(row3.textContent), 'historical drops stay out of the session row');
 assert(row3.children[4].textContent.includes('Active'), 'session with only historical drops must remain Active status');
 assert(row3.children[4].innerHTML.includes('badge-success'), 'nominal session with historical drops must have badge-success');
 
@@ -334,7 +333,7 @@ vpnLastStatus = {
             drops: 42,
             queue_full_drops_recent: 12,
             has_pressure: true,
-            traffic: { rx_bps: 4000000, tx_bps: 8000000 }
+            traffic: { rx_bps: 4000000, tx_bps: 8000000, rx_bytes: 8388608, tx_bytes: 4194304 }
         }
     ]
 };
@@ -343,8 +342,8 @@ assert.strictEqual(tbody.children.length, 4);
 const updatedAlice = tbody.children[0];
 assert(updatedAlice.children[2].textContent.includes('4.00 Mbps') && updatedAlice.children[2].textContent.includes('8.00 Mbps'), 'live traffic must be synced with status refresh');
 assert.strictEqual(updatedAlice.children[2].getAttribute('data-sort-value'), '12000000');
-assert(updatedAlice.children[3].innerHTML.includes('text-danger'), 'packet loss alarm must update dynamically');
-assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '10000000012');
+assert.strictEqual(updatedAlice.children[3].textContent, '12.00 MB', 'the transferred total must update with the status refresh');
+assert.strictEqual(updatedAlice.children[3].getAttribute('data-sort-value'), '12582912');
 assert(updatedAlice.children[4].innerHTML.includes('badge-warn'), 'status must update to Degraded dynamically');
 
 // Assertion 6: Correlation priority ordering (session_id > connection_id > assigned_ip)
@@ -504,14 +503,16 @@ func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
 
-// Old route from previous connection
+// Old route from previous connection. It carries traffic counters of its own so
+// the assertion below fails if the reconnected session inherits them.
 const oldRoute = {
     session_id: 'old-123',
     connection_id: 101,
     drops: 25,
     queue_full_drops_recent: 10,
     has_pressure: true,
-    assigned_ip: '10.8.0.101'
+    assigned_ip: '10.8.0.101',
+    traffic: { available: true, rx_bytes: 1048576, tx_bytes: 1048576 }
 };
 
 // New reconnected session
@@ -541,14 +542,29 @@ renderSessions(sessions);
 assert.strictEqual(tbody.children.length, 1, 'tbody must have 1 session row');
 const row = tbody.children[0];
 
-// Assert drops column does NOT inherit the old route's drops (drops: 25)
-const dropsCell = row.children[3];
-assert.strictEqual(dropsCell.textContent, '-', 'unroutable session must have dash for drops without inheriting old route telemetry');
+// The transferred column must NOT inherit the old route's traffic (2 MiB): the
+// session has no matching route, so it reports the explicit not-measured state.
+const transferredCell = row.children[3];
+assert.strictEqual(transferredCell.textContent, 'Not measured', 'unroutable session must report not-measured instead of inheriting old route telemetry');
+assert.strictEqual(transferredCell.getAttribute('data-sort-value'), '-1', 'unmeasured traffic sorts below a measured zero');
 
 // Assert status column renders with Unroutable badge
 const statusCell = row.children[4];
 assert(statusCell.textContent.includes('Unroutable'), 'session without matching route must show Unroutable status badge');
 assert(statusCell.innerHTML.includes('badge-warn'), 'unroutable status badge must have badge-warn');
+
+// 2b. Positive control: a route that DOES match must surface its own totals, so
+// the assertion above cannot pass by rendering the empty state unconditionally.
+vpnLastStatus = {
+    forwarder_available: true,
+    all_routes: [Object.assign({}, oldRoute, { session_id: 'new-456' })]
+};
+renderSessions(sessions);
+assert.strictEqual(tbody.children.length, 1, 'tbody must still have 1 session row');
+assert.strictEqual(tbody.children[0].children[3].textContent, '2.00 MB', 'a matching route must surface its transferred total');
+assert.strictEqual(tbody.children[0].children[3].getAttribute('data-sort-value'), '2097152');
+vpnLastStatus = { forwarder_available: true, all_routes: [oldRoute] };
+renderSessions(sessions);
 
 // 3. Switch to "Problems Only" filter
 vpnToggleSessionsProblemFilter();

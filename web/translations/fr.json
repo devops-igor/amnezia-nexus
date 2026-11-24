@@ -652,6 +652,7 @@
   "vpn_diag_condition_backend_device_unattributed": "les pertes du périphérique serveur sont actives, mais l'attribution détaillée par direction est indisponible",
   "vpn_col_user_device": "Utilisateur et appareil",
   "vpn_col_live_traffic": "Trafic en direct",
+  "vpn_col_transferred": "Transféré",
   "vpn_col_traffic": "Trafic en direct",
   "vpn_col_packet_loss": "Abandons dataplane",
   "vpn_col_queue_pressure": "Pression de file",
