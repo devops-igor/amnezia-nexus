@@ -18,6 +18,7 @@ package dialguard
 // inventory complete and the panel dialling again.
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -70,6 +71,8 @@ var dialSites = []dialSite{
 	{sshClientFile, "gossh.NewClient", viaBoundarySSH, "SSH client construction, after the admitted dial"},
 	{sshClientFile, "sftp.NewClient", viaNotAServer, "SFTP client over an SSH connection the transport already admitted"},
 	{sshPoolFile, "ssh.Config{", viaBoundarySSH, "builds the config from the server row, carrying its absence observation"},
+	{sshPoolFile, "alive", viaBoundarySSH, "checkout and maintenance use refusal-aware validation; refusal parks instead of evicting"},
+	{sshClientFile, "alive", viaBoundarySSH, "public liveness delegates to refusal-aware validation"},
 	{sshClientFile, "ssh.Config{", viaBoundarySSH, "DialFromServer builds the config from the row, carrying its absence observation"},
 	{sshHandshakeFile, "gossh.NewClientConn", viaNotAServer, "handshake of a connection a caller already obtained from the transport, which refused first"},
 
@@ -121,6 +124,7 @@ var dialSites = []dialSite{
 	{"internal/notifications/client.go", "DialContext", viaNotAServer, "same delivery"},
 	{"internal/vpn/backend_credential_rotation.go", "DialContext", viaNotAServer, "loopback self-check of a locally started port"},
 	{"internal/vpn/backend_credential_rotation.go", "naive.ProbeNaiveProxy", viaNotAServer, "probe of that locally started proxy"},
+	{"internal/vpn/generation.go", "alive", viaNotAServer, "diagnostic counter-window membership map, not a transport or liveness operation"},
 	{"internal/vpn/endpoint.go", "net.DialTimeout", viaNotAServer, "outbound-interface detection to a public address"},
 	{"internal/vpn/vpn_pbr.go", "net.Dial", viaNotAServer, "fixed public probe address used to find the default route"},
 	{"internal/vpn/tunnel/naive/daemon.go", "net.DialTimeout", viaNotAServer, "loopback readiness wait for the local naive daemon"},
@@ -149,6 +153,7 @@ var watchedSelectors = map[string]bool{
 	"ProbeAWGEndpointRange": true, "PerformAWGHandshake": true,
 	"ProbeVLESSReality": true, "ProbeNaiveProxy": true,
 	"probeEndpoint": true, "ProbeTunnel": true, "GetWithConfig": true, "GetSSHClient": true,
+	"IsAlive": true, "alive": true,
 }
 
 // coverageWitnesses are the identifiers each coverage claim must produce in the
@@ -156,7 +161,7 @@ var watchedSelectors = map[string]bool{
 var coverageWitnesses = map[string][]string{
 	viaBoundarySSH:   {"GetSSHClient", "DialFromServer", "sshPool", "ProviderAbsent"},
 	viaBoundaryProbe: {"probeEndpoint", "ProbeTunnel", "ErrProviderAbsent"},
-	viaRefusesItself: {"ProviderAbsent", "providerAbsent", "IsServerProviderAbsent", "not_measured", "ErrProviderAbsent"},
+	viaRefusesItself: {"ProviderAbsent", "providerAbsent", "IsServerProviderAbsent", "not_measured", "ErrProviderAbsent", "serverNotMeasured"},
 }
 
 // TestInventoryIsCurrent fails when a dialling construct appears in a file the
@@ -224,7 +229,7 @@ func TestBoundariesStillRefuse(t *testing.T) {
 	root := repoRoot(t)
 
 	t.Run("SSH transport refuses before dialing", func(t *testing.T) {
-		body := functionBody(t, root, sshClientFile, "*Client", "Connect")
+		body := functionBody(t, root, sshClientFile, "*Client", "connect")
 		if !hasPlainGuard(body, "ProviderAbsent", "ErrProviderAbsent") {
 			t.Fatal("Client.Connect no longer has a plain `if …ProviderAbsent` guard that returns ErrProviderAbsent")
 		}
@@ -402,7 +407,22 @@ func productionFiles(t *testing.T, root string) []string {
 func parseFile(t *testing.T, root, rel string) *ast.File {
 	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(root, rel), nil, 0)
+	path := filepath.Join(root, rel)
+	// Static-source checks must read the same overlaid bytes as the compiler.
+	if overlay := os.Getenv("SSH_GUARD_OVERLAY"); overlay != "" {
+		var mapping struct{ Replace map[string]string }
+		data, err := os.ReadFile(overlay)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &mapping); err != nil {
+			t.Fatal(err)
+		}
+		if replacement, ok := mapping.Replace[path]; ok {
+			path = replacement
+		}
+	}
+	file, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
 		t.Fatalf("parsing %s: %v", rel, err)
 	}

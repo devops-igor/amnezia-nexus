@@ -453,15 +453,15 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 	// would read as a real sample of a healthy or a dead host. The page renders
 	// this as "not checked", and the row's stored status is untouched.
 	if server.ProviderAbsent() {
-		h.JSON(w, http.StatusOK, map[string]any{
-			"status":          models.ProviderAbsentStatus,
-			"not_measured":    true,
-			"provider_absent": true,
-		})
+		h.serverNotMeasured(w)
 		return
 	}
 
 	client, err := h.GetSSHClient(ctx, server)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")
 		return
@@ -485,6 +485,10 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"uptime -p 2>/dev/null || uptime"
 
 	out, _, code, err := client.RunCommand(ctx, combinedCmd)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil || code != 0 {
 		h.JSONError(w, http.StatusBadGateway, "stats_failed", "Failed to collect server statistics")
 		return
@@ -514,7 +518,15 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if server.ProviderAbsent() {
+		h.serverNotMeasured(w)
+		return
+	}
 	client, err := h.GetSSHClient(ctx, server)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil {
 		h.JSON(w, http.StatusOK, models.ServerCheckResponse{
 			Connection:      "failed",
@@ -524,14 +536,22 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
-
 	// Check docker
 	dockerProbe := probeDockerPresence(ctx, client)
-	dockerProbe.logFailure(serverID)
 	dockerInstalled := dockerProbe.Installed
 
 	protocolsStatus := h.queryProtocolsStatus(ctx, server)
+	absent, err := h.db.IsServerProviderAbsent(ctx, serverID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to read server observation")
+		return
+	}
+	if absent {
+		h.serverNotMeasured(w)
+		return
+	}
+	dockerProbe.logFailure(serverID)
+	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
 	if syncDiscoveredProtocols(server, protocolsStatus) {
 		if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
 			slog.Warn("ServerCheckHandler: failed to persist detected protocols", "server_id", serverID, "err", err)

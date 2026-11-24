@@ -104,14 +104,17 @@ func (p *SSHClientPool) Get(ctx context.Context, server *models.Server) (SSHClie
 		Store:           p.store,
 		Timeout:         15 * time.Second,
 		KeepAlivePeriod: p.cfg.KeepAlivePeriod,
-		// The row's own observation travels with the config, so the transport
-		// refuses before dialing and every caller of the pool inherits that
-		// without repeating the check.
+		// Checkout refuses before validating or returning a cached connection.
 		ProviderAbsent: server.ProviderAbsent(),
 	}
 
+	cfg.presenceStore, _ = p.store.(ProviderPresenceStore)
 	key := ServerPoolKey(server)
-	return p.getOrCreate(ctx, key, cfg)
+	client, err := p.getOrCreate(ctx, key, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 // GetWithConfig retrieves or creates an active SSHClient with custom Config parameters.
@@ -119,6 +122,7 @@ func (p *SSHClientPool) GetWithConfig(ctx context.Context, cfg Config) (SSHClien
 	if cfg.Store == nil && p.store != nil {
 		cfg.Store = p.store
 	}
+	cfg.presenceStore, _ = p.store.(ProviderPresenceStore)
 	var key string
 	if cfg.ServerID != nil {
 		key = fmt.Sprintf("server:%d:%s:%d:%s", *cfg.ServerID, cfg.Host, cfg.Port, cfg.User)
@@ -126,59 +130,87 @@ func (p *SSHClientPool) GetWithConfig(ctx context.Context, cfg Config) (SSHClien
 		key = PoolKey(cfg.Host, cfg.Port, cfg.User)
 	}
 
-	return p.getOrCreate(ctx, key, cfg)
+	client, err := p.getOrCreate(ctx, key, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
-func (p *SSHClientPool) getOrCreate(ctx context.Context, key string, cfg Config) (SSHClient, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, ErrPoolClosed
+func (p *SSHClientPool) getOrCreate(ctx context.Context, key string, cfg Config) (*Client, error) {
+	// This admission dominates every cache lookup, validation and dial. Refusal
+	// parks the entry: it neither closes it nor changes its activity timestamp.
+	if err := checkProviderPresence(ctx, cfg); err != nil {
+		return nil, err
 	}
-
-	entry, exists := p.conns[key]
-	if exists && entry.client != nil {
-		if entry.client.IsAlive() {
-			entry.lastActive = time.Now()
-			client := entry.client
-			p.mu.Unlock()
-			return client, nil
+	cached, err := p.cachedClient(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if cached != nil {
+		if err := checkProviderPresence(ctx, cfg); err != nil {
+			return nil, err
 		}
-		// Connection dead -> evict
-		_ = entry.client.Close()
-		delete(p.conns, key)
+		return cached, nil
 	}
-	p.mu.Unlock()
-
-	// Dial outside mutex lock
-	client, err := Dial(ctx, cfg)
+	client, err := dialClient(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pool failed to dial %s: %w", key, err)
 	}
+	if err := checkProviderPresence(ctx, cfg); err != nil {
+		_ = client.Close() // Never published; no operation owns this transport.
+		return nil, err
+	}
+	return p.publishClient(ctx, key, cfg, client)
+}
 
+func (p *SSHClientPool) cachedClient(ctx context.Context, key string) (*Client, error) {
+	p.mu.RLock()
+	entry, closed := p.conns[key], p.closed
+	p.mu.RUnlock()
+	if closed {
+		return nil, ErrPoolClosed
+	}
+	if entry == nil {
+		return nil, nil
+	}
+	alive, err := entry.client.alive(ctx)
+	if err != nil {
+		return nil, err // A refused validation parks rather than retires the entry.
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed || p.conns[key] != entry {
+		p.mu.Unlock()
+		return nil, nil
+	}
+	if !alive {
+		delete(p.conns, key)
+		p.mu.Unlock()
+		_ = entry.client.Close()
+		return nil, nil
+	}
+	entry.lastActive = time.Now()
+	p.mu.Unlock()
+	return entry.client, nil
+}
 
-	if p.closed {
+func (p *SSHClientPool) publishClient(ctx context.Context, key string, cfg Config, client *Client) (*Client, error) {
+	p.mu.Lock()
+	closed := p.closed
+	_, exists := p.conns[key]
+	if !closed && !exists {
+		p.conns[key] = &pooledEntry{client: client, key: key, serverID: cfg.ServerID, cfg: cfg, lastActive: time.Now()}
+	}
+	p.mu.Unlock()
+	if closed {
 		_ = client.Close()
 		return nil, ErrPoolClosed
 	}
-
-	// Check if another goroutine connected while we were dialing
-	if existing, ok := p.conns[key]; ok && existing.client != nil && existing.client.IsAlive() {
-		_ = client.Close() // Discard our redundant new client
-		existing.lastActive = time.Now()
-		return existing.client, nil
+	if exists {
+		_ = client.Close()
+		// Re-enter admission and validation for the winning entry.
+		return p.getOrCreate(ctx, key, cfg)
 	}
-
-	p.conns[key] = &pooledEntry{
-		client:     client,
-		key:        key,
-		serverID:   cfg.ServerID,
-		cfg:        cfg,
-		lastActive: time.Now(),
-	}
-
 	return client, nil
 }
 
@@ -262,6 +294,7 @@ func (p *SSHClientPool) keepAliveLoop() {
 }
 
 func (p *SSHClientPool) pingAll() {
+	ctx := context.Background()
 	p.mu.RLock()
 	entries := make([]*pooledEntry, 0, len(p.conns))
 	for _, entry := range p.conns {
@@ -269,24 +302,24 @@ func (p *SSHClientPool) pingAll() {
 	}
 	p.mu.RUnlock()
 
-	var deadKeys []string
+	var deadEntries []*pooledEntry
 	for _, entry := range entries {
-		if entry.client != nil && !entry.client.IsAlive() {
-			deadKeys = append(deadKeys, entry.key)
+		alive, err := entry.client.alive(ctx)
+		if err != nil {
+			continue // Park without traffic, eviction or interrupting existing work.
+		}
+		if !alive {
+			deadEntries = append(deadEntries, entry)
 		}
 	}
 
-	if len(deadKeys) > 0 {
+	for _, entry := range deadEntries {
 		p.mu.Lock()
-		for _, key := range deadKeys {
-			if entry, ok := p.conns[key]; ok {
-				if entry.client != nil {
-					_ = entry.client.Close()
-				}
-				delete(p.conns, key)
-			}
+		if p.conns[entry.key] == entry {
+			delete(p.conns, entry.key)
 		}
 		p.mu.Unlock()
+		_ = entry.client.Close()
 	}
 }
 

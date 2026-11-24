@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +37,8 @@ type MockSSHServer struct {
 	activeConns  map[net.Conn]struct{}
 	closed       bool
 	hangCommands bool
+	commands     atomic.Int64
+	keepalives   atomic.Int64
 }
 
 func NewMockSSHServer(t *testing.T, user, password string) *MockSSHServer {
@@ -246,6 +249,7 @@ func (s *MockSSHServer) handleConn(netConn net.Conn, config *gossh.ServerConfig)
 	go func() {
 		for req := range reqs {
 			if req.Type == "keepalive@openssh.com" {
+				s.keepalives.Add(1)
 				_ = req.Reply(true, nil)
 			} else {
 				_ = req.Reply(false, nil)
@@ -273,6 +277,7 @@ func (s *MockSSHServer) handleSession(ch gossh.Channel, reqs <-chan *gossh.Reque
 	for req := range reqs {
 		switch req.Type {
 		case "exec":
+			s.commands.Add(1)
 			s.mu.RLock()
 			hang := s.hangCommands
 			s.mu.RUnlock()

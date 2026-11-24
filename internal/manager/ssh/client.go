@@ -50,8 +50,7 @@ type SSHClient interface {
 //
 // It is a refusal, not a transport failure: no connection was attempted, so a
 // caller must not report it as an unreachable host or record it as a health
-// sample. The refusal lives at the transport entry below so that every caller
-// passes through it, including callers written later.
+// sample. Pool admission and subsequent operations both enforce this refusal.
 var ErrProviderAbsent = errors.New("ssh refused: the provider's inventory no longer lists this server")
 
 // Config specifies the connection parameters for an SSH client.
@@ -69,9 +68,10 @@ type Config struct {
 	RequireFingerprintConfirm bool
 	HostKeyCallback           gossh.HostKeyCallback
 	// ProviderAbsent carries the server row's durable provider-absence
-	// observation. Every config built from a stored row sets it, and Connect
+	// observation. Every config built from a stored row sets it, and checkout
 	// refuses before opening a socket when it is true.
 	ProviderAbsent bool
+	presenceStore  ProviderPresenceStore
 }
 
 // Client implements the SSHClient interface with pooling, sudo, and SFTP support.
@@ -113,11 +113,10 @@ func NewClient(cfg Config) *Client {
 
 // Dial creates a new Client and immediately establishes an SSH connection.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
-	c := NewClient(cfg)
-	if err := c.Connect(ctx); err != nil {
-		return nil, err
-	}
-	return c, nil
+	// One-shot connections use the same admission path as reusable connections,
+	// without background workers or ownership beyond the returned client.
+	pool := &SSHClientPool{conns: make(map[string]*pooledEntry)}
+	return pool.getOrCreate(ctx, PoolKey(cfg.Host, cfg.Port, cfg.User), cfg)
 }
 
 // DialFromServer constructs a Client from a models.Server instance and establishes connection.
@@ -142,8 +141,8 @@ func DialFromServer(ctx context.Context, server *models.Server, store HostKeySto
 	return Dial(ctx, cfg)
 }
 
-// Connect establishes the SSH transport connection and completes the handshake.
-func (c *Client) Connect(ctx context.Context) error {
+// connect establishes a transport only after pool admission.
+func (c *Client) connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -254,6 +253,10 @@ func (c *Client) getSFTP() (*sftp.Client, error) {
 
 // RunCommand executes a command remotely and returns stdout, stderr, and exit code.
 func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
@@ -268,6 +271,10 @@ func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, in
 
 // RunSudoCommand executes a command with sudo privileges, delivering passwords via stdin safely.
 func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	cleanCmd := CleanSudoCommand(cmd)
 	if c.isRoot {
@@ -294,6 +301,10 @@ func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string
 
 // RunScript executes a multi-line shell script via bash stdin.
 func (c *Client) RunScript(ctx context.Context, script string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
@@ -309,6 +320,10 @@ func (c *Client) RunScript(ctx context.Context, script string) (string, string, 
 
 // RunSudoScript executes a multi-line script with root privileges.
 func (c *Client) RunSudoScript(ctx context.Context, script string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	if c.isRoot {
 		return c.RunScript(ctx, script)
@@ -332,6 +347,10 @@ func (c *Client) RunSudoScript(ctx context.Context, script string) (string, stri
 
 // UploadFile uploads content to a remote path via SFTP.
 func (c *Client) UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -342,13 +361,17 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 
 // UploadSudoFile uploads content to a root-owned remote path via atomic temp write and sudo move.
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer c.startOp()()
 
 	stagingDir := GenerateRandomTempPath("stage")
 	// Registered before staging and bound to an independent context so a failed or
 	// canceled upload still removes any partially staged secret from /tmp.
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", EscapeShellArg(stagingDir)))
 	}()
@@ -395,6 +418,10 @@ func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content 
 
 // DownloadFile downloads the complete content of a remote file via SFTP.
 func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -405,6 +432,10 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, e
 
 // DownloadSudoFile downloads a root-owned remote file, elevating reads for non-root SSH users.
 func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if c.isRoot {
 		return c.DownloadFile(ctx, remotePath)
 	}
@@ -421,6 +452,10 @@ func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byt
 
 // FileExists checks if a remote file or directory exists via SFTP.
 func (c *Client) FileExists(ctx context.Context, remotePath string) (bool, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return false, err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -443,10 +478,20 @@ func (c *Client) TestConnection(ctx context.Context) (string, error) {
 
 // IsAlive checks if the SSH transport connection is alive by sending a keepalive global request.
 func (c *Client) IsAlive() bool {
+	alive, _ := c.alive(context.Background())
+	return alive
+}
+
+// alive distinguishes a refused check from a dead transport so the pool never
+// evicts an in-use connection merely because its observation became absent.
+func (c *Client) alive(ctx context.Context) (bool, error) {
+	if err := checkProviderPresence(ctx, c.cfg); err != nil {
+		return false, err
+	}
 	c.mu.Lock()
 	if c.closed || c.sshClient == nil {
 		c.mu.Unlock()
-		return false
+		return false, nil
 	}
 	client := c.sshClient
 	c.mu.Unlock()
@@ -459,9 +504,9 @@ func (c *Client) IsAlive() bool {
 
 	select {
 	case err := <-doneCh:
-		return err == nil
+		return err == nil, nil
 	case <-time.After(5 * time.Second):
-		return false
+		return false, nil
 	}
 }
 
@@ -495,6 +540,9 @@ func (c *Client) Close() error {
 
 // GetUnderlyingClient returns the raw *golang.org/x/crypto/ssh.Client.
 func (c *Client) GetUnderlyingClient() *gossh.Client {
+	if checkProviderPresence(context.Background(), c.cfg) != nil {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sshClient
