@@ -3548,6 +3548,23 @@ td[data-backend-name]:focus-visible {
     min-height: 0;
     height: auto;
 }
+
+/* ===== Hint text ===== */
+/* A hint is read, not decoration, and --text-muted cannot carry it: it measures
+   2.95:1 on a card (dark) and 2.56:1 on one (light), under the 4.5:1 minimum for
+   normal text (WCAG 1.4.3). --text-secondary reaches 6.22:1 / 7.58:1 on a card
+   while staying quieter than body text (16.26:1 / 17.85:1), so the hint keeps its
+   rank below the label it explains. One value covers every surface a hint sits on,
+   because the worst of them still clears AA.
+
+   Placed here, like the page scale, because the marked class is newer than the
+   frozen comparison reference: the differential sets this selector aside, while a
+   rule on the legacy selector would move the comparison surface. `.portal-page`
+   reaches the content area and the block a page emits from its scripts, so a hint
+   in a page-owned dialog is as readable as one on the page. */
+.portal-page .form-hint {
+    color: var(--text-secondary);
+}
 /* ===== Settings page layout ===== */
 /* Cards sit directly in one grid. Two independent stacks side by side differ in
    height without bound (the Gigahost card alone is taller than most of the other

@@ -4,10 +4,10 @@
     /* The shared --text-muted token measures 2.95:1 in the dark theme and 2.56:1
        in the light one against a card, under the 4.5:1 minimum for body text
        (WCAG 1.4.3). This section carries the safety text an operator has to read
-       before enabling split egress, so its hints and value labels use the
-       secondary token here. Scoped to this card: the rest of the portal keeps its
-       current rendering. */
-    #policyRoutingCard .form-hint,
+       before enabling split egress, so its value labels use the secondary token.
+       The hint lines are already covered by the shared page rule for
+       .form-hint; scoping this block to the card keeps every other surface
+       unchanged. */
     #policyRoutingCard .info-card-label {
         color: var(--text-secondary);
     }
