@@ -4053,25 +4053,60 @@ td[data-backend-name]:focus-visible {
     list-style: none;
 }
 
-/* 40 px is the section-level step of the button scale. A long translation wraps
-   instead of being clipped by the .btn nowrap default. */
+/* An item may not force its link wider than the row: the link is allowed to
+   shrink and wrap its own label instead of pushing the page sideways. */
+.settings-subnav-list > li {
+    min-inline-size: 0;
+    max-inline-size: 100%;
+}
+
+/* The row speaks the sidebar's language: a pill, not a button surface. The
+   sidebar is a vertical drawer with smaller targets, so the label size, the
+   padding and the 40 px minimum are this row's own; the hue, the pill shape and
+   the selection shadow are shared. Nothing paints at rest, and a long
+   translation wraps inside its pill instead of being clipped. */
 .settings-subnav-link {
-    height: 40px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    max-inline-size: 100%;
+    padding: var(--space-sm) 12px;
+    border-radius: var(--radius-full);
+    font-size: 0.875rem;
+    font-weight: 500;
     white-space: normal;
+    overflow-wrap: anywhere;
     text-align: start;
     color: var(--text-secondary);
 }
 
-.settings-subnav-link:hover {
-    background: rgba(99, 102, 241, 0.08);
+/* Only a link that is not the current group responds to hover, so hovering never
+   dilutes the selected pill. No lift and no movement. */
+.settings-subnav-link:not([aria-current="true"]):hover {
+    background: rgba(139, 92, 246, 0.08);
     color: var(--text-primary);
 }
 
-/* The current group is stated with a border as well as a colour, so the state is
-   never carried by colour alone. */
+/* The current group is the sidebar's filled pill, so the state is carried by a
+   shape and a shadow rather than by a text colour alone. The 8% black layer over
+   the accent gradient darkens both stops: the raw stops leave this 14 px white
+   label at about 4.23-4.47:1, under the 4.5:1 minimum, and the darkened ones
+   clear it. The visible focus ring stays the shared one from base.css. */
 .settings-subnav-link[aria-current="true"] {
-    color: var(--text-primary);
-    border-block-end: 2px solid var(--accent);
+    color: #fff;
+    font-weight: 600;
+    background: linear-gradient(rgb(0 0 0 / 8%), rgb(0 0 0 / 8%)), var(--accent-gradient);
+    box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+}
+
+/* Forced-colors mode drops the gradient, which is what carries the shape, so the
+   current label keeps a second cue that survives: an underline, with the system
+   colours untouched and aria-current still naming the group. */
+@media (forced-colors: active) {
+    .settings-subnav-link[aria-current="true"] {
+        text-decoration: underline;
+    }
 }
 
 /* From the width where the sidebar is in flow the nav stays at the top of the

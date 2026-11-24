@@ -39,9 +39,33 @@ def test_settings_subnav_names_and_moves_between_groups(
         assert link["href"].startswith("#"), link
         assert page.evaluate("sel => !!document.querySelector(sel)", link["href"]), link
         assert link["text"], link
+        # No link is a filled control: the link's own background colour stays
+        # transparent and no side carries a border, so the row reads as navigation
+        # rather than as buttons. The current group's pill is a background IMAGE
+        # layer, asserted below, not a card fill.
+        assert link["background"] in ("rgba(0, 0, 0, 0)", "transparent"), link
+        for side in ("top", "right", "left", "bottom"):
+            assert link["borders"][side] == "0px", link
+        # The old per-link underline is gone; the current state must not be a
+        # decoration on one edge either way.
+        assert "underline" not in link["textDecorationLine"], link
+        # Exactly one link carries the current mark, and it is distinguished by
+        # more than a text colour: the sidebar's pill (gradient image + shadow)
+        # plus the heavier white label. Every other link paints no image and no
+        # shadow, and keeps the secondary hue at normal weight.
+        if link["current"] == "true":
+            assert "linear-gradient" in link["backgroundImage"], link
+            assert link["boxShadow"] not in ("none", ""), link
+            assert link["color"] == "rgb(255, 255, 255)", link
+            assert link["fontWeight"] == "600", link
+        else:
+            assert link["backgroundImage"] == "none", link
+            assert link["boxShadow"] == "none", link
+            assert link["fontWeight"] == "500", link
+        # The 40 px target holds at both widths; at 390 it must also stay fully
+        # inside the viewport, because the row wraps instead of clipping.
+        assert link["height"] >= 40, link
         if width == 390:
-            # A wrapped row still yields 40 px targets that stay inside the viewport.
-            assert link["height"] >= 40, link
             assert link["width"] > 0, link
             assert link["right"] <= probe["clientWidth"] + 0.5, link
     if width == 390:
@@ -93,3 +117,38 @@ def test_settings_subnav_names_and_moves_between_groups(
         assert abs(nav_top) < 1, nav_top
     else:
         assert nav_top < 0, nav_top
+
+    # SET2-16, read where it can be told apart from the mark: the shared focus
+    # ring must appear on a link that is NOT current. That link carries no pill
+    # and no shadow, so a non-`none` shadow could not be mistaken for the ring,
+    # and the ring cannot be mistaken for the current state.
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_function(
+        """() => {
+            const c = [...document.querySelectorAll('[aria-current="true"]')];
+            return c.length === 1 && c[0].getAttribute('href') === '#group-portal';
+        }"""
+    )
+    page.keyboard.press("Tab")  # keyboard modality, so :focus-visible follows keys
+    focus = page.evaluate(
+        """() => {
+      const a = [...document.querySelectorAll('.app-main nav a')]
+          .find(l => l.getAttribute('aria-current') !== 'true');
+      a.focus();
+      const s = getComputedStyle(a);
+      return {href: a.getAttribute('href'), current: a.getAttribute('aria-current'),
+              focused: document.activeElement === a,
+              focusVisible: a.matches(':focus-visible'),
+              outlineStyle: s.outlineStyle, outlineWidth: s.outlineWidth,
+              outlineOffset: s.outlineOffset, boxShadow: s.boxShadow,
+              backgroundImage: s.backgroundImage};
+    }"""
+    )
+    assert focus["focused"] and focus["focusVisible"], focus
+    assert focus["href"], focus
+    assert focus["current"] != "true", focus
+    assert focus["outlineStyle"] == "solid", focus
+    assert focus["outlineWidth"] == "2px", focus
+    assert focus["outlineOffset"] == "2px", focus
+    assert focus["boxShadow"] == "none", focus
+    assert focus["backgroundImage"] == "none", focus
