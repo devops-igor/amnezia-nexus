@@ -46,6 +46,186 @@ def _open_routing(page: Page, base_url: str) -> None:
     expect(page.locator("#policyStatusBadge")).to_have_attribute("data-enabled", "false")
 
 
+# Roles Chromium gives an SVG glyph. The finding was an "unnamed image" under the
+# link and the heading, so those are the roles the assertion refuses.
+GRAPHIC_ROLES = {"image", "img", "graphics-symbol"}
+
+
+def _ax_nodes(page: Page) -> list[dict]:
+    """Chromium's accessibility tree for the loaded document.
+
+    Read through CDP rather than from the markup: an attribute in the source says
+    what the author intended, and this says what the browser actually exposes.
+    """
+    cdp = page.context.new_cdp_session(page)
+    try:
+        cdp.send("Accessibility.enable")
+        return cdp.send("Accessibility.getFullAXTree")["nodes"]
+    finally:
+        cdp.detach()
+
+
+def _descendants(nodes: list[dict], root_id: str) -> list[dict]:
+    """Every node below root_id, following the tree's own parent links."""
+    children: dict[str, list[dict]] = {}
+    for node in nodes:
+        parent = node.get("parentId")
+        if parent:
+            children.setdefault(parent, []).append(node)
+    found, stack = [], list(children.get(root_id, []))
+    while stack:
+        node = stack.pop()
+        found.append(node)
+        stack.extend(children.get(node.get("nodeId"), []))
+    return found
+
+
+def _ax_named(nodes: list[dict], role: str, name: str) -> dict | None:
+    """The first unignored node with this role and accessible name."""
+    for node in nodes:
+        if node.get("ignored"):
+            continue
+        if node.get("role", {}).get("value") != role:
+            continue
+        if ((node.get("name") or {}).get("value") or "").strip() == name:
+            return node
+    return None
+
+
+def _exposed_graphics(nodes: list[dict], root_id: str) -> list[str]:
+    """The unignored graphic roles below a node, described for the failure message."""
+    return [
+        f"{d.get('role', {}).get('value')!s}:{((d.get('name') or {}).get('value') or '<unnamed>')!s}"
+        for d in _descendants(nodes, root_id)
+        if not d.get("ignored") and d.get("role", {}).get("value") in GRAPHIC_ROLES
+    ]
+
+
+def _glyph_paint(page: Page) -> list[dict]:
+    """Where the two glyphs paint and how, so "no visual change" can be measured.
+
+    Geometry and the properties a stylesheet could key on are read from the same
+    two elements the finding names.
+    """
+    return page.evaluate(
+        """() => [...document.querySelectorAll(
+        '.app-sidebar a[href="/routing"] svg, .app-main h1 svg')].map(svg => {
+      const box = svg.getBoundingClientRect();
+      const style = getComputedStyle(svg);
+      return {x: box.x, y: box.y, width: box.width, height: box.height,
+              color: style.color, display: style.display, visibility: style.visibility,
+              opacity: style.opacity, transform: style.transform, fill: style.fill};
+    })"""
+    )
+
+
+def _reveal_globe(page: Page) -> None:
+    """Control: take the hiding off the two glyphs so the query can be shown to see them."""
+    page.evaluate(
+        """() => {
+      for (const svg of document.querySelectorAll(
+          '.app-sidebar a[href="/routing"] svg, .app-main h1 svg')) {
+        svg.removeAttribute('aria-hidden');
+      }
+    }"""
+    )
+
+
+@pytest.mark.e2e
+def test_routing_globes_are_decorative_in_the_accessibility_tree(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The two globes the move introduced are hidden from assistive technology.
+
+    The sidebar entry and the page heading are named by their own text, so a glyph
+    inside either must not appear as an image in Chromium's accessibility tree and
+    must not take focus. Both halves are asserted: the names are the visible
+    labels, and neither node has an exposed graphic child. The control then removes
+    the hiding at runtime and requires the same query to see the images — an
+    assertion that passes when the query finds nothing would prove nothing.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _open_routing(page, base_url)
+
+    label = page.evaluate(
+        "() => document.querySelector('.app-sidebar a[href=\"/routing\"] .nav-label')"
+        ".textContent.trim()"
+    )
+    heading_text = page.evaluate("() => document.querySelector('.app-main h1').textContent.trim()")
+    assert label, "the sidebar entry has no visible label to compare its name against"
+    assert heading_text, "the page heading has no text of its own"
+
+    nodes = _ax_nodes(page)
+    entry = _ax_named(nodes, "link", label)
+    heading = _ax_named(nodes, "heading", heading_text)
+    assert entry is not None, f"no link named {label!r} in the accessibility tree"
+    assert heading is not None, f"no heading named {heading_text!r} in the accessibility tree"
+
+    # The name comes from the visible text, so it cannot be coming from the icon.
+    assert (entry["name"]["value"] or "").strip() == label
+    assert (heading["name"]["value"] or "").strip() == heading_text
+
+    assert not _exposed_graphics(nodes, entry["nodeId"]), (
+        "the sidebar entry exposes a graphic to assistive technology: "
+        f"{_exposed_graphics(nodes, entry['nodeId'])}"
+    )
+    assert not _exposed_graphics(nodes, heading["nodeId"]), (
+        "the page heading exposes a graphic to assistive technology: "
+        f"{_exposed_graphics(nodes, heading['nodeId'])}"
+    )
+
+    # The glyphs are also not reachable by keyboard: neither is in the tab order.
+    reachable = page.evaluate(
+        """() => [...document.querySelectorAll(
+        '.app-sidebar a[href="/routing"] svg, .app-main h1 svg')]
+        .filter(svg => svg.getAttribute('focusable') !== 'false'
+                    || svg.tabIndex >= 0).length"""
+    )
+    assert reachable == 0, "a decorative glyph is still focusable"
+
+    painted = _glyph_paint(page)
+    assert len(painted) == 2, f"expected two glyphs to measure, found {len(painted)}"
+
+    # Control: with the hiding removed, the same query finds the images. This is
+    # what makes the assertions above meaningful rather than vacuous.
+    _reveal_globe(page)
+    revealed = _ax_nodes(page)
+    for role, name in (("link", label), ("heading", heading_text)):
+        node = _ax_named(revealed, role, name)
+        assert node is not None, (role, name)
+        assert _exposed_graphics(revealed, node["nodeId"]), (
+            f"the control did not expose an image under the {role}: the assertion above could be "
+            "passing because the query sees nothing at all"
+        )
+
+    # "No visual change" is measured, not claimed: with the hiding off, the two
+    # glyphs paint in the same place and the same way.
+    revealed_paint = _glyph_paint(page)
+    for hidden_attrs, exposed_attrs in zip(painted, revealed_paint):
+        for edge in ("x", "y", "width", "height"):
+            assert abs(hidden_attrs[edge] - exposed_attrs[edge]) <= 0.5, (edge, painted, revealed_paint)
+        for prop in ("color", "display", "visibility", "opacity", "transform", "fill"):
+            assert hidden_attrs[prop] == exposed_attrs[prop], (prop, painted, revealed_paint)
+
+    # The entry is also the navigation on a phone, where it lives in the drawer.
+    page.goto(f"{base_url}{ROUTING}")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(CARD, state="visible")
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.click("#drawerToggle")
+    page.wait_for_function(
+        "() => !document.getElementById('appSidebar').hasAttribute('inert')"
+    )
+    drawer_nodes = _ax_nodes(page)
+    drawer_entry = _ax_named(drawer_nodes, "link", label)
+    assert drawer_entry is not None, "the drawer entry is missing from the accessibility tree"
+    assert not _exposed_graphics(drawer_nodes, drawer_entry["nodeId"]), (
+        "the drawer's sidebar entry exposes a graphic to assistive technology: "
+        f"{_exposed_graphics(drawer_nodes, drawer_entry['nodeId'])}"
+    )
+
+
 @pytest.mark.e2e
 def test_routing_card_button_height_matches_the_settings_scale(
     authenticated_page: Page, base_url: str

@@ -1,7 +1,9 @@
 {{ define "title_extra" }} — {{ _ "nav_routing" }}{{ end }}
 {{ define "content" }}
 <h1 class="section-title">
-    <span class="icon"><svg class="icon"><use href="#icon-globe"></use></svg></span>
+    {{/* Decorative, like the Settings and VPN page titles: the heading is named by its
+         own text, so the glyph is hidden from assistive technology and cannot focus. */}}
+    <span class="icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-globe"></use></svg></span>
     {{ _ "nav_routing" }}
 </h1>
 

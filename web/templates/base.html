@@ -308,7 +308,9 @@
 
                     {{ if has_role .current_user "admin" }}
                     <a href="/routing" class="sidebar-nav-link nav-link {{ if eq .active_page "routing" }}active{{ end }}"{{ if eq .active_page "routing" }} aria-current="page"{{ end }}>
-                        <span class="nav-icon"><svg class="icon"><use href="#icon-globe"></use></svg></span>
+                        {{/* Decorative: the entry is named by the visible label, so the
+                             glyph carries no name of its own and cannot take focus. */}}
+                        <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-globe"></use></svg></span>
                         <span class="nav-label">{{ _ "nav_routing" }}</span>
                     </a>
                     <a href="/settings" class="sidebar-nav-link nav-link {{ if eq .active_page "settings" }}active{{ end }}">
