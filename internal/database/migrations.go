@@ -58,7 +58,49 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateNotificationProducerStateGeneration(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateServersProviderAbsence(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
+}
+
+// migrateServersProviderAbsence adds the provider_absent_at column to servers.
+//
+// Existing rows start empty, which is the correct value: no successful provider
+// inventory read has judged them yet, so nothing may claim they are absent. The
+// column's presence is the migration marker.
+func (d *DB) migrateServersProviderAbsence(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(servers)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect servers schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "provider_absent_at") {
+			hasColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err := d.sqlDB.ExecContext(ctx,
+		`ALTER TABLE servers ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return fmt.Errorf("failed to add servers provider_absent_at column: %w", err)
+	}
+	return nil
 }
 
 // migrateNotificationProducerStateGeneration adds the transition generation used

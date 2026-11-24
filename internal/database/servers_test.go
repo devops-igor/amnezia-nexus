@@ -262,3 +262,62 @@ func TestServersEdgeCases(t *testing.T) {
 		t.Errorf("expected error in UpdateServerProtocols with unmarshalable protocol")
 	}
 }
+
+// The provider-absence observation is a durable column, and clearing it must
+// really clear it: a server the provider lists again carries no observation, which
+// is a different fact from "absent since the beginning of time".
+func TestServersProviderAbsenceRoundTrip(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	id, err := db.CreateServer(ctx, &models.Server{Name: "Provider server", Host: "198.51.100.9"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	created, err := db.GetServer(ctx, id)
+	if err != nil || created == nil {
+		t.Fatalf("GetServer(%d) failed: %v", id, err)
+	}
+	if created.ProviderAbsent() {
+		t.Fatalf("a newly registered server was already marked provider-absent: %q", created.ProviderAbsentAt)
+	}
+
+	observed := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
+	if err := db.SetServerProviderAbsence(ctx, id, observed); err != nil {
+		t.Fatalf("SetServerProviderAbsence failed: %v", err)
+	}
+	marked, err := db.GetServer(ctx, id)
+	if err != nil || marked == nil {
+		t.Fatalf("GetServer(%d) after recording absence failed: %v", id, err)
+	}
+	if !marked.ProviderAbsent() {
+		t.Fatal("the recorded absence did not reach the row")
+	}
+	if got, want := marked.ProviderAbsentAt, observed.Format(time.RFC3339); got != want {
+		t.Fatalf("recorded observation = %q, want %q", got, want)
+	}
+
+	all, err := db.GetAllServers(ctx)
+	if err != nil || len(all) != 1 {
+		t.Fatalf("GetAllServers = %d rows, err=%v", len(all), err)
+	}
+	if !all[0].ProviderAbsent() {
+		t.Fatal("GetAllServers did not read the recorded absence")
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+		t.Fatalf("clearing the absence failed: %v", err)
+	}
+	cleared, err := db.GetServer(ctx, id)
+	if err != nil || cleared == nil {
+		t.Fatalf("GetServer(%d) after clearing failed: %v", id, err)
+	}
+	if cleared.ProviderAbsent() {
+		t.Fatalf("a cleared observation still reads as absent: %q", cleared.ProviderAbsentAt)
+	}
+	// The rest of the row is untouched by both writes.
+	if cleared.Name != "Provider server" || cleared.Host != "198.51.100.9" {
+		t.Fatalf("recording provider absence changed the server row: %+v", cleared)
+	}
+}

@@ -185,11 +185,29 @@ type Server struct {
 	CreatedAt  time.Time          `json:"created_at" db:"created_at"`
 	Status     ReachabilityStatus `json:"status,omitempty"`
 	ServerInfo map[string]any     `json:"server_info,omitempty"`
+	// ProviderAbsentAt records when the provider's own server inventory last
+	// confirmed that this provider-provisioned server no longer exists, as an
+	// RFC3339 UTC timestamp. Empty means no such observation: either the provider
+	// still lists the server, or no successful inventory read has judged it. It is
+	// an observation about the provider's view, never a deletion: the row, its
+	// address, its credentials and its sessions are untouched.
+	ProviderAbsentAt string `json:"-" db:"provider_absent_at"`
 }
 
 // Reachable returns true if the server status is not offline.
 func (s Server) Reachable() bool {
 	return s.Status != ReachabilityOffline
+}
+
+// ProviderAbsent reports whether the provider's inventory has confirmed that
+// this server no longer exists.
+//
+// It is deliberately separate from Status: reachability says whether the panel
+// could talk to the host, this says whether the host is the provider's to list.
+// A server can be absent from the inventory and still carry an old reachability
+// observation, so consumers that filter on existence must ask this, not Status.
+func (s Server) ProviderAbsent() bool {
+	return strings.TrimSpace(s.ProviderAbsentAt) != ""
 }
 
 // User represents an authenticated dashboard user or VPN client subscriber.

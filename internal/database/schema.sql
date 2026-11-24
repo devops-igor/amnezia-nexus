@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS servers (
     ssh_pass TEXT,
     ssh_key TEXT,
     protocols TEXT,
-    created_at TEXT
+    created_at TEXT,
+    provider_absent_at TEXT NOT NULL DEFAULT ''
 );
 
 -- 2. Users Table

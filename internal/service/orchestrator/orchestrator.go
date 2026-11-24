@@ -60,12 +60,15 @@ type ProbeFunc func(ctx context.Context, endpoint string, serverPubKey string, c
 
 // Orchestrator coordinates scheduled background maintenance and telemetry tasks.
 type Orchestrator struct {
-	db                    *database.DB
-	registry              ProtocolResolver
-	userOps               UserOpsService
-	statusUpdater         TunnelStatusUpdater
-	sessionMigrator       SessionMigrator
-	probeFn               ProbeFunc
+	db              *database.DB
+	registry        ProtocolResolver
+	userOps         UserOpsService
+	statusUpdater   TunnelStatusUpdater
+	sessionMigrator SessionMigrator
+	probeFn         ProbeFunc
+	// inventoryReconciler records the provider's own view of the server table.
+	// It is optional: nil leaves the periodic loop exactly as it was.
+	inventoryReconciler   func(context.Context) error
 	bootDelay             time.Duration
 	interval              time.Duration
 	maxConcurrency        int
@@ -216,6 +219,24 @@ func (o *Orchestrator) SetTunnelStatusUpdater(u TunnelStatusUpdater) {
 	}
 }
 
+// SetServerInventoryReconciler configures the pass that records the provider's own
+// view of the server table. It runs at the head of the periodic background cycle,
+// ahead of the reachability probe, so a server the provider no longer lists stops
+// being dialed in the same pass that learns it, and no page load ever waits for a
+// provider read. Nil, the default, leaves the cycle as it was.
+func (o *Orchestrator) SetServerInventoryReconciler(fn func(context.Context) error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inventoryReconciler = fn
+}
+
+// serverInventoryReconciler returns the configured provider-inventory pass.
+func (o *Orchestrator) serverInventoryReconciler() func(context.Context) error {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.inventoryReconciler
+}
+
 // SetSessionMigrator configures the session migrator (e.g. VPN service) for live rebalancing (issue #289).
 func (o *Orchestrator) SetSessionMigrator(m SessionMigrator) {
 	o.mu.Lock()
@@ -316,6 +337,38 @@ func (o *Orchestrator) setStopped() {
 	o.running = false
 }
 
+// backgroundOperation is one periodic pass RunAll executes with its own error
+// isolation.
+type backgroundOperation struct {
+	name string
+	fn   func(context.Context) error
+}
+
+// backgroundOperations returns the passes one cycle runs, in order.
+//
+// The provider-inventory reconciliation, when one is configured, runs first: the
+// reachability probe reads the state it records, so recording the provider's view
+// and refusing to dial an absent server happen in the same pass instead of a pass
+// apart. It is a background read of a provider plus at most one write per changed
+// row, which is what makes it safe to run on this schedule rather than on a
+// request.
+func (o *Orchestrator) backgroundOperations() []backgroundOperation {
+	ops := make([]backgroundOperation, 0, 6)
+	if reconcile := o.serverInventoryReconciler(); reconcile != nil {
+		ops = append(ops, backgroundOperation{"reconcile_provider_server_inventory", reconcile})
+	}
+	return append(ops,
+		backgroundOperation{"sync_traffic", o.SyncTraffic},
+		backgroundOperation{"check_server_reachability", func(c context.Context) error {
+			_, err := o.CheckServerReachability(c)
+			return err
+		}},
+		backgroundOperation{"check_auto_trial_handshakes", o.CheckAutoTrialHandshakes},
+		backgroundOperation{"check_backend_tunnel_health", o.CheckBackendTunnelHealth},
+		backgroundOperation{"rebalance_vpn_sessions", o.RebalanceVPNSessions},
+	)
+}
+
 // RunAll executes all periodic background operations with error isolation.
 func (o *Orchestrator) RunAll(ctx context.Context) error {
 	now := time.Now().UTC()
@@ -323,19 +376,7 @@ func (o *Orchestrator) RunAll(ctx context.Context) error {
 	o.lastRun = &now
 	o.mu.Unlock()
 
-	operations := []struct {
-		name string
-		fn   func(context.Context) error
-	}{
-		{"sync_traffic", o.SyncTraffic},
-		{"check_server_reachability", func(c context.Context) error {
-			_, err := o.CheckServerReachability(c)
-			return err
-		}},
-		{"check_auto_trial_handshakes", o.CheckAutoTrialHandshakes},
-		{"check_backend_tunnel_health", o.CheckBackendTunnelHealth},
-		{"rebalance_vpn_sessions", o.RebalanceVPNSessions},
-	}
+	operations := o.backgroundOperations()
 
 	var combinedErrors []error
 

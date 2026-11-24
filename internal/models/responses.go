@@ -19,6 +19,13 @@ type ServerItemResponse struct {
 	LastChecked  *string        `json:"last_checked,omitempty"`
 	Reachable    *bool          `json:"reachable,omitempty"`
 	EngineStatus map[string]any `json:"engine_status,omitempty"`
+	// ProviderAbsent reports that the provider's own inventory confirmed this
+	// provider-provisioned server no longer exists. It is always present so a
+	// consumer can filter on it without inferring absence from an omitted key.
+	ProviderAbsent bool `json:"provider_absent"`
+	// ProviderAbsentSince is when that was observed, RFC3339 UTC. Present only
+	// when ProviderAbsent is true.
+	ProviderAbsentSince string `json:"provider_absent_since,omitempty"`
 }
 
 // ServerStatsResponse represents server resource telemetry.

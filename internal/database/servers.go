@@ -19,7 +19,7 @@ func (d *DB) GetAllServers(ctx context.Context) ([]models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at FROM servers ORDER BY id")
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at FROM servers ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query servers: %w", err)
 	}
@@ -42,7 +42,7 @@ func (d *DB) GetServer(ctx context.Context, id int64) (*models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at FROM servers WHERE id = ?", id)
+	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at FROM servers WHERE id = ?", id)
 	s, err := d.scanServerRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -263,6 +263,31 @@ func (d *DB) UpdateServerSSHStatus(ctx context.Context, id int64, status string)
 	return nil
 }
 
+// SetServerProviderAbsence records the provider's current view of a
+// provider-provisioned server. A non-zero observedAt records that the provider's
+// inventory confirmed the server no longer exists; a zero observedAt clears that
+// state, which is what a server the provider lists again must end up with.
+//
+// Only the observation column is written: the row's address, credentials,
+// sessions and reachability state are left exactly as they were, because this is
+// a statement about the provider's inventory rather than a deletion or a health
+// verdict.
+func (d *DB) SetServerProviderAbsence(ctx context.Context, id int64, observedAt time.Time) error {
+	value := ""
+	if !observedAt.IsZero() {
+		value = formatTime(observedAt.UTC())
+	}
+
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	if _, err := d.sqlDB.ExecContext(ctx,
+		"UPDATE servers SET provider_absent_at = ? WHERE id = ?", value, id); err != nil {
+		return fmt.Errorf("failed to record provider absence for server %d: %w", id, err)
+	}
+	return nil
+}
+
 // UpdateServerCredentials updates and encrypts SSH password and private key.
 func (d *DB) UpdateServerCredentials(ctx context.Context, id int64, sshPass, sshKey string) error {
 	return d.UpdateServer(ctx, id, map[string]any{
@@ -352,7 +377,7 @@ type scannable interface {
 
 func (d *DB) scanServer(s scannable) (models.Server, error) {
 	var srv models.Server
-	var sshPass, sshKey, protoJSON, createdAt sql.NullString
+	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt sql.NullString
 
 	err := s.Scan(
 		&srv.ID,
@@ -364,27 +389,13 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 		&sshKey,
 		&protoJSON,
 		&createdAt,
+		&providerAbsentAt,
 	)
 	if err != nil {
 		return srv, err
 	}
 
-	if sshPass.Valid && sshPass.String != "" {
-		srv.SSHPass = security.DecryptCredentialSafe(sshPass.String, d.secretKey)
-	}
-	if sshKey.Valid && sshKey.String != "" {
-		srv.SSHKey = security.DecryptCredentialSafe(sshKey.String, d.secretKey)
-	}
-
-	srv.Protocols = make(map[string]any)
-	if protoJSON.Valid && protoJSON.String != "" {
-		_ = json.Unmarshal([]byte(protoJSON.String), &srv.Protocols)
-		srv.Protocols = security.StripSensitiveProtocolFields(srv.Protocols)
-	}
-
-	if createdAt.Valid && createdAt.String != "" {
-		srv.CreatedAt = parseTime(createdAt.String)
-	}
+	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt)
 
 	d.reachabilityMu.RLock()
 	if st, ok := d.reachabilityCache[srv.ID]; ok {
@@ -395,6 +406,43 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 	d.reachabilityMu.RUnlock()
 
 	return srv, nil
+}
+
+// decodeServerColumns fills the server fields whose stored shape is not a plain
+// value: credentials are decrypted, the protocols blob is decoded and sanitized,
+// and the optional timestamps are parsed only when present.
+func (d *DB) decodeServerColumns(
+	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt sql.NullString,
+) {
+	if providerAbsentAt.Valid {
+		srv.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
+	}
+
+	if sshPass.Valid && sshPass.String != "" {
+		srv.SSHPass = security.DecryptCredentialSafe(sshPass.String, d.secretKey)
+	}
+	if sshKey.Valid && sshKey.String != "" {
+		srv.SSHKey = security.DecryptCredentialSafe(sshKey.String, d.secretKey)
+	}
+
+	srv.Protocols = decodeServerProtocols(protoJSON)
+
+	if createdAt.Valid && createdAt.String != "" {
+		srv.CreatedAt = parseTime(createdAt.String)
+	}
+}
+
+// decodeServerProtocols decodes the stored protocols blob, always returning a
+// non-nil map so a caller never has to nil-check it. A blob that is absent or not
+// valid JSON yields no protocols rather than an error: nothing usable can be read
+// from it, and one unreadable row must not fail the whole listing.
+func decodeServerProtocols(protoJSON sql.NullString) map[string]any {
+	protocols := make(map[string]any)
+	if protoJSON.Valid && protoJSON.String != "" {
+		_ = json.Unmarshal([]byte(protoJSON.String), &protocols)
+		protocols = security.StripSensitiveProtocolFields(protocols)
+	}
+	return protocols
 }
 
 func (d *DB) scanServerRow(row *sql.Row) (models.Server, error) {

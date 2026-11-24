@@ -921,14 +921,16 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 			reachable := s.Status == models.ReachabilityOnline || s.Status == ""
 
 			result = append(result, models.ServerItemResponse{
-				ID:        s.ID,
-				Name:      name,
-				Host:      "",
-				SSHPort:   0,
-				Username:  "",
-				Protocols: sanitizedProtocols,
-				Status:    status,
-				Reachable: &reachable,
+				ID:                  s.ID,
+				Name:                name,
+				Host:                "",
+				SSHPort:             0,
+				Username:            "",
+				Protocols:           sanitizedProtocols,
+				Status:              status,
+				Reachable:           &reachable,
+				ProviderAbsent:      s.ProviderAbsent(),
+				ProviderAbsentSince: s.ProviderAbsentAt,
 			})
 		} else {
 			protoMap := s.Protocols
@@ -944,14 +946,16 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 				createdAt = &s.CreatedAt
 			}
 			item := models.ServerItemResponse{
-				ID:        s.ID,
-				Name:      s.Name,
-				Host:      s.Host,
-				SSHPort:   s.SSHPort,
-				Username:  s.SSHUser,
-				Protocols: protoMap,
-				CreatedAt: createdAt,
-				Status:    status,
+				ID:                  s.ID,
+				Name:                s.Name,
+				Host:                s.Host,
+				SSHPort:             s.SSHPort,
+				Username:            s.SSHUser,
+				Protocols:           protoMap,
+				CreatedAt:           createdAt,
+				Status:              status,
+				ProviderAbsent:      s.ProviderAbsent(),
+				ProviderAbsentSince: s.ProviderAbsentAt,
 			}
 			h.populateServerEngineStatus(ctx, &item, &s, sess != nil && sess.Role == models.RoleAdmin)
 			result = append(result, item)
