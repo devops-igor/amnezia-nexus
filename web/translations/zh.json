@@ -652,6 +652,7 @@
   "vpn_diag_condition_backend_device_unattributed": "后端设备丢包处于活动状态，但无法获得按方向的详细归因",
   "vpn_col_user_device": "用户与设备",
   "vpn_col_live_traffic": "实时流量",
+  "vpn_col_transferred": "已传输",
   "vpn_col_traffic": "实时流量",
   "vpn_col_packet_loss": "数据面丢包",
   "vpn_col_queue_pressure": "队列压力",

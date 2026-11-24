@@ -453,18 +453,26 @@ assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alert
 	}
 }
 
-func TestVPNPacketLossCellDecoupledFromQueuePressure(t *testing.T) {
+// TestVPNSessionRowCarriesNoDropCounter covers the sessions-row consequence of
+// issue #976. The forwarder drop counter used to colour a per-session cell; that
+// cell is gone from the table and the counters remain available in Advanced
+// Diagnostics. What stays true, and is asserted here, is that neither the
+// lifetime nor the recent drop count reaches the row, that pressure and recent
+// drops still decide the status badge, and that a session whose payload carries
+// no traffic counters reports the localized not-measured state rather than a
+// number that would read as measured traffic.
+func TestVPNSessionRowCarriesNoDropCounter(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	node := fixture.RequireNode()
 
 	assertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
 
-// Route 1: Dan has historical drops (10) and queue pressure (occupancy 95/100, has_pressure: true),
-// but ZERO recent drops and ZERO drop rate pps.
-// Loss cell MUST NOT be red (no text-danger). Pressure cell MUST have badge-warn.
-// Route 2: Eve has recent drops (5 recent out of 20 total, no pps rate).
-// Loss cell MUST be red (text-danger) and use localized "recent" word.
+// Route 1: Dan has historical drops (10) and queue pressure (occupancy 95/100,
+// has_pressure: true), but ZERO recent drops and ZERO drop rate pps. Those
+// counters no longer have a cell; the row must not leak them.
+// Route 2: Eve has recent drops (5 recent out of 20 total) and no active rate.
+// Recent drops still decide the status badge, and nothing else in the row.
 vpnLastStatus = {
     forwarder_available: true,
     all_routes: [
@@ -523,27 +531,29 @@ assert.strictEqual(tbody.children.length, 2, 'table must render 2 session rows')
 
 // Row 0: Dan (historical drops + queue pressure)
 const rowDan = tbody.children[0];
-const lossDan = rowDan.children[3];
+assert.strictEqual(rowDan.children.length, 5, 'the session row has 5 cells');
+assert.strictEqual(rowDan.children[3].textContent, 'Not measured', 'no traffic counters means the explicit not-measured state');
+assert(!/drops/i.test(rowDan.textContent), 'the drop counter must not reach the session row: ' + rowDan.textContent);
+assert(![rowDan.children[2], rowDan.children[3], rowDan.children[4]].some(c => c.textContent.includes('10')), 'the lifetime drop count must not reach the telemetry or status cells');
+assert(!rowDan.innerHTML.includes('text-danger'), 'the row must not colour-carry the drop counter');
+assert(rowDan.children[4].innerHTML.includes('badge-warn'), 'queue pressure still drives the degraded status badge');
 
-// Loss cell MUST NOT be colored red
-assert.strictEqual(lossDan.textContent, '10', 'Dan loss cell must display historical drops count 10');
-assert(!lossDan.innerHTML.includes('text-danger'), 'Dan loss cell must NOT be red when only historical drops + pressure');
-
-// Row 1: Eve (recent drops without pps rate)
+// Row 1: Eve (recent drops without a pps rate)
 const rowEve = tbody.children[1];
-const lossEve = rowEve.children[3];
-
-// Loss cell MUST be colored red with localized format
-assert(lossEve.innerHTML.includes('text-danger'), 'Eve loss cell must have text-danger styling for recent drops');
-assert(lossEve.textContent.includes('5 recent (20)'), 'Eve loss cell must format as "5 recent (20)"');
+assert.strictEqual(rowEve.children.length, 5, 'the session row has 5 cells');
+assert.strictEqual(rowEve.children[3].textContent, 'Not measured', 'no traffic counters means the explicit not-measured state');
+assert(!/drops/i.test(rowEve.textContent), 'the recent drop counter must not reach the session row: ' + rowEve.textContent);
+assert(![rowEve.children[2], rowEve.children[3], rowEve.children[4]].some(c => c.textContent.includes('20')), 'the lifetime drop count must not reach the telemetry or status cells');
+assert(!rowEve.innerHTML.includes('text-danger'), 'recent drops no longer paint a danger cell in the row');
+assert(rowEve.children[4].innerHTML.includes('badge-warn'), 'recent drops continue to drive the status badge');
 `
 
 	script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", assertions)
 	if out, err := execNodeScript(node, script); err != nil {
-		t.Fatalf("packet loss decoupling test (en) failed: %v\n%s", err, out)
+		t.Fatalf("drop-counter-free session row test (en) failed: %v\n%s", err, out)
 	}
 
-	// Also verify Russian translation of fallback format "5 недавних (20)"
+	// The not-measured state is a localized string, not an English literal.
 	ruAssertions := `
 const tbody = document.getElementById('vpn-sessions-tbody');
 vpnLastStatus = {
@@ -577,12 +587,12 @@ const sessions = [
 vpnLastSessions = { sessions: sessions };
 renderSessions(sessions);
 
-const lossEve = tbody.children[0].children[3];
-assert(lossEve.innerHTML.includes('text-danger'), 'Russian: Eve loss cell must have text-danger');
-assert(lossEve.textContent.includes('5 недавних (20)'), 'Russian: Eve loss cell must use localized "недавних"');
+const transferredEve = tbody.children[0].children[3];
+assert.strictEqual(transferredEve.textContent, 'Не измерено', 'Russian: the not-measured state must be localized');
+assert(!transferredEve.innerHTML.includes('text-danger'), 'Russian: no danger styling without a counter');
 `
 	ruScript := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "ru", ruAssertions)
 	if out, err := execNodeScript(node, ruScript); err != nil {
-		t.Fatalf("packet loss decoupling test (ru) failed: %v\n%s", err, out)
+		t.Fatalf("drop-counter-free session row test (ru) failed: %v\n%s", err, out)
 	}
 }

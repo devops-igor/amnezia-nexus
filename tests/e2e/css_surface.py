@@ -90,6 +90,9 @@ VPN_SURFACE_CLASSES = frozenset({
     "vpn-numeric", "vpn-overview", "vpn-page-title",
     "vpn-route-table-region", "vpn-secondary", "vpn-signal-mismatch",
     "vpn-signal-unit", "vpn-subsection", "vpn-table-card", "vpn-table-loading",
+    # The Transferred column's own states: the value is one isolated, unbreakable
+    # token, and the not-measured label carries its own colour and wrapping.
+    "vpn-transferred-head", "vpn-transferred-missing", "vpn-transferred-value",
     # Accessible-name sink for the problem announcement.
     "vpn-visually-hidden",
     "vpn-windows",

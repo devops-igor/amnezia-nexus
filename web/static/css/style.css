@@ -3134,6 +3134,31 @@ td[data-backend-name]:focus-visible {
 .vpn-table-loading .spinner { width: 24px; height: 24px; margin: 0 auto var(--space-sm); }
 .vpn-modal-hint { margin-bottom: var(--space-md); }
 
+/* --- Transferred column ---
+   A session's cumulative traffic is one unbreakable token: the number and its
+   unit never separate, and the cell keeps it on one line where it fits. The
+   value isolates itself and declares its own left-to-right direction, so in a
+   right-to-left locale it paints as one left-to-right run instead of letting
+   the line's direction put the Latin unit before the number.
+   The header and the not-measured label only wrap where the locale offers a
+   break: a label written without a space stays whole rather than splitting a
+   word across two lines. The state label carries its own colour because the
+   shared muted token is below the 4.5:1 minimum on this row's background. */
+.vpn-transferred-value {
+    white-space: nowrap;
+    unicode-bidi: isolate;
+    direction: ltr;
+}
+
+.vpn-transferred-missing {
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.vpn-transferred-head {
+    white-space: nowrap;
+}
+
 .vpn-modal-footer {
     display: flex;
     justify-content: flex-end;

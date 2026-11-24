@@ -473,6 +473,15 @@ const backendsCode = %q;
 
 const dom = new JSDOM(source, { runScripts: 'outside-only', url: 'https://review.invalid' });
 const w = dom.window;
+// Load the real formatter module so the byte column is asserted against the same
+// formatter production ships, not a test-local imitation of it.
+let telemetryCode = null;
+for (const candidate of ['static/js/telemetry.js', 'web/static/js/telemetry.js']) {
+    if (fs.existsSync(candidate)) { telemetryCode = fs.readFileSync(candidate, 'utf8'); break; }
+}
+if (telemetryCode === null) throw new Error('telemetry.js not found');
+w.eval(telemetryCode);
+assert.strictEqual(typeof w.Telemetry.formatBytes, 'function', 'the real byte formatter must be loaded');
 w.eval(sessionsCode);
 w.eval(healthProblemsCode);
 w.eval(healthSummaryCode);
@@ -512,7 +521,7 @@ w.eval(tablesCode);
             queue_full_drops_recent: 0,
             queue_full_drop_rate_pps: 0,
             has_pressure: false,
-            traffic: { available: true, rx_bps: 25000000, tx_bps: 25000000 } // 50 Mbps
+            traffic: { available: true, rx_bps: 25000000, tx_bps: 25000000, rx_bytes: 104857600, tx_bytes: 104857600 } // 50 Mbps, 200 MiB
         },
         {
             session_id: 's-alice',
@@ -524,7 +533,7 @@ w.eval(tablesCode);
             queue_full_drops_recent: 10,
             queue_full_drop_rate_pps: 4.5,
             has_pressure: true,
-            traffic: { available: true, rx_bps: 10000000, tx_bps: 10000000 } // 20 Mbps
+            traffic: { available: true, rx_bps: 10000000, tx_bps: 10000000, rx_bytes: 157286400, tx_bytes: 157286400 } // 20 Mbps, 300 MiB
         },
         {
             session_id: 's-bob',
@@ -536,7 +545,7 @@ w.eval(tablesCode);
             queue_full_drops_recent: 2,
             queue_full_drop_rate_pps: 0.8,
             has_pressure: true,
-            traffic: { available: true, rx_bps: 500000, tx_bps: 500000 } // 1 Mbps
+            traffic: { available: true, rx_bps: 500000, tx_bps: 500000, rx_bytes: 5242880, tx_bytes: 5242880 } // 1 Mbps, 10 MiB
         },
         {
             session_id: 's-charlie',
@@ -548,7 +557,7 @@ w.eval(tablesCode);
             queue_full_drops_recent: 25,
             queue_full_drop_rate_pps: 0,
             has_pressure: true,
-            traffic: { available: true, rx_bps: 100000, tx_bps: 100000 } // 200 Kbps
+            traffic: { available: true, rx_bps: 100000, tx_bps: 100000, rx_bytes: 262144000, tx_bytes: 262144000 } // 200 Kbps, 500 MiB
         },
         {
             session_id: 's-eve',
@@ -560,7 +569,7 @@ w.eval(tablesCode);
             queue_full_drops_recent: 0,
             queue_full_drop_rate_pps: 0,
             has_pressure: false,
-            traffic: { available: true, rx_bps: 0, tx_bps: 0 } // 0 bps
+            traffic: { available: true, rx_bps: 0, tx_bps: 0, rx_bytes: 0, tx_bytes: 0 } // 0 bps, nothing transferred yet
         }
     ];
 
@@ -596,32 +605,38 @@ w.eval(tablesCode);
     assert.strictEqual(thTraffic.getAttribute('aria-sort'), 'descending');
     assert.deepStrictEqual(rowOrder(), ['dan', 'alice', 'bob', 'charlie', 'eve'], 'traffic descending: 50M > 20M > 1M > 200k > 0');
 
-    // Header 3: Packet Loss
-    const thLoss = headers[3];
-    assert(thLoss.textContent.includes('vpn_col_packet_loss'), 'col 3 must be packet loss header');
+    // Header 3: Transferred (issue #976 removed the dataplane-drops column from
+    // this table; its counters stay in Advanced Diagnostics).
+    const thTransferred = headers[3];
+    assert(thTransferred.textContent.includes('vpn_col_transferred'), 'col 3 must be the Transferred header');
+    assert(!thTransferred.textContent.includes('vpn_col_packet_loss'), 'the dataplane-drops column must not come back');
 
-    // Packet Loss Ascending (1st click)
-    thLoss.click();
-    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'ascending');
-    assert.deepStrictEqual(rowOrder(), ['eve', 'dan', 'charlie', 'bob', 'alice'], 'loss ascending: Tier 4 (0) < Tier 3 (10k drops) < Tier 2 (25 recent) < Tier 1 (0.8 pps) < Tier 1 (4.5 pps)');
+    // Transferred Ascending (1st click): eve 0 B < bob 10 MiB < dan 200 MiB
+    // < alice 300 MiB < charlie 500 MiB. The order is deliberately different from
+    // the live-traffic order asserted above, so sorting on the wrong cell (or on
+    // the departed drop counters) cannot pass this.
+    thTransferred.click();
+    assert.strictEqual(thTransferred.getAttribute('aria-sort'), 'ascending');
+    assert.deepStrictEqual(rowOrder(), ['eve', 'bob', 'dan', 'alice', 'charlie'], 'transferred ascending: 0 B < 10 MiB < 200 MiB < 300 MiB < 500 MiB');
 
-    // Packet Loss Descending (2nd click)
-    thLoss.click();
-    assert.strictEqual(thLoss.getAttribute('aria-sort'), 'descending');
-    assert.deepStrictEqual(rowOrder(), ['alice', 'bob', 'charlie', 'dan', 'eve'], 'loss descending: Tier 1 (4.5 pps) > Tier 1 (0.8 pps) > Tier 2 (25 recent) > Tier 3 (10k drops) > Tier 4 (0)');
+    // Transferred Descending (2nd click)
+    thTransferred.click();
+    assert.strictEqual(thTransferred.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['charlie', 'alice', 'dan', 'bob', 'eve'], 'transferred descending: 500 MiB > 300 MiB > 200 MiB > 10 MiB > 0 B');
 
-    // Explicit verification of operational triage guarantees:
-    const descOrder = rowOrder();
-    const aliceIdx = descOrder.indexOf('alice');
-    const bobIdx = descOrder.indexOf('bob');
-    const charlieIdx = descOrder.indexOf('charlie');
-    const danIdx = descOrder.indexOf('dan');
-    const eveIdx = descOrder.indexOf('eve');
-
-    assert(aliceIdx < bobIdx, 'higher active drop rate (4.5 pps) must sort before lower rate (0.8 pps)');
-    assert(bobIdx < charlieIdx, 'active rate loss must sort before recent loss with 0 current rate');
-    assert(charlieIdx < danIdx, 'recent loss (25 recent drops) must sort before historical drops (10000 drops) despite lower total');
-    assert(danIdx < eveIdx, 'historical drops must sort before zero drops');
+    // The cell reports both directions summed, in human-readable units, and no
+    // row exposes the drop counter that used to occupy this column.
+    const transferredByUser = {};
+    Array.from(tbody.children).forEach(function (r) {
+        const user = r.cells[0] ? r.cells[0].querySelector('.font-weight-600') : null;
+        if (user) transferredByUser[user.textContent.trim()] = r.cells[3];
+    });
+    assert.strictEqual(transferredByUser['dan'].textContent, '200 MB', 'dan: 100 MiB in + 100 MiB out');
+    assert.strictEqual(transferredByUser['alice'].textContent, '300 MB', 'alice: 150 MiB in + 150 MiB out');
+    assert.strictEqual(transferredByUser['eve'].textContent, '0 B', 'a measured zero renders as 0 B, not a dash');
+    Array.from(tbody.children).forEach(function (r) {
+        assert(!/drops/i.test(r.textContent), 'no session row may carry the drop counter: ' + r.textContent);
+    });
 
 `+vpnSessionsAccordionPersistenceSnippet+`    console.log('PASS');
 })().catch(e => {
@@ -642,6 +657,10 @@ w.eval(tablesCode);
 	}
 }
 
+// cssCommentPattern matches a CSS comment, which carries no selector text and
+// must be removed before a rule's selector list can be compared.
+var cssCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/`)
+
 // cssDeclaration returns the value of one declaration inside the rule whose
 // selector list contains selector. It exists so a styling oracle can bind a
 // declaration to its selector: checking that ".vpn-numeric" appears somewhere and
@@ -649,6 +668,10 @@ w.eval(tablesCode);
 // the numeric column. The last matching rule wins, as it does in the cascade for
 // equally specific selectors.
 func cssDeclaration(css, selector, property string) (string, bool) {
+	// A comment between two rules is not part of the selector that follows it.
+	// Left in place it breaks the comparison below, so a documented rule would be
+	// invisible to the binding while an undocumented one passed.
+	css = cssCommentPattern.ReplaceAllString(css, "")
 	value, found := "", false
 	declPattern := regexp.MustCompile(`(?m)(?:^|;)\s*` + regexp.QuoteMeta(property) + `\s*:\s*([^;{}]+)`)
 	close := -1
@@ -683,4 +706,243 @@ func cssDeclaration(css, selector, property string) (string, bool) {
 		}
 	}
 	return value, found
+}
+
+// requireJSDOMForTransferredGuard fails closed on the dependency this regression
+// guard exists to enforce. A guard that inherits the shared fixture's optional
+// t.Skip prints the same green "ok" as a passing one, so an environment without
+// Node/jsdom cannot silently disable the protection for the sessions table.
+func requireJSDOMForTransferredGuard(t *testing.T) string {
+	t.Helper()
+	nodePath, err := findNodeBinary()
+	if err != nil {
+		t.Fatalf("the Transferred-column guard requires a Node binary with jsdom: %v", err)
+	}
+	out, err := execNodeScript(nodePath, jsdomBootstrapSnippet+`console.log("JSDOM_READY");`)
+	if err != nil || !strings.Contains(string(out), "JSDOM_READY") {
+		t.Fatalf("the Transferred-column guard requires jsdom: %v\nOutput:\n%s", err, string(out))
+	}
+	return nodePath
+}
+
+// TestVPNSessionsTransferredColumn covers issue #976: the sessions table reports
+// the traffic each session has carried instead of the forwarder drop counter.
+// The drop counters themselves are unchanged and stay in Advanced Diagnostics.
+func TestVPNSessionsTransferredColumn(t *testing.T) {
+	fixture := NewVPNTestFixture(t)
+
+	t.Run("HeaderReplacesDataplaneDrops", func(t *testing.T) {
+		doc, err := xhtml.Parse(strings.NewReader(fixture.TemplateHTML))
+		if err != nil {
+			t.Fatalf("failed to parse vpn.html: %v", err)
+		}
+		table := findHTMLNodeByID(doc, "vpnSessionsTable")
+		if table == nil {
+			t.Fatal("sessions table #vpnSessionsTable not found in vpn.html")
+		}
+		thNodes := findHTMLNodesByTag(table, "th")
+		if len(thNodes) != 5 {
+			t.Fatalf("sessions table headers = %d, want 5", len(thNodes))
+		}
+		// The third header must be the new key, and the drop column key must not
+		// appear anywhere in this table's markup: re-adding it fails here.
+		if got := getHTMLNodeText(thNodes[3]); !strings.Contains(got, `vpn_col_transferred`) {
+			t.Errorf("sessions header 3 = %q, want the vpn_col_transferred label", got)
+		}
+		// The transferred header carries its own class, so the no-wrap rule that
+		// keeps a locale without a space from splitting the label can be bound to
+		// this column instead of every header in the table.
+		if cls := getHTMLNodeAttr(thNodes[3], "class"); !strings.Contains(cls, "vpn-transferred-head") {
+			t.Errorf("sessions header 3 class = %q, want .vpn-transferred-head", cls)
+		}
+		for i, th := range thNodes {
+			text := getHTMLNodeText(th)
+			if strings.Contains(text, "vpn_col_packet_loss") {
+				t.Errorf("sessions header %d still renders the dataplane-drops column: %q", i, text)
+			}
+			if strings.Contains(text, "vpn_dataplane_drops_scope") {
+				t.Errorf("sessions header %d still carries the forwarder drop scope note: %q", i, text)
+			}
+		}
+		// Drop figures stay reachable in Advanced Diagnostics: the routing drop
+		// readouts and the per-route table that carry them are still present.
+		for _, id := range []string{"vpn-routing-drops", "vpn-diag-drops-client", "vpn-diag-drops-return", "vpn-fwd-routes-table"} {
+			if findHTMLNodeByID(doc, id) == nil {
+				t.Errorf("Advanced Diagnostics drop surface %q is missing", id)
+			}
+		}
+	})
+
+	t.Run("LabelInAllFiveLocales", func(t *testing.T) {
+		for _, lang := range requiredLocales {
+			dict := fixture.Locale(lang)
+			if strings.TrimSpace(dict["vpn_col_transferred"]) == "" {
+				t.Errorf("%s missing vpn_col_transferred", lang)
+			}
+			if dict["vpn_col_transferred"] == dict["vpn_col_packet_loss"] {
+				t.Errorf("%s uses the dataplane-drops label for the Transferred column", lang)
+			}
+		}
+		if got := fixture.Locale("en")["vpn_col_transferred"]; got != "Transferred" {
+			t.Errorf("en vpn_col_transferred = %q, want %q", got, "Transferred")
+		}
+	})
+
+	t.Run("RenderedTotalsAndNotMeasured", func(t *testing.T) {
+		node := requireJSDOMForTransferredGuard(t)
+		enDict := fixture.Locale("en")
+		rendered := vpnDiagnosticsRenderedHTML(t, fixture.TemplateHTML, enDict)
+		translationsJS := vpnDiagnosticsTranslationsJS(t, "en")
+
+		staticFS, err := GetStaticSubFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		tablesJS, err := fs.ReadFile(staticFS, "js/tables.js")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		testScript := fmt.Sprintf(`
+const fs = require('fs');
+const assert = require('assert');
+let JSDOM;
+try {
+    JSDOM = require('jsdom').JSDOM;
+} catch (e) {
+    console.log('JSDOM_NOT_AVAILABLE: ' + e.message);
+    process.exit(2);
+}
+
+const source = %q;
+const tablesCode = %q;
+const sessionsCode = %q;
+
+// The real production formatter, so the assertion is about shipped formatting.
+let telemetryCode = null;
+for (const candidate of ['static/js/telemetry.js', 'web/static/js/telemetry.js']) {
+    if (fs.existsSync(candidate)) { telemetryCode = fs.readFileSync(candidate, 'utf8'); break; }
+}
+if (telemetryCode === null) { throw new Error('telemetry.js not found'); }
+
+const dom = new JSDOM(source, { runScripts: 'outside-only', url: 'https://review.invalid' });
+const w = dom.window;
+w.eval(telemetryCode);
+w.eval(sessionsCode);
+w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
+w.eval('const UI = { escapeHtml }; var vpnLastStatus = null;');
+w.eval(tablesCode);
+
+(async function() {
+    const sessions = [
+        { id: 's-dave', username: 'dave', server_name: 'eu-1', status: 'connected' },
+        { id: 's-erin', username: 'erin', server_name: 'eu-1', status: 'connected' },
+        { id: 's-frank', username: 'frank', server_name: 'eu-1', status: 'connected' },
+        { id: 's-gina', username: 'gina', server_name: 'eu-1', status: 'connected' },
+        { id: 's-hank', username: 'hank', server_name: 'eu-1', status: 'connected' }
+    ];
+    const routes = [
+        // 1 MiB in + 0.5 MiB out, plus the drop counters that used to own this
+        // column. The drop values must not reach the row.
+        { session_id: 's-dave', traffic: { available: true, rx_bytes: 1048576, tx_bytes: 524288 }, drops: 987654, queue_full_drops_recent: 17, queue_full_drop_rate_pps: 42.5 },
+        // Measured, genuinely nothing carried yet.
+        { session_id: 's-erin', traffic: { available: false, rx_bytes: 0, tx_bytes: 0 } },
+        // Hairline: a route registered but no byte counters in the payload.
+        { session_id: 's-gina', traffic: { available: false } },
+        // 3 MiB in + 2 MiB out.
+        { session_id: 's-hank', traffic: { available: true, rx_bytes: 3145728, tx_bytes: 2097152 } }
+        // frank has no route at all -> no forwarder counter to read.
+    ];
+
+    w.vpnLastSessions = { sessions: sessions };
+    w.vpnLastStatus = { forwarder_available: true, all_routes: routes };
+    w.renderSessions(sessions);
+
+    const tbody = w.document.getElementById('vpn-sessions-tbody');
+    const headerCells = Array.from(w.document.querySelectorAll('#vpnSessionsTable thead th'));
+    assert.strictEqual(headerCells.length, 5, 'the sessions table has 5 columns');
+    assert.strictEqual(headerCells[3].textContent.trim(), w.translations['vpn_col_transferred'], 'header 3 is the localized Transferred label');
+    headerCells.forEach(function (th, i) {
+        assert.notStrictEqual(th.textContent.trim(), w.translations['vpn_col_packet_loss'], 'header ' + i + ' must not be the dataplane-drops column');
+    });
+
+    const rowByUser = {};
+    Array.from(tbody.children).forEach(function (r) {
+        const user = r.cells[0] ? r.cells[0].querySelector('.font-weight-600') : null;
+        if (user) rowByUser[user.textContent.trim()] = r;
+    });
+    assert.deepStrictEqual(Object.keys(rowByUser).sort(), ['dave', 'erin', 'frank', 'gina', 'hank'], 'every session rendered');
+
+    const cell = name => rowByUser[name].cells[3];
+    // Both directions summed, in human-readable units from the shared formatter.
+    assert.strictEqual(cell('dave').textContent, '1.50 MB', 'dave: 1 MiB + 0.5 MiB is a formatted both-direction total');
+    assert.strictEqual(cell('hank').textContent, '5.00 MB', 'hank: 3 MiB + 2 MiB is a formatted both-direction total');
+    assert.strictEqual(cell('erin').textContent, '0 B', 'a measured zero is 0 B');
+    assert.strictEqual(cell('frank').textContent, w.translations['vpn_diag_not_measured'], 'no route means no counter: not measured');
+    assert.strictEqual(cell('gina').textContent, w.translations['vpn_diag_not_measured'], 'no byte counters means not measured');
+
+    assert.strictEqual(cell('dave').getAttribute('data-sort-value'), '1572864', 'the sort value is the raw byte total');
+    assert.strictEqual(cell('hank').getAttribute('data-sort-value'), '5242880', 'the sort value is the raw byte total');
+    assert.strictEqual(cell('erin').getAttribute('data-sort-value'), '0', 'a measured zero sorts as zero');
+    assert.strictEqual(cell('frank').getAttribute('data-sort-value'), '-1', 'unmeasured sorts below a measured zero');
+    assert.strictEqual(cell('gina').getAttribute('data-sort-value'), '-1', 'unmeasured sorts below a measured zero');
+
+    assert(cell('dave').className.indexOf('font-mono') !== -1, 'measured totals keep the numeric font');
+
+    // The measured value is one element of its own: the number and its unit are
+    // inside a single token, so no line break can fall between them, and the
+    // element isolates the run so a right-to-left line cannot reorder it.
+    const daveToken = cell('dave').querySelector('[data-transferred-value]');
+    assert(daveToken !== null, 'the measured value is its own element');
+    assert.strictEqual(cell('dave').children.length, 1, 'the cell holds exactly the value element');
+    assert.strictEqual(daveToken.className, 'vpn-transferred-value', 'the value element carries its own class');
+    assert.strictEqual(daveToken.textContent, '1.50 MB', 'the value element carries the formatted total');
+    assert(cell('hank').querySelector('[data-transferred-value]').textContent === '5.00 MB', 'every measured row uses the token');
+
+    // The not-measured state carries its own class rather than borrowing the
+    // shared muted utility that the whole row background makes unreadable.
+    assert(cell('frank').className.indexOf('vpn-transferred-missing') !== -1, 'the not-measured state carries its own class');
+    assert(cell('frank').className.indexOf('text-muted') === -1, 'the not-measured state does not borrow the shared muted utility');
+    assert(cell('frank').children.length === 0, 'the not-measured label stays plain text');
+
+    // The counter that used to live here is gone from every rendered row.
+    Array.from(tbody.children).forEach(function (r) {
+        assert(!/drops/i.test(r.textContent), 'no session row exposes the drop counter: ' + r.textContent);
+        assert(!r.textContent.includes(String(987654)), 'no session row exposes the lifetime drop count');
+    });
+
+    // Sorting follows the byte totals, not the departed drop tiers, and the
+    // unmeasured rows stay below a measured zero in ascending order.
+    const thTransferred = headerCells[3];
+    thTransferred.click();
+    assert.strictEqual(thTransferred.getAttribute('aria-sort'), 'ascending');
+    function rowOrder() {
+        return Array.from(tbody.children)
+            .filter(r => r.style.display !== 'none' && !r.classList.contains('table-empty-state'))
+            .map(r => r.cells[0]?.querySelector('.font-weight-600')?.textContent.trim());
+    }
+    assert.deepStrictEqual(rowOrder(), ['frank', 'gina', 'erin', 'dave', 'hank'], 'ascending: not measured < 0 B < 1.50 MB < 5.00 MB');
+
+    thTransferred.click();
+    assert.strictEqual(thTransferred.getAttribute('aria-sort'), 'descending');
+    assert.deepStrictEqual(rowOrder(), ['hank', 'dave', 'erin', 'frank', 'gina'], 'descending: 5.00 MB > 1.50 MB > 0 B > not measured');
+
+    console.log('TRANSFERRED_COLUMN_PASS');
+})().catch(function (e) {
+    console.error(e && e.stack ? e.stack : e);
+    process.exit(1);
+});
+`, rendered, string(tablesJS), fixture.SessionsJS, translationsJS)
+
+		out, err := execNodeScript(node, testScript)
+		if err != nil {
+			t.Fatalf("Transferred column DOM assertions failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+			t.Fatalf("the Transferred-column guard requires jsdom: %s", string(out))
+		}
+		if !strings.Contains(string(out), "TRANSFERRED_COLUMN_PASS") {
+			t.Fatalf("Transferred column DOM assertions did not complete\nOutput:\n%s", string(out))
+		}
+	})
 }

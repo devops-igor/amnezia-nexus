@@ -652,6 +652,7 @@
   "vpn_diag_condition_backend_device_unattributed": "حذف دستگاه سرور پشتیبان فعال است، اما انتساب دقیق جهت‌به‌جهت در دسترس نیست",
   "vpn_col_user_device": "کاربر و دستگاه",
   "vpn_col_live_traffic": "ترافیک زنده",
+  "vpn_col_transferred": "منتقل‌شده",
   "vpn_col_traffic": "ترافیک زنده",
   "vpn_col_packet_loss": "افت‌های صفحه داده",
   "vpn_col_queue_pressure": "فشار صف",
