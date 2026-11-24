@@ -238,6 +238,8 @@ def test_transferred_missing_state_meets_aa_on_the_session_row(theme: str, bg_na
         f"({contrast.resolve(name, tokens)}) on --{bg_name} in the {theme} theme: "
         f"{got:.2f}:1, below {contrast.AA_TEXT}:1"
     )
+
+
 def _focus_declarations() -> list[tuple[str, str]]:
     """(selector list, outline value) for every :focus-visible rule in base.css."""
     out = []
@@ -274,3 +276,84 @@ def test_focus_outline_is_visible_against_every_surface(theme: str, bg_name: str
             f"{head}: --{colour_token} on --{bg_name} in the {theme} theme is {got:.2f}:1, "
             f"below {contrast.AA_NON_TEXT}:1"
         )
+
+
+# ===== Notification feedback ink =====
+# #notificationTestResult is a `.form-hint` whose ink the controller assigns inline
+# (web/static/js/notifications_settings.js). An inline assignment beats the
+# stylesheet rule, so the sheet cannot fix it: the ink has to be a theme role the
+# controller names, and the roles have to be readable on a card in both themes.
+# Before this, the controller named two custom properties that exist nowhere
+# (--color-success / --color-danger) and fell back to literals #2f9e44 and #e5484d,
+# which measure 3.45:1 and 3.91:1 on the white card.
+STATUS_TEXT_TOKENS = ["text-success", "text-danger"]
+FEEDBACK_JS = CSS_DIR.parents[1] / "static" / "js" / "notifications_settings.js"
+STATUS_SURFACES = ["bg-card", "bg-card-hover", "bg-secondary"]
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("name", STATUS_TEXT_TOKENS)
+def test_status_ink_meets_aa_on_the_card(theme: str, name: str) -> None:
+    tokens = contrast.theme_tokens(theme)
+    assert name in tokens, f"--{name} is not defined for the {theme} theme"
+    ink = contrast.resolve(name, tokens)
+    for bg_name in STATUS_SURFACES:
+        got = contrast.ratio(ink, surface(tokens, bg_name))
+        assert got >= contrast.AA_TEXT, (
+            f"--{name} ({ink}) on --{bg_name} in the {theme} theme: {got:.2f}:1, "
+            f"below {contrast.AA_TEXT}:1"
+        )
+
+
+def test_status_ink_is_declared_in_the_token_file_and_used_only_by_the_feedback() -> None:
+    """One declaration site, one consumer — the check the review asked for.
+
+    A role that spreads by accident is how a palette drifts; a role the feedback
+    line names but the token file does not define is how this defect happened.
+    """
+    declared: set[str] = set()
+    referenced: set[str] = set()
+    for path in sorted((CSS_DIR.parents[1]).rglob("*")):
+        if not path.is_file() or path.suffix not in {".css", ".js", ".html"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for name in STATUS_TEXT_TOKENS:
+            if re.search(rf"--{name}\s*:", text):
+                declared.add(path.relative_to(CSS_DIR.parents[1]).as_posix())
+            if re.search(rf"var\(\s*--{name}\b", text):
+                referenced.add(path.relative_to(CSS_DIR.parents[1]).as_posix())
+    assert declared == {"static/css/tokens.css", "static/css/style.css"}, (
+        "the status ink must be declared once in tokens.css (and its generated "
+        f"bundle), not spread around: {sorted(declared)}"
+    )
+    assert referenced == {"static/js/notifications_settings.js"}, (
+        "only the notification feedback line may consume the status ink: " f"{sorted(referenced)}"
+    )
+
+
+def test_feedback_ink_assignment_names_a_token_and_carries_no_literal() -> None:
+    source = FEEDBACK_JS.read_text(encoding="utf-8")
+    assignments = re.findall(r"style\.color\s*=\s*([^;]+);", source)
+    assert assignments, "notifications_settings.js no longer assigns the feedback ink"
+    for value in assignments:
+        assert not re.search(r"#[0-9a-fA-F]{3,8}\b", value), (
+            f"the feedback ink falls back to a literal colour ({value.strip()!r}); an "
+            "undefined token must fail visibly rather than paint an unreadable literal"
+        )
+        for name in STATUS_TEXT_TOKENS:
+            assert (
+                f"--{name}" in value
+            ), f"the feedback ink assignment {value.strip()!r} does not name --{name}"
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_status_ink_keeps_success_and_failure_distinct(theme: str) -> None:
+    """A passing test and a failed one must not arrive in the same colour."""
+    tokens = contrast.theme_tokens(theme)
+    success = contrast.resolve("text-success", tokens)
+    danger = contrast.resolve("text-danger", tokens)
+    assert success != danger, f"the {theme} theme paints success and failure the same"
+    assert contrast.ratio(success, danger) > 1.1, (
+        f"the {theme} theme's success {success} and failure {danger} are too close "
+        f"({contrast.ratio(success, danger):.2f}:1 apart)"
+    )

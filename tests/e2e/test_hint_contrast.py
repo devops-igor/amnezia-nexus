@@ -18,7 +18,9 @@ from playwright.sync_api import Page
 from tests.e2e import contrast
 from tests.e2e.rendered_pixels import dominant_colour
 
-NO_TRANSITIONS = "*, *::before, *::after { transition: none !important; animation: none !important; }"
+NO_TRANSITIONS = (
+    "*, *::before, *::after { transition: none !important; animation: none !important; }"
+)
 
 # Every rendered hint on the page, with the box it occupied in document
 # coordinates, the colour the browser resolved for its text, and the colour of the
@@ -209,7 +211,9 @@ def test_hint_text_reaches_aa_on_every_measured_surface(
             continue
         role_checked += 1
         label = _hex(hint["labelColour"])
-        where = f"#{hint['id'] or hint['index']} {hint['text']!r} beside label {hint['labelText']!r}"
+        where = (
+            f"#{hint['id'] or hint['index']} {hint['text']!r} beside label {hint['labelText']!r}"
+        )
         if text == label:
             role_failures.append(
                 f"{surface}/{theme}: {where} — hint and label are the same colour {text}"
@@ -234,8 +238,7 @@ def test_hint_text_reaches_aa_on_every_measured_surface(
     )
     assert not role_failures, (
         f"{len(role_failures)} of {role_checked} labelled hints do not read as a role "
-        f"apart from their label on {surface} in the {theme} theme:\n"
-        + "\n".join(role_failures)
+        f"apart from their label on {surface} in the {theme} theme:\n" + "\n".join(role_failures)
     )
     # A pass is only meaningful if the surface really was the one measured: the
     # dialog-opening cases must have found hints inside a dialog.
