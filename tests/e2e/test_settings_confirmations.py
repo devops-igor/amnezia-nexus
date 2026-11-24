@@ -6,9 +6,10 @@ import pytest
 from playwright.sync_api import Page
 
 from tests.e2e import contrast
+from tests.e2e.conftest import api_post
 # The page probe and the hex reader are the settings suite's own, so the two files
 # cannot disagree about how the page is opened or how a colour is converted.
-from tests.e2e.test_settings import _hex, _open_settings
+from tests.e2e.test_settings import NO_TRANSITIONS, _hex, _open_settings
 
 
 # --- Deploy VPS confirms before the order leaves the page --------------------
@@ -194,6 +195,7 @@ NARROW_PROBE = """() => {
     };
   }
   return {
+    confirmKind: backdrop.getAttribute('data-confirm-kind'),
     viewport: {w: window.innerWidth, h: window.innerHeight},
     topbar: barBox,
     dialog: dialogBox,
@@ -246,6 +248,7 @@ def test_deploy_confirmation_keeps_the_confirmed_controls_clear_at_narrow_width(
         )
         probe = page.evaluate(NARROW_PROBE)
 
+        assert probe["confirmKind"] == "order", probe["confirmKind"]
         assert probe["topbar"], "the mobile top bar is missing"
         assert len(probe["fields"]) == 4, probe["fields"]
         assert probe["underBar"] == [], (probe["topbar"], probe["fields"])
@@ -387,6 +390,177 @@ def test_deploy_confirmation_leaves_the_form_comparable(
     finally:
         page.unroute("**/api/admin/hosting/gigahost/catalog**")
         page.unroute("**/api/admin/hosting/gigahost/order")
+
+
+# --- The confirmations that share the modal -----------------------------------
+# The VPS ordering confirmation docks itself and dims lightly; the shared modal must
+# look and sit exactly as it does for every other confirmation, so both states are
+# measured rather than assumed.
+
+SHARED_MODAL_PROBE = """() => {
+  const backdrop = document.getElementById('nexusConfirmModal');
+  const dialog = backdrop.querySelector('.modal');
+  const box = el => {
+    const r = el.getBoundingClientRect();
+    return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
+  };
+  return {
+    classes: backdrop.className,
+    confirmKind: backdrop.getAttribute('data-confirm-kind'),
+    bg: getComputedStyle(backdrop).backgroundColor,
+    filter: getComputedStyle(backdrop).backdropFilter
+      || getComputedStyle(backdrop).webkitBackdropFilter || 'none',
+    align: getComputedStyle(backdrop).alignItems,
+    padding: getComputedStyle(backdrop).padding,
+    dialog: box(dialog),
+    viewport: {w: window.innerWidth, h: window.innerHeight},
+    whiteSpace: getComputedStyle(document.getElementById('nexusConfirmBody')).whiteSpace,
+    okColor: getComputedStyle(document.getElementById('nexusConfirmOkBtn')).color,
+  };
+}"""
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_unrelated_confirmation_keeps_the_shared_modal(
+    authenticated_page: Page, base_url: str, csrf_token: str, theme: str
+) -> None:
+    """Deleting a user opens the shared modal, untouched by the ordering dialog.
+
+    The VPS confirmation marks the dialog only while it is open, and only for
+    itself; every other confirmation must keep the shared backdrop, the centred
+    position and the danger colour. The delete control only renders for another
+    user, so one is created and removed through the API around the check.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    created = api_post(
+        page,
+        "/api/users/add",
+        {
+            "username": f"delete-me-{theme}",
+            "password": "TempPass123!",
+            "role": "user",
+            "enabled": True,
+        },
+        csrf_token,
+    )
+    assert created["status"] == 200, created
+    user_id = (created["body"] or {}).get("user_id")
+    assert user_id, created
+    try:
+        page.goto(f"{base_url}/users")
+        page.wait_for_load_state("networkidle")
+        # The theme is applied after the navigation: a reload resets the attribute.
+        page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+        page.wait_for_selector('#usersGrid button[aria-label="Delete"]', timeout=15000)
+        page.add_style_tag(content=NO_TRANSITIONS)
+        page.locator('#usersGrid button[aria-label="Delete"]').first.click()
+        page.locator("#nexusConfirmModal.active").wait_for(state="visible")
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('nexusConfirmModal')).opacity === '1'"
+        )
+        probe = page.evaluate(SHARED_MODAL_PROBE)
+
+        tokens = contrast.theme_tokens(theme)
+
+        def channels(value: str) -> tuple:
+            r, g, b, a = contrast.parse_color(value)
+            return (round(r), round(g), round(b), round(a, 3))
+
+        assert channels(probe["bg"]) == channels(
+            contrast.resolve("bg-modal", tokens)
+        ), probe["bg"]
+        assert "blur(8px)" in probe["filter"], probe["filter"]
+        assert probe["align"] == "center", probe["align"]
+        assert probe["padding"] == "0px", probe["padding"]
+        assert probe["whiteSpace"] == "normal", probe["whiteSpace"]
+        assert channels(probe["okColor"]) == channels(
+            contrast.resolve("danger", tokens)
+        ), probe["okColor"]
+        assert probe["confirmKind"] is None, probe["confirmKind"]
+        centred = probe["dialog"]["y"] + probe["dialog"]["h"] / 2
+        assert abs(centred - probe["viewport"]["h"] / 2) <= 2, (
+            probe["dialog"],
+            probe["viewport"],
+        )
+
+        page.keyboard.press("Escape")
+        page.locator("#nexusConfirmModal.active").wait_for(state="detached")
+        assert page.evaluate(
+            "() => document.getElementById('nexusConfirmModal').getAttribute('data-confirm-kind')"
+        ) is None
+    finally:
+        api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+# --- The update-available state the renderer actually writes ------------------
+# The per-component and overall badges use `badge-warning` for "Update available".
+# That name has no stylesheet rule, so its contrast comes from the inherited text
+# colour; this case renders the real state and measures it.
+
+UPDATE_AVAILABLE = {
+    "status": "ok",
+    "update_available": True,
+    "checked_at": "2026-11-23T18:00:00Z",
+    "base_image": "devopsigor/amneziawg:v3.1.20261116-1",
+    "components": [
+        {
+            "name": "amneziawg-go",
+            "pinned_version": "v3.1.20261116",
+            "latest_version": "v3.1.20261128",
+            "release_url": "https://example.invalid/go",
+            "update_available": True,
+            "error": "",
+        },
+        {
+            "name": "amneziawg-tools",
+            "pinned_version": "v3.1.20260812",
+            "latest_version": "v3.1.20260812",
+            "release_url": "https://example.invalid/tools",
+            "update_available": False,
+            "error": "",
+        },
+        {
+            "name": "docker-base-image",
+            "pinned_version": "v3.1.20261116-1",
+            "latest_version": "v3.1.20261116-1",
+            "release_url": "https://example.invalid/img",
+            "update_available": False,
+            "error": "",
+        },
+    ],
+}
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_update_available_badge_meets_aa_in_both_themes(
+    authenticated_page: Page, base_url: str, theme: str
+) -> None:
+    """The badge the renderer writes for "Update available" clears 4.5:1."""
+    page = authenticated_page
+    page.route(
+        "**/api/system/upstream-status**",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(UPDATE_AVAILABLE)
+        ),
+    )
+    try:
+        _open_settings(page, base_url, theme)
+        page.wait_for_function(
+            "() => document.querySelectorAll('#upstreamCard .badge-warning').length > 0",
+            timeout=30000,
+        )
+        badges = page.evaluate(BADGE_PROBE)
+        warnings = [b for b in badges if "badge-warning" in b["cls"]]
+        assert len(warnings) >= 2, badges  # the component badge and the overall badge
+        assert all(b["text"] == "Update available" for b in warnings), warnings
+        for badge in warnings:
+            ratio = contrast.ratio(_hex(badge["color"]), _hex(badge["bg"]))
+            assert ratio >= contrast.AA_TEXT, (theme, badge, f"{ratio:.2f}:1")
+    finally:
+        page.unroute("**/api/system/upstream-status**")
 
 
 # --- Badge contrast and the destructive confirmation ------------------------

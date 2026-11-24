@@ -1108,25 +1108,28 @@ button:focus-visible,
     margin-top: var(--space-xs);
 }
 
-/* The order confirmation is read beside the form it describes, so its backdrop
-   dims without blurring and the dialog docks to the bottom edge: the selectors sit
-   above the button that opened it, at any width. Behaviour is the shared modal's. */
-#nexusConfirmModal {
+/* The order confirmation is read beside the form it describes, so that dialog -- and
+   only that one -- dims without blurring and docks to the bottom edge. The class is
+   applied by the VPS ordering confirmation alone (through the dialog's
+   data-confirm-kind attribute); every other confirmation keeps the shared modal's
+   own backdrop, position and colours. */
+#nexusConfirmModal[data-confirm-kind="order"] {
     background: rgba(9, 10, 15, 0.32);
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
     align-items: flex-end;
     padding: var(--space-md);
 }
-[data-theme="light"] #nexusConfirmModal { background: rgba(15, 23, 42, 0.18); }
+[data-theme="light"] #nexusConfirmModal[data-confirm-kind="order"] { background: rgba(15, 23, 42, 0.18); }
 /* The summary's first line lists plan, region, datacenter and image; the price
    follows on its own line and may wrap across several, so the figure being
    agreed to is never clipped at a narrow width. */
-#nexusConfirmBody { white-space: pre-line; }
+#nexusConfirmModal[data-confirm-kind="order"] #nexusConfirmBody { white-space: pre-line; }
 /* The danger fill is a tint of the hue, so the hue as text misses 4.5:1 on it
-   (3.38:1 light, 4.42:1 dark); these tones keep it red and readable. */
-#nexusConfirmModal .btn-danger { color: #fb7185; }
-[data-theme="light"] #nexusConfirmModal .btn-danger { color: #be123c; }
+   (3.38:1 light, 4.42:1 dark); the restore confirmation paints it in a tone that
+   keeps it red and readable. */
+#nexusConfirmModal[data-confirm-kind="destructive"] .btn-danger { color: #fb7185; }
+[data-theme="light"] #nexusConfirmModal[data-confirm-kind="destructive"] .btn-danger { color: #be123c; }
 
 /* ===== Modal ===== */
 .modal-backdrop {

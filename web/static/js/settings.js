@@ -10,11 +10,24 @@
         });
     }
 
+    // The shared confirmation modal serves every destructive action in the panel. A
+    // confirmation that needs its own layout marks the dialog for the length of one
+    // call, so the mark is gone again before any other confirmation can see it.
+    async function confirmWith(kind, options) {
+        const modal = document.getElementById('nexusConfirmModal');
+        if (modal) modal.dataset.confirmKind = kind;
+        try {
+            return await UI.confirm(options);
+        } finally {
+            if (modal) delete modal.dataset.confirmKind;
+        }
+    }
+
     async function handleRestore(e) {
         const file = e.target.files[0];
         if (!file) return;
 
-        const confirmed = await UI.confirm({
+        const confirmed = await confirmWith('destructive', {
             title: _('restore_backup'),
             message: _('restore_confirm'),
             confirmText: _('restore_backup'),
@@ -496,7 +509,7 @@
         deployConfirmationOpen = true;
         let confirmed = false;
         try {
-            confirmed = await UI.confirm({
+            confirmed = await confirmWith('order', {
                 title: _('deploy_vps_confirm_title'),
                 message: deployOrderMessage(plan),
                 confirmText: _('deploy_vps_btn'),
