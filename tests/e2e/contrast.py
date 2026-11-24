@@ -15,6 +15,12 @@ CSS_DIR = Path(__file__).resolve().parents[2] / "web" / "static" / "css"
 AA_TEXT = 4.5  # WCAG 1.4.3, normal text
 AA_NON_TEXT = 3.0  # WCAG 1.4.11, focus indicator against its surroundings
 
+# How far apart two text roles that sit beside each other — a field label and the
+# hint under it — must stay on the CIELAB lightness scale. A contrast floor alone
+# cannot express this: two greys can both clear 4.5:1 against their surface and
+# still be the same tone, which collapses a hierarchy into one role.
+MIN_ROLE_LIGHTNESS_STEP = 4.0
+
 _DECL_RE = re.compile(r"--([\w-]+)\s*:\s*([^;]+);")
 _HEX_RE = re.compile(r"^#([0-9a-fA-F]{6})$")
 _RGBA_RE = re.compile(r"^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$")
@@ -66,6 +72,18 @@ def ratio(fg: str, bg: str) -> float:
     """WCAG contrast ratio of two opaque colours."""
     hi, lo = sorted((luminance(parse_color(fg)), luminance(parse_color(bg))), reverse=True)
     return (hi + 0.05) / (lo + 0.05)
+
+
+def lightness(colour: str) -> float:
+    """CIELAB L* of an opaque colour.
+
+    Contrast ratios say whether text is readable against a surface; L* says how
+    far apart two text roles are from each other. Two greys can both clear AA
+    against a card and still be the same tone, which is the difference this scale
+    makes visible: a step of a few L* is a step the eye takes.
+    """
+    y = luminance(parse_color(colour))
+    return 116 * y ** (1 / 3) - 16 if y > 0.008856 else 903.3 * y
 
 
 def resolve(name: str, tokens: dict[str, str]) -> str:

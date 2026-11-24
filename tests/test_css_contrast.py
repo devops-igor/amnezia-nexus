@@ -42,7 +42,6 @@ TEXT_SURFACES = ["bg-card", "bg-secondary", "bg-input-over-card"]
 OUTLINE_SURFACES = ["bg-primary", "bg-surface", "bg-secondary", "bg-card", "bg-card-hover"]
 
 _RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
-_COLOR_RE = re.compile(r"(?<![-\w])color:\s*([^;]+);")
 
 
 def _css(name: str) -> str:
@@ -53,13 +52,24 @@ def _css(name: str) -> str:
 
 def declared_color(css: str, selector: str) -> str:
     """The `color` value of the last rule that lists the selector."""
+    found = declared(css, selector, "color")
+    assert found is not None, f"no rule declares a colour for {selector!r}"
+    return found
+
+
+def declared(css: str, selector: str, property: str) -> str | None:
+    """The value of `property` in the last rule that lists the selector.
+
+    Bound to the selector rather than searched for across the sheet: a value that
+    appears somewhere else tells nothing about the rule being checked.
+    """
+    pattern = re.compile(r"(?<![-\w])" + re.escape(property) + r":\s*([^;]+);")
     found = None
     for head, body in _RULE_RE.findall(css):
         if selector in [" ".join(part.split()) for part in head.split(",")]:
-            match = _COLOR_RE.search(body)
+            match = pattern.search(body)
             if match:
                 found = match.group(1).strip()
-    assert found is not None, f"no rule declares a colour for {selector!r}"
     return found
 
 
@@ -104,6 +114,110 @@ def test_muted_token_is_still_the_failing_one_the_fix_moves_away_from(
     tokens = contrast.theme_tokens(theme)
     got = contrast.ratio(contrast.resolve("text-muted", tokens), surface(tokens, "bg-card"))
     assert round(got, 2) == expected
+
+
+# The hint and the field label it sits under are two roles: the label names the
+# field, the hint says what to expect from it. A contrast floor alone cannot keep
+# them apart -- --text-secondary clears AA on every surface a hint sits on, so
+# painting the hint with it passed every ratio check and still collapsed the two
+# roles into one grey. The step is measured on the lightness scale, where a shared
+# token is a step of zero.
+HINT_SELECTORS = [
+    ("vpn", ".portal-page .form-hint"),
+    ("settings", ".settings-section-card .form-hint"),
+]
+# Surfaces a hint is drawn on: the card, the card under the pointer, and the tinted
+# field or table-header fill. The dialog panel resolves to the card colour in both
+# themes, which the browser suite measures on real pixels.
+HINT_SURFACES = ["bg-card", "bg-card-hover", "bg-secondary"]
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_hint_keeps_a_tone_of_its_own_beside_the_field_label(theme: str) -> None:
+    tokens = contrast.theme_tokens(theme)
+    label_token = token_name(declared_color(_css("components"), ".form-label"))
+    label = contrast.resolve(label_token, tokens)
+    label_lightness = contrast.lightness(label)
+    card = surface(tokens, "bg-card")
+    for sheet, selector in HINT_SELECTORS:
+        hint_token = token_name(declared_color(_css(sheet), selector))
+        hint = contrast.resolve(hint_token, tokens)
+        assert hint != label, (
+            f"{selector} paints the hint {hint} with the field label's own colour in "
+            f"the {theme} theme, so the two roles read as one"
+        )
+        step = abs(contrast.lightness(hint) - label_lightness)
+        assert step >= contrast.MIN_ROLE_LIGHTNESS_STEP, (
+            f"{selector} {hint} sits {step:.1f} L* from the field label {label} in the "
+            f"{theme} theme, under the {contrast.MIN_ROLE_LIGHTNESS_STEP} L* step"
+        )
+        for bg_name in HINT_SURFACES:
+            got = contrast.ratio(hint, surface(tokens, bg_name))
+            assert got >= contrast.AA_TEXT, (
+                f"{selector} uses --{hint_token} ({hint}) on --{bg_name} in the "
+                f"{theme} theme: {got:.2f}:1, below {contrast.AA_TEXT}:1"
+            )
+        assert contrast.ratio(hint, card) < contrast.ratio(label, card), (
+            f"{selector} {hint} is not quieter than the field label {label} on the card "
+            f"in the {theme} theme; the hint must stay the subordinate role"
+        )
+
+
+# Every other text role this delivery must leave alone: the label itself, muted
+# metadata, placeholders, badges, the Settings card variants, body text and the
+# disabled treatment. Each is pinned to the value it resolved to before the change,
+# so "nothing else moved" is asserted rather than assumed.
+UNCHANGED_ROLES = [
+    ("components", ".form-label", "color", "var(--text-secondary)"),
+    ("vpn", ".text-muted", "color", "var(--text-muted)"),
+    ("components", ".form-input::placeholder", "color", "var(--text-muted)"),
+    ("components", ".badge-secondary", "color", "var(--text-secondary)"),
+    ("base", "body", "color", "var(--text-primary)"),
+    ("settings", ".settings-section-card .info-card-label", "color", "var(--text-secondary)"),
+    ("settings", ".settings-section-card .text-muted", "color", "var(--text-secondary)"),
+    ("settings", ".settings-section-card .data-table th", "color", "var(--text-secondary)"),
+    (
+        "settings",
+        ".settings-section-card .form-input::placeholder",
+        "color",
+        "var(--text-secondary)",
+    ),
+    ("components", ".btn:disabled", "opacity", "0.5"),
+]
+
+
+@pytest.mark.parametrize("sheet,selector,property,expected", UNCHANGED_ROLES)
+def test_roles_outside_the_hint_keep_their_value(
+    sheet: str, selector: str, property: str, expected: str
+) -> None:
+    got = declared(_css(sheet), selector, property)
+    assert got == expected, (
+        f"{selector} {property} = {got!r} in {sheet}.css, want {expected!r}: this "
+        "delivery changes the hint's tone only"
+    )
+
+
+# The two pages that render outside the portal shell cannot inherit the shared
+# `.portal-page .form-hint` rule, so they carry the hint colour inline. They must
+# carry the same role value, or the role would be right on the panel and wrong on
+# the two pages an operator meets first.
+TEMPLATES_DIR = CSS_DIR.parents[1] / "templates"
+STANDALONE_HINT_PAGES = ["setup.html", "change_password.html"]
+
+
+@pytest.mark.parametrize("name", STANDALONE_HINT_PAGES)
+def test_standalone_page_hint_carries_the_hint_role_value(name: str) -> None:
+    html = (TEMPLATES_DIR / name).read_text(encoding="utf-8")
+    inline = re.findall(r'<div class="form-hint" style="([^"]*)"', html)
+    assert inline, f"{name}: no inline .form-hint declaration to check"
+    for style in inline:
+        colours = re.findall(r"(?<![-\w])color:\s*([^;]+);", style)
+        assert colours, f"{name}: inline .form-hint without a colour: {style!r}"
+        for value in colours:
+            assert value.strip() == "var(--text-tertiary)", (
+                f"{name}: inline hint colour is {value.strip()!r}; the standalone pages "
+                "must use the same hint role value as the shared page rule"
+            )
 
 
 def _focus_declarations() -> list[tuple[str, str]]:

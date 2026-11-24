@@ -22,6 +22,7 @@
 
     --text-primary: #f1f2f6;
     --text-secondary: #9496a8;
+    --text-tertiary: #84869c;
     --text-muted: #5e6074;
     --text-accent: #a5b4fc;
 
@@ -101,6 +102,7 @@
 
     --text-primary: #0f172a;
     --text-secondary: #475569;
+    --text-tertiary: #59697f;
     --text-muted: #94a3b8;
     --text-accent: #6366f1;
 
@@ -3552,10 +3554,18 @@ td[data-backend-name]:focus-visible {
 /* ===== Hint text ===== */
 /* A hint is read, not decoration, and --text-muted cannot carry it: it measures
    2.95:1 on a card (dark) and 2.56:1 on one (light), under the 4.5:1 minimum for
-   normal text (WCAG 1.4.3). --text-secondary reaches 6.22:1 / 7.58:1 on a card
-   while staying quieter than body text (16.26:1 / 17.85:1), so the hint keeps its
-   rank below the label it explains. One value covers every surface a hint sits on,
-   because the worst of them still clears AA.
+   normal text (WCAG 1.4.3). --text-secondary would clear AA but it is also the
+   field label's token, and painting both roles the same grey erases the rank the
+   hint is supposed to keep: the label says what the field is, the hint says what
+   to expect from it, and the two must not read as one role.
+
+   --text-tertiary is that step: one level below the label and one above the
+   muted token that failed. It measures 5.08:1 on a card and 4.72:1 on the
+   lightest surface a hint can sit on in the dark theme, 5.60:1 and 5.11:1 in the
+   light one, and the label it sits beside stays at 6.22:1 / 7.58:1 there, so the
+   two roles stay separable by tone as well as by size, weight and placement.
+   One value covers every surface a hint sits on, because the worst of them still
+   clears AA.
 
    Placed here, like the page scale, because the marked class is newer than the
    frozen comparison reference: the differential sets this selector aside, while a
@@ -3563,7 +3573,7 @@ td[data-backend-name]:focus-visible {
    reaches the content area and the block a page emits from its scripts, so a hint
    in a page-owned dialog is as readable as one on the page. */
 .portal-page .form-hint {
-    color: var(--text-secondary);
+    color: var(--text-tertiary);
 }
 /* ===== Settings page layout ===== */
 /* Cards sit directly in one grid. Two independent stacks side by side differ in
@@ -3976,12 +3986,18 @@ td[data-backend-name]:focus-visible {
    text. Inside the Settings cards every muted element carries information an
    operator reads (hints, value labels, column headers, status and loading
    text, input examples), so those use --text-secondary (6.22:1 and 7.58:1).
+   The hint line is the one element that must not share the label's grey: it sits
+   directly under a field label that already uses --text-secondary, so it takes
+   --text-tertiary and keeps its rank below the label it explains.
    The selectors are scoped to the cards so no other page changes. */
-.settings-section-card .form-hint,
 .settings-section-card .info-card-label,
 .settings-section-card .text-muted,
 .settings-section-card .data-table th {
     color: var(--text-secondary);
+}
+
+.settings-section-card .form-hint {
+    color: var(--text-tertiary);
 }
 
 .settings-section-card .form-input::placeholder {
