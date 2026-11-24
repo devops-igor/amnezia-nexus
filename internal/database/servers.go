@@ -58,6 +58,26 @@ func (d *DB) GetServerByID(ctx context.Context, id int64) (*models.Server, error
 	return d.GetServer(ctx, id)
 }
 
+// IsServerProviderAbsent reports whether the provider's own inventory has
+// confirmed that a server no longer exists. A row that is not found reports
+// false: nothing is known about it, and a caller must not read "missing" as
+// "provider-confirmed absent".
+func (d *DB) IsServerProviderAbsent(ctx context.Context, id int64) (bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var observed sql.NullString
+	err := d.sqlDB.QueryRowContext(ctx,
+		"SELECT provider_absent_at FROM servers WHERE id = ?", id).Scan(&observed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read provider absence for server %d: %w", id, err)
+	}
+	return observed.Valid && strings.TrimSpace(observed.String) != "", nil
+}
+
 // GetServerCount returns the total number of configured servers.
 func (d *DB) GetServerCount(ctx context.Context) (int, error) {
 	d.mu.RLock()

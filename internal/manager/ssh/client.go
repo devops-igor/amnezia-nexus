@@ -45,6 +45,15 @@ type SSHClient interface {
 	InUse() bool
 }
 
+// ErrProviderAbsent reports that an SSH session was refused because the
+// provider's own inventory no longer lists the server it would be opened to.
+//
+// It is a refusal, not a transport failure: no connection was attempted, so a
+// caller must not report it as an unreachable host or record it as a health
+// sample. The refusal lives at the transport entry below so that every caller
+// passes through it, including callers written later.
+var ErrProviderAbsent = errors.New("ssh refused: the provider's inventory no longer lists this server")
+
 // Config specifies the connection parameters for an SSH client.
 type Config struct {
 	Host                      string
@@ -59,6 +68,10 @@ type Config struct {
 	Store                     HostKeyStore
 	RequireFingerprintConfirm bool
 	HostKeyCallback           gossh.HostKeyCallback
+	// ProviderAbsent carries the server row's durable provider-absence
+	// observation. Every config built from a stored row sets it, and Connect
+	// refuses before opening a socket when it is true.
+	ProviderAbsent bool
 }
 
 // Client implements the SSHClient interface with pooling, sudo, and SFTP support.
@@ -123,6 +136,7 @@ func DialFromServer(ctx context.Context, server *models.Server, store HostKeySto
 		Store:           store,
 		Timeout:         15 * time.Second,
 		KeepAlivePeriod: 30 * time.Second,
+		ProviderAbsent:  server.ProviderAbsent(),
 	}
 
 	return Dial(ctx, cfg)
@@ -137,30 +151,22 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	if c.cfg.ProviderAbsent {
+		// Refuse before any socket is created: the provider's inventory says this
+		// server no longer exists, so there is no host to authenticate against and
+		// nothing to measure. No connection is attempted and no error about the
+		// network is produced, so a caller cannot mistake this for an unreachable
+		// host.
+		return ErrProviderAbsent
+	}
+
 	if c.cfg.Host == "" {
 		return errors.New("host is required")
 	}
 
-	authMethods, err := BuildAuthMethods(c.cfg.Password, c.cfg.PrivateKey, c.cfg.Passphrase)
+	sshConfig, err := c.buildClientConfig(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to configure authentication: %w", err)
-	}
-
-	hostKeyCB := c.cfg.HostKeyCallback
-	if hostKeyCB == nil {
-		hostKeyCB = NewHostKeyCallback(ctx, HostKeyCallbackOptions{
-			ServerID:               c.cfg.ServerID,
-			Store:                  c.cfg.Store,
-			RequireConfirm:         c.cfg.RequireFingerprintConfirm,
-			CapturedFingerprintOut: &c.capturedFingerprint,
-		})
-	}
-
-	sshConfig := &gossh.ClientConfig{
-		User:            c.cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCB,
-		Timeout:         c.cfg.Timeout,
+		return err
 	}
 
 	host := strings.Trim(strings.TrimSpace(c.cfg.Host), "[]")
@@ -190,6 +196,33 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.lastActive.Store(time.Now().UnixNano())
 
 	return nil
+}
+
+// buildClientConfig resolves the authentication methods and the host-key policy
+// into the configuration the transport handshake uses. It is split out of Connect
+// so that function stays a sequence of decisions about the connection itself.
+func (c *Client) buildClientConfig(ctx context.Context) (*gossh.ClientConfig, error) {
+	authMethods, err := BuildAuthMethods(c.cfg.Password, c.cfg.PrivateKey, c.cfg.Passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure authentication: %w", err)
+	}
+
+	hostKeyCB := c.cfg.HostKeyCallback
+	if hostKeyCB == nil {
+		hostKeyCB = NewHostKeyCallback(ctx, HostKeyCallbackOptions{
+			ServerID:               c.cfg.ServerID,
+			Store:                  c.cfg.Store,
+			RequireConfirm:         c.cfg.RequireFingerprintConfirm,
+			CapturedFingerprintOut: &c.capturedFingerprint,
+		})
+	}
+
+	return &gossh.ClientConfig{
+		User:            c.cfg.User,
+		Auth:            authMethods,
+		HostKeyCallback: hostKeyCB,
+		Timeout:         c.cfg.Timeout,
+	}, nil
 }
 
 // getSFTP returns an initialized SFTP client instance, creating one if not present or refreshing if stale.

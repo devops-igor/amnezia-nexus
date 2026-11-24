@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray/scanner"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // ScanRealitySNIRequest defines optional parameters for scanning camouflage domains.
@@ -32,6 +33,19 @@ func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request)
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
+		return
+	}
+
+	// A server the provider's inventory no longer lists is not scanned. Refusing
+	// here matters twice over: there is nothing to scan, and the code below would
+	// otherwise fall back to probing from the panel host when the SSH acquisition
+	// is refused, which is a direct connection to the address in question.
+	if server.ProviderAbsent() {
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":          models.ProviderAbsentStatus,
+			"not_measured":    true,
+			"provider_absent": true,
+		})
 		return
 	}
 

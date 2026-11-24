@@ -321,3 +321,39 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 		t.Fatalf("recording provider absence changed the server row: %+v", cleared)
 	}
 }
+
+// The narrow provider-absence read the background prober and the deploy path use.
+// A missing row must not read as "provider-confirmed absent": nothing is known
+// about it, and a caller must not turn that into a refusal.
+func TestServersIsProviderAbsent(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	id, err := db.CreateServer(ctx, &models.Server{Name: "Provider server", Host: "198.51.100.44"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || absent {
+		t.Fatalf("IsServerProviderAbsent(%d) = (%v, %v), want (false, nil)", id, absent, err)
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+		t.Fatalf("SetServerProviderAbsence failed: %v", err)
+	}
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || !absent {
+		t.Fatalf("IsServerProviderAbsent(%d) after recording = (%v, %v), want (true, nil)", id, absent, err)
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+		t.Fatalf("clearing the absence failed: %v", err)
+	}
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || absent {
+		t.Fatalf("IsServerProviderAbsent(%d) after clearing = (%v, %v), want (false, nil)", id, absent, err)
+	}
+
+	missing, err := db.IsServerProviderAbsent(ctx, 424242)
+	if err != nil || missing {
+		t.Fatalf("IsServerProviderAbsent on a missing row = (%v, %v), want (false, nil)", missing, err)
+	}
+}

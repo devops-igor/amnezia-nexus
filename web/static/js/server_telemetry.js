@@ -10,10 +10,22 @@ let connectionsTableInstance = null;
 async function loadServerStats() {
     try {
         const stats = await API.post(`/api/servers/${SERVER_ID}/stats`, null, { silent: true });
+        const el = document.getElementById('serverStats');
+        // A server the provider's inventory no longer lists is not measured. The
+        // panel refuses the SSH session and says so, so nothing here may render a
+        // sample: the pills would otherwise show zeros that read as a healthy or a
+        // dead host. The existing "not checked" label is reused rather than adding
+        // a second string for the same state.
+        if (stats && stats.not_measured === true) {
+            if (el) {
+                el.style.display = '';
+                el.innerHTML = `<span class="stat-pill" title="${_('gigahost_status_not_checked')}"><svg class="icon" style="width:12px;height:12px;"><use href="#icon-activity"></use></svg> ${_('gigahost_status_not_checked')}</span>`;
+            }
+            return stats;
+        }
         if (!stats || typeof stats !== 'object' || stats.error || Object.keys(stats).length === 0 || (stats.ram_total === 0 && stats.disk_total === 0)) {
             throw new Error(stats && stats.error ? stats.error : 'Empty or invalid server stats');
         }
-        const el = document.getElementById('serverStats');
         if (el) {
             el.style.display = '';
             el.innerHTML = `

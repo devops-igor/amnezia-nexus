@@ -448,6 +448,19 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A server the provider's inventory no longer lists is not measured: no SSH
+	// session is opened, and the answer says so instead of reporting zeros that
+	// would read as a real sample of a healthy or a dead host. The page renders
+	// this as "not checked", and the row's stored status is untouched.
+	if server.ProviderAbsent() {
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":          models.ProviderAbsentStatus,
+			"not_measured":    true,
+			"provider_absent": true,
+		})
+		return
+	}
+
 	client, err := h.GetSSHClient(ctx, server)
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")

@@ -163,6 +163,15 @@ const (
 	ReachabilityUnknown ReachabilityStatus = "unknown"
 )
 
+// ProviderAbsentStatus is the response status a measurement endpoint reports when
+// it refuses to measure a server the provider's inventory no longer lists.
+//
+// It is deliberately not a ReachabilityStatus: nothing was measured, so it must
+// not be read as a health sample of either direction. Consumers that ask "is this
+// server healthy" keep the previous observation; consumers that ask "does this
+// server still exist" read this or the server's provider_absent field.
+const ProviderAbsentStatus = "provider_absent"
+
 // LoadBalancingAlgorithm defines VPN routing algorithm.
 type LoadBalancingAlgorithm string
 

@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -193,6 +194,12 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 		rm.mu.Unlock()
 
 		_, err := rm.prober.ProbeTunnel(ctx, t)
+		if errors.Is(err, ErrProviderAbsent) {
+			// The server is no longer the provider's, so there is nothing to
+			// reconnect to. No attempt was made: the backoff and retry counters stay
+			// as they are and the tunnel keeps its status.
+			continue
+		}
 		latest, getErr := rm.pool.GetTunnel(t.ServerID)
 
 		rm.mu.Lock()

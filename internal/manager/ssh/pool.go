@@ -104,6 +104,10 @@ func (p *SSHClientPool) Get(ctx context.Context, server *models.Server) (SSHClie
 		Store:           p.store,
 		Timeout:         15 * time.Second,
 		KeepAlivePeriod: p.cfg.KeepAlivePeriod,
+		// The row's own observation travels with the config, so the transport
+		// refuses before dialing and every caller of the pool inherits that
+		// without repeating the check.
+		ProviderAbsent: server.ProviderAbsent(),
 	}
 
 	key := ServerPoolKey(server)

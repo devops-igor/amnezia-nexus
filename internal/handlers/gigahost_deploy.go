@@ -120,6 +120,12 @@ func (h *Handlers) SetSSHDialerForTest(fn func(context.Context, ssh.Config) (ssh
 }
 
 func (h *Handlers) dialDeploySSH(ctx context.Context, cfg ssh.Config) (ssh.SSHClient, error) {
+	if cfg.ProviderAbsent {
+		// The deployment resolved to a row the provider's inventory no longer
+		// lists. Refuse here as well as in the transport, so the deploy path cannot
+		// reach its dialer with an obsolete target.
+		return nil, ssh.ErrProviderAbsent
+	}
 	if h.sshDialerHook != nil {
 		return h.sshDialerHook(ctx, cfg)
 	}
