@@ -17,6 +17,7 @@ job = "e2e-hosted"
 paths = [
   "tests/e2e/test_auth.py",
   "tests/e2e/test_hint_contrast.py",
+  "tests/e2e/test_server_page_width.py",
   "tests/e2e/test_settings.py",
   "tests/e2e/test_settings_confirmations.py",
   "tests/e2e/test_settings_navigation.py",
@@ -39,6 +40,12 @@ The hint-contrast suite measures text colour against the pixels behind it on the
 pages and dialogs the panel renders. Those surfaces are painted by the panel's own
 stylesheets, so a local fixture is the same contract; nothing about it needs a
 deployment.
+
+The server page's width contract is panel-side as well: the harness seeds one
+server row, and the suite measures the page the panel renders at three viewports,
+in both themes, for each of the three panels. No protocol installation or SSH
+endpoint participates in the measurement, so a local fixture is the whole
+contract rather than a weaker version of it.
 """
 
 [[runner]]
