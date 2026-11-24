@@ -26,7 +26,7 @@
                 </div>
                 <div class="font-mono text-muted text-sm flex items-center gap-xs">
                     <span id="serverHostDisplay">{{ .server.Host }}</span>:{{ .server.SSHPort }} • {{ .server.SSHUser }}
-                    <button class="btn btn-ghost btn-sm btn-icon" style="padding:2px; height:auto; min-height:unset;" onclick="openEditHostModal({{ .server.ID }}, '{{ .server.Host }}')" title="{{ _ "edit_server_host" }}"><svg class="icon" style="width:14px;height:14px;"><use href="#icon-pencil"></use></svg></button>
+                    <button class="btn btn-ghost btn-sm btn-icon" onclick="openEditHostModal({{ .server.ID }}, '{{ .server.Host }}')" title="{{ _ "edit_server_host" }}"><svg class="icon" style="width:14px;height:14px;"><use href="#icon-pencil"></use></svg></button>
                 </div>
             </div>
         </div>
@@ -174,10 +174,10 @@
             {{ _ "server_management_desc" }}
         </div>
         <div class="flex" style="flex-direction: column; gap: var(--space-sm);">
-            <button class="btn btn-secondary" onclick="checkServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "check_server_services" }}</button>
-            <button class="btn btn-secondary" onclick="rebootServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "reboot_server" }}</button>
-            <button class="btn btn-danger" onclick="clearServer()" style="justify-content: flex-start; padding: 12px 20px; background: rgba(239, 68, 68, 0.05);"><svg class="icon" style="margin-right: 8px;"><use href="#icon-trash"></use></svg> {{ _ "clear_server" }}</button>
-            <button class="btn btn-danger" onclick="removeServer()" style="justify-content: flex-start; padding: 12px 20px;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-x"></use></svg> {{ _ "remove_server" }}</button>
+            <button class="btn btn-secondary" onclick="checkServer()" style="justify-content: flex-start;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "check_server_services" }}</button>
+            <button class="btn btn-secondary" onclick="rebootServer()" style="justify-content: flex-start;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-refresh"></use></svg> {{ _ "reboot_server" }}</button>
+            <button class="btn btn-danger" onclick="clearServer()" style="justify-content: flex-start; background: rgba(239, 68, 68, 0.05);"><svg class="icon" style="margin-right: 8px;"><use href="#icon-trash"></use></svg> {{ _ "clear_server" }}</button>
+            <button class="btn btn-danger" onclick="removeServer()" style="justify-content: flex-start;"><svg class="icon" style="margin-right: 8px;"><use href="#icon-x"></use></svg> {{ _ "remove_server" }}</button>
         </div>
     </div>
 </div>
@@ -289,7 +289,7 @@
                 <div class="form-group">
                     <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
                         Camouflage SNI / Target
-                        <button type="button" class="btn btn-secondary btn-sm" id="vlessScanBtn" onclick="scanRealitySNI()" style="padding: 2px 8px; font-size: 11px;">
+                        <button type="button" class="btn btn-secondary btn-sm" id="vlessScanBtn" onclick="scanRealitySNI()">
                             <svg class="icon" style="width:12px;height:12px;margin-right:4px;"><use href="#icon-search"></use></svg> Find Best SNIs
                         </button>
                     </label>

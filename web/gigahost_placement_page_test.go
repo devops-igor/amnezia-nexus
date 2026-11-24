@@ -120,7 +120,7 @@ w.API = {
   post: async (url, body) => { posts.push({url, body}); return {message:'ok'}; },
   delete: async () => ({status:'ok'}),
 };
-w.UI = {toast: (text, kind) => {(w.__toasts = w.__toasts || []).push({text, kind});}};
+w.UI = {toast: (text, kind) => {(w.__toasts = w.__toasts || []).push({text, kind});}, confirm: async () => true};
 w.confirm = () => true;
 // Status polling belongs to the order-status module, which this harness does not
 // load; stub the two entry points the page calls so its boot path can run.

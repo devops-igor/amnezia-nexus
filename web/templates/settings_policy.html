@@ -37,8 +37,11 @@
         </div>
 
         <fieldset class="form-group settings-fieldset">
-            <legend class="form-label settings-flush">{{ _ "policy_proxy_exceptions_label" }}</legend>
-            <textarea class="form-input font-mono" id="policy_proxy_exceptions" name="policy_proxy_exceptions" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_proxy_exceptions_placeholder" }}" aria-describedby="policyProxyExceptionsHint"></textarea>
+            <legend class="form-label settings-flush" id="policyProxyExceptionsLabel">{{ _ "policy_proxy_exceptions_label" }}</legend>
+            <!-- A legend names the group, not the control inside it. The textarea is
+                 named by the same visible label so a screen reader announces what the
+                 field is instead of an unnamed edit field. -->
+            <textarea class="form-input font-mono" id="policy_proxy_exceptions" name="policy_proxy_exceptions" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_proxy_exceptions_placeholder" }}" aria-labelledby="policyProxyExceptionsLabel" aria-describedby="policyProxyExceptionsHint"></textarea>
             <p class="form-hint" id="policyProxyExceptionsHint">{{ _ "policy_proxy_exceptions_hint" }}</p>
             <p class="form-hint" id="policyLegacyNotice" data-legacy-notice></p>
         </fieldset>
