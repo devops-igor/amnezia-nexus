@@ -183,10 +183,23 @@ func TestPolicySurfaceDoesNotDescribeTheRetiredDnsModel(t *testing.T) {
 
 // policyHintClaim is one statement the operator relies on, with the technical
 // token every bundle must keep for it.
+// policyHintClause is one statement the answer must keep making, with the phrase
+// that carries it in each language's own wording. Matching is case-sensitive on
+// purpose: "Do not check Policy status" contains the words of the instruction and
+// must not satisfy it.
+type policyHintClause struct {
+	claim   string
+	phrases map[string]string
+}
+
 type policyHintClaim struct {
 	key    string
 	claim  string
 	tokens []string
+	// clauses pin statements rather than words. A substring like "politique" is
+	// present in a sentence that says the opposite, so the reviewed phrases below
+	// are what a locale has to keep to satisfy the claim.
+	clauses []policyHintClause
 	// tokensByLocale pins a claim whose words differ in every language: a shared
 	// token cannot express "names the unusable list and points at the state
 	// readout" in five languages, and pinning English words would fail four of them.
@@ -195,6 +208,13 @@ type policyHintClaim struct {
 
 // TestPolicyHintsNameTheRealRoutingInput pins what the two corrected hints keep
 // saying, in every bundle: the terms that make each sentence true have to stay.
+//
+// The inventory answer is pinned by clause as well as by word. A substring test is
+// not enough there: the French value can lose the recovery guidance, and the English
+// one can be reversed to "Do not check Policy status", while every broad token and
+// every refused fragment stays absent. The review recorded both as passing this
+// guard, which is why the reviewed phrases below are matched exactly, in each
+// language's own wording.
 // The refused set above carries the corresponding negative direction, so a
 // locale that reverts to the retired mechanism or to the rejected first-round
 // wording fails there, and a locale that keeps the terms but loses the subject
@@ -229,6 +249,34 @@ func TestPolicyHintsNameTheRealRoutingInput(t *testing.T) {
 				"zh": {"地址列表", "策略"},
 				"fa": {"فهرست نشانی", "خط‌مشی"},
 			},
+			clauses: []policyHintClause{
+				{
+					// The read failure itself. Without it the answer can describe
+					// a list this build did read, which is the state the panel
+					// exists to rule out.
+					claim: "this build cannot read the shipped address list",
+					phrases: map[string]string{
+						"en": "This build cannot read the shipped address list",
+						"ru": "Эта сборка не может прочитать поставляемый список адресов",
+						"fr": "Cette version ne peut pas lire la liste d'adresses fournie",
+						"zh": "此构建无法读取随附的地址列表",
+						"fa": "این ساخت نمی‌تواند فهرست نشانی‌های همراه را بخواند",
+					},
+				},
+				{
+					// The recovery guidance: where the operator can learn whether
+					// routing is active at all, which is the only trustworthy
+					// statement while the freshness verdict is unavailable.
+					claim: "the operator is sent to Policy status for the active routing state",
+					phrases: map[string]string{
+						"en": "Check Policy status for the active routing state",
+						"ru": "Проверьте состояние политики, чтобы узнать активное состояние маршрутизации",
+						"fr": "Consultez l'état de la politique pour connaître l'état actif du routage",
+						"zh": "请查看策略状态以了解当前的路由状态",
+						"fa": "برای دیدن وضعیت فعال مسیریابی، وضعیت خط‌مشی را بررسی کنید",
+					},
+				},
+			},
 		},
 	} {
 		assertPolicyHintClaim(t, surface, dictionaries, want)
@@ -260,6 +308,17 @@ func assertPolicyHintClaim(t *testing.T, surface map[string]string, dictionaries
 			if !strings.Contains(value, token) {
 				t.Errorf("%s.json %q must name %s in every locale: %s\n  shipped value: %q",
 					locale, want.key, token, want.claim, value)
+			}
+		}
+		for _, clause := range want.clauses {
+			phrase, pinned := clause.phrases[locale]
+			if !pinned {
+				t.Errorf("no %s phrase is pinned for %q; the clause would go unchecked there", locale, want.key)
+				continue
+			}
+			if !strings.Contains(value, phrase) {
+				t.Errorf("%s.json %q must state that %s\n  expected phrase: %q\n  shipped value: %q",
+					locale, want.key, clause.claim, phrase, value)
 			}
 		}
 	}
