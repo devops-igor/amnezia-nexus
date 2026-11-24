@@ -435,12 +435,9 @@ def test_settings_layout_matches_token_derived_geometry(
             assert abs(distance - gap) <= 0.5, (grid["id"], distance, gap)
 
     if columns == 2:
-        # The cases are not vacuous: the page still has paired rows and a row that
-        # holds one full-width card. The count is the one this page has — four pairs
-        # across the three groups and the System group's lone backup card — because
-        # the two policy cards that used to span here moved to the Routing page
-        # (#987). The routing page's own card geometry is measured by the policy
-        # suite, which renders it at the same two widths.
+        # Not vacuous: four paired rows, plus the System group's lone backup card.
+        # The two policy cards that used to span here moved to the Routing page
+        # (#987), whose card geometry the routing suite measures at both widths.
         assert paired >= 4, paired
         assert spanning >= 1, spanning
 
@@ -521,17 +518,6 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
         )
         assert abs(height - px) <= 0.5, (selector, height, px)
 
-    # The same scale holds on the page the policy card moved to: a button in a card
-    # is 40 px there too, so the move did not take it out of the shared sizing rule.
-    page.goto(f"{base_url}/routing")
-    page.wait_for_load_state("networkidle")
-    page.locator("#policyClientRefreshBtn").wait_for(state="visible")
-    height = page.evaluate(
-        "sel => document.querySelector(sel).getBoundingClientRect().height",
-        "#policyClientRefreshBtn",
-    )
-    assert abs(height - large) <= 0.5, ("#policyClientRefreshBtn", height, large)
-
 
 def _restore_settings(page: Page, csrf_token: str, original: dict) -> None:
     """Put the sections a test changed back, through the unchanged save endpoint."""
@@ -568,14 +554,6 @@ def test_settings_every_staged_card_commits_from_inside_itself(
         commit = page.locator(f"#{card} [data-commit]")
         assert commit.count() == 1, card
         labels.add(" ".join(commit.inner_text().split()))
-
-    # The policy card is the same model on its own page: one commit inside itself,
-    # carrying the same label as every card that stayed here.
-    page.goto(f"{base_url}/routing")
-    page.wait_for_load_state("networkidle")
-    policy_commit = page.locator("#policyRoutingCard [data-commit]")
-    assert policy_commit.count() == 1, "policyRoutingCard"
-    labels.add(" ".join(policy_commit.inner_text().split()))
     assert len(labels) == 1, labels
 
 
@@ -792,9 +770,8 @@ def test_settings_two_tabs_do_not_undo_each_others_security_saves(
 # tests focus real controls on the real page and read the computed outline.
 
 # (control, element that carries the outline). A switch hides its input, so the
-# visible track beside it is what shows focus. The policy exceptions field is not
-# here: it moved to the Routing page with its card (#987), and its focus indicator
-# is asserted there by test_focused_policy_control_has_a_visible_outline.
+# visible track beside it is what shows focus. The policy exceptions field left with
+# its card (#987); its focus ring is asserted in tests/e2e/test_routing_page.py.
 FOCUS_CONTROLS = [
     ("#app_title", "#app_title"),
     ("#appearance_language", "#appearance_language"),
@@ -871,36 +848,6 @@ def test_focused_control_has_a_visible_outline(
     assert got["width"] == "2px", (focus_sel, theme, got)
     assert got["color"] == _rgb(accent), (focus_sel, theme, got, accent)
     assert got["offset"] == "2px", (focus_sel, theme, got)
-
-
-@pytest.mark.e2e
-@pytest.mark.parametrize("theme", ["dark", "light"])
-def test_focused_policy_control_has_a_visible_outline(
-    authenticated_page: Page, base_url: str, theme: str
-) -> None:
-    """The moved policy field keeps the shared focus ring on its own page.
-
-    The exceptions field was asserted here before #987, on the Settings page. It is
-    the same control with the same rule, on the page that now renders it, so it is
-    the same assertion — otherwise the move would silently drop the one control on
-    this surface an operator has to reach by keyboard.
-    """
-    page = authenticated_page
-    page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(f"{base_url}/routing")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_selector("#policy_proxy_exceptions", state="visible")
-    page.add_style_tag(content=NO_TRANSITIONS)
-    page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
-    page.keyboard.press("Tab")
-
-    got = page.evaluate(FOCUS_PROBE, ["#policy_proxy_exceptions", "#policy_proxy_exceptions"])
-    assert got["focused"] and got["focusVisible"], got
-    accent = contrast.resolve("accent", contrast.theme_tokens(theme))
-    assert got["style"] == "solid", (theme, got)
-    assert got["width"] == "2px", (theme, got)
-    assert got["color"] == _rgb(accent), (theme, got, accent)
-    assert got["offset"] == "2px", (theme, got)
 
 
 @pytest.mark.e2e
