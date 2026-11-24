@@ -26,7 +26,7 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e import contrast
 from tests.e2e import test_settings as settings_cases
-from tests.e2e.settings_surface import token_px
+from tests.e2e.settings_surface import SETTINGS_PROBE, geometry, token_px
 
 ROUTING = "/routing"
 CARD = "#policyRoutingCard"
@@ -224,6 +224,69 @@ def test_routing_globes_are_decorative_in_the_accessibility_tree(
         "the drawer's sidebar entry exposes a graphic to assistive technology: "
         f"{_exposed_graphics(drawer_nodes, drawer_entry['nodeId'])}"
     )
+
+
+ROUTING_CARDS = ["policyRoutingCard", "policyClientCard"]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,columns", [(1440, 2), (1024, 2), (390, 1)])
+def test_routing_cards_span_the_grid(
+    authenticated_page: Page, base_url: str, width: int, columns: int
+) -> None:
+    """Both policy cards take the whole grid, measured on the rendered page.
+
+    While the two cards were a Settings group, the Settings geometry case required
+    both of them among its spanning rows. The move left their rows unmeasured, so a
+    card that lost the spanning rule would render at one track and nothing would
+    fail. The property is read from rectangles, not from a class name: at the
+    desktop widths the grid has two tracks, and a card that spans both is exactly
+    the grid's content box wide.
+
+    1440 and 1024 are the two two-track widths; 390 is single-track by design, where
+    the same assertion becomes "one column, and both cards fill it". The theme is not
+    varied because grid placement has no themed rule: settings.css contains no
+    data-theme rule at all, and its only two grid-column declarations are
+    width-driven.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    _open_routing(page, base_url)
+
+    probe = page.evaluate(SETTINGS_PROBE)
+    assert len(probe["grids"]) == 1, (
+        f"the routing page renders {len(probe['grids'])} .settings-grid containers, "
+        f"want exactly one: {[g['id'] for g in probe['grids']]}"
+    )
+    grid = probe["grids"][0]
+    assert len(grid["tracks"]) == columns, (
+        f"the grid has {len(grid['tracks'])} track(s) at {width}px, want {columns}: {grid['tracks']}"
+    )
+
+    ids = [card["id"] for card in grid["cards"]]
+    assert ids == ROUTING_CARDS, f"the grid directly owns {ids} in order, want {ROUTING_CARDS}"
+
+    expected = geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
+
+    # The property under test, per card, so a failure names the card and the width:
+    # in a two-track grid a card that spans is exactly the content box wide, and a
+    # card that lost the hook is one track (half of it) wide.
+    for card in grid["cards"]:
+        assert abs(card["width"] - expected["content"]) <= 1, (
+            f"{card['id']} is {card['width']:.1f}px wide at {width}px viewport; the grid's "
+            f"content box is {expected['content']:.1f}px across {columns} track(s) with a "
+            f"{expected['gap']:.0f}px gap, so this card is no longer spanning the grid"
+        )
+
+    # And both in the same column: a card can be full width without being aligned
+    # with its neighbour, which would still be a layout change worth failing.
+    first = grid["cards"][0]
+    for card in grid["cards"][1:]:
+        assert abs(card["left"] - first["left"]) <= 0.5 and abs(card["right"] - first["right"]) <= 0.5, (
+            f"{card['id']} does not share the column of {first['id']} at {width}px: "
+            f"its box is {card['left']:.1f}..{card['right']:.1f}, the first card's is "
+            f"{first['left']:.1f}..{first['right']:.1f}"
+        )
 
 
 @pytest.mark.e2e
