@@ -24,12 +24,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/web"
 )
 
@@ -364,5 +366,144 @@ func TestPolicySectionRenderingDoesNotLeakIntoOtherPages(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), fmt.Sprintf(`id="%s"`, "policyRoutingCard")) {
 		t.Error("policy section leaked into a page that does not include it")
+	}
+}
+
+// TestPolicyControlsCarryTheRenamedLabels pins the two renamed control labels and
+// the text beside them, because these are operator-facing statements about which
+// rule wins: the copy has to agree with the accepted decision order in
+// internal/vpn/forwarder/routing_decision.go, not just with itself. The retired
+// texts are asserted absent from the dictionaries.
+func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
+	page := renderSettingsPage(t, models.RoleAdmin)
+	for _, want := range []string{
+		"Always PROXY (IPv4)",
+		"Always DIRECT (IPv4)",
+		// The PROXY hint states the precedence and its own limit.
+		"Addresses on this PROXY list take precedence over the DIRECT list",
+		"refused before either list applies",
+		// The DIRECT hint names what can supersede a DIRECT listing.
+		"Prefixes on this DIRECT list route direct unless",
+		"an entry on the PROXY list, a CDN exclusion, or a non-TCP/UDP flow",
+		"prohibited, internal and invalid destinations are refused before any list applies",
+		"changes apply to new connections only",
+		// The notice under both controls names which list it means, and states the
+		// same guard and transport limit as the hints rather than a bare promise.
+		"A destination on the PROXY list uses PROXY",
+		"an allocation match outside the CDN exclusion set uses DIRECT unless",
+		"or the flow is not TCP or UDP",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the rendered policy section does not carry %q", want)
+		}
+	}
+	for _, gone := range []string{
+		"PROXY exceptions (IPv4)",
+		"Address inventory override",
+		"Clearing this field changes new routing decisions only",
+		// One input deciding everything was the false claim this round removed.
+		"shipped allocation set decides everything else",
+		"observed through the gateway DNS",
+	} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the rendered policy section still carries the retired text %q", gone)
+		}
+	}
+
+	// The same four keys exist in all five bundles, the non-English ones are real
+	// translations rather than copies, and the retired note is gone everywhere.
+	keys := []string{
+		"policy_proxy_exceptions_label", "policy_proxy_exceptions_hint",
+		"policy_inventory_override_label", "policy_inventory_override_hint",
+	}
+	var english map[string]string
+	for _, locale := range []string{"en", "ru", "fr", "zh", "fa"} {
+		raw, err := web.TranslationsFS.ReadFile("translations/" + locale + ".json")
+		if err != nil {
+			t.Fatalf("read %s.json: %v", locale, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(raw, &dict); err != nil {
+			t.Fatalf("decode %s.json: %v", locale, err)
+		}
+		if locale == "en" {
+			english = dict
+		}
+		for _, key := range keys {
+			value := strings.TrimSpace(dict[key])
+			if value == "" {
+				t.Errorf("%s.json has no %q", locale, key)
+				continue
+			}
+			if locale != "en" && value == english[key] {
+				t.Errorf("%s.json %q is the English text", locale, key)
+			}
+		}
+		if _, ok := dict["policy_inventory_override_clear_hint"]; ok {
+			t.Errorf("%s.json still carries the retired clear-field note", locale)
+		}
+	}
+	if english["policy_proxy_exceptions_label"] != "Always PROXY (IPv4)" ||
+		english["policy_inventory_override_label"] != "Always DIRECT (IPv4)" {
+		t.Errorf("the English labels are %q / %q, want the renamed controls",
+			english["policy_proxy_exceptions_label"], english["policy_inventory_override_label"])
+	}
+}
+
+// TestPolicyPlaceholderExamplesDoNotImplyAnImpossibleRoute pins the two example
+// placeholders. They may be syntax examples or real routable values, but they must
+// never be destinations the router refuses on either list: the previous round
+// shipped TEST-NET ranges, and ValidateDirectDestination refuses those, so the
+// placeholder promised a routing outcome that could never happen. An entry that is
+// not an address at all has to match the documented shape instead, so a typo cannot
+// pass as a "syntax example".
+func TestPolicyPlaceholderExamplesDoNotImplyAnImpossibleRoute(t *testing.T) {
+	raw, err := web.TranslationsFS.ReadFile("translations/en.json")
+	if err != nil {
+		t.Fatalf("read en.json: %v", err)
+	}
+	var dict map[string]string
+	if err := json.Unmarshal(raw, &dict); err != nil {
+		t.Fatalf("decode en.json: %v", err)
+	}
+
+	maskShape := regexp.MustCompile(`^x\.x\.x\.x(/[0-9]{1,2})?$`)
+	lastAddr := func(p netip.Prefix) netip.Addr {
+		a := p.Masked().Addr().As4()
+		for i := p.Bits(); i < 32; i++ {
+			a[i/8] |= 1 << (7 - uint(i%8))
+		}
+		return netip.AddrFrom4(a)
+	}
+
+	checked := 0
+	for _, key := range []string{"policy_proxy_exceptions_placeholder", "policy_inventory_override_placeholder"} {
+		for _, line := range strings.Split(dict[key], "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			checked++
+			prefix, err := netip.ParsePrefix(line)
+			if err != nil {
+				addr, addrErr := netip.ParseAddr(line)
+				if addrErr != nil {
+					if !maskShape.MatchString(line) {
+						t.Errorf("%s: %q is neither an address, a prefix, nor the documented x.x.x.x shape", key, line)
+					}
+					continue
+				}
+				prefix = netip.PrefixFrom(addr, addr.BitLen())
+			}
+			// First and last address cover every refused range in the list, so a
+			// prefix that would be refused anywhere inside it is caught here.
+			if forwarder.IsProhibitedIPv4Destination(prefix.Masked().Addr()) ||
+				forwarder.IsProhibitedIPv4Destination(lastAddr(prefix)) {
+				t.Errorf("%s: %q is a destination the router refuses on either list", key, line)
+			}
+		}
+	}
+	if checked < 3 {
+		t.Fatalf("found only %d example entries; the extraction is wrong", checked)
 	}
 }
