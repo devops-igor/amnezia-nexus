@@ -47,25 +47,70 @@ var policySectionIDs = []string{
 	"policy_proxy_exceptions",
 	"policySaveBtn",
 	"policySyncBtn",
-	"policyLastSuccess",
+	"policy_sync_interval",
+	// The four readouts (#971). Each panel is a question, an answer inset, its
+	// supporting facts and the disclosures that hold the detail.
+	"policyPanelStatus",
+	"policyStatusTitle",
+	"policyStatusAnswer",
+	"policyStatusAnswerIcon",
+	"policyStatusAnswerHeadline",
+	"policyStatusAnswerBody",
+	"policyStatusActions",
+	"policyStatusActionError",
+	"policyStatusActionSettings",
 	"policySyncState",
+	"policyLastSuccess",
+	"policyRuleDetails",
 	"policyRuleCount",
-	"policyLastError",
-	"policyProxyBytes",
-	"policyDirectBytes",
-	"policyProxyDrops",
-	"policyDirectDrops",
-	"policy_inventory_override",
+	"policyPanelInventory",
+	"policyInventoryTitle",
+	"policyInventoryAnswer",
+	"policyInventoryAnswerIcon",
+	"policyInventoryAnswerHeadline",
+	"policyInventoryAnswerBody",
+	"policyInventoryActions",
+	"policyInventoryActionStatus",
+	"policyInventoryActionOverride",
+	"policyInventoryAge",
+	"policyInventoryLimit",
+	"policyInventoryOverrideStatus",
+	"policyInventoryDetails",
 	"policyInventorySource",
 	"policyInventoryPrefixes",
 	"policyInventoryRetrieved",
-	"policyInventoryAge",
-	"policyInventoryOverrideStatus",
+	"policyInventoryDigestRow",
+	"policyInventoryDigest",
 	"policyInventoryNotice",
+	"policy_inventory_override",
+	"policyPanelCdn",
+	"policyCdnTitle",
+	"policyCdnAnswer",
+	"policyCdnAnswerIcon",
+	"policyCdnAnswerHeadline",
+	"policyCdnAnswerBody",
+	"policyCdnActions",
+	"policyCdnActionDiagnosis",
+	"policyCdnNetworksDetails",
 	"policyCdnSource",
 	"policyCdnCount",
 	"policyCdnEntries",
+	"policyCdnExclusionDetails",
+	"policyCdnSourceDetails",
 	"policyCdnNotice",
+	"policyPanelSyncError",
+	"policySyncErrorTitle",
+	"policySyncErrorAnswer",
+	"policySyncErrorAnswerIcon",
+	"policySyncErrorAnswerHeadline",
+	"policySyncErrorAnswerBody",
+	"policySyncErrorActions",
+	"policySyncNowBtn",
+	"policyErrorDetails",
+	"policyLastError",
+	// The in-page action in P3 focuses the diagnosis card's heading, so the
+	// target has to exist in the same render.
+	"policyClientTitle",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -124,6 +169,67 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		} {
 			if strings.Contains(adminBody, removed) {
 				t.Errorf("admin settings page still renders the removed control %q", removed)
+			}
+		}
+	})
+
+	t.Run("TrafficCountersRemoved", func(t *testing.T) {
+		// The owner removed the counters panel from this page (#971). The four
+		// readouts that stayed must not render, fetch or translate it, and the
+		// retired elements must be gone from the markup rather than hidden.
+		for _, removed := range []string{
+			`id="policyProxyBytes"`,
+			`id="policyDirectBytes"`,
+			`id="policyProxyDrops"`,
+			`id="policyDirectDrops"`,
+			`id="policyCountersTitle"`,
+			`policy_counters_title`,
+			`policy_counter_proxy_bytes`,
+			`policy_counter_direct_bytes`,
+			`policy_counter_proxy_drops`,
+			`policy_counter_direct_drops`,
+		} {
+			if strings.Contains(adminBody, removed) {
+				t.Errorf("the section still renders the removed traffic counters (%s)", removed)
+			}
+		}
+		for _, asset := range []string{"static/js/policy_routing.js", "static/js/policy_panels.js"} {
+			body, err := web.StaticFS.ReadFile(asset)
+			if err != nil {
+				t.Fatalf("read %s: %v", asset, err)
+			}
+			for _, removed := range []string{
+				"/api/vpn/policy/stats",
+				"renderPolicyCounters",
+				"policyFormatBytes",
+				"policy_counter_proxy_bytes",
+			} {
+				if strings.Contains(string(body), removed) {
+					t.Errorf("%s still carries the removed counters path (%s)", asset, removed)
+				}
+			}
+		}
+		// The endpoint itself stays: it is a published API, not a page readout, and
+		// removing it would change a contract this delivery is not authorized to
+		// touch. The retired keys must be gone from every bundle, though, so no
+		// later surface can render a counter label the page no longer explains.
+		for _, locale := range []string{"en", "ru", "fr", "zh", "fa"} {
+			raw, err := web.TranslationsFS.ReadFile("translations/" + locale + ".json")
+			if err != nil {
+				t.Fatalf("read %s.json: %v", locale, err)
+			}
+			var dict map[string]string
+			if err := json.Unmarshal(raw, &dict); err != nil {
+				t.Fatalf("decode %s.json: %v", locale, err)
+			}
+			for _, key := range []string{
+				"policy_counters_title", "policy_counter_proxy_bytes", "policy_counter_direct_bytes",
+				"policy_counter_proxy_drops", "policy_counter_direct_drops",
+				"policy_inventory_override_active", "policy_inventory_stale", "policy_inventory_age_value",
+			} {
+				if _, ok := dict[key]; ok {
+					t.Errorf("%s.json still defines %q, whose only consumer was removed", locale, key)
+				}
 			}
 		}
 	})
@@ -252,12 +358,19 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		if strings.Contains(source, "onclick=") || strings.Contains(source, "onchange=") || strings.Contains(source, "onsubmit=") {
 			t.Error("policy section must not use inline event handlers")
 		}
-		// Exactly one script tag: the external controller asset.
-		if got := strings.Count(source, "<script"); got != 1 {
-			t.Errorf("policy section has %d script tags, want exactly 1 external asset", got)
+		// Exactly the external assets, in the order the page needs them: the
+		// readouts module is evaluated before the controller that calls it, and
+		// neither is an inline body.
+		if got := strings.Count(source, "<script"); got != 2 {
+			t.Errorf("policy section has %d script tags, want exactly 2 external assets", got)
 		}
 		if strings.Contains(source, "<script>") {
 			t.Error("policy section must not contain an inline script body")
+		}
+		readouts := strings.Index(source, "policy_panels.js")
+		controller := strings.Index(source, "policy_routing.js")
+		if readouts < 0 || controller < 0 || readouts > controller {
+			t.Errorf("the policy readouts module must load before the controller (readouts at %d, controller at %d)", readouts, controller)
 		}
 	})
 }
@@ -286,30 +399,34 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		t.Fatalf("found only %d policy translation keys in the partial; the extraction is wrong", len(keys))
 	}
 
-	// Keys the controller resolves at run time. The JSDOM harness stubs the
-	// translator, so it cannot notice a key missing from a dictionary; pin them
-	// here with the template's own keys.
-	for _, key := range []string{
-		"policy_load_failed", "policy_not_ready", "policy_saved", "policy_save_failed",
-		"policy_save_kept", "policy_sync_ok", "policy_sync_failed", "policy_sync_running",
-		"policy_never", "policy_none", "policy_status_unknown",
-		"policy_sync_state_disabled", "policy_sync_state_error",
-		"policy_sync_state_pending", "policy_sync_state_synced",
-		// Keys the inventory block formats at run time (issue #920). Their values
-		// carry the placeholders the controller substitutes, so a missing
-		// dictionary entry would leave a raw key on the page.
-		"policy_inventory_age_value", "policy_inventory_stale",
-		"policy_inventory_override_active", "policy_inventory_override_none",
-		"policy_inventory_unusable",
-		// Keys the CDN exclusion block renders at run time (issue #934). They are
-		// chosen by the controller, not written in markup, so a missing dictionary
-		// entry would leave a raw key on the page.
-		"policy_cdn_empty", "policy_cdn_unavailable", "policy_cdn_unusable",
-	} {
-		keys[key] = true
+	// Keys the two scripts resolve at run time. The JSDOM harness stubs the
+	// translator, so it cannot notice a key missing from a dictionary; the keys
+	// are read from the shipped modules here rather than copied by hand, which
+	// is what kept a renamed readout key in the list after its branch was gone.
+	scriptKeyPattern := regexp.MustCompile(`(?:policyText|panelText)\(\s*'([a-z0-9_]+)'`)
+	for _, asset := range []string{"static/js/policy_routing.js", "static/js/policy_panels.js"} {
+		body, err := web.StaticFS.ReadFile(asset)
+		if err != nil {
+			t.Fatalf("read %s: %v", asset, err)
+		}
+		found := 0
+		for _, match := range scriptKeyPattern.FindAllStringSubmatch(string(body), -1) {
+			keys[match[1]] = true
+			found++
+		}
+		if found < 10 {
+			t.Fatalf("%s: found only %d translation keys; the extraction is wrong", asset, found)
+		}
+	}
+	// A pluralised readout composes its key from a base, so the two forms are not
+	// literals in the module and have to be named here.
+	for _, base := range []string{"policy_days", "policy_inventory_override_count", "policy_cdn_count_answer"} {
+		keys[base+"_one"] = true
+		keys[base+"_other"] = true
 	}
 
 	locales := []string{"en.json", "ru.json", "fr.json", "fa.json", "zh.json"}
+	bundles := map[string]map[string]string{}
 	for _, locale := range locales {
 		raw, err := web.TranslationsFS.ReadFile("translations/" + locale)
 		if err != nil {
@@ -319,6 +436,7 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		if err := json.Unmarshal(raw, &dict); err != nil {
 			t.Fatalf("parse %s: %v", locale, err)
 		}
+		bundles[locale] = dict
 		for key := range keys {
 			value, ok := dict[key]
 			if !ok {
@@ -327,6 +445,24 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 			}
 			if strings.TrimSpace(value) == "" {
 				t.Errorf("%s has an empty value for %q", locale, key)
+			}
+		}
+	}
+
+	// Locale parity: the five bundles stay key-for-key identical. A key added to
+	// one bundle only renders as its own name to the operators of the other four,
+	// and no per-key lookup above notices a key the *other* bundles gained.
+	english := bundles["en.json"]
+	for _, locale := range locales[1:] {
+		dict := bundles[locale]
+		for key := range english {
+			if _, ok := dict[key]; !ok {
+				t.Errorf("%s is missing %q, which en.json defines; the bundles have drifted apart", locale, key)
+			}
+		}
+		for key := range dict {
+			if _, ok := english[key]; !ok {
+				t.Errorf("%s defines %q, which en.json does not; the bundles have drifted apart", locale, key)
 			}
 		}
 	}

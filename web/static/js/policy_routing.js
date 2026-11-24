@@ -14,10 +14,11 @@
  *     answered with;
  *   - a refusal is shown verbatim and the form is reloaded from the saved
  *     record, so a rejected "enabled" can never stay visible as enabled;
- *   - the status block and counters are read from the server's own snapshot and
- *     are never derived from local counters. In particular the enabled badge only
- *     ever mirrors a runtime observation: the stored record is intent, and the two
- *     deliberately differ while a startup activation failure is being recovered.
+ *   - the four readouts are rendered by static/js/policy_panels.js from the
+ *     server's own snapshot and are never derived from local state. In particular
+ *     the enabled badge only ever mirrors a runtime observation: the stored record
+ *     is intent, and the two deliberately differ while a startup activation
+ *     failure is being recovered.
  *
  * URLs are intentionally not validated here. The server applies the same SSRF
  * and HTTPS rules the fetcher enforces, and a client-side copy of that policy
@@ -29,7 +30,6 @@
 
     var POLICY_ENDPOINT = '/api/vpn/policy';
     var SYNC_ENDPOINT = '/api/vpn/policy/sync';
-    var STATS_ENDPOINT = '/api/vpn/policy/stats';
 
     // Last record the server returned. It is the fallback used to restore the form
     // when a refused save cannot be followed by a successful reload.
@@ -70,15 +70,6 @@
             return null;
         }
         return root.document.getElementById(id);
-    }
-
-    // setPolicyElementText writes one status value and tolerates an absent element,
-    // so a section rendered without a block never throws in the controller.
-    function setPolicyElementText(id, text) {
-        var el = policyElement(id);
-        if (el) {
-            el.textContent = text;
-        }
     }
 
     function policyRequest(url, options) {
@@ -131,60 +122,6 @@
         return seq > lastAcceptedMutation;
     }
 
-    function policyFormatBytes(raw) {
-        var bytes = Number(raw);
-        if (!isFinite(bytes) || bytes < 0) {
-            return '-';
-        }
-        var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
-        var value = bytes;
-        var unit = 0;
-        while (value >= 1024 && unit < units.length - 1) {
-            value = value / 1024;
-            unit++;
-        }
-        if (unit === 0) {
-            return Math.round(value) + ' ' + units[unit];
-        }
-        return value.toFixed(2) + ' ' + units[unit];
-    }
-
-    function policyFormatCount(raw) {
-        var count = Number(raw);
-        if (!isFinite(count) || count < 0) {
-            return '-';
-        }
-        return String(Math.round(count));
-    }
-
-    function policyFormatTimestamp(raw) {
-        if (!raw) {
-            return policyText('policy_never');
-        }
-        var parsed = new Date(raw);
-        if (isNaN(parsed.getTime())) {
-            return String(raw);
-        }
-        // Format in the page's language so a Russian portal does not fall back to
-        // the browser's own locale for the same timestamp.
-        var lang = root.document && root.document.documentElement
-            ? root.document.documentElement.lang
-            : '';
-        return parsed.toLocaleString(lang || undefined);
-    }
-
-    // policySyncStateLabel translates the runtime's own sync_state token. The set
-    // is closed (disabled/synced/pending/error); an unknown token is shown as
-    // received rather than replaced by a guess.
-    function policySyncStateLabel(state) {
-        if (!state) {
-            return policyText('policy_none');
-        }
-        var key = 'policy_sync_state_' + state;
-        var label = policyText(key);
-        return label === key ? state : label;
-    }
-
     // setPolicyAlert reports into the card's own two regions, the same ones every
     // other card has: a success goes to the status region and anything else to the
     // alert region, each with a role that never changes. An empty message clears
@@ -212,27 +149,33 @@
             }
             return;
         }
-        var button = policyElement('policySyncBtn');
-        var spinner = policyElement('policySyncSpinner');
-        var label = policyElement('policySyncBtnText');
-        if (button) {
+        // Both sync controls submit the same operation, so both are disabled for
+        // the whole request: the panel's retry control and the form's button.
+        var controls = ['policySyncBtn', 'policySyncNowBtn'];
+        controls.forEach(function (id) {
+            var button = policyElement(id);
+            if (!button) {
+                return;
+            }
             if (busy && root.document && root.document.activeElement === button) {
                 busyFocus = button;
             }
             button.disabled = !!busy;
             button.setAttribute('aria-busy', busy ? 'true' : 'false');
-            // Disabling a focused control moves focus to the document body, so a
-            // keyboard operator would lose their place for the whole request.
-            if (!busy) {
-                if (busyFocus === button && root.document && root.document.activeElement === root.document.body) {
-                    button.focus();
-                }
-                busyFocus = null;
+        });
+        // Disabling a focused control moves focus to the document body, so a
+        // keyboard operator would lose their place for the whole request.
+        if (!busy) {
+            if (busyFocus && root.document && root.document.activeElement === root.document.body) {
+                busyFocus.focus();
             }
+            busyFocus = null;
         }
+        var spinner = policyElement('policySyncSpinner');
         if (spinner) {
             spinner.classList.toggle('hidden', !busy);
         }
+        var label = policyElement('policySyncBtnText');
         if (label) {
             label.textContent = busy ? policyText('policy_sync_running') : policyText('policy_sync_btn');
         }
@@ -296,146 +239,6 @@
         }
     }
 
-    // renderPolicyInventory states which allocation inventory the classifier is
-    // using. The shipped set's provenance is reported as its own facts, and an
-    // operator override is reported beside it rather than as part of it: an
-    // operator who cannot tell the two apart cannot tell whether a routing
-    // decision came from the committed artifact or from their own correction.
-    //
-    // Every value comes from the server's snapshot. When the artifact is unusable
-    // the notice carries the reported error, because an empty grid would read as
-    // "no data" instead of "the set is broken and everything is proxied".
-    function renderPolicyInventory(snapshot) {
-        var inventory = snapshot && snapshot.inventory ? snapshot.inventory : null;
-        var source = policyElement('policyInventorySource');
-        var prefixes = policyElement('policyInventoryPrefixes');
-        var retrieved = policyElement('policyInventoryRetrieved');
-        var age = policyElement('policyInventoryAge');
-        var override = policyElement('policyInventoryOverrideStatus');
-        var notice = policyElement('policyInventoryNotice');
-
-        if (!inventory) {
-            [source, prefixes, retrieved, age, override].forEach(function (el) {
-                if (el) {
-                    el.textContent = '-';
-                }
-            });
-            if (notice) {
-                notice.textContent = '';
-            }
-            return;
-        }
-
-        if (source) {
-            source.textContent = inventory.source || policyText('policy_none');
-        }
-        if (prefixes) {
-            prefixes.textContent = policyFormatCount(inventory.prefix_count);
-        }
-        if (retrieved) {
-            retrieved.textContent = inventory.retrieved_at || policyText('policy_none');
-        }
-        if (age) {
-            var ageText = policyText('policy_inventory_age_value')
-                .replace('{days}', policyFormatCount(inventory.age_days))
-                .replace('{max}', policyFormatCount(inventory.max_age_days));
-            if (inventory.stale) {
-                ageText = ageText + ' · ' + policyText('policy_inventory_stale');
-            }
-            age.textContent = ageText;
-        }
-        if (override) {
-            var overrideCount = Number(inventory.override_prefix_count) || 0;
-            if (overrideCount > 0) {
-                // The digest is what distinguishes two overrides with the same
-                // number of prefixes; it is truncated for reading, never invented.
-                var digest = inventory.override_sha256 ? String(inventory.override_sha256).slice(0, 12) : '';
-                override.textContent = policyText('policy_inventory_override_active')
-                    .replace('{count}', policyFormatCount(overrideCount))
-                    .replace('{digest}', digest);
-            } else {
-                override.textContent = policyText('policy_inventory_override_none');
-            }
-        }
-        if (notice) {
-            notice.textContent = inventory.error
-                ? policyText('policy_inventory_unusable') + ' ' + inventory.error
-                : '';
-        }
-    }
-
-    // policyCDNEntryText renders one exclusion the way the list reads: the
-    // provider name, then the autonomous system the classifier matches against.
-    // A missing half is left out rather than filled with a placeholder, so the
-    // line never claims something the server did not send.
-    function policyCDNEntryText(entry) {
-        var provider = entry && entry.provider ? String(entry.provider) : '';
-        var asn = entry && entry.asn ? 'AS' + String(entry.asn) : '';
-        if (provider === '') {
-            return asn;
-        }
-        if (asn === '') {
-            return provider;
-        }
-        return provider + ' · ' + asn;
-    }
-
-    // renderPolicyCDNEntryList fills the exclusion list, distinguishing the three
-    // states a reader must not confuse: a reported empty set (the classifier
-    // excludes nothing), an unreported set (this deployment told us nothing), and
-    // an unusable one (the set exists but cannot be described).
-    function renderPolicyCDNEntryList(entries) {
-        var list = policyElement('policyCdnEntries');
-        if (!list) {
-            return;
-        }
-        while (list.firstChild) {
-            list.removeChild(list.firstChild);
-        }
-        var state = 'policy_cdn_unavailable';
-        if (entries && entries.length === 0) {
-            state = 'policy_cdn_empty';
-        }
-        if (!entries || entries.length === 0) {
-            var placeholder = document.createElement('li');
-            placeholder.className = 'text-muted';
-            placeholder.textContent = policyText(state);
-            list.appendChild(placeholder);
-            return;
-        }
-        entries.forEach(function (entry) {
-            var row = document.createElement('li');
-            row.textContent = policyCDNEntryText(entry);
-            list.appendChild(row);
-        });
-    }
-
-    // renderPolicyCDNNotice states why the set could not be described. It is empty
-    // when there is nothing to report, so a usable set carries no warning.
-    function renderPolicyCDNNotice(cdn) {
-        if (!cdn || !cdn.error) {
-            return '';
-        }
-        return policyText('policy_cdn_unusable') + ' ' + cdn.error;
-    }
-
-    // renderPolicyCDNExclusions states the CDN exclusion set the classifier
-    // consults (issue #934). The allocation block answers "is this address in the
-    // Russian set"; this block answers the rest of the decision — a destination
-    // inside that set is still proxied when its network belongs to a multi-region
-    // CDN. Before it, that half was visible only one flow at a time.
-    //
-    // Every value comes from the server's snapshot, which reads the table the
-    // classifier itself matches against; nothing is restated here.
-    function renderPolicyCDNExclusions(snapshot) {
-        var cdn = snapshot && snapshot.cdn ? snapshot.cdn : null;
-        var entries = cdn && Array.isArray(cdn.entries) ? cdn.entries : null;
-        setPolicyElementText('policyCdnSource', cdn && cdn.source ? cdn.source : '-');
-        setPolicyElementText('policyCdnCount', entries ? policyFormatCount(entries.length) : '-');
-        renderPolicyCDNEntryList(entries);
-        setPolicyElementText('policyCdnNotice', renderPolicyCDNNotice(cdn));
-    }
-
     // renderPolicyRetirement states what the stored record held and this build
     // could not carry. It is empty when the record carried nothing retired, so an
     // ordinary prefix-only upgrade shows no warning at all.
@@ -477,83 +280,19 @@
         notice.textContent = parts.join(' ');
     }
 
-    // renderPolicyStatus renders the runtime block. What the stored record could not
-    // carry is rendered beside it by renderPolicyRetirement, because the two answer
-    // different questions: what is running, and what the operator's saved record
-    // used to hold.
-    function renderPolicyStatus(record, status) {
-        renderPolicyRetirement(record);
-        var snapshot = policyRuntimeSnapshot({ status: status });
-        if (snapshot) {
-            // The newest real observation is also what a failed recovery read keeps.
-            lastRuntimeSnapshot = snapshot;
+    // renderPolicyPanels hands the newest accepted record and the newest runtime
+    // observation to the readout module (static/js/policy_panels.js). The form,
+    // the save and the sync stay here; the four answers live there so one file
+    // owns the state vocabulary instead of two.
+    function renderPolicyPanels(record, snapshot) {
+        var accepted = record || lastServerRecord;
+        // The retirement notice belongs to the form, not to a readout: it says
+        // what the stored record used to hold, so it is rendered beside the
+        // fields regardless of the runtime snapshot.
+        renderPolicyRetirement(accepted);
+        if (root.PolicyPanels && typeof root.PolicyPanels.render === 'function') {
+            root.PolicyPanels.render(accepted, snapshot);
         }
-
-        // Runtime enabled mirrors one server observation or nothing at all. It is
-        // never derived from `record.enabled`: storage keeps `enabled:true` through
-        // a failed startup activation while the runtime is inactive, so intent is
-        // not evidence about the running policy.
-        var runtimeEnabled = snapshot ? snapshot.enabled : null;
-
-        var badge = policyElement('policyStatusBadge');
-        if (badge) {
-            if (runtimeEnabled === null) {
-                badge.className = 'badge badge-secondary';
-                badge.textContent = policyText('policy_status_unknown');
-                badge.setAttribute('data-enabled', 'unknown');
-            } else {
-                badge.className = runtimeEnabled ? 'badge badge-success' : 'badge badge-secondary';
-                badge.textContent = policyText(runtimeEnabled ? 'policy_status_enabled' : 'policy_status_disabled');
-                badge.setAttribute('data-enabled', runtimeEnabled ? 'true' : 'false');
-            }
-        }
-
-        renderPolicyInventory(snapshot);
-        renderPolicyCDNExclusions(snapshot);
-
-        var lastSuccessEl = policyElement('policyLastSuccess');
-        if (lastSuccessEl) {
-            lastSuccessEl.textContent = policyFormatTimestamp(snapshot && snapshot.last_success);
-        }
-
-        var syncStateEl = policyElement('policySyncState');
-        if (syncStateEl) {
-            syncStateEl.textContent = policySyncStateLabel(snapshot && snapshot.sync_state);
-        }
-
-        var ruleCountEl = policyElement('policyRuleCount');
-        if (ruleCountEl) {
-            if (snapshot) {
-                ruleCountEl.textContent = policyFormatCount(Number(snapshot.cidr_count) || 0);
-            } else {
-                ruleCountEl.textContent = policyText('policy_none');
-            }
-        }
-
-        var lastErrorEl = policyElement('policyLastError');
-        if (lastErrorEl) {
-            lastErrorEl.textContent = snapshot && snapshot.last_error
-                ? snapshot.last_error
-                : policyText('policy_none');
-        }
-    }
-
-    function renderPolicyCounters(stats) {
-        if (!stats) {
-            return;
-        }
-        var mapping = [
-            ['policyProxyBytes', policyFormatBytes(stats.proxy_bytes)],
-            ['policyDirectBytes', policyFormatBytes(stats.direct_bytes)],
-            ['policyProxyDrops', policyFormatCount(stats.proxy_drops)],
-            ['policyDirectDrops', policyFormatCount(stats.direct_drops)]
-        ];
-        mapping.forEach(function (entry) {
-            var el = policyElement(entry[0]);
-            if (el) {
-                el.textContent = entry[1];
-            }
-        });
     }
 
     // refreshPolicyStatus re-reads the server's own snapshot. A failed read never
@@ -568,18 +307,8 @@
             return { ok: false, error: err };
         }
         if (policyReadApplies(seq)) {
-            renderPolicyStatus(policy, policyRuntimeSnapshot(policy));
+            renderPolicyPanels(policy, policyRuntimeSnapshot(policy));
         }
-
-        var stats = null;
-        try {
-            stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
-        } catch (err) {
-            // Counters are advisory: a stats read failure must not claim the save
-            // or the sync failed, so it is reported only when nothing else is shown.
-            return { ok: true, statsError: err, record: policy };
-        }
-        renderPolicyCounters(stats);
         return { ok: true, record: policy };
     }
 
@@ -594,14 +323,8 @@
             return policy;
         }
         applyPolicyRecord(policy);
-        renderPolicyStatus(policy, policyRuntimeSnapshot(policy));
+        renderPolicyPanels(policy, policyRuntimeSnapshot(policy));
         setPolicyReady(true);
-        try {
-            var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
-            renderPolicyCounters(stats);
-        } catch (err) {
-            renderPolicyCounters(null);
-        }
         return policy;
     }
 
@@ -704,13 +427,7 @@
                 await refreshPolicyStatus();
                 return null;
             }
-            renderPolicyStatus(saved, policyRuntimeSnapshot(saved));
-            try {
-                var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
-                renderPolicyCounters(stats);
-            } catch (statsErr) {
-                // Leave the last known counters in place rather than showing zeroes.
-            }
+            renderPolicyPanels(saved, policyRuntimeSnapshot(saved));
             return saved;
         } finally {
             inFlight.save = false;
@@ -730,13 +447,7 @@
             // A completed sync publishes a new snapshot, so it is a newer
             // observation than any read still in flight.
             lastAcceptedMutation = seq;
-            renderPolicyStatus(lastServerRecord, policyRuntimeSnapshot(result));
-            try {
-                var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
-                renderPolicyCounters(stats);
-            } catch (statsErr) {
-                // The sync outcome is already known; counters stay as they were.
-            }
+            renderPolicyPanels(lastServerRecord, policyRuntimeSnapshot(result));
             setPolicyAlert('success', policyText('policy_sync_ok'));
             return result;
         } catch (err) {
@@ -753,6 +464,47 @@
             inFlight.sync = false;
             setPolicyBusy('sync', false);
         }
+    }
+
+    // focusPolicyTarget moves focus to the control or heading an in-page action
+    // names, and opens the disclosure that would otherwise hide it. An anchor
+    // alone leaves a keyboard operator where they were in browsers that do not
+    // focus a tabindex="-1" fragment target, and the action would look inert.
+    function focusPolicyTarget(id) {
+        var target = policyElement(id);
+        if (!target) {
+            return;
+        }
+        var disclosure = target.closest ? target.closest('details') : null;
+        if (disclosure && !disclosure.open) {
+            disclosure.open = true;
+        }
+        if (target.focus) {
+            target.focus();
+        }
+        if (target.scrollIntoView) {
+            target.scrollIntoView({ block: 'center' });
+        }
+    }
+
+    // wirePolicyFocusActions routes every in-page answer action through
+    // focusPolicyTarget. The markup declares the destination in
+    // data-policy-focus, so adding an action does not add a listener here.
+    function wirePolicyFocusActions() {
+        var card = policyElement('policyRoutingCard');
+        if (!card) {
+            return;
+        }
+        card.addEventListener('click', function (event) {
+            var trigger = event.target && event.target.closest
+                ? event.target.closest('[data-policy-focus]')
+                : null;
+            if (!trigger) {
+                return;
+            }
+            event.preventDefault();
+            focusPolicyTarget(trigger.getAttribute('data-policy-focus'));
+        });
     }
 
     // initPolicyRouting wires the section once. It returns false when the section
@@ -792,6 +544,19 @@
                 syncPolicy();
             });
         }
+
+        // The panel's own retry control runs the same operation, so it shares the
+        // single-flight guard and the busy state above rather than starting a
+        // second sync path.
+        var syncNowBtn = policyElement('policySyncNowBtn');
+        if (syncNowBtn) {
+            syncNowBtn.addEventListener('click', function (event) {
+                event.preventDefault();
+                syncPolicy();
+            });
+        }
+
+        wirePolicyFocusActions();
 
         loadPolicySettings().catch(function (err) {
             // A failed initial read leaves the section read-only and says why: with

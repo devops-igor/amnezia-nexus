@@ -18,7 +18,12 @@ Covered here:
 * a list entry that is not an IPv4 rule, rejected inline with the typed value
   kept and nothing stored;
 * the admin-only boundary: a support operator gets no section and a 403 API;
-* CSRF: a mutating policy call without the token is rejected.
+* CSRF: a mutating policy call without the token is rejected;
+* the four readouts (#971): their healthy answers, the disclosures that keep
+  every excluded network reachable, the removed traffic counters, and the
+  in-page action that moves focus instead of only changing the URL;
+* the same page at 1440 and 390 px in both themes, which is where a layout that
+  "looks fine" in one width hides its overflow.
 
 The suite is registered as ``hosted-panel`` in ``runner_map.toml``. It must not
 acquire a DEV-only dependency: no SSH, no provisioning and no dataplane.
@@ -34,6 +39,7 @@ from tests.e2e.conftest import api_get, api_post
 
 POLICY_ENDPOINT = "/api/vpn/policy"
 SYNC_ENDPOINT = "/api/vpn/policy/sync"
+STATS_ENDPOINT = "/api/vpn/policy/stats"
 
 CARD = "#policyRoutingCard"
 ALERT = "#policyAlert"
@@ -171,6 +177,16 @@ def test_policy_sync_failure_is_reported_with_the_server_reason(
     # The action returns to a usable state instead of staying stuck or claiming success.
     expect(page.locator(SYNC_BTN)).to_be_enabled()
     expect(page.locator("#policySyncSpinner")).to_have_class("spinner hidden")
+
+    # The readout answers about the runtime snapshot, and the snapshot reports no
+    # failed sync: a refused request is not the runtime's last_error, so the
+    # failure belongs to the banner above and the readout must not invent a
+    # failure state (or a retry) of its own. This is the separation the contract
+    # draws between a request error and a recorded sync failure.
+    expect(page.locator("#policySyncErrorAnswer")).to_have_attribute("data-state", "info")
+    expect(page.locator("#policySyncErrorAnswerHeadline")).to_have_text("No sync error reported")
+    expect(page.locator("#policySyncErrorAnswerBody")).to_have_text("Split egress is off.")
+    expect(page.locator("#policySyncNowBtn")).to_be_hidden()
 
 
 @pytest.mark.e2e
@@ -311,3 +327,202 @@ def test_policy_section_and_api_are_admin_only(
     finally:
         context.close()
         api_post(admin_page, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+# ── #971: the four policy readouts ───────────────────────────────────
+#
+# The page answers four questions — is split egress active, is the shipped address
+# list current, can a CDN keep a destination on the proxy path, and did the latest
+# rule sync fail. Each answer is a state, not a bare value, so these tests assert
+# the state attribute and the sentence beside it, and they assert the disclosures
+# still carry the detail the answer does not.
+
+
+def _answers(page: Page) -> dict[str, str]:
+    """Return the rendered state of each readout by its answer element id."""
+    return page.evaluate(
+        """() => {
+            const ids = ['policyStatusAnswer', 'policyInventoryAnswer',
+                         'policyCdnAnswer', 'policySyncErrorAnswer'];
+            const out = {};
+            for (const id of ids) {
+                const node = document.getElementById(id);
+                const headline = document.getElementById(id + 'Headline');
+                out[id] = node ? node.getAttribute('data-state') + '|' + headline.textContent.trim() : 'missing';
+            }
+            return out;
+        }"""
+    )
+
+
+@pytest.mark.e2e
+def test_policy_readouts_answer_all_four_questions(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """Each readout reaches a real answer, and none of them is still loading.
+
+    The deployment is panel-only, so what matters here is that the answer is
+    derived from the server's snapshot rather than left at the loading
+    placeholder or invented locally.
+    """
+    page = authenticated_page
+    _open_settings(page, base_url)
+
+    stored = api_get(page, POLICY_ENDPOINT)
+    answers = _answers(page)
+    for answer_id, rendered in answers.items():
+        assert rendered != "missing", f"{answer_id} is not rendered at all"
+        state, headline = rendered.split("|", 1)
+        assert state != "loading", f"{answer_id} is still showing its loading state: {headline!r}"
+        assert headline, f"{answer_id} renders an empty answer"
+        assert "Loading" not in headline, f"{answer_id} still shows a loading sentence: {headline!r}"
+
+    # P1 answers from the runtime flag, and this deployment reports the policy as
+    # off: a management-only build reports no runtime at all, which has its own
+    # answer. Either way it must not claim the saved switch as the runtime.
+    status_state, status_headline = answers["policyStatusAnswer"].split("|", 1)
+    if "status" in stored:
+        assert status_headline == "Off", f"a disabled runtime must read Off, got {status_headline!r}"
+    else:
+        assert status_headline == "Status unavailable", (
+            f"without a runtime snapshot the answer must say so, got {status_headline!r}"
+        )
+    assert status_state in ("info", "warning")
+
+    # P4 reports the absence of a sync error as its own answer.
+    sync_state, sync_headline = answers["policySyncErrorAnswer"].split("|", 1)
+    assert sync_headline == "No sync error reported", (
+        f"an untouched deployment reports no sync error, got {sync_headline!r}"
+    )
+    assert sync_state in ("info", "success")
+
+    # An action the state does not offer must be absent from the layout, not only
+    # marked hidden in the DOM: the panel's own display rules would otherwise win
+    # over the hidden attribute and offer a retry beside a healthy answer.
+    expect(page.locator("#policySyncNowBtn")).to_be_hidden()
+    expect(page.locator("#policyCdnActionDiagnosis")).to_be_visible()
+    if status_headline == "Off":
+        expect(page.locator("#policyStatusActionSettings")).to_be_visible()
+        expect(page.locator("#policyStatusActionError")).to_be_hidden()
+
+
+@pytest.mark.e2e
+def test_policy_cdn_disclosure_lists_every_excluded_network(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The disclosure keeps the whole list, and the answer keeps the count.
+
+    The count in the answer is a summary; an operator who needs to know whether one
+    network is on the list has to be able to read every entry, in the order the
+    server sent them. A surface that dropped an entry would still render a
+    plausible count.
+    """
+    page = authenticated_page
+    _open_settings(page, base_url)
+
+    payload = api_get(page, POLICY_ENDPOINT)
+    cdn = (payload.get("status") or {}).get("cdn") or {}
+    entries = cdn.get("entries")
+    assert entries, f"the panel-only deployment must expose the built-in CDN set: {cdn}"
+
+    summary = page.locator("#policyCdnNetworksDetails > summary")
+    if not page.locator("#policyCdnNetworksDetails").evaluate("el => el.open"):
+        summary.click()
+    expect(page.locator("#policyCdnEntries li")).to_have_count(len(entries))
+
+    rendered = page.locator("#policyCdnEntries li").all_inner_texts()
+    for index, entry in enumerate(entries):
+        if entry.get("provider"):
+            assert entry["provider"] in rendered[index], f"entry {index} lost its provider: {rendered[index]!r}"
+        if entry.get("asn"):
+            assert f"AS{entry['asn']}" in rendered[index], f"entry {index} lost its ASN: {rendered[index]!r}"
+
+    expect(page.locator("#policyCdnAnswerHeadline")).to_have_text(
+        f"{len(entries)} networks excluded from direct routing"
+    )
+
+
+@pytest.mark.e2e
+def test_policy_traffic_counters_are_not_fetched_or_rendered(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The retired counters panel is gone from the page and from its reads."""
+    page = authenticated_page
+    _open_settings(page, base_url)
+
+    for removed in ("#policyProxyBytes", "#policyDirectBytes", "#policyProxyDrops", "#policyDirectDrops"):
+        assert page.locator(removed).count() == 0, f"the section still renders {removed}"
+
+    requested: list[str] = []
+    page.on("request", lambda request: requested.append(request.url))
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(CARD, state="visible")
+    expect(page.locator("#policyStatusBadge")).to_have_attribute("data-enabled", "false")
+
+    stats_reads = [url for url in requested if url.endswith(STATS_ENDPOINT)]
+    assert stats_reads == [], f"the page still reads the retired counters: {stats_reads}"
+
+
+@pytest.mark.e2e
+def test_policy_in_page_action_moves_focus(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """An in-page action moves focus to its target heading, not only the URL.
+
+    A fragment link alone leaves a keyboard operator where they were in browsers
+    that do not focus a tabindex="-1" target, so the action would look inert while
+    the address bar changed.
+    """
+    page = authenticated_page
+    _open_settings(page, base_url)
+
+    page.locator("#policyCdnActionDiagnosis").scroll_into_view_if_needed()
+    page.locator("#policyCdnActionDiagnosis").click()
+    focused = page.evaluate("() => document.activeElement ? document.activeElement.id : ''")
+    assert focused == "policyClientTitle", f"focus landed on {focused!r}, not the diagnosis heading"
+    expect(page.locator("#policyClientTitle")).to_be_in_viewport()
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+@pytest.mark.parametrize("width", [1440, 390])
+def test_policy_readouts_layout_and_state(
+    authenticated_page: Page, base_url: str, width: int, theme: str
+) -> None:
+    """The readouts render at both widths in both themes without horizontal overflow.
+
+    The answers, their actions and the network list are the parts that grow, so a
+    laptop viewport that wraps them still leaves the 390 px one to check.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    _open_settings(page, base_url)
+    page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+
+    for panel in ("policyPanelStatus", "policyPanelInventory", "policyPanelCdn", "policyPanelSyncError"):
+        expect(page.locator(f"#{panel}")).to_be_visible()
+
+    answers = _answers(page)
+    for answer_id, rendered in answers.items():
+        state, headline = rendered.split("|", 1)
+        assert state != "loading", f"{width}px/{theme}: {answer_id} never left its loading state"
+        assert headline and "Loading" not in headline, f"{width}px/{theme}: {answer_id} = {headline!r}"
+
+    overflow = page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 1, f"{width}px/{theme}: the page overflows horizontally by {overflow}px"
+
+    # The network list stays a single readable column, and a disclosure still opens
+    # with the keyboard rather than only with the pointer.
+    summary = page.locator("#policyCdnNetworksDetails > summary")
+    summary.focus()
+    page.keyboard.press("Enter")
+    assert page.locator("#policyCdnNetworksDetails").evaluate("el => el.open"), (
+        f"{width}px/{theme}: Enter did not open the excluded-network disclosure"
+    )
+    page.keyboard.press("Enter")
+    assert not page.locator("#policyCdnNetworksDetails").evaluate("el => el.open"), (
+        f"{width}px/{theme}: a second Enter did not close the disclosure again"
+    )

@@ -48,6 +48,8 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 var DeliveredAssets = []string{
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
+	"/static/js/policy_panels.js",
+	"/static/js/policy_routing.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",
 	"/static/js/vpn/backends.js",

@@ -1,17 +1,20 @@
 package web
 
-// Behavioural JSDOM coverage for the shipped policy routing controller (#679).
+// Behavioural JSDOM coverage for the shipped policy routing section (#679/#971).
 //
-// The assertions run static/js/policy_routing.js — read through StaticFS, i.e. the
-// asset the browser loads — against the section markup rendered from
-// templates/settings_policy.html. Nothing is re-implemented here: the module is
-// evaluated as-is and driven through its exported entry points and the DOM the
-// template actually produces.
+// The assertions run static/js/policy_panels.js and static/js/policy_routing.js —
+// read through StaticFS, i.e. the assets the browser loads — against the section
+// markup rendered from templates/settings_policy.html. Nothing is re-implemented
+// here: the modules are evaluated as-is and driven through their exported entry
+// points and the DOM the template actually produces.
 //
-// The cases are paired on purpose. Alongside "a save is accepted" there is "a
+// The cases are paired on purpose. Every readout is asserted in its healthy state
+// and in each state the design contract enumerates as unhealthy, because a panel
+// that only ever renders "current" and "no error" cannot be told apart from one
+// that never reads the server at all. Alongside "a save is accepted" there is "a
 // refused enablement must not stay visible as enabled", and alongside "a sync
 // succeeds" there is "a failed sync is reported with the server's own wording".
-// The API double below records method, URL and body, so the payload contract is
+// The API double records method, URL and body, so the payload contract is
 // asserted rather than inferred.
 
 import (
@@ -37,19 +40,30 @@ func policySectionHTMLForTest(t *testing.T) string {
 		},
 		"asset_url": AssetURL,
 	}
-	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html", "templates/settings_save_controls.html")
+	// The per-client diagnosis card is rendered too: one of P3's actions targets
+	// its heading, and a target that only exists on the real page is exactly what
+	// a fixture that renders half the page would miss.
+	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS,
+		"templates/settings_policy.html", "templates/settings_policy_client.html", "templates/settings_save_controls.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy.html: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "settings_policy", map[string]any{
+	data := map[string]any{
 		"current_user": nil,
 		"app_version":  "test",
-	}); err != nil {
+	}
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy", data); err != nil {
 		t.Fatalf("render settings_policy: %v", err)
+	}
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_client", data); err != nil {
+		t.Fatalf("render settings_policy_client: %v", err)
 	}
 	if !strings.Contains(buf.String(), `id="policyRoutingForm"`) {
 		t.Fatal("rendered policy section does not contain the form; the fixture is wrong")
+	}
+	if !strings.Contains(buf.String(), `id="policySyncErrorTitle"`) {
+		t.Fatal("rendered policy section does not contain the sync-error readout; the fixture is wrong")
 	}
 	return buf.String()
 }
@@ -69,21 +83,50 @@ func settingsCardsModuleForTest(t *testing.T) string {
 	return string(encoded)
 }
 
-// policyControllerHarness builds a JSDOM window with the shipped module and the
+// policyScriptForTest returns one shipped policy module encoded for w.eval.
+func policyScriptForTest(t *testing.T, path string) string {
+	t.Helper()
+	module, err := StaticFS.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	encoded, err := json.Marshal(string(module))
+	if err != nil {
+		t.Fatalf("encode %s: %v", path, err)
+	}
+	return string(encoded)
+}
+
+// policyTranslatorScript stubs the page translator. Every key resolves to itself
+// so an assertion can name the exact key a branch chose; the templates whose
+// substitution is under test resolve to a recognisable shape, because a key
+// stubbed to itself would swallow the substitution and "named the value" could
+// not be told from "printed the key".
+const policyTranslatorScript = `w._ = key => {
+  if (key.indexOf('policy_sync_state_') === 0) return 'sync:' + key.slice('policy_sync_state_'.length);
+  if (key === 'policy_days_one') return '{days} day';
+  if (key === 'policy_days_other') return '{days} days';
+  if (key === 'policy_inventory_override_count_one') return 'OVERRIDE1 {count}';
+  if (key === 'policy_inventory_override_count_other') return 'OVERRIDE {count}';
+  if (key === 'policy_cdn_count_answer_one') return 'COUNT1 {count}';
+  if (key === 'policy_cdn_count_answer_other') return 'COUNT {count}';
+  if (key === 'policy_sync_error_none_body') return 'NOERR {when}';
+  if (key === 'policy_legacy_entries_retired') return 'retired entries: {entries}';
+  if (key === 'policy_legacy_source_retired') return 'retired source: {source}';
+  if (key === 'policy_legacy_urls_retired') return 'retired URLs: {count}';
+  if (key === 'policy_legacy_exclusions_retired') return 'retired exclusions: {count}';
+  return key;
+};`
+
+// policyControllerHarness builds a JSDOM window with the shipped modules and the
 // rendered section. `prelude` installs the API double before the initial load;
 // `scenario` runs after that load has settled.
 func policyControllerHarness(t *testing.T, prelude, scenario string) string {
 	t.Helper()
 
-	module, err := StaticFS.ReadFile("static/js/policy_routing.js")
-	if err != nil {
-		t.Fatalf("read policy controller: %v", err)
-	}
-	encodedModule, err := json.Marshal(string(module))
-	if err != nil {
-		t.Fatalf("encode module: %v", err)
-	}
 	encodedCards := settingsCardsModuleForTest(t)
+	encodedPanels := policyScriptForTest(t, "static/js/policy_panels.js")
+	encodedController := policyScriptForTest(t, "static/js/policy_routing.js")
 	encodedSection, err := json.Marshal(policySectionHTMLForTest(t))
 	if err != nil {
 		t.Fatalf("encode section: %v", err)
@@ -92,28 +135,9 @@ func policyControllerHarness(t *testing.T, prelude, scenario string) string {
 	return jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="policyFixtureHost"></div>', {runScripts:'outside-only'});
 const w = dom.window;
-// Every translation key resolves to itself, so an assertion can name the exact
-// key a branch chose instead of depending on English wording. Two exceptions are
-// keys whose resolution is the contract under test: the rule-count template (its
-// substituted values) and the runtime sync-state tokens (a token must be looked
-// up in the dictionary, not printed raw).
-w._ = key => {
-  if (key.indexOf('policy_sync_state_') === 0) return 'sync:' + key.slice('policy_sync_state_'.length);
-  // The two inventory templates whose substitution is under test: everything else
-  // resolves to its own key, so an assertion can name the exact key a branch chose.
-  if (key === 'policy_inventory_age_value') return '{days} d / max {max}';
-  if (key === 'policy_inventory_override_active') return 'OVERRIDE {count} · {digest}';
-  // The retirement notice carries the retired entries and counts as placeholders.
-  // A key stubbed to itself would silently swallow the substitution, so an
-  // assertion could not tell "named the entry" from "printed the key".
-  if (key === 'policy_legacy_entries_retired') return 'retired entries: {entries}';
-  if (key === 'policy_legacy_source_retired') return 'retired source: {source}';
-  if (key === 'policy_legacy_urls_retired') return 'retired URLs: {count}';
-  if (key === 'policy_legacy_exclusions_retired') return 'retired exclusions: {count}';
-  return key;
-};
+%s
 
-// calls records every request the controller made. The responder decides the
+// calls records every request the module made. The responder decides the
 // answer per URL, which is what lets a case hold a failure and its recovery.
 const calls = [];
 let responder = null;
@@ -168,12 +192,17 @@ const badge = () => {
   return {text: el.textContent, enabled: el.getAttribute('data-enabled')};
 };
 const text = id => w.document.getElementById(id).textContent;
+const el = id => w.document.getElementById(id);
+const hidden = id => el(id).hasAttribute('hidden');
+const answerState = id => el(id).getAttribute('data-state');
+const answerIcon = id => el(id).querySelector('use').getAttribute('href');
+const activeId = () => (w.document.activeElement ? w.document.activeElement.id : '');
 
-// Evaluate the module before the section exists: the auto-init entry point must
+// Evaluate the modules before the section exists: the auto-init entry point must
 // be inert without a form, and the test then installs the real markup.
 (async () => {
-// The page loads the card module before the controller, and the controller hands
-// the commit control, the busy state and the focus to it.
+// The page loads the card module, then the readouts module, then the controller.
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 assert.equal(w.initPolicyRouting(), false, 'init must be inert without the section');
@@ -191,7 +220,7 @@ await settle();
 console.log('POLICY_SCENARIO_OK');
 dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedCards), string(encodedModule), string(encodedSection), prelude, scenario)
+`, policyTranslatorScript, string(encodedCards), string(encodedPanels), string(encodedController), string(encodedSection), prelude, scenario)
 }
 
 // runPolicyControllerScenario executes one scenario and fails the test with the
@@ -229,30 +258,47 @@ func policyCDNPayloadForTest(t *testing.T) string {
 }
 
 // policyRecordScript is the API double's default answer: a record carrying an
-// operator exception list, plus the runtime snapshot and counters the status block
-// reads.
+// operator exception list, plus the runtime snapshot the four panels read. It
+// deliberately answers no other URL: the page no longer fetches the traffic
+// counters, so a request for them fails the scenario instead of quietly passing.
 func policyRecordScript(t *testing.T, enabled bool, exceptions string) string {
 	t.Helper()
 	return fmt.Sprintf(`
 const cdn = %s;
 const record = () => ({enabled: %t, proxy_exceptions: %s, sync_interval_seconds: 21600,
   inventory_override: [],
-  status: {enabled: %t, cidr_count: 56, sync_state: 'synced',
+  status: {enabled: %t, ready: true, cidr_count: 56, sync_state: 'synced',
            last_success: '2026-11-14T10:00:00Z', last_error: '',
            cdn: cdn,
            inventory: {source: 'ipdeny', source_url: 'https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone',
                        retrieved_at: '2026-11-19', prefix_count: 8664, override_prefix_count: 0,
                        age_days: 1, max_age_days: 180, stale: false}}});
-const stats = () => ({proxy_bytes: 2048, direct_bytes: 1048576, proxy_drops: 3, direct_drops: 0});
+// The initial load runs before the scenario body, so the default answer is
+// installed here. No /stats branch exists: the page no longer reads the retired
+// counters, and an unexpected request fails the scenario instead of passing.
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return stats();
-  if (url.endsWith('/api/vpn/policy')) return record();
+  if (url.endsWith('/api/vpn/policy') && (!opts.method || opts.method === 'GET')) {
+    return record();
+  }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };`, policyCDNPayloadForTest(t), enabled, exceptions, enabled)
 }
 
 func TestPolicyRoutingControllerInitialRender(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24", "198.51.100.7/32"]`), `
+	runPolicyControllerScenario(t, `
+const cdn = `+policyCDNPayloadForTest(t)+`;
+responder = async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy') && (!opts.method || opts.method === 'GET')) {
+    return {enabled: false, proxy_exceptions: ["203.0.113.0/24", "198.51.100.7/32"],
+      sync_interval_seconds: 21600, inventory_override: [],
+      status: {enabled: false, ready: false, cidr_count: 56, sync_state: 'disabled',
+               last_success: '2026-11-14T10:00:00Z', last_error: '',
+               cdn: cdn,
+               inventory: {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: 8664,
+                           override_prefix_count: 0, age_days: 1, max_age_days: 180, stale: false}}};
+  }
+  throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
+};`, `
 assert.equal(toggle(), false, 'the saved record is disabled, so the toggle must be off');
 assert.equal(w.document.getElementById('policy_proxy_exceptions').value,
   '203.0.113.0/24\n198.51.100.7/32',
@@ -260,27 +306,33 @@ assert.equal(w.document.getElementById('policy_proxy_exceptions').value,
 assert.equal(badge().enabled, 'false', 'a disabled record must not render an enabled badge');
 assert.equal(badge().text, 'policy_status_disabled');
 assert.match(text('policyLastSuccess'), /\d{4}|\d{1,2}:\d{2}/, 'the last success must be a timestamp, not "never"');
-assert.equal(text('policyLastError'), 'policy_none');
-assert.equal(text('policyRuleCount'), '56', 'the rule count is the published prefix count');
-assert.equal(text('policySyncState'), 'sync:synced',
+assert.equal(text('policySyncState'), 'sync:disabled',
   'the runtime sync-state token must be looked up in the dictionary, not printed raw');
-assert.equal(text('policyProxyBytes'), '2.00 KiB');
-assert.equal(text('policyDirectBytes'), '1.00 MiB');
-assert.equal(text('policyProxyDrops'), '3');
-assert.equal(text('policyDirectDrops'), '0');
-assert.equal(w.document.getElementById('policyCustomUrlsGroup'), null,
-  'the removed custom-URL group must not be rendered');
+assert.equal(text('policyRuleCount'), '56', 'the rule count is the published prefix count');
+// P1 answers from the runtime, not from the saved switch: both are off here.
+assert.equal(answerState('policyStatusAnswer'), 'info');
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_off');
+assert.equal(text('policyStatusAnswerBody'), 'policy_status_off_body');
+assert.equal(hidden('policyStatusActionSettings'), false, 'the off answer offers the settings link');
+assert.equal(hidden('policyStatusActionError'), true, 'with no failure there is no error link');
+// The removed traffic counters must not be fetched at all.
+assert.equal(requestsTo('/api/vpn/policy/stats', 'GET').length, 0,
+  'the retired counters panel must not fetch /stats');
 // The inventory block reports the shipped set's own provenance and says plainly
 // that no operator override is in force.
+assert.equal(answerState('policyInventoryAnswer'), 'success');
+assert.equal(text('policyInventoryAnswerHeadline'), 'policy_inventory_current');
+assert.equal(text('policyInventoryAge'), '1 day', 'a one-day-old artifact reads in the singular');
+assert.equal(text('policyInventoryLimit'), '180 days', 'the freshness limit is its own fact');
+assert.equal(text('policyInventoryOverrideStatus'), 'policy_inventory_override_none',
+  'an absent override must read as "not configured", not as an empty override');
 assert.equal(text('policyInventorySource'), 'ipdeny');
 assert.equal(text('policyInventoryPrefixes'), '8664');
 assert.equal(text('policyInventoryRetrieved'), '2026-11-19');
-assert.equal(text('policyInventoryAge'), '1 d / max 180',
-  'a fresh artifact reports its age against the configured bound, without the stale marker');
-assert.equal(text('policyInventoryOverrideStatus'), 'policy_inventory_override_none',
-  'an absent override must read as "shipped set only", not as an empty override');
+assert.equal(hidden('policyInventoryDigestRow'), true, 'without an override there is no digest to show');
 assert.equal(text('policyInventoryNotice'), '', 'a usable artifact needs no warning');
-assert.equal(requestsTo('/api/vpn/policy/stats', 'GET').length, 1, 'counters come from the server exactly once');
+assert.equal(w.document.getElementById('policyCustomUrlsGroup'), null,
+  'the removed custom-URL group must not be rendered');
 `)
 }
 
@@ -289,11 +341,10 @@ func TestPolicyRoutingControllerSaveAccepted(t *testing.T) {
 // The operator types an exception list and toggles the master switch on; the
 // server accepts both.
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 1};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     return {status: 'ok', enabled: true, proxy_exceptions: ['203.0.113.0/24'],
             sync_interval_seconds: 21600,
-            policy_status: {enabled: true, cidr_count: 1,
+            policy_status: {enabled: true, ready: true, cidr_count: 1,
                             sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}};
   }
   if (url.endsWith('/api/vpn/policy')) return {enabled: false, proxy_exceptions: [],
@@ -316,7 +367,9 @@ assert.equal(alertText().text, 'policy_saved');
 assert.equal(toggle(), true, 'the accepted record is reflected in the form');
 assert.equal(badge().enabled, 'true', 'the runtime snapshot the server returned is enabled');
 assert.equal(text('policyRuleCount'), '1', 'the rule count is the published prefix count');
-assert.equal(text('policyDirectDrops'), '1', 'counters are refreshed from the stats endpoint');
+// The accepted snapshot is rendered by the panels module as well.
+assert.equal(answerState('policyStatusAnswer'), 'success');
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_active');
 `)
 }
 
@@ -327,7 +380,6 @@ func TestPolicyRoutingControllerRefusedEnableIsNotShownEnabled(t *testing.T) {
 // operator's edit stays in the form, marked unsaved.
 let putCalls = 0;
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     putCalls++;
     const err = new Error('direct egress is unavailable');
@@ -361,7 +413,7 @@ assert.equal(card().getAttribute('aria-busy'), 'false');
 assert.equal(w.document.getElementById('policySaveBtn').disabled, false, 'the operator can try again');
 assert.equal(badge().enabled, 'false', 'the badge follows what the server runs, not the refused intent');
 assert.equal(text('policyLastError'), 'direct egress is unavailable',
-  'the status block must show the server-reported error');
+  'the sync-error readout must show the server-reported error verbatim');
 `)
 }
 
@@ -402,10 +454,9 @@ responder = async (url, opts) => {
     err.data = {error: 'unavailable', detail: 'VPN data plane is not available'};
     throw err;
   }
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy')) {
     return {enabled: true, sync_interval_seconds: 21600,
-            status: {enabled: true, cidr_count: 0,
+            status: {enabled: true, ready: false, cidr_count: 0,
                      sync_state: 'error', last_success: '', last_error: 'VPN data plane is not available'}};
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
@@ -424,17 +475,21 @@ assert.equal(w.document.getElementById('policySyncBtnText').textContent, 'policy
 assert.ok(w.document.getElementById('policySyncSpinner').classList.contains('hidden'),
   'the spinner must be hidden after a failed sync');
 assert.ok(requestsTo('/api/vpn/policy/sync', 'POST').length === 1, 'exactly one sync was attempted');
+// The readout states the failure and offers the retry that the state allows.
+assert.equal(answerState('policySyncErrorAnswer'), 'danger');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_failed');
+assert.equal(text('policySyncErrorAnswerBody'), 'policy_sync_error_failed_body_not_ready');
+assert.equal(hidden('policySyncNowBtn'), false, 'a retryable failure offers the retry control');
 
 // 2. The next sync succeeds and the status block adopts the new snapshot.
 responder = async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/sync')) {
     return {status: 'ok', published: true, version: 2, generation_id: 'gen-2',
-            policy_status: {enabled: true, cidr_count: 4,
+            policy_status: {enabled: true, ready: true, cidr_count: 4,
                             sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   }
-  if (url.endsWith('/stats')) return {proxy_bytes: 4096, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy')) return {enabled: true,
-    sync_interval_seconds: 21600, status: {enabled: true, 
+    sync_interval_seconds: 21600, status: {enabled: true, ready: true,
     cidr_count: 4, sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
@@ -445,7 +500,9 @@ assert.equal(alertText().state, 'success', 'a completed sync is reported as succ
 assert.equal(alertText().text, 'policy_sync_ok');
 assert.equal(text('policyRuleCount'), '4', 'the status block adopts the new snapshot');
 assert.equal(text('policyLastError'), 'policy_none', 'a recovered sync clears the reported error');
-assert.equal(text('policyProxyBytes'), '4.00 KiB', 'counters are re-read after a successful sync');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_none',
+  'the retry readout returns to the healthy answer');
+assert.equal(hidden('policySyncNowBtn'), true, 'the retry control is gone once the sync succeeds');
 `)
 }
 
@@ -456,7 +513,6 @@ func TestPolicyRoutingControllerExceptionListPayload(t *testing.T) {
 editField('policy_proxy_exceptions',
   '  203.0.113.0/24  \n\n 198.51.100.7 \n');
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     const err = new Error('proxy exception rejected: proxy exception must be an IPv4 address or prefix');
     err.status = 400;
@@ -500,15 +556,14 @@ let putCalls = 0;
 let syncCalls = 0;
 const accepted = () => ({status: 'ok', enabled: true,
   sync_interval_seconds: 21600,
-  policy_status: {enabled: true, cidr_count: 0,
+  policy_status: {enabled: true, ready: true, cidr_count: 0,
                   sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}});
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy/sync')) {
     syncCalls++;
     await new Promise(resolve => setTimeout(resolve, 10));
     return {status: 'ok', published: true,
-            policy_status: {enabled: true, sync_state: 'synced'}};
+            policy_status: {enabled: true, ready: true, sync_state: 'synced'}};
   }
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     putCalls++;
@@ -547,14 +602,13 @@ const initialGate = new Promise(resolve => { releaseInitial = resolve; });
 // The stored record is enabled, carries a non-default refresh interval and an
 // operator exception list, so the load has something to reveal.
 let stored = {enabled: true, proxy_exceptions: ['203.0.113.0/24'], sync_interval_seconds: 7200,
-  status: {enabled: true, sync_state: 'synced', cidr_count: 1,
+  status: {enabled: true, ready: true, sync_state: 'synced', cidr_count: 1,
            last_success: '2026-11-15T00:00:00Z', last_error: ''}};
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (opts.method === 'PUT') {
     const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
     stored = Object.assign({}, body,
-      {status: {enabled: body.enabled, sync_state: 'disabled'}});
+      {status: {enabled: body.enabled, ready: true, sync_state: 'disabled'}});
     return Object.assign({}, stored, {status: 'ok', policy_status: stored.status});
   }
   // The first read is held: the record has not reached the form yet.
@@ -622,17 +676,22 @@ func TestPolicyRoutingControllerFailedRecoveryKeepsRuntimeState(t *testing.T) {
 let offline = false;
 const stored = () => ({enabled: true,
   sync_interval_seconds: 7200,
-  status: {enabled: false, sync_state: 'error', cidr_count: 0,
+  status: {enabled: false, ready: false, sync_state: 'error', cidr_count: 0,
            last_success: '', last_error: 'activation failed: list source unavailable'}});
 responder = async (url) => {
   if (offline) throw new TypeError('Failed to fetch');
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   return stored();
 };
 `, `
 assert.equal(toggle(), true, 'stored intent stays enabled through the failed activation');
 assert.equal(badge().enabled, 'false', 'the badge follows the runtime, not the stored intent');
 assert.equal(text('policyLastError'), 'activation failed: list source unavailable');
+// The panel states the startup failure and does not offer a retry that cannot
+// start the runtime.
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_not_active');
+assert.equal(text('policyStatusAnswerBody'), 'policy_status_start_failed_body');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_did_not_start');
+assert.equal(hidden('policySyncNowBtn'), true, 'a startup failure is not retryable from here');
 
 // The panel becomes unreachable: the save and its recovery read both fail.
 offline = true;
@@ -654,15 +713,15 @@ assert.equal(text('policySyncState'), 'sync:error');
 
 // Ordinary control: a fresh observation that reports an active runtime.
 responder = async (url) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   return {enabled: true, sync_interval_seconds: 7200,
-          status: {enabled: true, sync_state: 'synced',
+          status: {enabled: true, ready: true, sync_state: 'synced',
                    cidr_count: 0, last_success: '2026-11-15T02:00:00Z', last_error: ''}};
 };
 await w.loadPolicySettings();
 await settle();
 assert.equal(badge().enabled, 'true', 'a fresh snapshot still drives the badge');
 assert.equal(text('policyLastError'), 'policy_none');
+assert.equal(text('policyRuleCount'), '0', 'a loaded rule count of zero is a valid count, not a missing value');
 `)
 }
 
@@ -673,7 +732,6 @@ assert.equal(text('policyLastError'), 'policy_none');
 func TestPolicyRoutingControllerRuntimeSnapshotShapeIsStrict(t *testing.T) {
 	runPolicyControllerScenario(t, `
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (opts.method === 'PUT') {
     // Management-only deployment: the record saves, but there is no runtime to
     // observe, so the only status field in the answer is the result code.
@@ -686,6 +744,12 @@ responder = async (url, opts) => {
 assert.equal(badge().enabled, 'unknown',
   'without a runtime snapshot the badge must not repeat the stored intent');
 assert.equal(badge().text, 'policy_status_unknown');
+// Every readout says it has no snapshot rather than rendering a neutral answer.
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_unavailable');
+assert.equal(text('policySyncState'), 'policy_not_available');
+assert.equal(text('policyLastSuccess'), 'policy_not_available');
+assert.equal(text('policyRuleCount'), 'policy_not_available');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_unavailable');
 
 w.document.getElementById('policy_enabled').checked = true;
 await w.savePolicySettings();
@@ -694,6 +758,34 @@ assert.equal(alertText().state, 'success');
 assert.equal(toggle(), true, 'the accepted record is applied to the form');
 assert.equal(badge().enabled, 'unknown',
   'the PUT result code "ok" must not be promoted to a runtime snapshot');
+`)
+}
+
+// TestPolicyRuleCountDistinguishesZeroFromUnreported pins the difference between a
+// count the server reported as zero and a count it did not report at all. "0 loaded
+// rules" is a real, healthy answer; a missing count rendered as 0 would tell an
+// operator the classifier has nothing loaded when the snapshot simply said nothing.
+func TestPolicyRuleCountDistinguishesZeroFromUnreported(t *testing.T) {
+	runPolicyControllerScenario(t, `
+let snapshot = () => ({enabled: true, ready: true, sync_state: 'synced',
+  last_success: '2026-11-15T00:00:00Z', last_error: ''});
+responder = async () => ({enabled: true, sync_interval_seconds: 21600, status: snapshot()});
+`, `
+const ruleDetails = el('policyRuleDetails');
+ruleDetails.open = true;
+assert.equal(text('policyRuleCount'), 'policy_not_available',
+  'a snapshot that reports no rule count must not be read as zero loaded rules');
+assert.equal(hidden('policyRuleDetails'), false,
+  'the rule count stays reachable while its value is unavailable');
+
+snapshot = () => ({enabled: true, ready: true, cidr_count: 0, sync_state: 'synced',
+  last_success: '2026-11-15T00:00:00Z', last_error: ''});
+await w.loadPolicySettings();
+await settle();
+assert.equal(text('policyRuleCount'), '0',
+  'zero loaded rules is a valid count and must read as zero');
+assert.equal(ruleDetails.open, true,
+  'a refresh does not close the disclosure the operator opened');
 `)
 }
 
@@ -706,14 +798,13 @@ func TestPolicyRoutingControllerInventoryOverride(t *testing.T) {
 const recordWith = (inventory) => ({
   enabled: false, sync_interval_seconds: 21600,
   inventory_override: ['203.0.113.0/24'],
-  status: {enabled: false, cidr_count: 0,
+  status: {enabled: false, ready: false, cidr_count: 0,
            sync_state: 'disabled', last_success: '', last_error: '', inventory: inventory}
 });
 const shipped = {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: 8664,
                  sha256: 'a115697bb8ca', override_prefix_count: 0, age_days: 2,
                  max_age_days: 180, stale: false};
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     return {status: 'ok', enabled: false,
             inventory_override: ['198.51.100.0/24', '203.0.113.0/24'],
@@ -729,12 +820,14 @@ responder = async (url, opts) => {
 assert.equal(w.document.getElementById('policy_inventory_override').value, '203.0.113.0/24',
   'the override textarea is populated from the record');
 assert.equal(text('policyInventoryOverrideStatus'), 'policy_inventory_override_none');
-assert.equal(text('policyInventoryAge'), '2 d / max 180');
+assert.equal(text('policyInventoryAge'), '2 days');
 assert.equal(text('policyInventoryNotice'), '');
+assert.equal(hidden('policyInventoryDigestRow'), true);
 
 // The operator replaces it; the payload carries the edited list, and the answer
-// renders the accepted override beside the shipped set, with the stale marker the
-// server reported and the digest that distinguishes two overrides of equal size.
+// renders the accepted override beside the shipped set, with the stale verdict
+// the server reported and the digest that distinguishes two overrides of equal
+// size.
 editField('policy_inventory_override', ' 198.51.100.0/24 \n\n 203.0.113.0/24 ');
 await w.savePolicySettings();
 await settle();
@@ -745,31 +838,60 @@ assert.deepEqual(puts[0].body.inventory_override, ['198.51.100.0/24', '203.0.113
   'the payload carries the override prefixes, trimmed and without blank lines');
 assert.equal(text('policyInventoryPrefixes'), '8664',
   'the shipped prefix count stays the shipped count while an override is in force');
-assert.equal(text('policyInventoryOverrideStatus'), 'OVERRIDE 2 · deadbeefcafe',
-  'the override is reported beside the shipped set, identified by its digest');
-assert.equal(text('policyInventoryAge'), '200 d / max 180 · policy_inventory_stale',
-  'a stale artifact is marked stale, not presented as current');
+assert.equal(text('policyInventoryOverrideStatus'), 'OVERRIDE 2',
+  'the override is reported beside the shipped set, by its configured count');
+assert.equal(text('policyInventoryAge'), '200 days',
+  'the age is the artifact age the server reported');
+assert.equal(text('policyInventoryLimit'), '180 days', 'the limit is reported beside the age');
+assert.equal(text('policyInventoryDigest'), 'deadbeefcafe',
+  'the digest is shown, truncated to its reading length, so two overrides of equal size differ');
+assert.equal(hidden('policyInventoryDigestRow'), false, 'with an override the digest row is shown');
+assert.equal(answerState('policyInventoryAnswer'), 'warning',
+  'a stale artifact is marked for attention, not presented as current');
+assert.equal(text('policyInventoryAnswerHeadline'), 'policy_inventory_update_needed');
+assert.equal(text('policyInventoryAnswerBody'), 'policy_inventory_update_needed_body');
+// A single configured prefix reads in the singular.
+responder = async (url, opts) => {
+  return recordWith(Object.assign({}, shipped, {override_prefix_count: 1, override_sha256: 'aaaabbbbcccc'}));
+};
+await w.loadPolicySettings();
+await settle();
+assert.equal(text('policyInventoryOverrideStatus'), 'OVERRIDE1 1');
 `)
 }
 
 // TestPolicyRoutingControllerInventoryUnusable keeps the broken-artifact case
 // visible: an operator who sees an empty grid cannot tell "no data" from "the set
-// is broken and address-based direct routing is unavailable".
+// is broken and the classifier cannot be installed".
 func TestPolicyRoutingControllerInventoryUnusable(t *testing.T) {
 	runPolicyControllerScenario(t, `
 responder = async (url) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   return {enabled: false, sync_interval_seconds: 21600,
-          status: {enabled: false, cidr_count: 0,
+          status: {enabled: false, ready: false, cidr_count: 0,
                    sync_state: 'disabled', last_error: '',
                    inventory: {error: 'inventory provenance does not match the committed data',
                                prefix_count: 0, max_age_days: 180}}};
 };
 `, `
-assert.equal(text('policyInventoryPrefixes'), '0',
-  'an unusable artifact reports no usable prefix count');
-assert.equal(text('policyInventoryNotice'), 'policy_inventory_unusable inventory provenance does not match the committed data',
-  'the reported error is shown, so a broken set does not read as an empty one');
+assert.equal(answerState('policyInventoryAnswer'), 'danger');
+assert.equal(text('policyInventoryAnswerHeadline'), 'policy_inventory_unusable_headline');
+assert.equal(text('policyInventoryAnswerBody'), 'policy_inventory_unusable',
+  'the unusable answer is the reported state, not a placeholder age');
+assert.equal(text('policyInventoryPrefixes'), 'policy_not_available',
+  'an unusable artifact reports no usable prefix count, never zero');
+assert.equal(text('policyInventoryAge'), 'policy_not_available',
+  'the age is unavailable rather than a placeholder day count');
+assert.equal(text('policyInventoryLimit'), '180 days',
+  'the reported freshness threshold is kept even when the artifact is unusable');
+assert.equal(text('policyInventoryNotice'), 'inventory provenance does not match the committed data',
+  'the reported error is preserved verbatim inside the disclosure');
+assert.equal(hidden('policyInventoryActionStatus'), false,
+  'the unusable answer points at the panel that states the active routing state');
+
+// The action moves focus to the named heading, and opens nothing it does not need.
+el('policyInventoryActionStatus').click();
+assert.equal(activeId(), 'policyStatusTitle',
+  'the action must move focus to the policy status heading, not only change the URL');
 `)
 }
 
@@ -780,13 +902,13 @@ assert.equal(text('policyInventoryNotice'), 'policy_inventory_unusable inventory
 func TestPolicyRoutingControllerCDNExclusions(t *testing.T) {
 	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), fmt.Sprintf(`
 const expected = %s;
+assert.equal(answerState('policyCdnAnswer'), 'success');
+assert.equal(text('policyCdnAnswerHeadline'), 'COUNT ' + expected.entries.length,
+  'the headline states how many networks the classifier excludes');
+assert.equal(text('policyCdnAnswerBody'), 'policy_cdn_count_answer_body');
 const rows = w.document.querySelectorAll('#policyCdnEntries li');
-assert.equal(text('policyCdnSource'), expected.source,
-  'the block must name where the set comes from');
-assert.equal(text('policyCdnCount'), String(expected.entries.length),
-  'the count must be the number of networks the classifier excludes');
 assert.equal(rows.length, expected.entries.length,
-  'every excluded network the server reported must be listed');
+  'every excluded network the server reported must be listed, in server order');
 for (let i = 0; i < expected.entries.length; i++) {
   const entry = expected.entries[i];
   assert.ok(rows[i].textContent.indexOf(entry.provider) !== -1,
@@ -794,32 +916,43 @@ for (let i = 0; i < expected.entries.length; i++) {
   assert.ok(rows[i].textContent.indexOf('AS' + entry.asn) !== -1,
     'entry ' + i + ' must name its ASN, got: ' + rows[i].textContent);
 }
+assert.equal(hidden('policyCdnNetworksDetails'), false,
+  'the populated set is reachable behind its own disclosure');
+assert.equal(hidden('policyCdnExclusionDetails'), true,
+  'the disclosure reserved for an unusable set is not rendered for a usable one');
+assert.equal(text('policyCdnSource'), expected.source,
+  'the block must name where the set comes from');
+assert.equal(text('policyCdnCount'), String(expected.entries.length),
+  'the count must be the number of networks the classifier excludes');
 assert.equal(text('policyCdnNotice'), '', 'a usable set carries no warning');
 `, policyCDNPayloadForTest(t)))
 }
 
-// TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable keeps the two honest
-// failure shapes apart: a set that is genuinely empty (every CDN destination is
-// proxied) must not read as a set that could not be reported, and the other way
-// round. Neither may be rendered as an invented count.
+// TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable keeps the three honest
+// shapes apart: a set that is genuinely empty (no network excluded) must not read
+// as a set that could not be reported, an unreported set must not read as empty,
+// and neither may be rendered as an invented count.
 func TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable(t *testing.T) {
 	runPolicyControllerScenario(t, `
 const recordWith = (cdn) => ({enabled: false,
   sync_interval_seconds: 21600,
-  status: {enabled: false, cidr_count: 0,
+  status: {enabled: false, ready: false, cidr_count: 0,
            sync_state: 'disabled', cdn: cdn}});
 let answer = () => recordWith({source: 'geodb.KnownCDNASNs', entries: []});
-responder = async (url) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
-  return answer();
-};
+responder = async (url) => answer();
 `, `
 // 1. The set is reported and empty.
 assert.equal(text('policyCdnCount'), '0',
   'an empty exclusion set has a count of zero, not a blank');
 assert.equal(text('policyCdnEntries'), 'policy_cdn_empty',
-  'an empty set must say that the classifier excludes nothing');
+  'an empty set must say that no network is excluded');
+assert.equal(text('policyCdnAnswerHeadline'), 'COUNT 0',
+  'the headline count is zero, stated as a fact');
+assert.equal(text('policyCdnAnswerBody'), 'policy_cdn_empty_body',
+  'an empty list is evidence about this list only, so the body says so');
 assert.equal(text('policyCdnNotice'), '', 'an empty set is not an error');
+assert.equal(hidden('policyCdnExclusionDetails'), false,
+  'an empty set keeps its source reachable behind the exclusion details');
 
 // 2. The set cannot be described: the count is unknown, not zero, and the server
 // reason is shown so the block does not read as "nothing is excluded".
@@ -827,40 +960,82 @@ answer = () => recordWith({source: 'geodb.KnownCDNASNs',
   error: 'CDN exclusion entry is unusable: AS0 ""'});
 await w.loadPolicySettings();
 await settle();
-assert.equal(text('policyCdnCount'), '-',
+assert.equal(answerState('policyCdnAnswer'), 'danger');
+assert.equal(text('policyCdnAnswerHeadline'), 'policy_cdn_answer_unusable');
+assert.equal(text('policyCdnCount'), 'policy_not_available',
   'an unusable set has no count to report; zero would be a claim the server did not make');
 assert.equal(text('policyCdnEntries'), 'policy_cdn_unavailable',
   'an unusable set must not render as an empty list');
-assert.equal(text('policyCdnNotice'), 'policy_cdn_unusable CDN exclusion entry is unusable: AS0 ""',
-  'the server reason must be shown, so the failure is diagnosable');
+assert.equal(text('policyCdnNotice'), 'CDN exclusion entry is unusable: AS0 ""',
+  'the raw server reason must be preserved, so the failure is diagnosable');
+
+// 3. The deployment reported no set at all.
+answer = () => recordWith(null);
+await w.loadPolicySettings();
+await settle();
+assert.equal(text('policyCdnAnswerHeadline'), 'policy_cdn_not_reported');
+assert.equal(text('policyCdnAnswerBody'), 'policy_cdn_not_reported_body');
+assert.equal(text('policyCdnEntries'), 'policy_cdn_unavailable',
+  'an unreported set never renders as an empty one');
+assert.equal(text('policyCdnCount'), 'policy_not_available');
 `)
 }
 
-// TestPolicyRoutingModuleElementIDs guards the wiring between the module and the
-// template: every id the controller looks up must exist in the rendered section.
-func TestPolicyRoutingModuleElementIDs(t *testing.T) {
-	module, err := StaticFS.ReadFile("static/js/policy_routing.js")
-	if err != nil {
-		t.Fatalf("read policy controller: %v", err)
-	}
-	section := policySectionHTMLForTest(t)
+// TestPolicyPanelsShowLoadingNotAnAnswer holds the first read open and asserts the
+// four readouts say they are loading. A neutral "off", "current" or "no error"
+// shown before the server answered is a factual claim nobody made.
+func TestPolicyPanelsShowLoadingNotAnAnswer(t *testing.T) {
+	runPolicyControllerScenario(t, `
+let releaseInitial = null;
+const initialGate = new Promise(resolve => { releaseInitial = resolve; });
+responder = async (url) => {
+  await initialGate;
+  return {enabled: false, sync_interval_seconds: 21600,
+          status: {enabled: false, ready: false, cidr_count: 0, sync_state: 'disabled',
+                   last_success: '', last_error: ''}};
+};
+`, `
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_loading');
+assert.equal(hidden('policyStatusAnswerBody'), true, 'a loading answer carries no explanation');
+assert.equal(answerState('policyStatusAnswer'), 'loading');
+assert.equal(text('policyInventoryAnswerHeadline'), 'policy_panel_loading');
+assert.equal(text('policyCdnAnswerHeadline'), 'policy_panel_loading');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_panel_loading');
+assert.equal(text('policySyncState'), '…', 'the value placeholder must not read as a state');
+assert.equal(text('policyLastSuccess'), '…');
+assert.equal(text('policyInventoryAge'), '…');
+assert.equal(badge().enabled, 'unknown', 'the badge ships as unknown until the runtime answers');
 
-	lookup := regexp.MustCompile(`(?:policyElement|setPolicyElementText)\('([A-Za-z0-9_]+)'`)
-	matches := lookup.FindAllStringSubmatch(string(module), -1)
-	if len(matches) < 10 {
-		t.Fatalf("found only %d element lookups in the controller; the extraction is wrong", len(matches))
-	}
-	seen := map[string]bool{}
-	for _, match := range matches {
-		id := match[1]
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		if !strings.Contains(section, `id="`+id+`"`) {
-			t.Errorf("controller looks up #%s, which the rendered policy section does not define", id)
-		}
-	}
+releaseInitial();
+await settle();
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_off');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_none');
+assert.equal(text('policySyncErrorAnswerBody'), 'policy_sync_error_off_body');
+`)
+}
+
+// TestPolicyPanelsSurviveARefresh keeps a disclosure the operator opened open, and
+// keeps focus on the control they were using, across a re-read. A refresh that
+// rebuilt the readout would close the detail under them and drop their place.
+func TestPolicyPanelsSurviveARefresh(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(t, false, `["203.0.113.0/24"]`), `
+const summary = el('policyCdnNetworksDetails').querySelector('summary');
+const expected = Number(el('policyCdnCount').textContent);
+assert.ok(expected > 0, 'the fixture must list at least one excluded network');
+el('policyCdnNetworksDetails').open = true;
+summary.focus();
+assert.equal(w.document.activeElement, summary, 'focus is on the disclosure the test opens');
+
+await w.loadPolicySettings();
+await settle();
+
+assert.equal(el('policyCdnNetworksDetails').open, true,
+  'a disclosure the operator opened stays open across a refresh');
+assert.equal(w.document.activeElement, summary,
+  'focus stays on the summary the operator was using');
+assert.equal(w.document.querySelectorAll('#policyCdnEntries li').length, expected,
+  'a refresh re-lists every excluded network');
+`)
 }
 
 // The exception list is the section's one routing input, so its two directions are
@@ -879,14 +1054,13 @@ func TestPolicyRoutingControllerSendsAnExplicitEmptyList(t *testing.T) {
 // always sends the key, so the server can tell this apart from a client that has no
 // editor for it.
 responder = async (url, opts) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
     return {status: 'ok', enabled: false, proxy_exceptions: [], sync_interval_seconds: 21600,
-            policy_status: {enabled: false, cidr_count: 4, sync_state: 'disabled'}};
+            policy_status: {enabled: false, ready: false, cidr_count: 4, sync_state: 'disabled'}};
   }
   if (url.endsWith('/api/vpn/policy')) return {enabled: false, proxy_exceptions: ['203.0.113.0/24'],
     sync_interval_seconds: 21600,
-    status: {enabled: false, cidr_count: 4, sync_state: 'disabled'}};
+    status: {enabled: false, ready: false, cidr_count: 4, sync_state: 'disabled'}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
 editField('policy_proxy_exceptions', '');
@@ -910,12 +1084,8 @@ const retired = {source_selection: 'aggregate', custom_url_count: 1, excluded_do
   non_ipv4_entries: ['example.com'], summary: 'irrelevant to the rendering'};
 const record = () => ({enabled: true, proxy_exceptions: ['198.51.100.0/24'], sync_interval_seconds: 21600,
   inventory_override: [], retired: retired,
-  status: {enabled: true, cidr_count: 1, sync_state: 'synced', last_success: '', last_error: ''}});
-responder = async (url) => {
-  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
-  if (url.endsWith('/api/vpn/policy')) return record();
-  throw new Error('unexpected ' + url);
-};
+  status: {enabled: true, ready: true, cidr_count: 1, sync_state: 'synced', last_success: '', last_error: ''}});
+responder = async (url) => record();
 `, `
 // The surviving IPv4 entry is shown, and the retired domain line is named rather
 // than only counted: the operator is the one who recognises what they wrote.
@@ -940,4 +1110,64 @@ func TestPolicyRoutingControllerSilentWhenNothingWasRetired(t *testing.T) {
 assert.equal(text('policyLegacyNotice'), '',
   'a record that carried nothing retired must not render a warning');
 `)
+}
+
+// TestPolicyRoutingModuleElementIDs guards the wiring between the modules and the
+// template: every id the scripts look up must exist in the rendered section. The
+// check reads the modules rather than a list, so an id added to a readout is
+// covered without editing it.
+func TestPolicyRoutingModuleElementIDs(t *testing.T) {
+	section := policySectionHTMLForTest(t)
+
+	lookup := regexp.MustCompile(`(?:policyElement|setPolicyElementText|panelElement|setPanelText|setPanelAnswer|setPanelActions)\('([A-Za-z0-9_]+)'`)
+	// Panel ids are also built from literals that are passed around rather than
+	// looked up inline, so every element-id-shaped literal counts as a lookup.
+	literal := regexp.MustCompile(`'(policy[A-Z][A-Za-z0-9_]*)'`)
+
+	seen := map[string]bool{}
+	checked := 0
+	for _, path := range []string{"static/js/policy_routing.js", "static/js/policy_panels.js"} {
+		module, err := StaticFS.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		ids := []string{}
+		for _, match := range lookup.FindAllStringSubmatch(string(module), -1) {
+			ids = append(ids, match[1])
+		}
+		for _, match := range literal.FindAllStringSubmatch(string(module), -1) {
+			ids = append(ids, match[1])
+		}
+		for _, id := range ids {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			checked++
+			if !strings.Contains(section, `id="`+id+`"`) {
+				t.Errorf("%s looks up #%s, which the rendered policy section does not define", path, id)
+			}
+		}
+	}
+	if checked < 40 {
+		t.Fatalf("checked only %d element ids; the extraction is wrong", checked)
+	}
+	// Every in-page action names its focus target in the markup, so the targets are
+	// read from the rendered section: a typo in data-policy-focus would otherwise
+	// produce a link that moves focus nowhere, and no module lookup would notice.
+	focusTarget := regexp.MustCompile(`data-policy-focus="([A-Za-z0-9_]+)"`)
+	targets := focusTarget.FindAllStringSubmatch(section, -1)
+	if len(targets) < 3 {
+		t.Fatalf("the rendered section declares only %d in-page focus targets; the extraction is wrong", len(targets))
+	}
+	for _, match := range targets {
+		if !strings.Contains(section, `id="`+match[1]+`"`) {
+			t.Errorf("an in-page action targets #%s, which the rendered section does not define", match[1])
+		}
+	}
+	for _, id := range []string{"policyClientTitle", "policy_enabled", "policy_inventory_override"} {
+		if !strings.Contains(section, `data-policy-focus="`+id+`"`) {
+			t.Errorf("the action targeting #%s is missing from the markup; a broken link would pass unnoticed", id)
+		}
+	}
 }
