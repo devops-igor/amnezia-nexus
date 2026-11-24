@@ -85,6 +85,8 @@ responder = async (url, opts) => {
 `, `
 const retry = el('policySyncNowBtn');
 assert.equal(hidden('policySyncNowBtn'), false, 'an active sync failure offers the retry');
+assert.ok(retry.classList.contains('policy-answer-action'),
+  'the retry carries the readout action treatment: 44 px target and no shared motion');
 retry.focus();
 assert.equal(activeId(), 'policySyncNowBtn', 'the operator activates the retry from focus');
 

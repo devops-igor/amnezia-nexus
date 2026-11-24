@@ -119,9 +119,21 @@
     }
     /* The actions are the shared secondary button: its ink, hover and focus are
        the treatments the rest of the panel already uses, measured in both themes.
-       Only the target size is page-local, because these sit inside a readout. */
+       Only the target size, the wrapping and the motion are page-local, because
+       these controls sit inside a readout.
+
+       The shared button sets `white-space: nowrap`, so a localized label such as
+       "Показать последнюю ошибку синхронизации" is wider than the column a phone
+       gives it and ran past the card and the viewport. The label wraps inside the
+       space it actually has instead: the control never exceeds its container, and
+       an unbreakable run in a long translation breaks rather than pushing out. */
     #policyRoutingCard .policy-answer-action {
         min-height: 44px;
+        max-width: 100%;
+        min-width: 0;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-align: center;
         text-decoration: none;
         font-size: 0.85rem;
     }
@@ -165,8 +177,11 @@
         margin-inline-start: auto;
         width: 7px;
         height: 7px;
-        border-inline-end: 2px solid var(--text-secondary);
-        border-block-end: 2px solid var(--text-secondary);
+        /* Physical, not logical: `border-inline-end` mirrors in RTL and the same
+           rotation then points sideways. The marker is placed at the inline end by
+           `margin-inline-start: auto`; its own shape stays direction-independent. */
+        border-right: 2px solid var(--text-secondary);
+        border-bottom: 2px solid var(--text-secondary);
         transform: rotate(45deg);
     }
     #policyRoutingCard .policy-disclosure[open] > .policy-disclosure-summary::after {
@@ -320,7 +335,7 @@
                 <p class="policy-answer-headline" id="policySyncErrorAnswerHeadline">{{ _ "policy_panel_loading" }}</p>
                 <p class="policy-answer-body" id="policySyncErrorAnswerBody" hidden></p>
                 <div class="policy-answer-actions" id="policySyncErrorActions" hidden>
-                    <button type="button" class="btn btn-secondary" id="policySyncNowBtn" data-policy-action>{{ _ "policy_sync_now" }}</button>
+                    <button type="button" class="btn btn-secondary policy-answer-action" id="policySyncNowBtn" data-policy-action>{{ _ "policy_sync_now" }}</button>
                 </div>
             </div>
         </div>

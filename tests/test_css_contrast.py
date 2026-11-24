@@ -83,6 +83,22 @@ def surface(tokens: dict[str, str], name: str) -> str:
     return "#%02x%02x%02x" % tuple(flat)
 
 
+def rule_body(css: str, selector: str) -> str:
+    """Every declaration block that lists `selector`, in cascade order.
+
+    A grouped rule repeats the selector, so a presence assertion has to read all of
+    them: the last block for `.policy-answer-action` is the one that cancels its
+    motion, not the one that sets its wrapping.
+    """
+    bodies = [
+        decls
+        for head, decls in _RULE_RE.findall(css)
+        if selector in [" ".join(part.split()) for part in head.split(",")]
+    ]
+    assert bodies, f"no rule declares {selector!r}"
+    return "\n".join(bodies)
+
+
 def token_name(value: str) -> str:
     match = re.fullmatch(r"var\(--([\w-]+)\)", value)
     assert match, f"expected a design token, got {value!r}"
@@ -431,7 +447,7 @@ def test_policy_readout_disclosure_shows_an_open_closed_state() -> None:
     """The summary's marker is suppressed by the flex layout, so a replacement is required."""
     css = policy_style()
     assert re.search(
-        r"#policyRoutingCard \.policy-disclosure-summary::after\s*\{[^}]*border-inline-end[^}]*\}",
+        r"#policyRoutingCard \.policy-disclosure-summary::after\s*\{[^}]*border-right[^}]*\}",
         css,
     ), "the readout disclosure draws no open/closed indicator"
     assert re.search(
@@ -535,3 +551,64 @@ def test_policy_focus_ring_clears_the_non_text_floor(theme: str, state: str, bac
             f"{head}: --{found.group(1)} on the {state} answer inset over --{backdrop} in the "
             f"{theme} theme is {got:.2f}:1, below {contrast.AA_NON_TEXT}:1"
         )
+
+
+# ===== Readout action targets =====
+# The review measured these in a browser; these are the structural halves that keep a
+# later edit from undoing the fix, and the browser case in the policy suite is the
+# rendered measurement.
+def test_policy_readout_actions_wrap_inside_their_column() -> None:
+    """A localized label wraps; it is never clipped and never overflows its card."""
+    body = rule_body(policy_style(), "#policyRoutingCard .policy-answer-action")
+    assert "white-space: normal" in body, (
+        "the readout action inherits the shared button's nowrap, so a long localized "
+        "label cannot fit the column a phone gives it"
+    )
+    assert "overflow-wrap: anywhere" in body, (
+        "a long unbreakable translated word would still push the control out"
+    )
+    assert "max-width: 100%" in body, "the action is not bounded by its container"
+    assert "overflow: hidden" not in body, (
+        "the action hides its overflow instead of wrapping: the label would be cut"
+    )
+    # The retry is a real button in the same panel, so it has to carry the same class.
+    markup = POLICY_TEMPLATE.read_text(encoding="utf-8")
+    assert re.search(
+        r'<button[^>]*class="btn btn-secondary policy-answer-action"[^>]*id="policySyncNowBtn"',
+        markup,
+    ), "the retry button does not carry the readout action treatment"
+
+
+def test_policy_readout_actions_do_not_move() -> None:
+    """Every readout action cancels the shared button's hover lift and transition."""
+    css = policy_style()
+    for state in ("", ":hover", ":active"):
+        selector = f"#policyRoutingCard .policy-answer-action{state}"
+        body = rule_body(css, selector)
+        assert "transform: none" in body, f"{selector} keeps the shared button's lift"
+    base = rule_body(css, "#policyRoutingCard .policy-answer-action")
+    assert "transition: none" in base, (
+        "the action keeps a transition, so it moves for a reader who asked for "
+        "reduced motion"
+    )
+
+
+def test_policy_disclosure_marker_is_direction_independent() -> None:
+    """The chevron's own shape is physical; only its placement is logical."""
+    css = policy_style()
+    body = rule_body(css, "#policyRoutingCard .policy-disclosure-summary::after")
+    assert "border-right:" in body and "border-bottom:" in body, (
+        "the marker's border pair is not the physical pair that points down in both "
+        "directions"
+    )
+    assert "border-inline-end" not in body and "border-block-end" not in body, (
+        "a logical border mirrors in RTL while the rotation does not, so the marker "
+        "points sideways there"
+    )
+    assert "margin-inline-start: auto" in body, (
+        "the marker is not placed at the inline end"
+    )
+    assert not re.search(r'\[dir="rtl"\][^{]*policy-disclosure-summary::after', css), (
+        "the marker needs a direction-specific override again: its shape should not "
+        "depend on the writing direction"
+    )

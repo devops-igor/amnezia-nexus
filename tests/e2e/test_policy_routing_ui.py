@@ -29,8 +29,10 @@ The suite is registered as ``hosted-panel`` in ``runner_map.toml``. It must not
 acquire a DEV-only dependency: no SSH, no provisioning and no dataplane.
 """
 
+import json
 import random
 import uuid
+from typing import Any
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -527,4 +529,231 @@ def test_policy_readouts_layout_and_state(
     page.keyboard.press("Enter")
     assert not page.locator("#policyCdnNetworksDetails").evaluate("el => el.open"), (
         f"{width}px/{theme}: a second Enter did not close the disclosure again"
+    )
+
+
+# ── R3: action fit, target size and the RTL marker ───────────────────
+#
+# These are rendered measurements, so they live in the browser suite: a stylesheet
+# assertion cannot tell whether a translated label fits the column a phone gives it.
+
+ACTION_IDS = [
+    "policyStatusActionError",
+    "policyStatusActionSettings",
+    "policyInventoryActionStatus",
+    "policyInventoryActionOverride",
+    "policyCdnActionDiagnosis",
+    "policySyncNowBtn",
+]
+
+
+def _failure_payload() -> dict:
+    """An active runtime whose last sync failed: every readout shows an action."""
+    return {
+        "enabled": True,
+        "proxy_exceptions": [],
+        "inventory_override": [],
+        "sync_interval_seconds": 21600,
+        "status": {
+            "enabled": True,
+            "ready": False,
+            "cidr_count": 4,
+            "sync_state": "error",
+            "last_success": "2026-11-15T00:00:00Z",
+            "last_error": "sync failed: backend unavailable",
+            "cdn": {"source": "geodb.KnownCDNASNs", "entries": []},
+            "inventory": {
+                "source": "ipdeny",
+                "retrieved_at": "2026-11-19",
+                "prefix_count": 8664,
+                "age_days": 1,
+                "max_age_days": 180,
+                "stale": False,
+                "override_prefix_count": 2,
+                "override_sha256": "deadbeefcafe1234",
+            },
+        },
+    }
+
+
+def _open_settings_with_failure(page: Page, base_url: str, lang: str) -> None:
+    """Open the section in `lang` with a sync-failure snapshot served in the browser."""
+    payload = json.dumps(_failure_payload())
+
+    def fulfil(route: Any, *args: Any) -> None:
+        if route.request.url.endswith(POLICY_ENDPOINT):
+            route.fulfill(status=200, content_type="application/json", body=payload)
+            return
+        route.continue_()
+
+    page.route(f"**{POLICY_ENDPOINT}", fulfil)
+    page.goto(f"{base_url}/settings?lang={lang}")
+    page.wait_for_selector(CARD, state="visible")
+    page.wait_for_function(
+        "() => document.getElementById('policySyncNowBtn') && "
+        "!document.getElementById('policySyncErrorAnswer').getAttribute('data-state').includes('loading')"
+    )
+    expect(page.locator("#policySyncErrorAnswerHeadline")).to_have_text(
+        {
+            "en": "Rule sync failed",
+            "ru": "Синхронизация правил не удалась",
+            "fr": "Synchronisation des règles en échec",
+            "zh": "规则同步失败",
+            "fa": "همگام‌سازی قواعد ناموفق بود",
+        }[lang]
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("lang", ["ru", "fr", "en", "zh", "fa"])
+def test_policy_readout_actions_fit_a_phone_width(
+    authenticated_page: Page, base_url: str, lang: str
+) -> None:
+    """Every readout action wraps inside its card inset and inside the viewport.
+
+    The shared button sets `white-space: nowrap`, so a long localized label used to
+    run past the answer card and, in Russian and French, past the viewport itself.
+    Both bounds are measured here, because a control can fit the viewport and still
+    leave its card.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_settings_with_failure(page, base_url, lang)
+
+    bounds = page.evaluate(
+        """(ids) => {
+            const card = document.getElementById('policyRoutingCard').getBoundingClientRect();
+            const doc = document.documentElement;
+            const out = {overflow: doc.scrollWidth - doc.clientWidth, bad: []};
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                if (!el || el.hidden || el.closest('[hidden]')) continue;
+                const r = el.getBoundingClientRect();
+                const inset = el.closest('.policy-answer').getBoundingClientRect();
+                const problems = [];
+                if (r.width === 0 || r.height === 0) problems.push('not rendered');
+                if (r.left < inset.left - 0.5 || r.right > inset.right + 0.5) {
+                    problems.push('outside its answer inset');
+                }
+                if (r.left < card.left - 0.5 || r.right > card.right + 0.5) {
+                    problems.push('outside the card');
+                }
+                if (r.left < -0.5 || r.right > doc.clientWidth + 0.5) {
+                    problems.push('outside the viewport');
+                }
+                if (el.scrollWidth > el.clientWidth + 1) {
+                    problems.push('label clipped inside the control');
+                }
+                if (problems.length) out.bad.push(id + ': ' + problems.join(', '));
+            }
+            return out;
+        }""",
+        ACTION_IDS,
+    )
+    assert bounds["overflow"] <= 1, (
+        f"{lang} at 390 px scrolls {bounds['overflow']} px past the viewport"
+    )
+    assert not bounds["bad"], f"{lang} at 390 px: " + "; ".join(bounds["bad"])
+
+
+@pytest.mark.e2e
+def test_policy_retry_meets_the_target(authenticated_page: Page, base_url: str) -> None:
+    """The retry is the same 44 px target as the links beside it."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_settings_with_failure(page, base_url, "en")
+    assert page.locator("#policySyncNowBtn").evaluate("el => el.tagName") == "BUTTON", (
+        "the retry must keep its button semantics"
+    )
+    height = page.evaluate(
+        "() => document.getElementById('policySyncNowBtn').getBoundingClientRect().height"
+    )
+    assert height >= 44, f"the retry measures {height} px, below the 44 px target"
+
+
+@pytest.mark.e2e
+def test_policy_retry_does_not_move_under_reduced_motion(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The sizing treatment carries the no-motion rule to the retry as well."""
+    page = authenticated_page
+    page.emulate_media(reduced_motion="reduce")
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_settings_with_failure(page, base_url, "en")
+    measured = page.evaluate(
+        """() => {
+            const el = document.getElementById('policySyncNowBtn');
+            return {
+                reduced: matchMedia('(prefers-reduced-motion: reduce)').matches,
+                durations: getComputedStyle(el).transitionDuration.split(',')
+                    .map(v => parseFloat(v) * (v.trim().endsWith('ms') ? 1 : 1000)),
+                transform: getComputedStyle(el).transform
+            };
+        }"""
+    )
+    assert measured["reduced"], "the reduced-motion preference was not in effect"
+    assert all(value == 0 for value in measured["durations"]), (
+        f"the retry still transitions under reduced motion: {measured['durations']}"
+    )
+    assert measured["transform"] in ("none", "matrix(1, 0, 0, 1, 0, 0)"), (
+        f"the retry is transformed at rest: {measured['transform']}"
+    )
+
+
+@pytest.mark.e2e
+def test_policy_disclosure_marker_points_down_and_up_in_rtl(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The marker's shape is direction-independent; only its placement is logical."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 390, "height": 900})
+
+    def marker(lang: str) -> dict:
+        _open_settings_with_failure(page, base_url, lang)
+        return page.evaluate(
+            """() => {
+                const details = document.getElementById('policyCdnNetworksDetails');
+                const summary = details.querySelector('summary');
+                const read = () => getComputedStyle(summary, '::after').transform;
+                details.open = false;
+                const closed = read();
+                details.open = true;
+                const open = read();
+                details.open = false;
+                const marker = getComputedStyle(summary, '::after');
+                return {
+                    closed, open,
+                    direction: getComputedStyle(summary).direction,
+                    // Which sides of the marker box carry the chevron's stroke. A
+                    // logical pair mirrors here in RTL, which is the whole defect:
+                    // the pair that is drawn decides which way the corner points.
+                    right: marker.borderRightWidth,
+                    left: marker.borderLeftWidth,
+                    bottom: marker.borderBottomWidth,
+                    markerStart: parseFloat(marker.marginInlineStart) || 0
+                };
+            }"""
+        )
+
+    ltr = marker("en")
+    rtl = marker("fa")
+    assert ltr["direction"] == "ltr" and rtl["direction"] == "rtl"
+    assert ltr["closed"] != ltr["open"], "the marker does not change between states"
+    for name, markers in (("LTR", ltr), ("RTL", rtl)):
+        assert markers["right"] == "2px" and markers["bottom"] == "2px", (
+            f"the {name} marker does not draw the right+bottom pair, so its corner "
+            f"does not point down (right={markers['right']}, left={markers['left']}, "
+            f"bottom={markers['bottom']})"
+        )
+        assert markers["left"] == "0px", (
+            f"the {name} marker draws its left border, so the chevron is mirrored"
+        )
+    assert rtl["closed"] == ltr["closed"], (
+        "the closed marker is drawn differently in RTL, so it points sideways"
+    )
+    assert rtl["open"] == ltr["open"], (
+        "the open marker is drawn differently in RTL, so it points sideways"
+    )
+    assert rtl["markerStart"] > 0, (
+        "the marker is not pushed to the inline end in RTL"
     )
