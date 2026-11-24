@@ -31,9 +31,6 @@ type mockOrchProtocolManager struct {
 	rotateFunc      func(ctx context.Context, server *models.Server, clientID string) (string, error)
 	returnError     bool
 	addClientCalls  int
-	// clientQueries records the server id of every GetClients call, so a test can
-	// show that a job did not open a session to a particular server.
-	clientQueries []int64
 }
 
 func newMockOrchProtocolManager(proto string) *mockOrchProtocolManager {
@@ -58,9 +55,6 @@ func (m *mockOrchProtocolManager) Uninstall(ctx context.Context, server *models.
 func (m *mockOrchProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if server != nil {
-		m.clientQueries = append(m.clientQueries, server.ID)
-	}
 	if m.returnError {
 		return nil, errors.New("get clients error")
 	}

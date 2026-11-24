@@ -8,11 +8,40 @@ package reconciliation
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+// recordingStatusManager records which servers a remote audit contacted. It lives
+// here rather than in the shared mock so the large existing test file does not
+// grow.
+type recordingStatusManager struct {
+	*mockStatusProtocolManager
+	mu            sync.Mutex
+	statusQueries []int64
+	clientQueries []int64
+}
+
+func (m *recordingStatusManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	m.mu.Lock()
+	if server != nil {
+		m.statusQueries = append(m.statusQueries, server.ID)
+	}
+	m.mu.Unlock()
+	return m.mockStatusProtocolManager.GetServerStatus(ctx, server)
+}
+
+func (m *recordingStatusManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	if server != nil {
+		m.clientQueries = append(m.clientQueries, server.ID)
+	}
+	m.mu.Unlock()
+	return m.mockStatusProtocolManager.GetClients(ctx, server)
+}
 
 func TestReconciliation_SkipsProviderAbsentServerRemoteAudits(t *testing.T) {
 	db, cleanup := setupTestDB(t)
@@ -38,7 +67,9 @@ func TestReconciliation_SkipsProviderAbsentServerRemoteAudits(t *testing.T) {
 
 	// container_exists=true keeps this a pure read: no protocol is judged stale,
 	// so the only thing under test is whether the backend was contacted.
-	awgMgr := &mockStatusProtocolManager{proto: "awg", containerExists: true}
+	awgMgr := &recordingStatusManager{
+		mockStatusProtocolManager: &mockStatusProtocolManager{proto: "awg", containerExists: true},
+	}
 	reg := newMockRegistry()
 	reg.Register(awgMgr)
 

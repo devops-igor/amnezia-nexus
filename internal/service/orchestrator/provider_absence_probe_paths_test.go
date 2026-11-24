@@ -10,12 +10,41 @@ package orchestrator
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+// recordingProtocolManager counts the GetClients calls a job makes per server,
+// which is the SSH session a traffic or auto-trial pass would open. It lives here
+// rather than in the shared mock so the large existing test file does not grow.
+type recordingProtocolManager struct {
+	*mockOrchProtocolManager
+	mu      sync.Mutex
+	queries []int64
+}
+
+func newRecordingProtocolManager(proto string) *recordingProtocolManager {
+	return &recordingProtocolManager{mockOrchProtocolManager: newMockOrchProtocolManager(proto)}
+}
+
+func (m *recordingProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	if server != nil {
+		m.queries = append(m.queries, server.ID)
+	}
+	m.mu.Unlock()
+	return m.mockOrchProtocolManager.GetClients(ctx, server)
+}
+
+func (m *recordingProtocolManager) clientQueries() []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int64(nil), m.queries...)
+}
 
 // TestOrchestrator_CheckBackendTunnelHealth_SkipsProviderAbsentServer covers the
 // scheduled backend health pass: the AWG handshake probe must not run for a tunnel
@@ -149,7 +178,7 @@ func TestOrchestrator_SyncTraffic_SkipsProviderAbsentServer(t *testing.T) {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 
-	awgMgr := newMockOrchProtocolManager("awg")
+	awgMgr := newRecordingProtocolManager("awg")
 	awgMgr.clients = []map[string]any{{
 		"clientId": "cid-live",
 		"userData": map[string]any{"dataReceivedBytes": 1024, "dataSentBytes": 2048},
@@ -163,7 +192,7 @@ func TestOrchestrator_SyncTraffic_SkipsProviderAbsentServer(t *testing.T) {
 	}
 
 	queried := map[int64]int{}
-	for _, id := range awgMgr.clientQueries {
+	for _, id := range awgMgr.clientQueries() {
 		queried[id]++
 	}
 	if queried[absentServerID] != 0 {
@@ -222,7 +251,7 @@ func TestOrchestrator_CheckAutoTrialHandshakes_SkipsProviderAbsentServer(t *test
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 
-	awgMgr := newMockOrchProtocolManager("awg")
+	awgMgr := newRecordingProtocolManager("awg")
 	// Both clients have stalled handshakes, so both would be rotated if the pass
 	// dialled them.
 	awgMgr.clients = []map[string]any{
@@ -237,7 +266,7 @@ func TestOrchestrator_CheckAutoTrialHandshakes_SkipsProviderAbsentServer(t *test
 		t.Fatalf("CheckAutoTrialHandshakes failed: %v", err)
 	}
 
-	for _, id := range awgMgr.clientQueries {
+	for _, id := range awgMgr.clientQueries() {
 		if id == absentServerID {
 			t.Fatal("the absent server's clients were read over SSH; it must not be dialled")
 		}
