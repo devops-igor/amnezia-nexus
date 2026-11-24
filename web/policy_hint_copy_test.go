@@ -324,6 +324,52 @@ func assertPolicyHintClaim(t *testing.T, surface map[string]string, dictionaries
 	}
 }
 
+// policyApprovedInventoryAnswer is the approved answer for an unusable inventory,
+// verbatim, in each shipped language. It is the design contract's sentence for
+// English and the reviewed translations the design and independent reviews accepted
+// for the other four.
+//
+// The pin is an EQUALITY, on purpose, and it is the check that makes this guard
+// bite. Two rounds of containment pins were defeated by the same class of edit: a
+// value with the recovery guidance removed, a value that negated the instruction,
+// and a value that kept both sentences but postponed the instruction until the
+// inventory became readable. Words cannot distinguish "the approved answer" from
+// "the approved answer plus a condition", so the whole answer is compared.
+//
+// Consequence for the next author: changing this copy is a deliberate act — update
+// the value here in the same change that updates the bundle, in every language you
+// touch. A trailing space, a double space or a re-punctuated sentence fails this
+// test by design; it is not normalised.
+var policyApprovedInventoryAnswer = map[string]string{
+	"en": "This build cannot read the shipped address list. Check Policy status for the active routing state.",
+	"ru": "Эта сборка не может прочитать поставляемый список адресов. Проверьте состояние политики, чтобы узнать активное состояние маршрутизации.",
+	"fr": "Cette version ne peut pas lire la liste d'adresses fournie. Consultez l'état de la politique pour connaître l'état actif du routage.",
+	"zh": "此构建无法读取随附的地址列表。请查看策略状态以了解当前的路由状态。",
+	"fa": "این ساخت نمی‌تواند فهرست نشانی‌های همراه را بخواند. برای دیدن وضعیت فعال مسیریابی، وضعیت خط‌مشی را بررسی کنید.",
+}
+
+// TestPolicyInventoryAnswerMatchesTheApprovedCopy is the equality pin. Every locale
+// must ship exactly the approved answer; the clause and token checks elsewhere in
+// this file stay as a second, redundant layer that names what is missing, and this
+// test is what decides whether the answer is the one that was approved.
+func TestPolicyInventoryAnswerMatchesTheApprovedCopy(t *testing.T) {
+	dictionaries := policyDictionaries(t)
+
+	for _, locale := range policyLocales {
+		want, recorded := policyApprovedInventoryAnswer[locale]
+		if !recorded {
+			t.Fatalf("no approved answer is recorded for %s; the pin would not check it", locale)
+		}
+		got := dictionaries[locale]["policy_inventory_unusable"]
+		if got != want {
+			t.Errorf("%s.json \"policy_inventory_unusable\" is not the approved answer\n  approved: %q\n  shipped:  %q\n"+
+				"  If this copy was changed deliberately, update policyApprovedInventoryAnswer for %s "+
+				"in the same change; otherwise the shipped answer has drifted from the reviewed one.",
+				locale, want, got, locale)
+		}
+	}
+}
+
 // policySurfaceKeys reads every policy translation key the shipped policy
 // templates and controllers reference, with the file that references it.
 func policySurfaceKeys(t *testing.T) map[string]string {
