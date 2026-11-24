@@ -206,16 +206,24 @@ def apply_theme(page: Page, theme: str) -> None:
     page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
 
 
+def settle(page: Page) -> None:
+    """Wait for an earlier switch's transitions to finish.
+
+    The shared tab transition is 0.15 s long, so a sample taken straight after a
+    selection reports the tail of that selection — a `before` style that no
+    reader rests on. This waits for the layout's own animations rather than
+    sleeping for a guessed duration.
+    """
+    page.wait_for_function("() => document.getAnimations().every(a => a.playState !== 'running')")
+
+
 def measure(page: Page) -> dict:
     """Scroll the tab row into view without panning, then measure the page."""
     page.evaluate(
         "() => document.getElementById('tab-protocols').parentElement"
         ".scrollIntoView({block: 'center', inline: 'nearest'})"
     )
-    # A tab carries the shared 0.15 s transition, so a sample taken while a
-    # selection fades reports a style no reader ever rests on. Wait for the
-    # transitions the layout owns to finish instead of sleeping for them.
-    page.wait_for_function("() => document.getAnimations().every(a => a.playState !== 'running')")
+    settle(page)
     return page.evaluate(ROW_PROBE)
 
 
@@ -555,3 +563,191 @@ def test_server_focused_tab_stays_clear_of_the_shell_bars(
         assert page.evaluate(
             "() => document.querySelectorAll('[aria-current=\"true\"]').length"
         ) == 1
+
+
+# The two R2 findings: motion and decorative-icon semantics.
+
+# A synchronous sample in one task. `before` is the resting state, `immediate` is
+# read in the same task as the click — a running transition reports its START
+# value there, an immediate change reports the settled one — and `settled` is read
+# after the tabs stop animating. `running` is counted before the first await, so
+# it is the number of transitions the click actually created.
+SWITCH_PROBE = r"""async (id) => {
+  const tabs = () => [...document.querySelectorAll('.nav-tab')];
+  const read = () => {
+    const s = getComputedStyle(document.getElementById(id));
+    return {
+      fontWeight: s.fontWeight,
+      color: s.color,
+      boxShadow: s.boxShadow,
+      borderBottomColor: s.borderBottomColor,
+      backgroundImage: s.backgroundImage,
+    };
+  };
+  const before = read();
+  document.getElementById(id).click();
+  const immediate = read();
+  const running = tabs()
+    .flatMap(tab => tab.getAnimations())
+    .filter(animation => animation.playState === 'running').length;
+  const started = performance.now();
+  while (
+    tabs().some(tab => tab.getAnimations().some(a => a.playState === 'running')) &&
+    performance.now() - started < 2000
+  ) {
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+  return {
+    before: before,
+    immediate: immediate,
+    settled: read(),
+    running: running,
+    reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+    panelVisible: !document
+      .getElementById(id.replace('tab-', '') + '-grid')
+      .classList.contains('hidden'),
+  };
+}"""
+
+# What one tab button renders and what it is called, without touching semantics.
+TAB_A11Y_PROBE = r"""(id) => {
+  const btn = document.getElementById(id);
+  const count = btn.querySelector('[id$="-count"]');
+  const icon = btn.querySelector('svg.icon');
+  const box = icon ? icon.getBoundingClientRect() : null;
+  let label = '';
+  const walker = document.createTreeWalker(btn, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.parentElement && /-count$/.test(node.parentElement.id || '')) continue;
+    label += node.nodeValue || '';
+  }
+  return {
+    label: label.replace(/\s+/g, ' ').trim(),
+    count: count ? count.textContent.trim() : '',
+    iconWidth: box ? box.width : 0,
+    iconHeight: box ? box.height : 0,
+  };
+}"""
+
+# Chromium exposes a bare decorative `<svg>` as an unnamed graphic; a fix that
+# hides it must leave no such child in the button's accessibility subtree.
+GRAPHIC_ROLES = frozenset({"image", "img", "SvgRoot"})
+
+# Per width, the state a switch must produce. The two treated widths are the
+# phone pill and the desktop underline; 1440 shares the desktop treatment.
+EXPECTED_STATE = {
+    390: {"fontWeight": "600", "color": "rgb(255, 255, 255)"},
+    1024: {"fontWeight": "600"},
+}
+
+
+def accessibility_subtree(page: Page, selector: str) -> list[dict]:
+    """The non-ignored and ignored accessibility nodes of one element's subtree.
+
+    Read through CDP because the question is what the accessibility tree holds,
+    not what the DOM says: an `aria-hidden` subtree is invisible to a screen
+    reader while its markup is unchanged, and only the tree shows that.
+    """
+    client = page.context.new_cdp_session(page)
+    try:
+        client.send("Accessibility.enable")
+        document = client.send("DOM.getDocument", {"depth": 0})
+        found = client.send(
+            "DOM.querySelector", {"nodeId": document["root"]["nodeId"], "selector": selector}
+        )
+        assert found["nodeId"], f"{selector} is not in the document"
+        tree = client.send("Accessibility.queryAXTree", {"nodeId": found["nodeId"]})
+    finally:
+        client.detach()
+    return [
+        {
+            "role": (node.get("role") or {}).get("value", ""),
+            "name": (node.get("name") or {}).get("value", ""),
+            "ignored": bool(node.get("ignored")),
+        }
+        for node in tree["nodes"]
+    ]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,height", [PHONE, WIDE[0]])
+def test_server_tab_state_change_is_immediate_under_reduced_motion(
+    authenticated_page: Page, base_url: str, width: int, height: int
+) -> None:
+    """A reader who asked for less motion gets the new tab state without a fade."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": height})
+
+    # The control first: with motion allowed, the same probe must SEE a
+    # transition. Without it, "no transition" below could just mean an oracle
+    # that cannot detect one.
+    page.emulate_media(reduced_motion="no-preference")
+    open_server_page(page, base_url)
+    settle(page)
+    allowed = page.evaluate(SWITCH_PROBE, "tab-services")
+    assert allowed["reducedMotion"] is False, allowed
+    assert allowed["panelVisible"] is True, allowed
+    assert allowed["before"]["fontWeight"] != allowed["settled"]["fontWeight"], allowed
+    assert allowed["running"] > 0, f"the ordinary transition is gone: {allowed}"
+    assert allowed["immediate"] != allowed["settled"], (
+        f"the probe read the settled state before the transition ran: {allowed}"
+    )
+
+    page.emulate_media(reduced_motion="reduce")
+    for tab in PANELS:
+        open_server_page(page, base_url)  # a fresh page rests on Protocols
+        if tab == "protocols":
+            select_panel(page, "services")  # so the probe starts from a resting tab
+        settle(page)
+        probe = page.evaluate(SWITCH_PROBE, f"tab-{tab}")
+        where = f"{width}/{tab}"
+        assert probe["reducedMotion"] is True, f"{where}: reduced motion was not emulated: {probe}"
+        assert probe["panelVisible"] is True, f"{where}: the tab did not select its panel: {probe}"
+        assert probe["before"]["fontWeight"] != probe["settled"]["fontWeight"], (
+            f"{where}: the tab was already current, so there was no state change: {probe}"
+        )
+        assert probe["running"] == 0, (
+            f"{where}: {probe['running']} transition(s) still started under reduced motion: {probe}"
+        )
+        assert probe["immediate"] == probe["settled"], (
+            f"{where}: the state change was not immediate: immediate "
+            f"{probe['immediate']} vs settled {probe['settled']}"
+        )
+        for prop, expected in EXPECTED_STATE[width].items():
+            assert probe["settled"][prop] == expected, f"{where}: {prop} is {probe['settled'][prop]}"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", THEMES)
+def test_server_tab_icons_are_decorative_in_the_accessibility_tree(
+    authenticated_page: Page, base_url: str, theme: str
+) -> None:
+    """Each tab is one named button; its icon is painted but not announced."""
+    page = authenticated_page
+    page.set_viewport_size({"width": PHONE[0], "height": PHONE[1]})
+    open_server_page(page, base_url)
+    apply_theme(page, theme)
+
+    for tab in PANELS:
+        select_panel(page, tab)
+        details = page.evaluate(TAB_A11Y_PROBE, f"tab-{tab}")
+        label = f"{theme}/{tab}"
+        # The icon is still drawn — hiding it from the tree is not removing it.
+        assert details["iconWidth"] > 0 and details["iconHeight"] > 0, f"{label}: {details}"
+        nodes = accessibility_subtree(page, f"#tab-{tab}")
+        live = [node for node in nodes if not node["ignored"]]
+        buttons = [node for node in live if node["role"] == "button"]
+        assert len(buttons) == 1, f"{label}: expected one button in the subtree: {nodes}"
+        name = buttons[0]["name"]
+        assert details["label"] and details["label"] in name, (
+            f"{label}: the accessible name {name!r} lost the visible label {details['label']!r}"
+        )
+        if details["count"]:
+            assert details["count"] in name, (
+                f"{label}: the accessible name {name!r} lost the visible count {details['count']!r}"
+            )
+        graphics = [node for node in live if node["role"] in GRAPHIC_ROLES]
+        assert not graphics, (
+            f"{label}: the decorative icon is still in the accessibility tree: {graphics}"
+        )
