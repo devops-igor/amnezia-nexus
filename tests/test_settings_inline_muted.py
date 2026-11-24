@@ -75,13 +75,16 @@ DELIBERATE: dict[tuple[str, str], str] = {}
 
 
 def settings_templates(templates_root: Path | None = None) -> list[Path]:
-    """The templates the Settings page is made of: the layout, the shell, the partials.
+    """The templates the settings surface is made of: the layout, both shells, the partials.
 
     Partials live in two places: templates/settings/ and the settings_*.html files
-    beside the page shell (the policy cards). Both load their own scripts.
+    beside the page shells (the policy cards). Both load their own scripts. The
+    policy cards render on routing.html since #987, so that shell is scanned too:
+    a page whose own script builds a coloured node is the same problem as one that
+    loads it from a partial.
     """
     root = templates_root or WEB / "templates"
-    files = [root / "base.html", root / "settings.html"]
+    files = [root / "base.html", root / "settings.html", root / "routing.html"]
     files += sorted(root.glob("settings_*.html"))
     files += sorted((root / "settings").glob("*.html"))
     return files

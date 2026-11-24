@@ -62,7 +62,7 @@ var clientDiagSectionIDs = []string{
 }
 
 func TestSettingsTemplatePolicyClientSection(t *testing.T) {
-	adminBody := renderSettingsPage(t, models.RoleAdmin)
+	adminBody := renderRoutingPage(t, models.RoleAdmin)
 
 	t.Run("AdminSeesSectionAndControls", func(t *testing.T) {
 		for _, id := range clientDiagSectionIDs {
@@ -92,7 +92,7 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 	})
 
 	t.Run("SectionLoadedOnlyForAdmins", func(t *testing.T) {
-		supportBody := renderSettingsPage(t, models.RoleSupport)
+		supportBody := renderRoutingPage(t, models.RoleSupport)
 		if strings.Contains(supportBody, `id="policyClientCard"`) {
 			t.Error("support operator received the admin-only per-client section")
 		}

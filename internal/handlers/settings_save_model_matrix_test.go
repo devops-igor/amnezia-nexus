@@ -32,10 +32,16 @@ var settingsMatrixOutcomes = []string{
 	"success", "repeat", "late-ok-cross", "late-ok-own",
 }
 
+// settingsMatrixCards are the cards the Settings page renders. The policy card is
+// not one of them since #987: it is the Routing page's card, and it keeps the same
+// matrix there (routingMatrixCards) rather than losing the coverage it had here.
 var settingsMatrixCards = []string{
 	"appearanceCard", "captchaCard", "sslCard", "limitsCard", "telegramCard",
-	"gigahostCard", "notificationsCard", "policyRoutingCard",
+	"gigahostCard", "notificationsCard",
 }
+
+// routingMatrixCards are the cards the Routing page renders.
+var routingMatrixCards = []string{"policyRoutingCard"}
 
 // matrixCell is one result row the scenario prints.
 type matrixCell struct {
@@ -73,7 +79,7 @@ function mxIsWrite(u, o) {
 async function mxPage() {
   const vc2 = new VirtualConsole();
   vc2.on('jsdomError', () => {});
-  const dom2 = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + '/settings', virtualConsole: vc2});
+  const dom2 = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + CFG.path, virtualConsole: vc2});
   const w2 = dom2.window;
   w2.I18N = CFG.dict;
   w2._ = k => w2.I18N[k] || k;
@@ -165,7 +171,12 @@ async function mxCell(cardId, outcome) {
     const commit = mxCommit(p);
     ok(commit.disabled === true, 'a loaded card has nothing staged, so its commit is disabled');
     const before = await mxStored(cfg);
-    const other = p.doc.getElementById(cfg.other);
+    // The cross-card focus case needs an editable field in a DIFFERENT card on the
+    // page under test. The policy card lives on /routing, where the appearance card
+    // is not rendered, so its neighbour is the override textarea beside it.
+    const other = p.doc.getElementById(cfg.other) ? p.doc.getElementById(cfg.other)
+        : p.doc.getElementById('policy_inventory_override');
+    if (!other) throw new Error('no field in another card to move to on this page');
     const draft = mxEdit(p, cfg, ++mxN);
     ok(mxDirty(p) !== '', 'editing marks the card unsaved');
     ok(commit.disabled === false, 'a staged card offers its commit');
@@ -303,8 +314,8 @@ for (const outcome of MX_PLAN.outcomes) {
 console.log('MX_JSON=' + JSON.stringify(MX_RESULTS));
 `
 
-// runMatrix runs the plan on the real page and returns every cell.
-func runMatrix(t *testing.T, outcomes, cards []string) []matrixCell {
+// runMatrix runs the plan on the page those cards render and returns every cell.
+func runMatrix(t *testing.T, path string, outcomes, cards []string) []matrixCell {
 	t.Helper()
 	h, _, _ := setupTestHandlers(t)
 	plan, err := json.Marshal(map[string][]string{"outcomes": outcomes, "cards": cards})
@@ -312,7 +323,7 @@ func runMatrix(t *testing.T, outcomes, cards []string) []matrixCell {
 		t.Fatal(err)
 	}
 	t.Setenv("MX_PLAN", string(plan))
-	out := runSettingsScenarioWith(t, h, settingsHarnessOptions{liveNotifications: true},
+	out := runSettingsScenarioWith(t, h, settingsHarnessOptions{liveNotifications: true, path: path},
 		settingsMatrixHelpers+settingsMatrixCells+settingsMatrixDriver)
 	i := strings.LastIndex(out, "MX_JSON=")
 	if i < 0 {
@@ -330,10 +341,24 @@ func runMatrix(t *testing.T, outcomes, cards []string) []matrixCell {
 }
 
 // TestSettingsSaveModel_Matrix is the class-level oracle. Each cell is a subtest,
-// so a broken cell names its card and its outcome.
+// so a broken cell names its card and its outcome. It runs on every page that holds
+// a card with a commit control: the cards that stayed in Settings and the policy
+// card that moved to Routing.
 func TestSettingsSaveModel_Matrix(t *testing.T) {
-	cells := runMatrix(t, settingsMatrixOutcomes, settingsMatrixCards)
-	if want := len(settingsMatrixOutcomes) * len(settingsMatrixCards); len(cells) != want {
+	pages := []struct {
+		path  string
+		cards []string
+	}{
+		{"/settings", settingsMatrixCards},
+		{"/routing", routingMatrixCards},
+	}
+	var cells []matrixCell
+	want := 0
+	for _, page := range pages {
+		cells = append(cells, runMatrix(t, page.path, settingsMatrixOutcomes, page.cards)...)
+		want += len(settingsMatrixOutcomes) * len(page.cards)
+	}
+	if len(cells) != want {
 		t.Fatalf("matrix ran %d cells, want %d", len(cells), want)
 	}
 	ran, na := 0, 0

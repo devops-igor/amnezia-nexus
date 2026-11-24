@@ -296,16 +296,18 @@ await w.loadPolicySettings();
 await settle();
 assert.equal(text('policyInventoryAnswerHeadline'), 'policy_inventory_freshness_not_reported',
   'without a named source the freshness claim is not made');
-assert.equal(text('policyInventorySource'), 'policy_none');
+assert.equal(text('policyInventorySource'), 'policy_not_available',
+  'a source the server did not name is not available, not an answer of "none"');
 assert.equal(text('policyInventoryAge'), '1 day', 'the reported age is still shown');
 
-// The retrieval date is missing: same reasoning, and the date field says None.
+// The retrieval date is missing: same reasoning, and the date field says so.
 inventory = {source: 'ipdeny', prefix_count: 8664, age_days: 1,
              max_age_days: 180, stale: false, override_prefix_count: 0};
 await w.loadPolicySettings();
 await settle();
 assert.equal(text('policyInventoryAnswerHeadline'), 'policy_inventory_freshness_not_reported');
-assert.equal(text('policyInventoryRetrieved'), 'policy_none');
+assert.equal(text('policyInventoryRetrieved'), 'policy_not_available',
+  'a retrieval date the server did not report is not available, not "none"');
 
 // A null shipped count is unreported, not zero prefixes in the shipped list.
 inventory = {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: null,

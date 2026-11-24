@@ -38,10 +38,9 @@ type settingsGroupSpec struct {
 	cards   []string
 }
 
-// settingsGroupsForAdmin is the structure an administrator receives: four groups,
-// eleven cards. The three cards that carry two surfaces each (notifications,
-// gigahost, per-client diagnosis) keep both surfaces inside the one card, so the
-// group owns the card and the second surface is reached within it.
+// settingsGroupsForAdmin is the structure an administrator receives: three groups,
+// nine cards. The policy surface is not one of them any more: it is the Routing
+// page (#987), and its two cards left with it.
 var settingsGroupsForAdmin = []settingsGroupSpec{
 	{id: "group-portal", nameKey: "settings_group_portal", cards: []string{
 		"appearanceCard", "sslCard", "captchaCard", "limitsCard",
@@ -49,17 +48,14 @@ var settingsGroupsForAdmin = []settingsGroupSpec{
 	{id: "group-notifications", nameKey: "settings_group_notifications", cards: []string{
 		"telegramCard", "notificationsCard",
 	}},
-	{id: "group-network", nameKey: "settings_group_network", cards: []string{
-		"policyRoutingCard", "policyClientCard",
-	}},
 	{id: "group-system", nameKey: "settings_group_system", cards: []string{
 		"upstreamCard", "gigahostCard", "backupCard",
 	}},
 }
 
-// settingsGroupsForSupport is the same page for a role that may not reach the
-// admin-only sections: the Network policy group renders no section and therefore
-// does not render at all (design section 4.5).
+// settingsGroupsForSupport is the same page rendered for a role the route refuses:
+// the administrative cards that need that role are absent, and no group is left
+// without cards (design section 4.5).
 var settingsGroupsForSupport = []settingsGroupSpec{
 	{id: "group-portal", nameKey: "settings_group_portal", cards: []string{
 		"appearanceCard", "sslCard", "captchaCard", "limitsCard",
@@ -353,10 +349,12 @@ func TestSettingsPageCardHeadingsSitBelowTheGroupHeading(t *testing.T) {
 				})
 				// The admin session is the one that renders the policy, notification
 				// history and hosting sub-areas at all.
+				// The four policy readouts that carried a .settings-subheading left
+				// with the surface (#987); the remaining sub-areas are unaffected.
 				want := 0
 				if role == models.RoleAdmin {
 					want = map[string]int{
-						"settings-subheading":       8,
+						"settings-subheading":       0,
 						"settings-list-title":       3,
 						"settings-subsection-title": 1,
 					}[class]
@@ -384,8 +382,30 @@ func inDialog(n *html.Node) bool {
 // design section 10.2: each evidence table inside a settings card is named by the
 // label of the sub-area it belongs to, so a screen-reader user hears which table
 // they have entered instead of "table".
+//
+// The two policy tables are the only evidence tables either page renders, and they
+// moved to the Routing page with their card (#987). Both pages are therefore
+// checked, and the count each must reach is stated: a page whose tables silently
+// stopped rendering would otherwise satisfy a walk that found nothing.
 func TestSettingsPageEvidenceTablesHaveAccessibleNames(t *testing.T) {
-	doc := parseSettingsDocument(t, renderSettingsPage(t, models.RoleAdmin))
+	for _, page := range []struct {
+		name    string
+		body    string
+		atLeast int
+	}{
+		{"settings", renderSettingsPage(t, models.RoleAdmin), 0},
+		{"routing", renderRoutingPage(t, models.RoleAdmin), 2},
+	} {
+		t.Run(page.name, func(t *testing.T) {
+			assertEvidenceTablesNamed(t, parseSettingsDocument(t, page.body), page.atLeast)
+		})
+	}
+}
+
+// assertEvidenceTablesNamed walks the tables inside settings cards and fails any
+// that no sub-area label names.
+func assertEvidenceTablesNamed(t *testing.T, doc *html.Node, atLeast int) {
+	t.Helper()
 
 	tables := 0
 	walkLive(doc, func(n *html.Node) {
@@ -413,8 +433,8 @@ func TestSettingsPageEvidenceTablesHaveAccessibleNames(t *testing.T) {
 			t.Error("a table inside a settings card has no accessible name from its sub-area label")
 		}
 	})
-	if tables == 0 {
-		t.Fatal("found no evidence table inside a settings card, so nothing was checked")
+	if tables < atLeast {
+		t.Fatalf("found %d evidence tables inside settings cards, want at least %d", tables, atLeast)
 	}
 }
 

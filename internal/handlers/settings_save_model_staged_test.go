@@ -3,11 +3,11 @@ package handlers
 // Staged-edit and announcement contract for the two cards that load their own
 // record: Notifications and Policy routing (#888).
 //
-// Same harness as settings_save_model_test.go: the real /settings page, the
-// scripts that page names, and real handlers over HTTP. The policy endpoints are
-// answered by an in-memory double, because the handler fixture does not mount
-// them; the double is the only injected server behaviour, and it only refuses or
-// accepts.
+// Same harness as settings_save_model_test.go: the real page the card renders on —
+// /settings for Notifications, /routing for the policy card since #987 — the scripts
+// that page names, and real handlers over HTTP. The policy endpoints are answered
+// by an in-memory double, because the handler fixture does not mount them; the
+// double is the only injected server behaviour, and it only refuses or accepts.
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 // stored record is separate, and is still the one the server holds.
 func TestSettingsStagedEdits_PolicyRefusalKeepsTheEditedForm(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
-	runSettingsScenario(t, h, `
+	runRoutingScenario(t, h, `
 policyDouble.refuse = true;
 const policy = card('policyRoutingCard');
 const save = policy.querySelector('[data-commit]');
@@ -116,7 +116,7 @@ assert.equal(toasts.length, 0);
 // its answer, stay marked unsaved, and the stored record holds what was sent.
 func TestSettingsStagedEdits_PolicySlowSaveKeepsNewerEdits(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
-	runSettingsScenario(t, h, `
+	runRoutingScenario(t, h, `
 const policy = card('policyRoutingCard');
 const save = policy.querySelector('[data-commit]');
 await sleep(300);

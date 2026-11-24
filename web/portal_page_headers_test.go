@@ -46,6 +46,7 @@ var portalPages = []portalPage{
 	{Template: "index.html", TitleIsSectionTitle: true, TitleIsFirstHeading: true},
 	{Template: "users.html", TitleIsSectionTitle: true, TitleIsFirstHeading: true},
 	{Template: "vpn.html", TitleIsSectionTitle: true, TitleIsFirstHeading: true},
+	{Template: "routing.html", TitleIsSectionTitle: true, TitleIsFirstHeading: true},
 	{Template: "leaderboard.html", TitleIsSectionTitle: true, TitleIsFirstHeading: true},
 	{
 		Template:            "my_connections.html",
