@@ -3382,6 +3382,139 @@ td[data-backend-name]:focus-visible {
     color: var(--accent);
     flex-shrink: 0;
 }
+
+/* ===== Page button scale ===== */
+/* One size scale for the controls a page renders, in the two steps the Settings
+   page already uses: 40 px for a page-level action, 32 px for a compact one. The
+   natural height of a control differs with what it contains (an icon, a text-only
+   label, a link versus a button), which is what produced up to seven different
+   heights on one page. A floor with no vertical padding gives every control the
+   same height while still letting one grow when the text is enlarged or a
+   translation wraps. `.portal-page` marks the shell's content area, so a modal a
+   page owns is on the scale and the shell's own chrome (sidebar, mobile bars, the
+   language and confirm dialogs the shell renders) is not.
+
+   The rules live here because this sheet is the one the computed-style
+   differential already treats as holding rules the frozen reference never had:
+   tests/e2e/css_surface.py sets a selector aside only when it uses a class that
+   is new since that reference, and tests/test_css_reference_frozen.py requires
+   every other sheet to stay byte-identical in the compared view. */
+.portal-page .btn {
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    padding-block: 0;
+}
+
+.portal-page .btn-sm {
+    min-height: var(--space-xl);
+}
+
+/* An icon-only control is the compact step, and it stays square. The legacy rule
+   that sizes one at 30 px is overridden here rather than left off the scale; both
+   selectors have the same specificity, so this block comes after it. */
+.portal-page .btn-icon {
+    width: var(--space-xl);
+    height: var(--space-xl);
+    min-height: var(--space-xl);
+}
+
+/* The VPN health surface is tested for a 44 px interactive target
+   (web/vpn_health_acceptance_test.go), which outranks the page scale. Named
+   explicitly so a control that must meet the target keeps it. */
+.portal-page .vpn-diag-entry,
+.portal-page .vpn-issue-action,
+.portal-page .vpn-windows .btn {
+    min-block-size: 44px;
+}
+
+/* Tabs, chips, table page controls and the dialog affordances are controls an
+   operator presses too, so they take the same two steps. Each of them sets its
+   own padding or its own height in the sheet that owns the component; the scale
+   overrides that here instead of editing that sheet, because a new rule on a
+   legacy selector would move the frozen comparison surface, and `.nav-tab` is
+   declared in a template style block, which is the other place a rule cannot
+   move from.
+
+   The page-level tab bar takes the large step, like the Settings page's in-page
+   navigation. The rest take the compact step: they sit inside another surface
+   (a segment control, a toolbar, a dialog header, a table footer) and must not
+   grow the row they belong to. */
+.portal-page .nav-tab {
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    padding-block: 0;
+}
+
+.portal-page .tab,
+.portal-page .config-tab,
+.portal-page .filter-chip {
+    min-height: var(--space-xl);
+    padding-block: 0;
+}
+
+/* These two state an explicit height rather than a floor, so the height itself is
+   what has to move. The dialog close control is square, so its width moves with
+   it; the page control keeps its own minimum width. */
+.portal-page .modal-close {
+    width: var(--space-xl);
+    height: var(--space-xl);
+    min-height: var(--space-xl);
+}
+
+.portal-page .page-btn {
+    height: var(--space-xl);
+    min-height: var(--space-xl);
+}
+
+/* The search field's clear affordance is inset in the field, so its own centring
+   follows the compact step: left at the fixed 20 px inset it used, a 32 px control
+   would sit three pixels past the field's lower edge. */
+.portal-page .table-search-clear {
+    width: var(--space-xl);
+    height: var(--space-xl);
+    min-height: var(--space-xl);
+    inset-block-start: 50%;
+    inset-inline-end: var(--space-sm);
+    translate: 0 -50%;
+}
+
+/* The VPN health surface's two disclosure summaries are the same kind of target as
+   the controls above: the same acceptance test requires an interactive control to
+   reach 44 px, so they are named here as well. The scale above does not reach a
+   summary element, and naming them keeps a future rule from shrinking one. */
+.portal-page .vpn-config > summary,
+.portal-page .vpn-diag-fold > summary {
+    min-block-size: 44px;
+}
+
+/* Pressed controls that stay off the two steps, each with the reason it cannot
+   take one. They are named rather than merely left out, because a control that is
+   silently off the scale looks exactly like one nobody noticed — which is how the
+   first pass at this scale managed to look complete while a page's own dialog kept
+   three different button heights.
+
+   - A sortable table header is a cell in a row: the whole cell is the target and
+     its height is the row's, so a 32 or 40 px floor would crop the header row.
+   - A switch is a 44x24 track with an 18 px knob travelling between two inset
+     positions. Its height is the track's geometry, not a control box; a 32 px one
+     would leave the knob travelling in a track built for 24.
+   - Two script-generated actions are text inside a line of text: the users page's
+     connection count in a table cell's meta line, and the per-client flow
+     disclosure inside a Live flows cell. Both are reachable by keyboard as well as
+     pointer, both take their height from their line box, and a 32 px box would
+     grow every row of the table they sit in. */
+.portal-page .data-table th.sortable {
+    height: auto;
+}
+
+.portal-page .switch {
+    width: 44px;
+    height: 24px;
+}
+
+.portal-page .client-meta > span[onclick],
+.portal-page .cell-detail-toggle {
+    min-height: 0;
+    height: auto;
+}
 /* ===== Settings page layout ===== */
 /* Cards sit directly in one grid. Two independent stacks side by side differ in
    height without bound (the Gigahost card alone is taller than most of the other
