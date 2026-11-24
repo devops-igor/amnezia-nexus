@@ -146,8 +146,13 @@
         transform: none;
         transition: none;
     }
+    /* The shared `a:hover` ink is the accent, which measures 4.08:1 on the light
+       hover fill and 3.78:1 on the dark one — below the 4.5:1 floor for the label.
+       The action keeps the readable ink the shared secondary button uses at rest,
+       which the oracle below measures on the fill it is actually painted on. */
     #policyRoutingCard .policy-answer-action:hover {
         background: var(--bg-card-hover);
+        color: var(--text-primary);
     }
     #policyRoutingCard .policy-facts {
         margin-block-start: var(--space-sm);

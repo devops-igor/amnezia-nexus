@@ -434,6 +434,74 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 	})
 }
 
+// policyScriptCall captures the whole argument of a translator call, and
+// policyKeyLiteral every policy key inside it. Reading the call's arguments — not
+// only a literal first argument — is what keeps a label chosen through a
+// conditional guarded: `panelText(hasList ? 'a' : 'b')` is still a rendered key,
+// and a bundle that emptied either one must fail the guard.
+var (
+	policyScriptCall = regexp.MustCompile(`(?:policyText|panelText)\(([^()]*)\)`)
+	policyKeyLiteral = regexp.MustCompile(`'(policy_[a-z0-9_]+)'`)
+)
+
+// policyModuleTranslationKeys returns every translation key a policy module resolves
+// through its translator, in source order.
+func policyModuleTranslationKeys(source string) []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, call := range policyScriptCall.FindAllStringSubmatch(source, -1) {
+		for _, literal := range policyKeyLiteral.FindAllStringSubmatch(call[1], -1) {
+			// A key ending in "_" is the base of a concatenation
+			// ("policy_sync_state_" + token), not a key a bundle can define; the
+			// composed forms are pinned separately.
+			if strings.HasSuffix(literal[1], "_") {
+				continue
+			}
+			if seen[literal[1]] {
+				continue
+			}
+			seen[literal[1]] = true
+			keys = append(keys, literal[1])
+		}
+	}
+	return keys
+}
+
+// TestPolicyModuleTranslationKeysSeesConditionalLabels pins the extraction against
+// the forms the shipped modules use. A literal-argument regex passed the earlier
+// round while silently missing a label chosen in a conditional, which is exactly the
+// case the guard has to cover.
+func TestPolicyModuleTranslationKeysSeesConditionalLabels(t *testing.T) {
+	source := `
+summary.textContent = panelText(hasList ? 'policy_cdn_view_networks' : 'policy_cdn_entries_details');
+var label = policyText('policy_status_active');
+var raw = panelText('policy_not_available');
+var composed = panelText('policy_sync_state_' + state);
+`
+	keys := policyModuleTranslationKeys(source)
+	want := []string{"policy_cdn_view_networks", "policy_cdn_entries_details", "policy_status_active", "policy_not_available"}
+	for _, key := range want {
+		found := false
+		for _, got := range keys {
+			if got == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("the extraction misses %q; a bundle that emptied it would still pass the guard", key)
+		}
+	}
+	if len(keys) != len(want) {
+		t.Errorf("the extraction returned %v, want %v", keys, want)
+	}
+	for _, key := range keys {
+		if strings.HasSuffix(key, "_") {
+			t.Errorf("the extraction returned the concatenation base %q as a key", key)
+		}
+	}
+}
+
 // TestPolicySectionTranslationKeysInEveryLocale pins the keys the partial uses
 // against the five shipped dictionaries. The javascript part of the section uses
 // a few more keys; those are checked by the JSDOM contract test, which fails on a
@@ -462,19 +530,17 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	// translator, so it cannot notice a key missing from a dictionary; the keys
 	// are read from the shipped modules here rather than copied by hand, which
 	// is what kept a renamed readout key in the list after its branch was gone.
-	scriptKeyPattern := regexp.MustCompile(`(?:policyText|panelText)\(\s*'([a-z0-9_]+)'`)
 	for _, asset := range []string{"static/js/policy_routing.js", "static/js/policy_panels.js"} {
 		body, err := web.StaticFS.ReadFile(asset)
 		if err != nil {
 			t.Fatalf("read %s: %v", asset, err)
 		}
-		found := 0
-		for _, match := range scriptKeyPattern.FindAllStringSubmatch(string(body), -1) {
-			keys[match[1]] = true
-			found++
+		found := policyModuleTranslationKeys(string(body))
+		if len(found) < 10 {
+			t.Fatalf("%s: found only %d translation keys; the extraction is wrong", asset, len(found))
 		}
-		if found < 10 {
-			t.Fatalf("%s: found only %d translation keys; the extraction is wrong", asset, found)
+		for _, key := range found {
+			keys[key] = true
 		}
 	}
 	// A pluralised readout composes its key from a base, so the two forms are not

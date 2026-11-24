@@ -57,6 +57,70 @@ assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0, 'no write followed 
 `)
 }
 
+// TestLateFirstReadFailureKeepsANewerSyncObservation is 971-R2-01. The form's sync
+// action is callable while the stored record is still being read — eligibility is
+// unknown, not known to be impossible — so a sync can be accepted and publish a
+// runtime observation before the initial read fails. The failed read used to settle
+// the readouts unconditionally and wipe that newer, confirmed state.
+func TestLateFirstReadFailureKeepsANewerSyncObservation(t *testing.T) {
+	runPolicyControllerScenario(t, `
+let releaseReadReject = null;
+const readGate = new Promise((resolve, reject) => { releaseReadReject = reject; });
+let resolveSync = null;
+const syncGate = new Promise(resolve => { resolveSync = resolve; });
+let posts = 0;
+responder = async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/sync')) {
+    posts++;
+    return syncGate;
+  }
+  if (opts.method === 'PUT') {
+    throw new Error('no PUT may be issued while the stored record is unread');
+  }
+  await readGate;
+  return {};
+};
+`, `
+// The initial read is still pending, so the form is closed but the sync action is
+// available: nothing has told the page the operation is impossible.
+assert.equal(el('policySaveBtn').disabled, true, 'the form is closed until the record is read');
+assert.equal(el('policySyncBtn').disabled, false, 'eligibility is unknown, so the action is offered');
+
+el('policySyncBtn').click();
+await settle();
+assert.equal(posts, 1, 'the sync action issued one POST while the read was still pending');
+
+// The sync publishes a newer runtime observation than the read that is still open.
+resolveSync({status: 'ok', published: true,
+  policy_status: {enabled: true, ready: true, cidr_count: 4, sync_state: 'synced',
+                  last_success: '2026-11-15T01:00:00Z', last_error: ''}});
+await settle(12);
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_active',
+  'the accepted sync observation is rendered');
+assert.equal(text('policySyncState'), 'sync:synced');
+
+// Now the earlier read fails. It is older evidence than the observation on screen.
+releaseReadReject(new Error('backend unavailable'));
+await settle(12);
+
+assert.equal(text('policyStatusAnswerHeadline'), 'policy_status_active',
+  'a late first-read failure must not erase a newer accepted observation');
+assert.equal(text('policySyncState'), 'sync:synced', 'the accepted sync state survives the failure');
+assert.equal(text('policyRuleCount'), '4', 'the published rule count survives the failure');
+assert.equal(text('policySyncErrorAnswerHeadline'), 'policy_sync_error_none',
+  'the readouts still report the observation the operator just produced');
+assert.equal(answerState('policyInventoryAnswer'), 'info',
+  'a field the observation did not carry still reads as not reported');
+
+// The read failure is still reported, and the unread record still closes the form.
+assert.ok(alertText().text.indexOf('policy_load_failed') !== -1,
+  'the read failure is announced in the existing feedback region, got: ' + alertText().text);
+assert.equal(el('policySaveBtn').disabled, true, 'the form stays closed: the record was never read');
+assert.equal(el('policyRoutingForm').getAttribute('data-policy-ready'), 'false');
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0, 'no write followed the failure');
+`)
+}
+
 // TestPolicySyncRetrySuccessRestoresFocusToTheVisibleAnswer is the defect
 // 971-R1-03 named: the retry control hides itself on success, and the busy guard
 // used to try to restore focus to it anyway — a no-op that left a keyboard operator

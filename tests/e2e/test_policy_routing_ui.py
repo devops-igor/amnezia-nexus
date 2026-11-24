@@ -37,6 +37,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e import contrast
 from tests.e2e.conftest import api_get, api_post
 
 POLICY_ENDPOINT = "/api/vpn/policy"
@@ -757,3 +758,61 @@ def test_policy_disclosure_marker_points_down_and_up_in_rtl(
     assert rtl["markerStart"] > 0, (
         "the marker is not pushed to the inline end in RTL"
     )
+
+
+def _ratio(a: str, b: str) -> float:
+    return contrast.ratio(a, b)
+
+
+def _rgb(value: str) -> str:
+    """`rgb(r, g, b)` from a computed style, as the contrast helper's hex form."""
+    numbers = [int(part) for part in value.replace("rgba(", "").replace("rgb(", "")
+               .replace(")", "").split(",")[:3]]
+    return "#%02x%02x%02x" % tuple(numbers)
+
+
+def _lifted(colour: str, amount: float = 0.1) -> str:
+    """A fill with the shared button's white hover overlay at `amount`."""
+    red, green, blue, _ = contrast.parse_color(colour)
+    return "#%02x%02x%02x" % tuple(
+        round(component * (1 - amount) + 255 * amount) for component in (red, green, blue)
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("lang", ["ru", "fr"])
+def test_policy_readout_action_hover_meets_the_text_floor(
+    authenticated_page: Page, base_url: str, lang: str
+) -> None:
+    """A hovered action label is readable on the fill it is actually painted on.
+
+    The shared `a:hover` ink is the accent, which measures below 4.5:1 on the
+    button's hover fill in both themes. The readout overrides it, and this measures
+    the winning pair in the browser — including the shared white overlay the button
+    paints on hover, which only lightens the fill under the label.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_settings_with_failure(page, base_url, lang)
+
+    for action in ("policyStatusActionError", "policyInventoryActionOverride", "policyCdnActionDiagnosis"):
+        selector = f"#{action}"
+        if not page.locator(selector).is_visible():
+            continue
+        page.hover(selector)
+        painted = page.evaluate(
+            """(id) => {
+                const el = document.getElementById(id);
+                const cs = getComputedStyle(el);
+                return {color: cs.color, background: cs.backgroundColor};
+            }""",
+            action,
+        )
+        ink = _rgb(painted["color"])
+        fill = _rgb(painted["background"])
+        for surface_name, surface in (("hover fill", fill), ("hover fill + overlay", _lifted(fill))):
+            got = _ratio(ink, surface)
+            assert got >= 4.5, (
+                f"{lang} at 390 px: {action} on its {surface_name} measures {got:.2f}:1 "
+                f"({ink} on {surface}), below 4.5:1"
+            )

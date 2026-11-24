@@ -527,6 +527,30 @@ def test_policy_action_label_meets_aa_on_the_shared_button(theme: str, state: st
             f"the readout action label --{ink} on --{name} in the {theme} theme: "
             f"{got:.2f}:1, below {contrast.AA_TEXT}:1"
         )
+    # The readout's own hover rule is what wins: the shared `a:hover` ink is the
+    # accent (0,1,1) and would silently re-take the label at hover without it.
+    hovered = policy_color("#policyRoutingCard .policy-answer-action:hover")
+    assert hovered == "var(--text-primary)", (
+        "the readout action's hover ink is no longer the readable one: " + hovered
+    )
+    hover_got = contrast.ratio(
+        contrast.resolve(token_name(hovered), tokens),
+        contrast.resolve(token_name(hover), tokens),
+    )
+    assert hover_got >= contrast.AA_TEXT, (
+        f"the hovered readout action in the {theme} theme measures {hover_got:.2f}:1 on "
+        f"its hover fill, below {contrast.AA_TEXT}:1"
+    )
+    # And the shared rule it overrides really is the failing ink.
+    shared_hover = declared_color(_css("base"), "a:hover")
+    shared_got = contrast.ratio(
+        contrast.resolve(token_name(shared_hover), tokens),
+        contrast.resolve(token_name(hover), tokens),
+    )
+    assert shared_got < contrast.AA_TEXT, (
+        "the shared link hover ink now clears the floor on the button fill; the scoped "
+        "override can be retired if so"
+    )
     # And the action really is that button, not a look-alike.
     markup = POLICY_TEMPLATE.read_text(encoding="utf-8")
     assert 'class="btn btn-secondary policy-answer-action"' in markup, (

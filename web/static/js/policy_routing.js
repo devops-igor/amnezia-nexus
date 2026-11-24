@@ -54,6 +54,10 @@
     // was issued, so a slow earlier GET cannot overwrite a newer accepted result.
     var requestSeq = 0;
     var lastAcceptedMutation = 0;
+    // The request sequence of the newest observation the readouts were rendered
+    // from. It is what keeps a late read failure from erasing an observation that
+    // was accepted after that read started.
+    var lastObservationSeq = 0;
     // Whether the rule-sync operation is known to be available. The backend refuses
     // a sync while policy routing has no runtime ("policy routing is not started"),
     // so a control that offers it in that state cannot do what it says.
@@ -319,7 +323,7 @@
     // observation to the readout module (static/js/policy_panels.js). The form,
     // the save and the sync stay here; the four answers live there so one file
     // owns the state vocabulary instead of two.
-    function renderPolicyPanels(record, snapshot) {
+    function renderPolicyPanels(record, snapshot, seq) {
         var accepted = record || lastServerRecord;
         // The retirement notice belongs to the form, not to a readout: it says
         // what the stored record used to hold, so it is rendered beside the
@@ -329,6 +333,24 @@
             root.PolicyPanels.render(accepted, snapshot);
         }
         setPolicySyncEligibility(snapshot);
+        // Every accepted observation carries the sequence of the request that
+        // produced it, so a failure from an earlier request can tell whether it is
+        // still the owner of what is on screen.
+        lastObservationSeq = Math.max(lastObservationSeq, seq || 0);
+    }
+
+    // settlePolicyPanelsAfterFailedRead presents the no-observation answers for a
+    // read that failed, unless a newer observation was accepted after that read
+    // started. A sync can be accepted while the stored record is still being read
+    // (the form action is callable because eligibility is unknown, not known to be
+    // impossible), and its published state is newer evidence than the failed read.
+    // The read failure is still reported by the caller and the form still stays
+    // closed, because the stored record was never read.
+    function settlePolicyPanelsAfterFailedRead(readSeq) {
+        if (readSeq > 0 && lastObservationSeq > readSeq) {
+            return;
+        }
+        renderPolicyPanels(null, null, readSeq);
     }
 
     // setPolicySyncEligibility reconciles the form's sync control with the operation
@@ -357,7 +379,7 @@
             return { ok: false, error: err };
         }
         if (policyReadApplies(seq)) {
-            renderPolicyPanels(policy, policyRuntimeSnapshot(policy));
+            renderPolicyPanels(policy, policyRuntimeSnapshot(policy), seq);
         }
         return { ok: true, record: policy };
     }
@@ -366,14 +388,24 @@
     // gate. It is the only opener: an unread record is not a default record.
     async function loadPolicySettings() {
         var seq = ++requestSeq;
-        var policy = await policyRequest(POLICY_ENDPOINT, { method: 'GET' });
+        var policy;
+        try {
+            policy = await policyRequest(POLICY_ENDPOINT, { method: 'GET' });
+        } catch (err) {
+            // The caller settles the readouts, and it can leave a newer observation
+            // alone only if it knows which read failed.
+            if (err && typeof err === 'object') {
+                err.policyReadSeq = seq;
+            }
+            throw err;
+        }
         if (!policyReadApplies(seq)) {
             // A mutation accepted after this read started owns the form; replaying
             // the older record here would undo it.
             return policy;
         }
         applyPolicyRecord(policy);
-        renderPolicyPanels(policy, policyRuntimeSnapshot(policy));
+        renderPolicyPanels(policy, policyRuntimeSnapshot(policy), seq);
         setPolicyReady(true);
         return policy;
     }
@@ -477,7 +509,7 @@
                 await refreshPolicyStatus();
                 return null;
             }
-            renderPolicyPanels(saved, policyRuntimeSnapshot(saved));
+            renderPolicyPanels(saved, policyRuntimeSnapshot(saved), seq);
             return saved;
         } finally {
             inFlight.save = false;
@@ -497,7 +529,7 @@
             // A completed sync publishes a new snapshot, so it is a newer
             // observation than any read still in flight.
             lastAcceptedMutation = seq;
-            renderPolicyPanels(lastServerRecord, policyRuntimeSnapshot(result));
+            renderPolicyPanels(lastServerRecord, policyRuntimeSnapshot(result), seq);
             setPolicyAlert('success', policyText('policy_sync_ok'));
             return result;
         } catch (err) {
@@ -614,7 +646,8 @@
             // readouts are settled as well: once the read has failed, claiming they
             // are still loading would describe a request that is not running.
             setPolicyReady(false);
-            renderPolicyPanels(null, null);
+            settlePolicyPanelsAfterFailedRead(
+                err && typeof err.policyReadSeq === 'number' ? err.policyReadSeq : 0);
             setPolicyAlert('error', policyText('policy_load_failed') + ': '
                 + policyErrorDetail(err) + ' ' + policyText('policy_not_ready'));
         });
