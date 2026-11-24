@@ -1028,6 +1028,16 @@ button:focus-visible,
     background: currentColor;
 }
 
+/* The status hues are tuned for the dark canvas; on the light one the same values
+   fall below 4.5:1 as badge text (success 2.35:1, warn 2.02:1, info 2.56:1), so the
+   light theme paints a darker tone of the same hue. Only the badge classes the
+   sheets define are overridden -- the renderers' `badge-warning` name has no rule
+   here, and styling it would add a surface the frozen reference never had. */
+[data-theme="light"] .badge-success { color: #046c4e; }
+[data-theme="light"] .badge-warn { color: #92400e; }
+[data-theme="light"] .badge-danger { color: #be123c; }
+[data-theme="light"] .badge-info { color: #0369a1; }
+
 /* ===== Form Elements ===== */
 .form-group {
     margin-bottom: var(--space-md);
@@ -1097,6 +1107,29 @@ button:focus-visible,
     color: var(--text-muted);
     margin-top: var(--space-xs);
 }
+
+/* The order confirmation is read beside the form it describes, so that dialog -- and
+   only that one -- dims without blurring and docks to the bottom edge. The class is
+   applied by the VPS ordering confirmation alone (through the dialog's
+   data-confirm-kind attribute); every other confirmation keeps the shared modal's
+   own backdrop, position and colours. */
+#nexusConfirmModal[data-confirm-kind="order"] {
+    background: rgba(9, 10, 15, 0.32);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    align-items: flex-end;
+    padding: var(--space-md);
+}
+[data-theme="light"] #nexusConfirmModal[data-confirm-kind="order"] { background: rgba(15, 23, 42, 0.18); }
+/* The summary's first line lists plan, region, datacenter and image; the price
+   follows on its own line and may wrap across several, so the figure being
+   agreed to is never clipped at a narrow width. */
+#nexusConfirmModal[data-confirm-kind="order"] #nexusConfirmBody { white-space: pre-line; }
+/* The danger fill is a tint of the hue, so the hue as text misses 4.5:1 on it
+   (3.38:1 light, 4.42:1 dark); the restore confirmation paints it in a tone that
+   keeps it red and readable. */
+#nexusConfirmModal[data-confirm-kind="destructive"] .btn-danger { color: #fb7185; }
+[data-theme="light"] #nexusConfirmModal[data-confirm-kind="destructive"] .btn-danger { color: #be123c; }
 
 /* ===== Modal ===== */
 .modal-backdrop {
