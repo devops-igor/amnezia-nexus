@@ -34,11 +34,17 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 }
 
 // DeliveredAssets are the /static paths this delivery replaced in place: the
-// six VPN modules, the stylesheet every shell links and the table engine the
-// VPN page's reveal depends on. The release version did not move with them, so
-// ?v=<release> is exactly the URL their predecessor served and a returning
-// browser keeps the old bytes. Each one therefore has to be requested through
-// AssetURL, in every shell that loads it.
+// server page's tab controller, the six VPN modules, the stylesheet every shell
+// links and the table engine the VPN page's reveal depends on. The release
+// version did not move with them, so ?v=<release> is exactly the URL their
+// predecessor served and a returning browser keeps the old bytes. Each one
+// therefore has to be requested through AssetURL, in every shell that loads it.
+//
+// The tab controller is here because this delivery changed its bytes without
+// moving the release version: a browser that cached the previous controller
+// under ?v=<release> would keep it while the page it runs against is the new
+// one, and the previous controller cannot write aria-current, so the programmatic
+// current tab would stay on the first panel after a switch.
 //
 // This is the only place that set is spelled. A check that kept its own copy
 // could answer "every asset is identified" while the copy was missing the asset
@@ -48,6 +54,7 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 var DeliveredAssets = []string{
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
+	"/static/js/server_actions.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",
 	"/static/js/vpn/backends.js",
