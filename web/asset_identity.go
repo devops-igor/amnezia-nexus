@@ -33,9 +33,10 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// DeliveredAssets are the /static paths this delivery replaced in place: the
-// server page's tab controller, the six VPN modules, the stylesheet every shell
-// links and the table engine the VPN page's reveal depends on. The release
+// DeliveredAssets are the /static paths this branch replaced in place: the two
+// policy readout modules, the server page's tab controller, the six VPN modules,
+// the stylesheet every shell links and the table engine the VPN page's reveal
+// depends on. The release
 // version did not move with them, so ?v=<release> is exactly the URL their
 // predecessor served and a returning browser keeps the old bytes. Each one
 // therefore has to be requested through AssetURL, in every shell that loads it.
@@ -54,6 +55,8 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 var DeliveredAssets = []string{
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
+	"/static/js/policy_panels.js",
+	"/static/js/policy_routing.js",
 	"/static/js/server_actions.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",

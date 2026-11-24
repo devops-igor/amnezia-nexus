@@ -46,6 +46,7 @@ var policySurfaceFiles = []struct {
 	{path: "templates/settings_policy.html", template: true},
 	{path: "templates/settings_policy_client.html", template: true},
 	{path: "static/js/policy_routing.js"},
+	{path: "static/js/policy_panels.js"},
 	{path: "static/js/policy_client_diag.js"},
 	{path: "static/js/policy_client_diag_filter.js"},
 }
@@ -58,9 +59,16 @@ var (
 	// as string literals are not translation keys, so only these call forms are
 	// read.
 	policyScriptKeys = []*regexp.Regexp{
-		regexp.MustCompile(`(?:policyText|clientText|label)\(\s*'(policy_[a-z0-9_]+)'`),
+		regexp.MustCompile(`(?:policyText|clientText|label|panelText)\(\s*'(policy_[a-z0-9_]+)'`),
 		regexp.MustCompile(`:\s*'(policy_client_decision_reason_[a-z0-9_]+)'`),
 	}
+	// A translator call's whole argument list, so a label chosen inside a
+	// conditional (`panelText(hasList ? 'a' : 'b')`) is guarded like a literal one.
+	// A literal-call pattern misses it, and a miss is invisible: the key resolves
+	// elsewhere and only the emptied translation reaches the operator.
+	policyScriptCallEnv = regexp.MustCompile(`(?:policyText|clientText|label|panelText)\(([^()]*)\)`)
+	// Any policy key literal inside such a call.
+	policyScriptKeyLiteral = regexp.MustCompile(`'(policy_[a-z0-9_]+)'`)
 )
 
 // policyRefusedClaims are statements the policy surface must not make. Each
@@ -175,14 +183,38 @@ func TestPolicySurfaceDoesNotDescribeTheRetiredDnsModel(t *testing.T) {
 
 // policyHintClaim is one statement the operator relies on, with the technical
 // token every bundle must keep for it.
+// policyHintClause is one statement the answer must keep making, with the phrase
+// that carries it in each language's own wording. Matching is case-sensitive on
+// purpose: "Do not check Policy status" contains the words of the instruction and
+// must not satisfy it.
+type policyHintClause struct {
+	claim   string
+	phrases map[string]string
+}
+
 type policyHintClaim struct {
 	key    string
 	claim  string
 	tokens []string
+	// clauses pin statements rather than words. A substring like "politique" is
+	// present in a sentence that says the opposite, so the reviewed phrases below
+	// are what a locale has to keep to satisfy the claim.
+	clauses []policyHintClause
+	// tokensByLocale pins a claim whose words differ in every language: a shared
+	// token cannot express "names the unusable list and points at the state
+	// readout" in five languages, and pinning English words would fail four of them.
+	tokensByLocale map[string][]string
 }
 
 // TestPolicyHintsNameTheRealRoutingInput pins what the two corrected hints keep
 // saying, in every bundle: the terms that make each sentence true have to stay.
+//
+// The inventory answer is pinned by clause as well as by word. A substring test is
+// not enough there: the French value can lose the recovery guidance, and the English
+// one can be reversed to "Do not check Policy status", while every broad token and
+// every refused fragment stays absent. The review recorded both as passing this
+// guard, which is why the reviewed phrases below are matched exactly, in each
+// language's own wording.
 // The refused set above carries the corresponding negative direction, so a
 // locale that reverts to the retired mechanism or to the rejected first-round
 // wording fails there, and a locale that keeps the terms but loses the subject
@@ -201,11 +233,50 @@ func TestPolicyHintsNameTheRealRoutingInput(t *testing.T) {
 			tokens: []string{"IPv4", "DNS", "IPv6"},
 		},
 		{
+			// This key is the P2 answer body in this branch, not the free-standing
+			// notice it was when the hint copy was written: the accepted design puts
+			// "this build cannot read the list, check Policy status" in the panel and
+			// states the mechanism limits in policy_limits_notice. The claim below is
+			// therefore the one the panel actually makes; the mechanism sentence this
+			// pin used to require is recorded as a handover disagreement, not silently
+			// dropped — see the note in the R4 handover.
 			key:   "policy_inventory_unusable",
-			claim: "a broken inventory stops policy routing from starting, and PROXY is what applies while it is off",
-			// PROXY is the list name the operator sees elsewhere on the page; a
-			// locale that replaces it with prose stops matching the lists.
-			tokens: []string{"PROXY"},
+			claim: "the unusable artifact is named, and the reader is sent to the Policy status readout",
+			tokensByLocale: map[string][]string{
+				"en": {"shipped address list", "Policy status"},
+				"ru": {"список адресов", "политики"},
+				"fr": {"liste d'adresses", "politique"},
+				"zh": {"地址列表", "策略"},
+				"fa": {"فهرست نشانی", "خط‌مشی"},
+			},
+			clauses: []policyHintClause{
+				{
+					// The read failure itself. Without it the answer can describe
+					// a list this build did read, which is the state the panel
+					// exists to rule out.
+					claim: "this build cannot read the shipped address list",
+					phrases: map[string]string{
+						"en": "This build cannot read the shipped address list",
+						"ru": "Эта сборка не может прочитать поставляемый список адресов",
+						"fr": "Cette version ne peut pas lire la liste d'adresses fournie",
+						"zh": "此构建无法读取随附的地址列表",
+						"fa": "این ساخت نمی‌تواند فهرست نشانی‌های همراه را بخواند",
+					},
+				},
+				{
+					// The recovery guidance: where the operator can learn whether
+					// routing is active at all, which is the only trustworthy
+					// statement while the freshness verdict is unavailable.
+					claim: "the operator is sent to Policy status for the active routing state",
+					phrases: map[string]string{
+						"en": "Check Policy status for the active routing state",
+						"ru": "Проверьте состояние политики, чтобы узнать активное состояние маршрутизации",
+						"fr": "Consultez l'état de la politique pour connaître l'état actif du routage",
+						"zh": "请查看策略状态以了解当前的路由状态",
+						"fa": "برای دیدن وضعیت فعال مسیریابی، وضعیت خط‌مشی را بررسی کنید",
+					},
+				},
+			},
 		},
 	} {
 		assertPolicyHintClaim(t, surface, dictionaries, want)
@@ -229,11 +300,72 @@ func assertPolicyHintClaim(t *testing.T, surface map[string]string, dictionaries
 		if locale != "en" && value == dictionaries["en"][want.key] {
 			t.Errorf("%s.json %q is the English text, not a translation", locale, want.key)
 		}
-		for _, token := range want.tokens {
+		tokens := want.tokens
+		if len(want.tokensByLocale) > 0 {
+			tokens = want.tokensByLocale[locale]
+		}
+		for _, token := range tokens {
 			if !strings.Contains(value, token) {
 				t.Errorf("%s.json %q must name %s in every locale: %s\n  shipped value: %q",
 					locale, want.key, token, want.claim, value)
 			}
+		}
+		for _, clause := range want.clauses {
+			phrase, pinned := clause.phrases[locale]
+			if !pinned {
+				t.Errorf("no %s phrase is pinned for %q; the clause would go unchecked there", locale, want.key)
+				continue
+			}
+			if !strings.Contains(value, phrase) {
+				t.Errorf("%s.json %q must state that %s\n  expected phrase: %q\n  shipped value: %q",
+					locale, want.key, clause.claim, phrase, value)
+			}
+		}
+	}
+}
+
+// policyApprovedInventoryAnswer is the approved answer for an unusable inventory,
+// verbatim, in each shipped language. It is the design contract's sentence for
+// English and the reviewed translations the design and independent reviews accepted
+// for the other four.
+//
+// The pin is an EQUALITY, on purpose, and it is the check that makes this guard
+// bite. Two rounds of containment pins were defeated by the same class of edit: a
+// value with the recovery guidance removed, a value that negated the instruction,
+// and a value that kept both sentences but postponed the instruction until the
+// inventory became readable. Words cannot distinguish "the approved answer" from
+// "the approved answer plus a condition", so the whole answer is compared.
+//
+// Consequence for the next author: changing this copy is a deliberate act — update
+// the value here in the same change that updates the bundle, in every language you
+// touch. A trailing space, a double space or a re-punctuated sentence fails this
+// test by design; it is not normalised.
+var policyApprovedInventoryAnswer = map[string]string{
+	"en": "This build cannot read the shipped address list. Check Policy status for the active routing state.",
+	"ru": "Эта сборка не может прочитать поставляемый список адресов. Проверьте состояние политики, чтобы узнать активное состояние маршрутизации.",
+	"fr": "Cette version ne peut pas lire la liste d'adresses fournie. Consultez l'état de la politique pour connaître l'état actif du routage.",
+	"zh": "此构建无法读取随附的地址列表。请查看策略状态以了解当前的路由状态。",
+	"fa": "این ساخت نمی‌تواند فهرست نشانی‌های همراه را بخواند. برای دیدن وضعیت فعال مسیریابی، وضعیت خط‌مشی را بررسی کنید.",
+}
+
+// TestPolicyInventoryAnswerMatchesTheApprovedCopy is the equality pin. Every locale
+// must ship exactly the approved answer; the clause and token checks elsewhere in
+// this file stay as a second, redundant layer that names what is missing, and this
+// test is what decides whether the answer is the one that was approved.
+func TestPolicyInventoryAnswerMatchesTheApprovedCopy(t *testing.T) {
+	dictionaries := policyDictionaries(t)
+
+	for _, locale := range policyLocales {
+		want, recorded := policyApprovedInventoryAnswer[locale]
+		if !recorded {
+			t.Fatalf("no approved answer is recorded for %s; the pin would not check it", locale)
+		}
+		got := dictionaries[locale]["policy_inventory_unusable"]
+		if got != want {
+			t.Errorf("%s.json \"policy_inventory_unusable\" is not the approved answer\n  approved: %q\n  shipped:  %q\n"+
+				"  If this copy was changed deliberately, update policyApprovedInventoryAnswer for %s "+
+				"in the same change; otherwise the shipped answer has drifted from the reviewed one.",
+				locale, want, got, locale)
 		}
 	}
 }
@@ -257,6 +389,21 @@ func policySurfaceKeys(t *testing.T) map[string]string {
 			for _, match := range pattern.FindAllStringSubmatch(source, -1) {
 				if _, seen := keys[match[1]]; !seen {
 					keys[match[1]] = file.path
+				}
+			}
+		}
+		if file.template {
+			continue
+		}
+		for _, call := range policyScriptCallEnv.FindAllStringSubmatch(source, -1) {
+			for _, literal := range policyScriptKeyLiteral.FindAllStringSubmatch(call[1], -1) {
+				// A key ending in "_" is the base of a concatenation, not a key a
+				// bundle can define; the composed forms are pinned below by name.
+				if strings.HasSuffix(literal[1], "_") {
+					continue
+				}
+				if _, seen := keys[literal[1]]; !seen {
+					keys[literal[1]] = file.path
 				}
 			}
 		}

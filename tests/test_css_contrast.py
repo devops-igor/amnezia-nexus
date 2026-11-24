@@ -83,6 +83,22 @@ def surface(tokens: dict[str, str], name: str) -> str:
     return "#%02x%02x%02x" % tuple(flat)
 
 
+def rule_body(css: str, selector: str) -> str:
+    """Every declaration block that lists `selector`, in cascade order.
+
+    A grouped rule repeats the selector, so a presence assertion has to read all of
+    them: the last block for `.policy-answer-action` is the one that cancels its
+    motion, not the one that sets its wrapping.
+    """
+    bodies = [
+        decls
+        for head, decls in _RULE_RE.findall(css)
+        if selector in [" ".join(part.split()) for part in head.split(",")]
+    ]
+    assert bodies, f"no rule declares {selector!r}"
+    return "\n".join(bodies)
+
+
 def token_name(value: str) -> str:
     match = re.fullmatch(r"var\(--([\w-]+)\)", value)
     assert match, f"expected a design token, got {value!r}"
@@ -326,8 +342,16 @@ def test_status_ink_is_declared_in_the_token_file_and_used_only_by_the_feedback(
         "the status ink must be declared once in tokens.css (and its generated "
         f"bundle), not spread around: {sorted(declared)}"
     )
-    assert referenced == {"static/js/notifications_settings.js"}, (
-        "only the notification feedback line may consume the status ink: " f"{sorted(referenced)}"
+    # The readouts are the second legitimate consumer: their success and failure
+    # answers are status messages an operator must act on, painted on the answer
+    # inset rather than on the feedback line. Every consumer is named here, so a
+    # third file that reaches for the status ink still fails this guard.
+    assert referenced == {
+        "static/js/notifications_settings.js",
+        "templates/settings_policy.html",
+    }, (
+        "the status ink is consumed outside its declared surfaces (the notification "
+        f"feedback line and the policy readout answers): {sorted(referenced)}"
     )
 
 
@@ -356,4 +380,259 @@ def test_status_ink_keeps_success_and_failure_distinct(theme: str) -> None:
     assert contrast.ratio(success, danger) > 1.1, (
         f"the {theme} theme's success {success} and failure {danger} are too close "
         f"({contrast.ratio(success, danger):.2f}:1 apart)"
+    )
+
+
+# ===== Policy readout answers =====
+# The four policy readouts paint a state as a tinted answer inset: a headline, a
+# sentence, an action and a disclosure. Those roles are declared in the page
+# template rather than a stylesheet, so the guards above cannot see them. Every
+# colour is still a design token, and the surfaces are resolved the way the browser
+# composites them: a translucent tint over the card behind it. The floors are read
+# from the contrast helper, never pinned, so a palette change that breaks one of
+# these roles fails here.
+POLICY_TEMPLATE = CSS_DIR.parents[1] / "templates" / "settings_policy.html"
+POLICY_ANSWER_STATES = ["success", "warning", "danger", "info"]
+POLICY_BACKDROPS = ["bg-card", "bg-secondary"]
+
+
+def policy_style() -> str:
+    markup = POLICY_TEMPLATE.read_text(encoding="utf-8")
+    match = re.search(r"<style>(.*?)</style>", markup, flags=re.S)
+    assert match, "settings_policy.html declares no <style> block for the readouts"
+    return re.sub(r"/\*.*?\*/", "", match.group(1), flags=re.S)
+
+
+def flattened(top: str, bottom: str) -> str:
+    """A translucent colour over an opaque one, the way the page paints it."""
+    r, g, b, a = contrast.parse_color(top)
+    br, bg, bb, _ = contrast.parse_color(bottom)
+    return "#%02x%02x%02x" % (
+        round(a * r + (1 - a) * br),
+        round(a * g + (1 - a) * bg),
+        round(a * b + (1 - a) * bb),
+    )
+
+
+def policy_color(selector: str, property: str = "color") -> str:
+    css = policy_style()
+    value = declared(css, selector, property)
+    assert value is not None, f"the readout style declares no {property} for {selector!r}"
+    return value
+
+
+def answer_surface(tokens: dict[str, str], state: str, backdrop: str) -> str:
+    """The composited surface of one answer state over one backdrop."""
+    tint = policy_color(f'#policyRoutingCard .policy-answer[data-state="{state}"]', "background")
+    assert tint.startswith("var("), f"the {state} answer paints {tint!r}, not a design token"
+    return flattened(contrast.resolve(token_name(tint), tokens), surface(tokens, backdrop))
+
+
+def test_policy_readout_style_names_tokens_and_no_literal_colour() -> None:
+    """Every colour in the readout style is a token, so the palette stays authoritative."""
+    css = policy_style()
+    literals = re.findall(
+        r"(?<![\w-])(#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\))", css
+    )
+    assert not literals, f"the readout style paints literal colours: {sorted(set(literals))}"
+    # Focus is the shared rule's job. A local outline is how the previous revision
+    # replaced a compliant focus ring with a translucent border token.
+    assert "outline" not in css, (
+        "the readout style declares its own outline; the shared :focus-visible rule "
+        "is the one measured against the focus floor"
+    )
+
+
+def test_policy_readout_disclosure_shows_an_open_closed_state() -> None:
+    """The summary's marker is suppressed by the flex layout, so a replacement is required."""
+    css = policy_style()
+    assert re.search(
+        r"#policyRoutingCard \.policy-disclosure-summary::after\s*\{[^}]*border-right[^}]*\}",
+        css,
+    ), "the readout disclosure draws no open/closed indicator"
+    assert re.search(
+        r"#policyRoutingCard \.policy-disclosure\[open\][^{]*\.policy-disclosure-summary::after\s*\{[^}]*transform",
+        css,
+    ), "the readout disclosure indicator does not change when the disclosure opens"
+    # No motion is introduced: the only transition this block may declare is one that
+    # removes motion (the shared button's hover lift is cancelled above).
+    for match in re.finditer(r"transition\s*:\s*([^;]+);", css):
+        assert match.group(1).strip() == "none", (
+            f"the readout style sets up a transition ({match.group(1).strip()!r}); movement "
+            "must not be introduced for readers who asked for reduced motion"
+        )
+    assert "animation" not in css and "@keyframes" not in css, (
+        "the readout style declares an animation"
+    )
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("state", POLICY_ANSWER_STATES)
+@pytest.mark.parametrize("backdrop", POLICY_BACKDROPS)
+def test_policy_answer_text_meets_aa_on_its_inset(theme: str, state: str, backdrop: str) -> None:
+    """The headline and the sentence are read on the tint the state paints."""
+    tokens = contrast.theme_tokens(theme)
+    bg = answer_surface(tokens, state, backdrop)
+    # The cascade: a state rule wins where it exists, the base rule otherwise. The
+    # oracle resolves the pair rather than requiring a rule per state.
+    headline = declared(
+        policy_style(),
+        f'#policyRoutingCard .policy-answer[data-state="{state}"] .policy-answer-headline',
+        "color",
+    ) or policy_color("#policyRoutingCard .policy-answer-headline")
+    roles = {
+        "headline": headline,
+        "body": policy_color("#policyRoutingCard .policy-answer-body"),
+    }
+    for role, value in roles.items():
+        name = token_name(value)
+        got = contrast.ratio(contrast.resolve(name, tokens), bg)
+        assert got >= contrast.AA_TEXT, (
+            f"the {state} answer's {role} uses --{name} on its {backdrop} inset in the "
+            f"{theme} theme: {got:.2f}:1, below {contrast.AA_TEXT}:1"
+        )
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("backdrop", POLICY_BACKDROPS)
+def test_policy_disclosure_and_fact_ink_meet_aa_on_the_panel(theme: str, backdrop: str) -> None:
+    tokens = contrast.theme_tokens(theme)
+    bg = surface(tokens, backdrop)
+    for selector in ("#policyRoutingCard .policy-disclosure-summary", "#policyRoutingCard .policy-raw"):
+        name = token_name(policy_color(selector))
+        got = contrast.ratio(contrast.resolve(name, tokens), bg)
+        assert got >= contrast.AA_TEXT, (
+            f"{selector} uses --{name} on --{backdrop} in the {theme} theme: {got:.2f}:1"
+        )
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("state", POLICY_ANSWER_STATES)
+def test_policy_action_label_meets_aa_on_the_shared_button(theme: str, state: str) -> None:
+    """The readout actions are the shared secondary button, so its own pair is measured.
+
+    They sit inside a tinted inset, so the button's declared fill is what the label
+    is read against; the tint behind the button is not the label's background.
+    """
+    tokens = contrast.theme_tokens(theme)
+    sheet = _css("components")
+    ink = token_name(declared_color(sheet, ".btn-secondary"))
+    fill = declared(sheet, ".btn-secondary", "background")
+    hover = declared(sheet, ".btn-secondary:hover", "background")
+    assert fill and hover, "the shared secondary button lost its fill or hover fill"
+    for value in (fill, hover):
+        name = token_name(value)
+        got = contrast.ratio(contrast.resolve(ink, tokens), contrast.resolve(name, tokens))
+        assert got >= contrast.AA_TEXT, (
+            f"the readout action label --{ink} on --{name} in the {theme} theme: "
+            f"{got:.2f}:1, below {contrast.AA_TEXT}:1"
+        )
+    # The readout's own hover rule is what wins: the shared `a:hover` ink is the
+    # accent (0,1,1) and would silently re-take the label at hover without it.
+    hovered = policy_color("#policyRoutingCard .policy-answer-action:hover")
+    assert hovered == "var(--text-primary)", (
+        "the readout action's hover ink is no longer the readable one: " + hovered
+    )
+    hover_got = contrast.ratio(
+        contrast.resolve(token_name(hovered), tokens),
+        contrast.resolve(token_name(hover), tokens),
+    )
+    assert hover_got >= contrast.AA_TEXT, (
+        f"the hovered readout action in the {theme} theme measures {hover_got:.2f}:1 on "
+        f"its hover fill, below {contrast.AA_TEXT}:1"
+    )
+    # And the shared rule it overrides really is the failing ink.
+    shared_hover = declared_color(_css("base"), "a:hover")
+    shared_got = contrast.ratio(
+        contrast.resolve(token_name(shared_hover), tokens),
+        contrast.resolve(token_name(hover), tokens),
+    )
+    assert shared_got < contrast.AA_TEXT, (
+        "the shared link hover ink now clears the floor on the button fill; the scoped "
+        "override can be retired if so"
+    )
+    # And the action really is that button, not a look-alike.
+    markup = POLICY_TEMPLATE.read_text(encoding="utf-8")
+    assert 'class="btn btn-secondary policy-answer-action"' in markup, (
+        "the readout actions no longer use the shared secondary button treatment"
+    )
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("state", POLICY_ANSWER_STATES)
+@pytest.mark.parametrize("backdrop", POLICY_BACKDROPS)
+def test_policy_focus_ring_clears_the_non_text_floor(theme: str, state: str, backdrop: str) -> None:
+    """The shared focus ring is what a keyboard operator sees on a readout control."""
+    tokens = contrast.theme_tokens(theme)
+    focus_declarations = _focus_declarations()
+    assert focus_declarations, "base.css declares no :focus-visible rule"
+    bg = answer_surface(tokens, state, backdrop)
+    for head, outline in focus_declarations:
+        found = re.search(r"var\(--([\w-]+)\)", outline)
+        assert found, f"{head}: outline {outline!r} names no token"
+        got = contrast.ratio(contrast.resolve(found.group(1), tokens), bg)
+        assert got >= contrast.AA_NON_TEXT, (
+            f"{head}: --{found.group(1)} on the {state} answer inset over --{backdrop} in the "
+            f"{theme} theme is {got:.2f}:1, below {contrast.AA_NON_TEXT}:1"
+        )
+
+
+# ===== Readout action targets =====
+# The review measured these in a browser; these are the structural halves that keep a
+# later edit from undoing the fix, and the browser case in the policy suite is the
+# rendered measurement.
+def test_policy_readout_actions_wrap_inside_their_column() -> None:
+    """A localized label wraps; it is never clipped and never overflows its card."""
+    body = rule_body(policy_style(), "#policyRoutingCard .policy-answer-action")
+    assert "white-space: normal" in body, (
+        "the readout action inherits the shared button's nowrap, so a long localized "
+        "label cannot fit the column a phone gives it"
+    )
+    assert "overflow-wrap: anywhere" in body, (
+        "a long unbreakable translated word would still push the control out"
+    )
+    assert "max-width: 100%" in body, "the action is not bounded by its container"
+    assert "overflow: hidden" not in body, (
+        "the action hides its overflow instead of wrapping: the label would be cut"
+    )
+    # The retry is a real button in the same panel, so it has to carry the same class.
+    markup = POLICY_TEMPLATE.read_text(encoding="utf-8")
+    assert re.search(
+        r'<button[^>]*class="btn btn-secondary policy-answer-action"[^>]*id="policySyncNowBtn"',
+        markup,
+    ), "the retry button does not carry the readout action treatment"
+
+
+def test_policy_readout_actions_do_not_move() -> None:
+    """Every readout action cancels the shared button's hover lift and transition."""
+    css = policy_style()
+    for state in ("", ":hover", ":active"):
+        selector = f"#policyRoutingCard .policy-answer-action{state}"
+        body = rule_body(css, selector)
+        assert "transform: none" in body, f"{selector} keeps the shared button's lift"
+    base = rule_body(css, "#policyRoutingCard .policy-answer-action")
+    assert "transition: none" in base, (
+        "the action keeps a transition, so it moves for a reader who asked for "
+        "reduced motion"
+    )
+
+
+def test_policy_disclosure_marker_is_direction_independent() -> None:
+    """The chevron's own shape is physical; only its placement is logical."""
+    css = policy_style()
+    body = rule_body(css, "#policyRoutingCard .policy-disclosure-summary::after")
+    assert "border-right:" in body and "border-bottom:" in body, (
+        "the marker's border pair is not the physical pair that points down in both "
+        "directions"
+    )
+    assert "border-inline-end" not in body and "border-block-end" not in body, (
+        "a logical border mirrors in RTL while the rotation does not, so the marker "
+        "points sideways there"
+    )
+    assert "margin-inline-start: auto" in body, (
+        "the marker is not placed at the inline end"
+    )
+    assert not re.search(r'\[dir="rtl"\][^{]*policy-disclosure-summary::after', css), (
+        "the marker needs a direction-specific override again: its shape should not "
+        "depend on the writing direction"
     )
