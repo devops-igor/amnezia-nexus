@@ -734,6 +734,9 @@ func (h *Handlers) installAndEnableDeploy(
 	// 5. Backend Enablement
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusEnablingBackend, DeployStatusEnablingBackend, "", providerServerID, nexusServerID, assignedIP)
 	if err := h.enableDeployBackend(ctx, server, protocol); err != nil {
+		if errors.Is(err, tunnel.ErrProviderAbsent) {
+			return nil, err
+		}
 		// The enablement path already withdrew the backend generation it observed
 		// (durable + runtime quarantine, administrative disable, device detach).
 		// A second disable keyed only by server ID would withdraw whatever owns
@@ -847,6 +850,10 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 // credential is a pause with instructions. Everything else is a real failure, and
 // the ordering below keeps the most specific cause first.
 func (h *Handlers) writeGigahostDeployFailure(w http.ResponseWriter, status *GigahostDeployStatus, err error) {
+	if errors.Is(err, tunnel.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	var confirmation *ssh.ErrFingerprintRequired
 	if errors.As(err, &confirmation) {
 		h.JSON(w, http.StatusConflict, map[string]any{

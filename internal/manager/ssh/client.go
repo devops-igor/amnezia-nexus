@@ -190,7 +190,7 @@ func (c *Client) connect(ctx context.Context) error {
 		c.sftpClient = nil
 	}
 
-	c.sshClient = gossh.NewClient(sshConn, chans, reqs)
+	c.sshClient = gossh.NewClient(&presenceConn{Conn: sshConn, cfg: c.cfg}, chans, reqs)
 	c.closed = false
 	c.lastActive.Store(time.Now().UnixNano())
 
@@ -227,28 +227,35 @@ func (c *Client) buildClientConfig(ctx context.Context) (*gossh.ClientConfig, er
 // getSFTP returns an initialized SFTP client instance, creating one if not present or refreshing if stale.
 func (c *Client) getSFTP() (*sftp.Client, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed || c.sshClient == nil {
+	cached, transport, closed := c.sftpClient, c.sshClient, c.closed
+	c.mu.Unlock()
+	if closed || transport == nil {
 		return nil, ErrNotConnected
 	}
-
-	if c.sftpClient != nil {
-		// Verify if cached SFTP client session is still healthy
-		if _, err := c.sftpClient.Getwd(); err == nil {
-			return c.sftpClient, nil
+	if cached != nil {
+		if _, err := cached.Getwd(); err == nil {
+			return cached, nil
 		}
-		// Stale / broken SFTP client session -> close and recreate
-		_ = c.sftpClient.Close()
-		c.sftpClient = nil
+		_ = cached.Close()
 	}
-
-	sftpClient, err := sftp.NewClient(c.sshClient)
+	candidate, err := sftp.NewClient(transport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize sftp client: %w", err)
 	}
-	c.sftpClient = sftpClient
-	return c.sftpClient, nil
+	c.mu.Lock()
+	if c.closed || c.sshClient != transport {
+		c.mu.Unlock()
+		_ = candidate.Close()
+		return nil, ErrNotConnected
+	}
+	if current := c.sftpClient; current != nil && current != cached {
+		c.mu.Unlock()
+		_ = candidate.Close()
+		return current, nil
+	}
+	c.sftpClient = candidate
+	c.mu.Unlock()
+	return candidate, nil
 }
 
 // RunCommand executes a command remotely and returns stdout, stderr, and exit code.

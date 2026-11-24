@@ -38,6 +38,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostsetup"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // installStepTimeout bounds one install attempt. It matches the request-path
@@ -270,6 +271,10 @@ func (h *Handlers) finishInstall(
 	plan installPlan, journal *gigahostsetup.InstallJournal,
 ) error {
 	if err := h.installEnableStep(ctx, req, server, plan, journal); err != nil {
+		if errors.Is(err, tunnel.ErrProviderAbsent) {
+			journal.Pause(ctx, "not_measured", err)
+			return nil // Non-terminal stop, not a completed phase or health verdict.
+		}
 		return err
 	}
 	if err := journal.Admit(ctx, "ready", server.ID); err != nil {

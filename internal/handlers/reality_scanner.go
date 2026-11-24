@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"net/http"
 	"time"
 
@@ -69,7 +71,12 @@ func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request)
 		Timeout:     timeout,
 		Domains:     req.Domains,
 	}
-	if sshClient, err := h.GetSSHClient(ctx, server); err == nil && sshClient != nil {
+	sshClient, err := h.GetSSHClient(ctx, server)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
+	if err == nil && sshClient != nil {
 		if underlying := sshClient.GetUnderlyingClient(); underlying != nil {
 			opts.DialContext = underlying.DialContext
 		}
@@ -77,6 +84,19 @@ func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request)
 	fellBack := opts.DialContext == nil
 
 	report, err := scanner.ScanSNI(ctx, server.Host, opts)
+	absent, readErr := h.db.IsServerProviderAbsent(ctx, serverID)
+	if absent {
+		h.serverNotMeasured(w)
+		return
+	}
+	if readErr != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to read server observation")
+		return
+	}
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "scan_failed", err.Error())
 		return

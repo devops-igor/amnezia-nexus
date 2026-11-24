@@ -37,6 +37,7 @@ type MockSSHServer struct {
 	activeConns  map[net.Conn]struct{}
 	closed       bool
 	hangCommands bool
+	channels     atomic.Int64
 	commands     atomic.Int64
 	keepalives   atomic.Int64
 }
@@ -258,6 +259,7 @@ func (s *MockSSHServer) handleConn(netConn net.Conn, config *gossh.ServerConfig)
 	}()
 
 	for newChannel := range chans {
+		s.channels.Add(1)
 		switch newChannel.ChannelType() {
 		case "session":
 			channel, requests, err := newChannel.Accept()

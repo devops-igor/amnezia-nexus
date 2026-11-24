@@ -117,6 +117,9 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 	if server == nil {
 		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
 	}
+	if server.ProviderAbsent() {
+		return tunnel.ErrProviderAbsent
+	}
 
 	var opt tunnel.BackendTunnelOptions
 	if len(opts) > 0 {
@@ -392,7 +395,7 @@ func (s *Service) finishEnableBackend(
 		}
 	}
 	if candidateDev == nil && proto == models.ProtocolNaive && tun != nil {
-		cand, closer, err := s.prepareNaiveCandidateDevice(ctx, tun, prepared...)
+		cand, closer, err := s.preparePresentNaiveCandidate(ctx, tun, prepared...)
 		if err != nil {
 			return err
 		}
