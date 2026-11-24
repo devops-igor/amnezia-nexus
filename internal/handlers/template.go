@@ -111,24 +111,12 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"vpn.html",
 	}
 
-	// layoutPartials are template files that only define a section included by a
-	// layout page (for example settings_policy.html, rendered by settings.html).
-	// They are parsed with every layout page because a page resolves its includes
-	// at execution time, and a define that no page uses costs nothing.
-	layoutPartials := []string{
-		"settings_policy.html",
-		"settings_policy_client.html",
-		"settings_notifications.html",
-		"settings_save_controls.html",
-		"settings/appearance.html",
-		"settings/captcha.html",
-		"settings/telegram.html",
-		"settings/ssl.html",
-		"settings/limits.html",
-		"settings/backup.html",
-		"settings/upstream_components.html",
-		"settings/gigahost.html",
-	}
+	// layoutPartials are template files that only define a section included by a layout
+	// page. They are parsed with every layout page because a page resolves its includes at
+	// execution time, and a define that no page uses costs nothing. The list is owned by
+	// the web package, beside the embedded templates, so a test that renders a page parses
+	// exactly the files the application does.
+	layoutPartials := web.LayoutPartials
 
 	fresh := make(map[string]*template.Template)
 

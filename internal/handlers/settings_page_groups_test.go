@@ -454,17 +454,33 @@ func TestSettingsPageSubNavigationLinksEveryGroup(t *testing.T) {
 					label, englishTranslation(t, "settings_nav_label"))
 			}
 
-			var hrefs, texts []string
+			var hrefs, texts, classes []string
 			walkLive(nav, func(n *html.Node) {
 				if n.Type != html.ElementNode || n.Data != "a" {
 					return
 				}
 				href, _ := attr(n, "href")
+				class, _ := attr(n, "class")
 				hrefs = append(hrefs, href)
 				texts = append(texts, textOf(n))
+				classes = append(classes, class)
 			})
 			if len(hrefs) != len(tc.groups) {
 				t.Fatalf("the sub-navigation has %d links, want one per rendered group (%d)", len(hrefs), len(tc.groups))
+			}
+			// A navigation link is not a control with a surface: it carries no
+			// button class, because every button variant paints a fill or a
+			// border that reads as four chips on the page. The settings sheet
+			// owns the link's size, alignment and states instead.
+			for i, class := range classes {
+				if !containsClass(class, "settings-subnav-link") {
+					t.Errorf("link %d has class %q, want settings-subnav-link", i, class)
+				}
+				for _, token := range strings.Fields(class) {
+					if token == "btn" || strings.HasPrefix(token, "btn-") {
+						t.Errorf("link %d carries the button class %q, which paints a fill the navigation must not have", i, token)
+					}
+				}
 			}
 			for i, spec := range tc.groups {
 				if hrefs[i] != "#"+spec.id {

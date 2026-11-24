@@ -10,15 +10,30 @@
         });
     }
 
+    // The shared confirmation modal serves every destructive action in the panel. A
+    // confirmation that needs its own layout marks the dialog for the length of one
+    // call, so the mark is gone again before any other confirmation can see it.
+    async function confirmWith(kind, options) {
+        const modal = document.getElementById('nexusConfirmModal');
+        if (modal) modal.dataset.confirmKind = kind;
+        try {
+            return await UI.confirm(options);
+        } finally {
+            if (modal) delete modal.dataset.confirmKind;
+        }
+    }
+
     async function handleRestore(e) {
         const file = e.target.files[0];
         if (!file) return;
 
-        const confirmed = await UI.confirm({
+        const confirmed = await confirmWith('destructive', {
             title: _('restore_backup'),
             message: _('restore_confirm'),
             confirmText: _('restore_backup'),
-            confirmVariant: 'warning'
+            // A restore overwrites the current data and restarts the panel, so the
+            // confirming control carries the destructive variant, not a warning.
+            confirmVariant: 'danger'
         });
 
         if (!confirmed) {
@@ -154,6 +169,11 @@
 
     let cachedPlans = [];
 
+    // A confirmation the operator has not answered yet blocks a second request, so
+    // two rapid presses cannot become two orders. It is not a button state: the
+    // form stays exactly as it was while the dialog is open.
+    let deployConfirmationOpen = false;
+
     // The rule lives in the module so it cannot drift between rebuilds and choice.
     const deploymentPlacementIntent = placementNewIntent();
 
@@ -228,6 +248,64 @@
         if (p.monthly_ceiling_nok > 0) price.push('max ' + p.monthly_ceiling_nok + ' ' + currency + '/mo');
         const spec = parts.join(', ');
         return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
+    }
+
+    // revealDeploySelection puts the first control the confirmation names below the
+    // fixed mobile top bar, so the plan it is checked against is not clipped by the
+    // shell when the dialog opens. On a viewport where that control is already clear
+    // (no top bar, or it sits below one) it moves nothing. The settings page scrolls
+    // smoothly; an animated scroll would still be running when the dialog freezes the
+    // page, so this one is applied instantly.
+    function revealDeploySelection() {
+        if (!deployPlanSelect || typeof deployPlanSelect.getBoundingClientRect !== 'function') return;
+        const bar = document.querySelector('.mobile-topbar');
+        if (!bar || typeof window.scrollBy !== 'function') return;
+        const margin = 8;
+        const covered = bar.getBoundingClientRect().bottom + margin
+            - deployPlanSelect.getBoundingClientRect().top;
+        if (covered <= 0) return;
+        const root = document.documentElement;
+        const previous = root.style.scrollBehavior;
+        root.style.scrollBehavior = 'auto';
+        window.scrollBy(0, -covered);
+        root.style.scrollBehavior = previous;
+    }
+
+    // deployCostText renders the provider's own price facts for the confirmation:
+    // the hourly rate it charges and the monthly ceiling it documents. A plan the
+    // provider quoted no rate for says so instead of reading as a free order; no
+    // figure here is computed, converted or capped by the page.
+    function deployCostText(plan) {
+        const currency = plan.currency || 'NOK';
+        const parts = [];
+        if (plan.hourly_rate_nok > 0) {
+            parts.push(_('deploy_vps_cost_hourly')
+                .replace('{rate}', plan.hourly_rate_nok)
+                .replace('{currency}', currency));
+        }
+        if (plan.monthly_ceiling_nok > 0) {
+            parts.push(_('deploy_vps_cost_ceiling')
+                .replace('{ceiling}', plan.monthly_ceiling_nok)
+                .replace('{currency}', currency));
+        }
+        return parts.length ? parts.join(', ') : _('deploy_vps_cost_unknown');
+    }
+
+    // deployOrderMessage names the five facts the operator approves: the plan, the
+    // region and datacenter the selectors are showing, the image, and the cost. The
+    // names are read from the same options the payload's ids came from, so the
+    // summary cannot describe a different selection than the one being ordered. The
+    // datacenter option's own label already says when the provider chooses it.
+    function deployOrderMessage(plan) {
+        const selectedText = select => (select && select.selectedIndex >= 0)
+            ? select.options[select.selectedIndex].textContent
+            : '';
+        return _('deploy_vps_confirm_body')
+            .replace('{plan}', plan.name || '')
+            .replace('{region}', selectedText(deployRegionSelect))
+            .replace('{datacenter}', selectedText(deployPlacementSelect))
+            .replace('{os}', selectedText(deployOSSelect))
+            .replace('{cost}', deployCostText(plan));
     }
 
     // appendDeployOption adds one disabled-by-default placeholder option, used
@@ -416,6 +494,31 @@
             UI.toast(_('deploy_vps_select_required'), 'error');
             return;
         }
+
+        // A paid action is confirmed before the request leaves the page. The
+        // summary is built from the values the payload below already carries and
+        // the labels the operator is looking at, so it cannot describe a different
+        // order. Cancelling returns here: nothing is sent, nothing is disabled and
+        // the form keeps every selection.
+        if (deployConfirmationOpen) return;
+        // The confirmation is checked against the form, so the first control it
+        // names is brought clear of the fixed top bar before the dialog opens (the
+        // dialog itself docks to the bottom edge). Nothing moves when that control
+        // is already fully visible.
+        revealDeploySelection();
+        deployConfirmationOpen = true;
+        let confirmed = false;
+        try {
+            confirmed = await confirmWith('order', {
+                title: _('deploy_vps_confirm_title'),
+                message: deployOrderMessage(plan),
+                confirmText: _('deploy_vps_btn'),
+                confirmVariant: 'primary'
+            });
+        } finally {
+            deployConfirmationOpen = false;
+        }
+        if (!confirmed) return;
 
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');

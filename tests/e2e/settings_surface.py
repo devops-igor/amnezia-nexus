@@ -117,8 +117,22 @@ SETTINGS_NAV_PROBE = """() => {
   const r = nav ? nav.getBoundingClientRect() : null;
   const links = nav ? [...nav.querySelectorAll('a')].map(a => {
     const lr = a.getBoundingClientRect();
+    // The resting paint of the link itself and the marks that carry the current
+    // group: a navigation link that kept a filled background or a full border box
+    // would read as a button, and a current group marked by a text hue alone
+    // would be indistinguishable to a reader who cannot separate the hues. The
+    // suite states the values it requires rather than trusting the sheet.
+    const s = getComputedStyle(a);
     return {href: a.getAttribute('href'), text: (a.textContent || '').trim(),
             current: a.getAttribute('aria-current'),
+            background: s.backgroundColor,
+            backgroundImage: s.backgroundImage,
+            boxShadow: s.boxShadow,
+            color: s.color,
+            fontWeight: s.fontWeight,
+            textDecorationLine: s.textDecorationLine,
+            borders: {top: s.borderTopWidth, right: s.borderRightWidth,
+                      bottom: s.borderBottomWidth, left: s.borderLeftWidth},
             width: lr.width, height: lr.height, left: lr.left, right: lr.right};
   }) : [];
   const current = document.querySelector('[aria-current="true"]');

@@ -35,6 +35,13 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "settings-choice", "settings-choice-hint", "settings-choice-title",
     "settings-cluster", "settings-divider", "settings-field-label",
     "settings-field-pair", "settings-fieldset", "settings-flush",
+    # The Gigahost status widget: its row, the two sides of that row, the progression
+    # badge and its steps. The rules lay the row out and mark which step is in flight,
+    # and the reference predates the widget. Settings-only, so they are named here
+    # rather than with the VPN surface.
+    "gigahost-order-identity", "gigahost-order-row", "gigahost-order-state",
+    "gigahost-order-status", "gigahost-order-status-stage",
+    "gigahost-order-status-toggle",
     "settings-grid", "settings-group", "settings-group-title", "settings-inline",
     "settings-list",
     "settings-list-title", "settings-loading", "settings-notice",
@@ -91,10 +98,20 @@ VPN_SURFACE_CLASSES = frozenset({
     "vpn-windows",
 })
 
+# Every class the page-content surface adds beyond the frozen reference. The
+# shell's content area carries it so the two-step button scale reaches the
+# controls a page renders, which the reference predates. `nav-tab` is here for the
+# same reason: the server page declares it in a template style block, so the
+# frozen reference has never known it, and the page-content scale names it.
+PORTAL_SURFACE_CLASSES = frozenset({
+    "portal-page",
+    "nav-tab",
+})
+
 # Every class newly introduced beyond the frozen reference, whichever sheet holds
 # it. tests/test_css_reference_frozen.py asserts this equals the real difference
 # between the modular sheets and the reference, so it cannot be padded.
-SURFACE_CLASSES = SETTINGS_SURFACE_CLASSES | VPN_SURFACE_CLASSES
+SURFACE_CLASSES = SETTINGS_SURFACE_CLASSES | VPN_SURFACE_CLASSES | PORTAL_SURFACE_CLASSES
 
 # Rules that pair a legacy class with a Settings card and exist only to size or
 # place controls inside it. Named exactly, so no other legacy rule is set aside by

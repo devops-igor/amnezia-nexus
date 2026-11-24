@@ -1,10 +1,10 @@
 {{ define "title_extra" }} - {{ _ "vpn_page_title" }}{{ end }}
 
 {{ define "content" }}
-<div class="section-title vpn-page-title">
-    <svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg>
-    <span>{{ _ "vpn_page_title" }}</span>
-</div>
+<h1 class="section-title vpn-page-title">
+    <span class="icon"><svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg></span>
+    {{ _ "vpn_page_title" }}
+</h1>
 
 <!-- VPN HEALTH: one status, one sentence, problems first -->
 <section class="card vpn-health" id="vpn-forwarder-card" aria-labelledby="vpn-health-title" aria-busy="true">

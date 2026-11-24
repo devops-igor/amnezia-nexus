@@ -151,14 +151,38 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 	return d.readGigahostOrders(ctx)
 }
 
+// gigahostOrderSelectColumns is the canonical column list every ledger read scans in
+// this order, so a second reader cannot drift from the first.
+const gigahostOrderSelectColumns = `id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
+             created_at, updated_at, price_id, monthly_cap_nok, currency,
+             purchase_origin, purchase_recorded_at`
+
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
-	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	             created_at, updated_at, price_id, monthly_cap_nok, currency,
-	             purchase_origin, purchase_recorded_at
+	q := `SELECT ` + gigahostOrderSelectColumns + `
 	      FROM gigahost_orders
 	      ORDER BY id DESC`
 	return d.scanGigahostOrders(ctx, q)
+}
+
+// ListGigahostDeployments reads the ledger for a page that only displays it.
+//
+// It differs from ListGigahostOrders in one decision: it never creates or upgrades the
+// table. A dashboard render must not run schema DDL, and a panel that has never placed
+// an order has no ledger, so a missing table is answered as "no deployments" instead of
+// being created on the read path. Every other error is returned unchanged, because
+// "could not read" is not "nothing is there".
+func (d *DB) ListGigahostDeployments(ctx context.Context) ([]models.GigahostOrder, error) {
+	if d == nil || d.sqlDB == nil {
+		return []models.GigahostOrder{}, nil
+	}
+	list, err := d.scanGigahostOrders(ctx, `SELECT `+gigahostOrderSelectColumns+`
+	      FROM gigahost_orders
+	      ORDER BY id DESC`)
+	if err != nil && containsFold(err.Error(), "no such table") {
+		return []models.GigahostOrder{}, nil
+	}
+	return list, err
 }
 
 // scanGigahostOrders runs a query with the canonical column order and scans it.

@@ -279,7 +279,9 @@
         var container = byId('notificationHistory');
         if (!container) return;
         try {
-            var data = await root.API.get('/api/notifications/history?limit=25', { silent: true });
+            // This panel shows the most recent five events, newest first; the
+            // endpoint's own default (50) is what other callers get.
+            var data = await root.API.get('/api/notifications/history?limit=5', { silent: true });
             renderHistory(container, (data && data.events) || []);
         } catch (err) {
             container.textContent = translate('notifications_history_failed', 'Could not load notification history');
