@@ -29,13 +29,14 @@ import (
 )
 
 const (
-	sshClientFile    = "internal/manager/ssh/client.go"
-	sshPoolFile      = "internal/manager/ssh/pool.go"
-	sshHandshakeFile = "internal/manager/ssh/handshake.go"
-	tunnelHealthFile = "internal/vpn/tunnel/health.go"
-	tunnelSelfHeal   = "internal/vpn/tunnel/health_selfheal.go"
-	tunnelHealthLoop = "internal/vpn/tunnel/health_loop.go"
-	tunnelReconnect  = "internal/vpn/tunnel/reconnect.go"
+	sshClientFile     = "internal/manager/ssh/client.go"
+	sshPoolFile       = "internal/manager/ssh/pool.go"
+	sshHandshakeFile  = "internal/manager/ssh/handshake.go"
+	tunnelHealthFile  = "internal/vpn/tunnel/health.go"
+	tunnelAbsenceFile = "internal/vpn/tunnel/health_provider_absence.go"
+	tunnelSelfHeal    = "internal/vpn/tunnel/health_selfheal.go"
+	tunnelHealthLoop  = "internal/vpn/tunnel/health_loop.go"
+	tunnelReconnect   = "internal/vpn/tunnel/reconnect.go"
 )
 
 // How a dialling construct is covered.
@@ -73,7 +74,7 @@ var dialSites = []dialSite{
 	{sshHandshakeFile, "gossh.NewClientConn", viaNotAServer, "handshake of a connection a caller already obtained from the transport, which refused first"},
 
 	// ---- tunnel probe dispatch: the boundary every backend probe passes through ----
-	{tunnelHealthFile, "probeEndpoint", viaBoundaryProbe, "the dispatch every tunnel probe passes through; returns ErrProviderAbsent"},
+	{tunnelHealthFile, "probeEndpoint", viaBoundaryProbe, "called from ProbeTunnel; the refusal happens inside the dispatch"},
 	{tunnelHealthFile, "health.ProbeAWGEndpointRange", viaBoundaryProbe, "default AWG sender of the prober, called only through probeEndpoint"},
 	{tunnelHealthFile, "naive.ProbeNaiveProxy", viaBoundaryProbe, "default naive sender, called only through probeEndpoint"},
 	{tunnelHealthFile, "vless.ProbeVLESSReality", viaBoundaryProbe, "default vless sender, called only through probeEndpoint"},
@@ -98,7 +99,7 @@ var dialSites = []dialSite{
 
 	// ---- sites that refuse before dialing on their own ----
 	{"internal/handlers/servers.go", "GetSSHClient", viaRefusesItself, "stats and check handlers answer an absent row without acquisition, and every other use inherits the transport refusal"},
-	{"internal/handlers/servers.go", "net.DialTimeout", viaRefusesItself, "server page reachability poll refuses an absent row before dialing"},
+	{"internal/handlers/server_reachability_probe.go", "net.DialTimeout", viaRefusesItself, "the detail-page measurement dial, called only after the handler's absent-row refusal"},
 	{"internal/handlers/servers.go", "ssh.Config{", viaRefusesItself, "single-server connection test in the detail flow, behind the row checks above"},
 	{"internal/handlers/servers.go", "ssh.Dial", viaNotAServer, "adding a brand-new host from a request body: no stored row exists yet, so no absence can apply"},
 	{"internal/handlers/gigahost_bootstrap.go", "ssh.Config{", viaRefusesItself, "builds the config from the row including its absence observation, so the transport refuses"},
@@ -237,7 +238,7 @@ func TestBoundariesStillRefuse(t *testing.T) {
 	})
 
 	t.Run("tunnel probe dispatch refuses before probing", func(t *testing.T) {
-		body := functionBody(t, root, tunnelHealthFile, "*HealthProber", "probeEndpoint")
+		body := functionBody(t, root, tunnelAbsenceFile, "*HealthProber", "probeEndpoint")
 		if !hasPlainCallGuard(body, "providerAbsent", "ErrProviderAbsent") {
 			t.Fatal("probeEndpoint no longer refuses through a plain providerAbsent guard returning ErrProviderAbsent")
 		}
