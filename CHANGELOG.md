@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - Andromeda - 2026-11-24
+
+A release that moves policy routing onto the destination address itself, retires the DNS-driven surfaces it replaces, and rebuilds the portal around the operator's first question.
+
+### Added
+- Destination-address policy routing: each flow is classified by its IPv4 destination against a committed Russian allocation inventory and the CDN exclusion set the build ships, with the router's precedence and refusal guards stated on the page (#923, #926, #927, #932, #939, #941, #943).
+- Live flows table with four readable columns and per-flow decision evidence next to the inventory override (#932, #941).
+- Problem-first VPN health: the summary names the active problem, and the full technical cards stay available behind advanced diagnostics (#955).
+- Per-session transferred traffic in the VPN sessions table, summed from the forwarder counters in readable units, with an explicit not-measured state (#976, #978).
+- One page heading per portal page and one two-step control scale, measured across 1144 controls (#967, #968).
+- Settings rebuilt into four labelled groups with in-page navigation, per-card saving, an unsaved badge and a result region in each card (#884, #887, #969).
+- Gigahost deployments shown with their real provider state, and listed in Servers from the moment the order exists (#970, #974).
+
+### Changed
+- Paid VPS orders require a confirmation that names plan, region, datacenter, image and price. Cancelling sends nothing, and a second press cannot place a second order (#972, #973).
+- A deployment is identified by its provider server id; the address is only a fallback for a ledger row that never recorded one (#974).
+- The Settings navigation takes the sidebar's selected treatment instead of borrowing the button surface, and the two policy lists are named for the routing they force (#969).
+- Hint text, notification feedback and badge states meet 4.5:1 in both themes, with hints keeping their own tone below field labels (#977, #980).
+- The routing contract is documented as the destination classifier implements it, replacing the DNS-policy prose (#961).
+
+### Removed
+- The encrypted upstream resolver editor and its DNS-over-HTTPS and DNS-over-TLS upstreams, which the address-based classifier replaces (#954).
+- DNS-based routing evidence and the surfaces built on it: the DNS history store, the route cache and its diagnosis table, the per-client DNS diagnosis panel and the DNS evidence producer (#945, #948, #949, #951).
+- Steering of generated client profiles at the panel DNS resolver (#942).
+- The external list source for policy routing; only IPv4 PROXY exceptions remain operator-editable (#917).
+
+### Fixed
+- A stale upstream handshake is no longer reported as a fault, while genuine routing, queue and write failures still are (#964).
+- Naive backends wait for daemon recovery instead of accepting a port that answers (#937).
+- Mixed IPv4 inventory overrides are refused, and the copy states the rule the router applies (#936).
+- Protocol container logs stay readable, size-capped and complete (#930).
+- The share page is judged by navigation status rather than token text in the end-to-end suite (#921).
+
+Upgrading from 2.6.x: a configured encrypted upstream resolver is gone, and routing decisions now come from the destination address rather than DNS evidence. Review the two policy lists in Settings after upgrading.
+
 ## [2.6.0] - Meridian - 2026-11-19
 
 A release centred on the Settings experience, together with policy routing gains, a credential-free backup export, and lower-level VPN and test-infrastructure fixes.

@@ -21,10 +21,10 @@ import (
 )
 
 // AppVersion represents the current version of the web panel.
-const AppVersion = "2.6.0"
+const AppVersion = "3.0.0"
 
 // AppCodename represents the release codename of the current version.
-const AppCodename = "Meridian"
+const AppCodename = "Andromeda"
 
 // Paths represents the standard filesystem paths used by the application.
 type Paths struct {
