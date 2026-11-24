@@ -125,6 +125,18 @@
         text-decoration: none;
         font-size: 0.85rem;
     }
+    /* The shared button is used for its ink, fill and focus, not for its motion.
+       These actions are the readouts' recovery controls, so they do not start
+       moving on hover or press for a reader who asked for reduced motion. */
+    #policyRoutingCard .policy-answer-action,
+    #policyRoutingCard .policy-answer-action:hover,
+    #policyRoutingCard .policy-answer-action:active {
+        transform: none;
+        transition: none;
+    }
+    #policyRoutingCard .policy-answer-action:hover {
+        background: var(--bg-card-hover);
+    }
     #policyRoutingCard .policy-facts {
         margin-block-start: var(--space-sm);
     }

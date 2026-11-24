@@ -438,9 +438,15 @@ def test_policy_readout_disclosure_shows_an_open_closed_state() -> None:
         r"#policyRoutingCard \.policy-disclosure\[open\][^{]*\.policy-disclosure-summary::after\s*\{[^}]*transform",
         css,
     ), "the readout disclosure indicator does not change when the disclosure opens"
-    assert "transition" not in css, (
-        "the readout style animates; movement must not be introduced for readers who "
-        "asked for reduced motion"
+    # No motion is introduced: the only transition this block may declare is one that
+    # removes motion (the shared button's hover lift is cancelled above).
+    for match in re.finditer(r"transition\s*:\s*([^;]+);", css):
+        assert match.group(1).strip() == "none", (
+            f"the readout style sets up a transition ({match.group(1).strip()!r}); movement "
+            "must not be introduced for readers who asked for reduced motion"
+        )
+    assert "animation" not in css and "@keyframes" not in css, (
+        "the readout style declares an animation"
     )
 
 
