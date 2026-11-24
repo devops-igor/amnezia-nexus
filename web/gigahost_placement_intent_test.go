@@ -92,7 +92,7 @@ w.API = {
   post: async (url, body) => { posts.push({url, body}); return {message:'ok'}; },
   delete: async () => ({status:'ok'}),
 };
-w.UI = {toast: () => {}};
+w.UI = {toast: () => {}, confirm: async () => true};
 w.confirm = () => true;
 w.startGigahostOrderStatusRefresh = () => {};
 w.loadRecentOrders = () => {};
