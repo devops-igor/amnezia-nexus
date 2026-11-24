@@ -12,14 +12,15 @@
      render for this role contributes no link, so no link is ever a dead end.
      The links carry no button class: they are navigation, so the settings
      stylesheet owns their size, alignment and states, and none of them paints
-     a fill or a border at rest. */}}
+     a fill or a border at rest.
+
+     The network policy group is not here: it is the Routing page. An old
+     bookmark that names one of its anchors is handed off there by
+     settings_nav.js, and the sidebar entry is the durable route to it. */}}
 <nav class="settings-subnav" id="settingsSubnav" aria-label="{{ _ "settings_nav_label" }}">
     <ul class="settings-subnav-list">
         <li><a class="settings-subnav-link" href="#group-portal">{{ _ "settings_group_portal" }}</a></li>
         <li><a class="settings-subnav-link" href="#group-notifications">{{ _ "settings_group_notifications" }}</a></li>
-        {{ if is_admin .current_user }}
-        <li><a class="settings-subnav-link" href="#group-network">{{ _ "settings_group_network" }}</a></li>
-        {{ end }}
         <li><a class="settings-subnav-link" href="#group-system">{{ _ "settings_group_system" }}</a></li>
     </ul>
 </nav>
@@ -43,17 +44,6 @@
         {{ template "settings_notifications" . }}
     </div>
 </section>
-
-{{ if is_admin .current_user }}
-<section class="settings-group" id="group-network" aria-labelledby="group-network-title">
-    <h2 class="settings-group-title" id="group-network-title" tabindex="-1">{{ _ "settings_group_network" }}</h2>
-    <p class="card-subtitle">{{ _ "settings_group_network_desc" }}</p>
-    <div class="settings-grid">
-        {{ template "settings_policy" . }}
-        {{ template "settings_policy_client" . }}
-    </div>
-</section>
-{{ end }}
 
 <section class="settings-group" id="group-system" aria-labelledby="group-system-title">
     <h2 class="settings-group-title" id="group-system-title" tabindex="-1">{{ _ "settings_group_system" }}</h2>

@@ -200,6 +200,7 @@
   "name": "Название",
   "nav_connections": "Подключения",
   "nav_logout": "Выход",
+  "nav_routing": "Маршрутизация",
   "nav_servers": "Серверы",
   "nav_settings": "Настройки",
   "nav_users": "Пользователи",

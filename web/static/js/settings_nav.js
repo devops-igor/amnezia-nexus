@@ -75,6 +75,40 @@
         return current.id;
     }
 
+    // The policy surface is its own page. A bookmark, a shared link or a saved
+    // browser entry written before the move still names one of the anchors it used
+    // to have here, and every one of those fragments now matches nothing in this
+    // document. This table is the whole allowed set, keyed by the literal fragment:
+    // anything not listed — an ordinary Settings group, a query-only URL, an
+    // unknown hash — is left alone for the browser to handle.
+    //
+    // The target is a fixed same-origin path, so a fragment can never decide where
+    // the browser goes: the value is a constant, not something built from the hash.
+    // location.replace() rather than assign() is what keeps Back usable — the old
+    // URL is replaced in place, so going back reaches the page the reader came
+    // from instead of this one, which would hand off again and trap them.
+    //
+    // The old group fragment is consumed here rather than forwarded as a fragment:
+    // the group does not exist on the new page, so the reader arrives at its
+    // heading instead of at a fragment that would match nothing there either.
+    var LEGACY_POLICY_FRAGMENTS = {
+        '#group-network': '/routing',
+        '#group-network-title': '/routing',
+        '#policyRoutingCard': '/routing#policyRoutingCard',
+        '#policyClientCard': '/routing#policyClientCard'
+    };
+
+    // handOffLegacyFragment replaces a Settings document whose fragment names a
+    // policy surface that has moved. It answers whether it took over, so a caller
+    // stops treating the location as a position on this page.
+    function handOffLegacyFragment(loc) {
+        if (!loc || loc.pathname !== '/settings') return false;
+        var hash = loc.hash || '';
+        if (!Object.prototype.hasOwnProperty.call(LEGACY_POLICY_FRAGMENTS, hash)) return false;
+        loc.replace(LEGACY_POLICY_FRAGMENTS[hash]);
+        return true;
+    }
+
     // focusGroup moves focus to the group's own heading. The heading is the
     // landmark's accessible name, so the reader arrives at "Portal, heading
     // level 2" instead of at the first field with no context.
@@ -109,6 +143,10 @@
         });
 
         root.addEventListener('hashchange', function () {
+            // A change to one of the old policy fragments is a handoff, not a
+            // position on this page: the document is being replaced, so there is no
+            // group here to focus or to mark.
+            if (handOffLegacyFragment(root.location)) return;
             var id = (root.location.hash || '').slice(1);
             if (id) focusGroup(doc, id);
             mark(doc);
@@ -134,8 +172,14 @@
     root.SettingsNav = {
         init: init,
         mark: mark,
-        currentGroup: currentGroup
+        currentGroup: currentGroup,
+        handOffLegacyFragment: handOffLegacyFragment
     };
+
+    // The check runs before init, at parse time: an old bookmark must be on its way
+    // to the page that owns that surface before this document draws anything the
+    // reader could act on.
+    handOffLegacyFragment(root.location);
 
     if (root.document) {
         if (root.document.readyState === 'loading') {

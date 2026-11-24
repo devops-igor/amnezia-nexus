@@ -1,0 +1,26 @@
+{{ define "title_extra" }} — {{ _ "nav_routing" }}{{ end }}
+{{ define "content" }}
+<h1 class="section-title">
+    <span class="icon"><svg class="icon"><use href="#icon-globe"></use></svg></span>
+    {{ _ "nav_routing" }}
+</h1>
+
+{{/* The policy surface: one full-width stack in reading order, so the operator
+     learns the state before being offered the controls that change it. The two
+     cards are the same partials Settings rendered, moved here rather than copied,
+     and they keep their ids, hooks, assets and behaviour. The stack reuses the
+     Settings grid so a card spans the desktop track instead of sitting beside an
+     empty column, and one track on a phone.
+
+     The save model loads first: it discovers [data-settings-card] on its own and
+     is what the policy controller reports its dirty and busy state through. Both
+     register their DOMContentLoaded work in load order, so the module has to be
+     parsed before the controller that calls it. It keeps the application-version
+     query it carries on the Settings page, because its bytes move with the
+     release and not with this move. */}}
+<script src="/static/js/settings_cards.js?v={{ .app_version }}"></script>
+<div class="settings-grid">
+    {{ template "settings_policy" . }}
+    {{ template "settings_policy_client" . }}
+</div>
+{{ end }}
