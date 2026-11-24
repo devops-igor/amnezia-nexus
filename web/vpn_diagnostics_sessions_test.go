@@ -657,6 +657,10 @@ w.eval(tablesCode);
 	}
 }
 
+// cssCommentPattern matches a CSS comment, which carries no selector text and
+// must be removed before a rule's selector list can be compared.
+var cssCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/`)
+
 // cssDeclaration returns the value of one declaration inside the rule whose
 // selector list contains selector. It exists so a styling oracle can bind a
 // declaration to its selector: checking that ".vpn-numeric" appears somewhere and
@@ -664,6 +668,10 @@ w.eval(tablesCode);
 // the numeric column. The last matching rule wins, as it does in the cascade for
 // equally specific selectors.
 func cssDeclaration(css, selector, property string) (string, bool) {
+	// A comment between two rules is not part of the selector that follows it.
+	// Left in place it breaks the comparison below, so a documented rule would be
+	// invisible to the binding while an undocumented one passed.
+	css = cssCommentPattern.ReplaceAllString(css, "")
 	value, found := "", false
 	declPattern := regexp.MustCompile(`(?m)(?:^|;)\s*` + regexp.QuoteMeta(property) + `\s*:\s*([^;{}]+)`)
 	close := -1
@@ -741,6 +749,12 @@ func TestVPNSessionsTransferredColumn(t *testing.T) {
 		if got := getHTMLNodeText(thNodes[3]); !strings.Contains(got, `vpn_col_transferred`) {
 			t.Errorf("sessions header 3 = %q, want the vpn_col_transferred label", got)
 		}
+		// The transferred header carries its own class, so the no-wrap rule that
+		// keeps a locale without a space from splitting the label can be bound to
+		// this column instead of every header in the table.
+		if cls := getHTMLNodeAttr(thNodes[3], "class"); !strings.Contains(cls, "vpn-transferred-head") {
+			t.Errorf("sessions header 3 class = %q, want .vpn-transferred-head", cls)
+		}
 		for i, th := range thNodes {
 			text := getHTMLNodeText(th)
 			if strings.Contains(text, "vpn_col_packet_loss") {
@@ -756,6 +770,83 @@ func TestVPNSessionsTransferredColumn(t *testing.T) {
 			if findHTMLNodeByID(doc, id) == nil {
 				t.Errorf("Advanced Diagnostics drop surface %q is missing", id)
 			}
+		}
+	})
+
+	// The value is one unbreakable, explicitly isolated run and the labels only
+	// wrap where the locale offers a break. Both are declarations bound to their
+	// own selectors, so a rule renamed or moved elsewhere cannot pass. The sheet
+	// read here is the one the page links (vpn.css), not the concatenated
+	// artifact; TestStyleCSSConcatenationParity keeps the two identical.
+	t.Run("ValueAndLabelsDeclareTheirOwnWrapping", func(t *testing.T) {
+		staticFS, err := GetStaticSubFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		vpnCSS, err := fs.ReadFile(staticFS, "css/vpn.css")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cssStr := string(vpnCSS)
+		expect := []struct{ selector, property, value string }{
+			{".vpn-transferred-value", "white-space", "nowrap"},
+			{".vpn-transferred-value", "unicode-bidi", "isolate"},
+			{".vpn-transferred-value", "direction", "ltr"},
+			{".vpn-transferred-missing", "white-space", "nowrap"},
+			{".vpn-transferred-head", "white-space", "nowrap"},
+		}
+		for _, want := range expect {
+			got, ok := cssDeclaration(cssStr, want.selector, want.property)
+			if !ok || got != want.value {
+				t.Errorf("%s %s = %q (found=%t), want %q", want.selector, want.property, got, ok, want.value)
+			}
+		}
+
+		// Counterexample control: the mutation a substring oracle lets through.
+		// Dropping the isolation and letting the value wrap again must be visible
+		// through the same selector binding, not absorbed by a nearby rule.
+		original := ".vpn-transferred-value {\n    white-space: nowrap;\n    unicode-bidi: isolate;\n    direction: ltr;\n}"
+		mutated := ".vpn-transferred-value {\n    white-space: normal;\n    unicode-bidi: normal;\n    direction: ltr;\n}"
+		if strings.Count(cssStr, original) != 1 {
+			t.Fatalf("the .vpn-transferred-value rule is not present exactly once in the delivered stylesheet")
+		}
+		mutatedCSS := strings.Replace(cssStr, original, mutated, 1)
+		if got, _ := cssDeclaration(mutatedCSS, ".vpn-transferred-value", "unicode-bidi"); got != "normal" {
+			t.Errorf("mutation control: unicode-bidi = %q, want the mutated value", got)
+		}
+		if got, _ := cssDeclaration(mutatedCSS, ".vpn-transferred-value", "white-space"); got != "normal" {
+			t.Errorf("mutation control: white-space = %q, want the mutated value", got)
+		}
+	})
+
+	// The not-measured state owns its colour. The shared muted token and the
+	// shared .form-hint style are issue 977's subject, so this delivery must not
+	// reach for either: the state label declares --text-secondary itself.
+	t.Run("NotMeasuredStateOwnsItsColour", func(t *testing.T) {
+		staticFS, err := GetStaticSubFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		vpnCSS, err := fs.ReadFile(staticFS, "css/vpn.css")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cssStr := string(vpnCSS)
+		got, ok := cssDeclaration(cssStr, ".vpn-transferred-missing", "color")
+		if !ok || got != "var(--text-secondary)" {
+			t.Errorf(".vpn-transferred-missing color = %q (found=%t), want var(--text-secondary)", got, ok)
+		}
+		if got, _ := cssDeclaration(cssStr, ".vpn-transferred-missing", "color"); got == "var(--text-muted)" {
+			t.Error("the not-measured state must not borrow the shared muted token")
+		}
+
+		componentsCSS, err := fs.ReadFile(staticFS, "css/components.css")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Issue 977 tracks the shared hint style; it stays exactly as it is.
+		if got, ok := cssDeclaration(string(componentsCSS), ".form-hint", "color"); !ok || got != "var(--text-muted)" {
+			t.Errorf(".form-hint color = %q (found=%t); the shared hint style belongs to issue 977 and must not move here", got, ok)
 		}
 	})
 
@@ -874,7 +965,22 @@ w.eval(tablesCode);
     assert.strictEqual(cell('gina').getAttribute('data-sort-value'), '-1', 'unmeasured sorts below a measured zero');
 
     assert(cell('dave').className.indexOf('font-mono') !== -1, 'measured totals keep the numeric font');
-    assert(cell('frank').className.indexOf('text-muted') !== -1, 'the not-measured state is visually distinct');
+
+    // The measured value is one element of its own: the number and its unit are
+    // inside a single token, so no line break can fall between them, and the
+    // element isolates the run so a right-to-left line cannot reorder it.
+    const daveToken = cell('dave').querySelector('[data-transferred-value]');
+    assert(daveToken !== null, 'the measured value is its own element');
+    assert.strictEqual(cell('dave').children.length, 1, 'the cell holds exactly the value element');
+    assert.strictEqual(daveToken.className, 'vpn-transferred-value', 'the value element carries its own class');
+    assert.strictEqual(daveToken.textContent, '1.50 MB', 'the value element carries the formatted total');
+    assert(cell('hank').querySelector('[data-transferred-value]').textContent === '5.00 MB', 'every measured row uses the token');
+
+    // The not-measured state carries its own class rather than borrowing the
+    // shared muted utility that the whole row background makes unreadable.
+    assert(cell('frank').className.indexOf('vpn-transferred-missing') !== -1, 'the not-measured state carries its own class');
+    assert(cell('frank').className.indexOf('text-muted') === -1, 'the not-measured state does not borrow the shared muted utility');
+    assert(cell('frank').children.length === 0, 'the not-measured label stays plain text');
 
     // The counter that used to live here is gone from every rendered row.
     Array.from(tbody.children).forEach(function (r) {

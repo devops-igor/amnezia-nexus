@@ -106,6 +106,26 @@ def test_muted_token_is_still_the_failing_one_the_fix_moves_away_from(
     assert round(got, 2) == expected
 
 
+# The Transferred column's not-measured state declares its own colour on the
+# sessions row rather than borrowing the shared muted token: that token is
+# 2.95:1 in the dark theme and 2.56:1 in the light theme on the card the row is
+# drawn on. The shared .form-hint style is issue 977's subject, so this cell owns
+# its own rule. Both surfaces the text can sit on are measured: the row as
+# rendered, and the row under the pointer.
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("bg_name", ["bg-card", "bg-card-hover"])
+def test_transferred_missing_state_meets_aa_on_the_session_row(theme: str, bg_name: str) -> None:
+    tokens = contrast.theme_tokens(theme)
+    declared = declared_color(_css("vpn"), ".vpn-transferred-missing")
+    name = token_name(declared)
+    got = contrast.ratio(contrast.resolve(name, tokens), surface(tokens, bg_name))
+    assert got >= contrast.AA_TEXT, (
+        f".vpn-transferred-missing uses --{name} "
+        f"({contrast.resolve(name, tokens)}) on --{bg_name} in the {theme} theme: "
+        f"{got:.2f}:1, below {contrast.AA_TEXT}:1"
+    )
+
+
 def _focus_declarations() -> list[tuple[str, str]]:
     """(selector list, outline value) for every :focus-visible rule in base.css."""
     out = []

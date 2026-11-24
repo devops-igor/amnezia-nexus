@@ -184,7 +184,9 @@ function vpnRenderSessionRow(s, route) {
     // carried since its route started, from the forwarder rx_bytes/tx_bytes
     // counters the status payload already delivers. A session with no counter
     // snapshot reports the explicit not-measured state instead of a zero, so an
-    // unmeasured session cannot read as an idle one.
+    // unmeasured session cannot read as an idle one. The value is one token of
+    // its own so the number and unit cannot separate and, in a right-to-left
+    // locale, the amount and its unit paint in the order they are written.
     const tdTransferred = document.createElement('td');
     const traffic = route && route.traffic ? route.traffic : null;
     const hasTransferredTotals = !!traffic &&
@@ -193,10 +195,14 @@ function vpnRenderSessionRow(s, route) {
     if (hasTransferredTotals) {
         const transferredTotal = Number(traffic.rx_bytes || 0) + Number(traffic.tx_bytes || 0);
         tdTransferred.className = 'font-mono text-sm';
-        tdTransferred.textContent = vpnFormatBytes(transferredTotal);
+        const value = document.createElement('span');
+        value.className = 'vpn-transferred-value';
+        value.setAttribute('data-transferred-value', '');
+        value.textContent = vpnFormatBytes(transferredTotal);
+        tdTransferred.appendChild(value);
         tdTransferred.setAttribute('data-sort-value', String(transferredTotal));
     } else {
-        tdTransferred.className = 'text-muted text-sm';
+        tdTransferred.className = 'text-sm vpn-transferred-missing';
         tdTransferred.textContent = _('vpn_diag_not_measured');
         // Unknown traffic sorts below a measured zero, so it cannot be mistaken
         // for the least-active session.
