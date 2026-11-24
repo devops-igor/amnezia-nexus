@@ -48,13 +48,14 @@ func deploymentCard(t *testing.T, body, orderID string) string {
 	return card
 }
 
-// renderServersPage renders the admin dashboard through the real handler and template.
-func renderServersPage(t *testing.T, h *Handlers) string {
+// renderServersPageAs renders the Servers page for one role, through the real handler
+// and template.
+func renderServersPageAs(t *testing.T, h *Handlers, role models.UserRole) string {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	reqCtx := middleware.WithSession(req.Context(), &models.SessionData{
-		UserID: "admin-servers-page",
-		Role:   models.RoleAdmin,
+		UserID: "servers-page-" + string(role),
+		Role:   role,
 	})
 	w := httptest.NewRecorder()
 	h.IndexPageHandler(w, req.WithContext(reqCtx))
@@ -62,6 +63,12 @@ func renderServersPage(t *testing.T, h *Handlers) string {
 		t.Fatalf("expected 200 from the servers page, got %d", w.Code)
 	}
 	return w.Body.String()
+}
+
+// renderServersPage renders the Servers page as an administrator.
+func renderServersPage(t *testing.T, h *Handlers) string {
+	t.Helper()
+	return renderServersPageAs(t, h, models.RoleAdmin)
 }
 
 // TestServersPageListsDeploymentWithoutSetupRequest is the reported defect itself: the
@@ -152,6 +159,69 @@ func TestServersPageDoesNotDuplicateAnAlreadyRegisteredDeployment(t *testing.T) 
 	}
 	if !strings.Contains(body, `id="server-1"`) {
 		t.Fatalf("the registered server card is missing from the Servers page")
+	}
+}
+
+// TestServersPageKeepsTwoDeploymentsThatShareAnAddressButNotAProviderID is the
+// regression for the owner's finding: an address is not identity. Two deployments with
+// different provider server ids are two deployments even when they report the same
+// address, so the one without a panel server must still be listed.
+func TestServersPageKeepsTwoDeploymentsThatShareAnAddressButNotAProviderID(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+	const sharedIP = "198.51.100.70"
+
+	if _, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Gigahost-ord_970_first",
+		Host:      sharedIP,
+		SSHPort:   22,
+		SSHUser:   "root",
+		Protocols: map[string]any{"provider": "gigahost", "provider_server_id": 900},
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create the registered server: %v", err)
+	}
+	insertServersPageOrder(t, db, models.GigahostOrder{
+		OrderID: "ord_970_first", Status: "ready", ServerID: 900, AssignedIP: sharedIP, PlanID: 1, RegionID: 1,
+	})
+	insertServersPageOrder(t, db, models.GigahostOrder{
+		OrderID: "ord_970_second", Status: "ready", ServerID: 901, AssignedIP: sharedIP, PlanID: 1, RegionID: 1,
+	})
+
+	body := renderServersPage(t, h)
+
+	if strings.Contains(body, `id="deployment-ord_970_first"`) {
+		t.Fatalf("the deployment whose provider id owns the server was listed again")
+	}
+	if !strings.Contains(body, `id="deployment-ord_970_second"`) {
+		t.Fatalf("a different provider server id at the same address disappeared from Servers")
+	}
+}
+
+// TestServersPageTellsSupportWhoFinishesSetup pins the owner's finding: the Settings
+// page that finishes a deployment is administrator-only, so a support user must be told
+// who has to act instead of being offered a control whose page refuses them.
+func TestServersPageTellsSupportWhoFinishesSetup(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	insertServersPageOrder(t, db, models.GigahostOrder{
+		OrderID: "ord_970_support_view", Status: "active", AssignedIP: "198.51.100.71", PlanID: 1, RegionID: 1,
+	})
+
+	supportCard := deploymentCard(t, renderServersPageAs(t, h, models.RoleSupport), "ord_970_support_view")
+	if strings.Contains(supportCard, `href="/settings#gigahostCard"`) {
+		t.Fatalf("a support user was offered the Settings action whose page refuses them")
+	}
+	if !strings.Contains(supportCard, "Only an administrator can finish the setup.") {
+		t.Fatalf("the card does not say who has to finish the setup")
+	}
+
+	// Control: the administrator still gets the action, so the difference is the role.
+	adminCard := deploymentCard(t, renderServersPage(t, h), "ord_970_support_view")
+	if !strings.Contains(adminCard, `href="/settings#gigahostCard"`) {
+		t.Fatalf("an administrator must still be offered the Settings action")
+	}
+	if strings.Contains(adminCard, "Only an administrator can finish the setup.") {
+		t.Fatalf("the administrator is offered the action and needs no note about who acts")
 	}
 }
 

@@ -752,6 +752,7 @@
   "gigahost_status_provider_error": "Provider error",
   "gigahost_status_vpn_setup": "VPN setup",
   "gigahost_status_backend_health": "Backend health",
+  "gigahost_deployments_admin_only": "Only an administrator can finish the setup.",
   "gigahost_deployments_desc": "Deployments this panel has ordered that have no server yet. None of them can carry traffic until setup runs in Settings; the state the panel recorded for each one is shown beside it.",
   "gigahost_deployment_no_address": "No address yet",
   "gigahost_deployment_not_set_up": "Not usable yet - no panel server. Request setup in Settings > Gigahost Cloud Hosting.",

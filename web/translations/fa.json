@@ -752,6 +752,7 @@
   "gigahost_status_provider_error": "خطای ارائه‌دهنده",
   "gigahost_status_vpn_setup": "راه‌اندازی VPN",
   "gigahost_status_backend_health": "سلامت بک‌اند",
+  "gigahost_deployments_admin_only": "تنها یک مدیر می‌تواند راه‌اندازی را کامل کند.",
   "gigahost_deployments_desc": "استقرارهایی که این پنل سفارش داده و هنوز سروری ندارند. تا زمانی که راه‌اندازی در تنظیمات انجام نشود هیچ‌کدام نمی‌توانند ترافیک را حمل کنند؛ وضعیتی که پنل برای هرکدام ثبت کرده است در کنار آن نمایش داده می‌شود.",
   "gigahost_deployment_no_address": "هنوز آدرسی اختصاص نیافته",
   "gigahost_deployment_not_set_up": "هنوز قابل استفاده نیست - سروری در پنل ثبت نشده است. در تنظیمات > Gigahost Cloud Hosting درخواست راه‌اندازی کنید.",

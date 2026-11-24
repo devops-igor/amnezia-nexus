@@ -95,10 +95,26 @@ func gigahostDeploymentHasServer(order models.GigahostOrder, servers []models.Se
 
 // gigahostServerRepresentsDeployment is the one place that decides whether one server
 // row is the panel's record of one deployment.
+//
+// A provider server id is identity. When the deployment recorded one, only the server
+// registered from that same id represents it, and the address is not consulted at all:
+// two deployments with different provider ids are two deployments, whatever addresses
+// they report. Sharing an address would otherwise merge them, and the one that gained no
+// server would vanish from this page while the other kept the card.
+//
+// The address is a fallback for exactly one case: a ledger row that never recorded a
+// provider id. There it is the only evidence the panel holds, and without it such a row
+// would be listed twice once setup had registered its server.
 func gigahostServerRepresentsDeployment(server models.Server, order models.GigahostOrder) bool {
-	if gigahostServerMatchesProviderID(server, order) {
-		return true
+	if order.ServerID > 0 {
+		return gigahostServerMatchesProviderID(server, order)
 	}
+	return gigahostServerSharesAddress(server, order)
+}
+
+// gigahostServerSharesAddress is the fallback for a deployment whose provider id was
+// never recorded.
+func gigahostServerSharesAddress(server models.Server, order models.GigahostOrder) bool {
 	return order.AssignedIP != "" && strings.EqualFold(strings.TrimSpace(server.Host), order.AssignedIP)
 }
 

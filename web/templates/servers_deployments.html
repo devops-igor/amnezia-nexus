@@ -38,11 +38,18 @@
 
             <p class="form-hint">{{ _ "gigahost_deployment_not_set_up" }}</p>
 
+            {{/* Only an administrator can open the Settings page that finishes this, so a
+                 support user is told who has to act instead of being offered a control
+                 that refuses them. */}}
+            {{ if is_admin $.current_user }}
             <div class="server-actions">
                 <a href="/settings#gigahostCard" class="btn btn-secondary btn-sm" style="flex:1">
                     {{ _ "nav_settings" }}
                 </a>
             </div>
+            {{ else }}
+            <p class="form-hint">{{ _ "gigahost_deployments_admin_only" }}</p>
+            {{ end }}
         </div>
         {{ end }}
     </div>

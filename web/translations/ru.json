@@ -752,6 +752,7 @@
   "gigahost_status_provider_error": "Ошибка провайдера",
   "gigahost_status_vpn_setup": "Настройка VPN",
   "gigahost_status_backend_health": "Состояние бэкенда",
+  "gigahost_deployments_admin_only": "Завершить установку может только администратор.",
   "gigahost_deployments_desc": "Развёртывания, заказанные этой панелью, для которых ещё нет сервера. Ни одно из них не может передавать трафик, пока в настройках не выполнена установка; записанное панелью состояние показано рядом с каждым.",
   "gigahost_deployment_no_address": "Адрес ещё не назначен",
   "gigahost_deployment_not_set_up": "Пока не используется - сервера в панели нет. Запросите установку в Настройки > Gigahost Cloud Hosting.",
