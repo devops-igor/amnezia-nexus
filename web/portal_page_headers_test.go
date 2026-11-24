@@ -92,9 +92,17 @@ func renderPortalPage(t *testing.T, name string) string {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	tmpl, err := template.New("base.html").Funcs(portalTemplateFuncMap()).ParseFS(templatesFS, "base.html", name)
+	// The same set the application renders this page from: the shell, every section
+	// partial, and the page itself. Parsing only base.html and the page would fail on any
+	// page that includes a section defined elsewhere, which is a property of the page's
+	// template set rather than a fact about this test.
+	files := make([]string, 0, len(LayoutPartials)+2)
+	files = append(files, "base.html")
+	files = append(files, LayoutPartials...)
+	files = append(files, name)
+	tmpl, err := template.New("base.html").Funcs(portalTemplateFuncMap()).ParseFS(templatesFS, files...)
 	if err != nil {
-		t.Fatalf("parse base.html and %s: %v", name, err)
+		t.Fatalf("parse the template set for %s: %v", name, err)
 	}
 
 	data := map[string]any{
