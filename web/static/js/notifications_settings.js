@@ -268,11 +268,15 @@
         }
     }
 
+    // The ink is a theme role, not a literal: --text-success / --text-danger are
+    // defined once with the other text tokens and measure AA on the card in both
+    // themes. An undefined name here would fall back to a literal that does not,
+    // so there is no fallback to inherit.
     function showTestResult(message, isError) {
         var target = byId('notificationTestResult');
         if (!target) return;
         target.textContent = message;
-        target.style.color = isError ? 'var(--color-danger, #e5484d)' : 'var(--color-success, #2f9e44)';
+        target.style.color = isError ? 'var(--text-danger)' : 'var(--text-success)';
     }
 
     async function loadHistory() {

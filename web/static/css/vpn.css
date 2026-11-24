@@ -995,3 +995,5 @@ td[data-backend-name]:focus-visible {
     min-height: 0;
     height: auto;
 }
+/* Hints take --text-tertiary: AA on every surface, below the label (tokens.css). */
+.portal-page .form-hint { color: var(--text-tertiary); }

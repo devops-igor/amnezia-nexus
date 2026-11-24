@@ -409,12 +409,18 @@
    text. Inside the Settings cards every muted element carries information an
    operator reads (hints, value labels, column headers, status and loading
    text, input examples), so those use --text-secondary (6.22:1 and 7.58:1).
+   The hint line is the one element that must not share the label's grey: it sits
+   directly under a field label that already uses --text-secondary, so it takes
+   --text-tertiary and keeps its rank below the label it explains.
    The selectors are scoped to the cards so no other page changes. */
-.settings-section-card .form-hint,
 .settings-section-card .info-card-label,
 .settings-section-card .text-muted,
 .settings-section-card .data-table th {
     color: var(--text-secondary);
+}
+
+.settings-section-card .form-hint {
+    color: var(--text-tertiary);
 }
 
 .settings-section-card .form-input::placeholder {

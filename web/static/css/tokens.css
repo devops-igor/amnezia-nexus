@@ -22,8 +22,18 @@
 
     --text-primary: #f1f2f6;
     --text-secondary: #9496a8;
+    /* One step below the field label and one above the muted token that failed
+       4.5:1: 5.08:1 on a card, 4.72:1 on the lightest surface a hint sits on in
+       this theme, 5.60:1 and 5.11:1 in the light one. The hint and the label stay
+       6.0 L* / 8.2 L* apart, so the two roles read as two roles. */
+    --text-tertiary: #84869c;
     --text-muted: #5e6074;
     --text-accent: #a5b4fc;
+    /* Status ink for a message a reader must act on. The fill tokens (--success,
+       --danger) are tuned for badges and borders and are unreadable as text on a
+       card in the light theme, so the readable step is its own pair. */
+    --text-success: #34d399;
+    --text-danger: #fb7185;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
@@ -101,8 +111,11 @@
 
     --text-primary: #0f172a;
     --text-secondary: #475569;
+    --text-tertiary: #59697f;
     --text-muted: #94a3b8;
     --text-accent: #6366f1;
+    --text-success: #047857;
+    --text-danger: #be123c;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
