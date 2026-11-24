@@ -433,6 +433,10 @@ jobs:
       # The contrast guard is browser-free too: it computes WCAG ratios from the
       # design tokens and the colours the Settings sheet declares, so a palette
       # change or a selector that drifts back to a failing token fails here.
+      # The rendered-pixel reader is the arithmetic the browser contrast guard
+      # depends on — a wrong PNG decoder would report a backdrop nobody painted —
+      # and its suite builds its PNGs with the standard library, so it runs here
+      # beside the other browser-free guards instead of in the e2e job.
       # The inline-colour guard reads the scripts the Settings page loads, because
       # nodes built at runtime never match a stylesheet rule.
       - name: Run Offline Diagnostics Privacy Suite
@@ -465,6 +469,7 @@ jobs:
             tests/test_e2e_runner_map.py \
             tests/test_css_reference_frozen.py \
             tests/test_css_contrast.py \
+            tests/test_rendered_pixels.py \
             tests/test_settings_inline_muted.py
 
   # The subprocess proof builds and runs the real Go panel, so it needs a
