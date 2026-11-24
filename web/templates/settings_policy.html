@@ -46,10 +46,6 @@
         margin-block: 0 var(--space-xs);
         scroll-margin-block-start: var(--space-lg);
     }
-    #policyRoutingCard .policy-panel-title:focus-visible {
-        outline: 2px solid var(--border-focus);
-        outline-offset: 2px;
-    }
     #policyRoutingCard .policy-panel-question {
         margin-block: 0 var(--space-sm);
         color: var(--text-secondary);
@@ -81,6 +77,10 @@
         background: var(--info-bg);
         border-color: var(--info-border);
     }
+    /* The glyph is decorative: aria-hidden, with the state named in words beside
+       it. It keeps one readable ink rather than a status colour, so the state is
+       carried by the inset tint, the glyph's shape and the headline — not by
+       colour alone — and no status ink is consumed outside the feedback line. */
     #policyRoutingCard .policy-answer-icon {
         flex: 0 0 auto;
         width: 20px;
@@ -88,11 +88,6 @@
         margin-block-start: 1px;
         color: var(--text-secondary);
     }
-    #policyRoutingCard .policy-answer[data-state="success"] .policy-answer-icon { color: var(--text-success); }
-    #policyRoutingCard .policy-answer[data-state="warning"] .policy-answer-icon { color: var(--warning); }
-    #policyRoutingCard .policy-answer[data-state="danger"] .policy-answer-icon { color: var(--text-danger); }
-    #policyRoutingCard .policy-answer[data-state="info"] .policy-answer-icon,
-    #policyRoutingCard .policy-answer[data-state="loading"] .policy-answer-icon { color: var(--info); }
     #policyRoutingCard .policy-answer-text {
         min-width: 0;
     }
@@ -100,6 +95,15 @@
         margin: 0;
         font-weight: 600;
         color: var(--text-primary);
+    }
+    /* The two states whose answer is a verdict use the readable status ink; a
+       warning and a neutral answer stay in the body ink, because they ask for
+       attention rather than reporting a result. */
+    #policyRoutingCard .policy-answer[data-state="success"] .policy-answer-headline {
+        color: var(--text-success);
+    }
+    #policyRoutingCard .policy-answer[data-state="danger"] .policy-answer-headline {
+        color: var(--text-danger);
     }
     #policyRoutingCard .policy-answer-body {
         margin-block: 2px 0;
@@ -113,28 +117,13 @@
         gap: var(--space-sm);
         margin-block-start: var(--space-sm);
     }
-    #policyRoutingCard .policy-answer-action,
-    #policyRoutingCard .policy-answer-actions .btn {
-        display: inline-flex;
-        align-items: center;
+    /* The actions are the shared secondary button: its ink, hover and focus are
+       the treatments the rest of the panel already uses, measured in both themes.
+       Only the target size is page-local, because these sit inside a readout. */
+    #policyRoutingCard .policy-answer-action {
         min-height: 44px;
-        padding-block: var(--space-xs);
-        padding-inline: var(--space-md);
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-sm);
-        color: var(--text-accent);
-        font-weight: 600;
-        font-size: 0.85rem;
         text-decoration: none;
-    }
-    #policyRoutingCard .policy-answer-action:hover {
-        border-color: var(--border-hover);
-        background: var(--bg-card-hover);
-    }
-    #policyRoutingCard .policy-answer-action:focus-visible,
-    #policyRoutingCard .policy-answer-actions .btn:focus-visible {
-        outline: 2px solid var(--border-focus);
-        outline-offset: 2px;
+        font-size: 0.85rem;
     }
     #policyRoutingCard .policy-facts {
         margin-block-start: var(--space-sm);
@@ -151,12 +140,25 @@
         font-size: 0.85rem;
         font-weight: 600;
     }
-    #policyRoutingCard .policy-disclosure-summary:focus-visible {
-        outline: 2px solid var(--border-focus);
-        outline-offset: 2px;
-    }
     #policyRoutingCard .policy-disclosure[open] > .policy-disclosure-summary {
         margin-block-end: var(--space-xs);
+    }
+    /* A visible open/closed state. The summary is a flex row, which suppresses the
+       native marker, so this replaces it: a chevron drawn from borders keeps the
+       size and colour in the theme's own tokens, and it flips without a
+       transition, so nothing moves for a reader who asked for reduced motion. */
+    #policyRoutingCard .policy-disclosure-summary::after {
+        content: '';
+        flex: 0 0 auto;
+        margin-inline-start: auto;
+        width: 7px;
+        height: 7px;
+        border-inline-end: 2px solid var(--text-secondary);
+        border-block-end: 2px solid var(--text-secondary);
+        transform: rotate(45deg);
+    }
+    #policyRoutingCard .policy-disclosure[open] > .policy-disclosure-summary::after {
+        transform: rotate(225deg);
     }
     #policyRoutingCard .policy-network-list {
         margin-block: var(--space-sm) 0;
@@ -244,13 +246,18 @@
                 <span id="policySaveBtnText">{{ _ "save_changes" }}</span>
                 <span class="spinner hidden" id="policySaveSpinner" aria-hidden="true"></span>
             </button>
-            <button type="button" class="btn btn-secondary" id="policySyncBtn">
+            <button type="button" class="btn btn-secondary" id="policySyncBtn" aria-describedby="policySyncUnavailableHint">
                 <svg class="icon"><use href="#icon-refresh"></use></svg>
                 <span id="policySyncBtnText">{{ _ "policy_sync_btn" }}</span>
                 <span class="spinner hidden" id="policySyncSpinner" aria-hidden="true"></span>
             </button>
             {{ template "settings_immediate" "policy_sync_btn" }}
         </div>
+        <!-- The form action and the panel readout must agree about whether the
+             operation is available: when the server reports split egress is off,
+             a sync cannot start it, so the control is disabled and this explains
+             why rather than leaving a button that cannot do what it says. -->
+        <p class="form-hint" id="policySyncUnavailableHint" hidden>{{ _ "policy_sync_unavailable_hint" }}</p>
     </form>
 
     <!-- P1 · Policy status: is split egress active? The answer is the runtime
@@ -264,8 +271,8 @@
                 <p class="policy-answer-headline" id="policyStatusAnswerHeadline">{{ _ "policy_status_loading" }}</p>
                 <p class="policy-answer-body" id="policyStatusAnswerBody" hidden></p>
                 <div class="policy-answer-actions" id="policyStatusActions" hidden>
-                    <a class="policy-answer-action" id="policyStatusActionError" data-policy-action data-policy-focus="policySyncErrorTitle" href="#policySyncErrorTitle">{{ _ "policy_status_view_sync_error" }}</a>
-                    <a class="policy-answer-action" id="policyStatusActionSettings" data-policy-action data-policy-focus="policy_enabled" href="#policy_enabled">{{ _ "policy_status_view_settings" }}</a>
+                    <a class="btn btn-secondary policy-answer-action" id="policyStatusActionError" data-policy-action data-policy-focus="policySyncErrorTitle" href="#policySyncErrorTitle">{{ _ "policy_status_view_sync_error" }}</a>
+                    <a class="btn btn-secondary policy-answer-action" id="policyStatusActionSettings" data-policy-action data-policy-focus="policy_enabled" href="#policy_enabled">{{ _ "policy_status_view_settings" }}</a>
                 </div>
             </div>
         </div>
@@ -290,6 +297,27 @@
         </details>
     </section>
 
+    <!-- P4 · Latest sync error: did the latest rule sync fail, and what can I
+         do? The raw server text is kept verbatim behind Error details. -->
+    <section class="policy-panel" id="policyPanelSyncError" aria-labelledby="policySyncErrorTitle">
+        <h4 class="settings-subheading policy-panel-title" id="policySyncErrorTitle" tabindex="-1">{{ _ "policy_status_last_error" }}</h4>
+        <p class="policy-panel-question">{{ _ "policy_sync_error_question" }}</p>
+        <div class="policy-answer" id="policySyncErrorAnswer" data-state="loading">
+            <svg class="policy-answer-icon" aria-hidden="true" focusable="false"><use id="policySyncErrorAnswerIcon" href="#policy-glyph-info"></use></svg>
+            <div class="policy-answer-text">
+                <p class="policy-answer-headline" id="policySyncErrorAnswerHeadline">{{ _ "policy_panel_loading" }}</p>
+                <p class="policy-answer-body" id="policySyncErrorAnswerBody" hidden></p>
+                <div class="policy-answer-actions" id="policySyncErrorActions" hidden>
+                    <button type="button" class="btn btn-secondary" id="policySyncNowBtn" data-policy-action>{{ _ "policy_sync_now" }}</button>
+                </div>
+            </div>
+        </div>
+        <details class="policy-disclosure" id="policyErrorDetails">
+            <summary class="policy-disclosure-summary">{{ _ "policy_sync_error_details" }}</summary>
+            <p class="policy-raw font-mono" id="policyLastError" dir="auto">…</p>
+        </details>
+    </section>
+
     <!-- P2 · Direct-routing address inventory: is the shipped list current? The
          shipped artifact and the operator override are separate facts. -->
     <section class="policy-panel" id="policyPanelInventory" aria-labelledby="policyInventoryTitle">
@@ -301,8 +329,8 @@
                 <p class="policy-answer-headline" id="policyInventoryAnswerHeadline">{{ _ "policy_panel_loading" }}</p>
                 <p class="policy-answer-body" id="policyInventoryAnswerBody" hidden></p>
                 <div class="policy-answer-actions" id="policyInventoryActions" hidden>
-                    <a class="policy-answer-action" id="policyInventoryActionStatus" data-policy-action data-policy-focus="policyStatusTitle" href="#policyStatusTitle">{{ _ "policy_inventory_view_status" }}</a>
-                    <a class="policy-answer-action" id="policyInventoryActionOverride" data-policy-action data-policy-focus="policy_inventory_override" href="#policy_inventory_override">{{ _ "policy_inventory_view_override" }}</a>
+                    <a class="btn btn-secondary policy-answer-action" id="policyInventoryActionStatus" data-policy-action data-policy-focus="policyStatusTitle" href="#policyStatusTitle">{{ _ "policy_inventory_view_status" }}</a>
+                    <a class="btn btn-secondary policy-answer-action" id="policyInventoryActionOverride" data-policy-action data-policy-focus="policy_inventory_override" href="#policy_inventory_override">{{ _ "policy_inventory_view_override" }}</a>
                 </div>
             </div>
         </div>
@@ -355,13 +383,18 @@
                 <p class="policy-answer-headline" id="policyCdnAnswerHeadline">{{ _ "policy_panel_loading" }}</p>
                 <p class="policy-answer-body" id="policyCdnAnswerBody" hidden></p>
                 <div class="policy-answer-actions" id="policyCdnActions">
-                    <a class="policy-answer-action" id="policyCdnActionDiagnosis" data-policy-focus="policyClientTitle" href="#policyClientTitle">{{ _ "policy_cdn_view_diagnosis" }}</a>
+                    <a class="btn btn-secondary policy-answer-action" id="policyCdnActionDiagnosis" data-policy-focus="policyClientTitle" href="#policyClientTitle">{{ _ "policy_cdn_view_diagnosis" }}</a>
                 </div>
             </div>
         </div>
         <p class="form-hint">{{ _ "policy_cdn_hint" }}</p>
+        <!-- One disclosure for every CDN state. A second one per variant would
+             close whatever the operator had opened the moment the state changed,
+             and a summary that exists in only one variant has nowhere to carry
+             that open state or the keyboard focus. The label and the contents
+             change with the state; the element does not. -->
         <details class="policy-disclosure" id="policyCdnNetworksDetails">
-            <summary class="policy-disclosure-summary">{{ _ "policy_cdn_view_networks" }}</summary>
+            <summary class="policy-disclosure-summary" id="policyCdnDisclosureLabel">{{ _ "policy_cdn_entries_details" }}</summary>
             <div class="info-card-grid policy-facts">
                 <div class="info-card-item">
                     <span class="info-card-label">{{ _ "policy_cdn_source_label" }}</span>
@@ -373,37 +406,7 @@
                 </div>
             </div>
             <ul class="form-hint policy-network-list" id="policyCdnEntries"><li class="text-muted">{{ _ "loading" }}</li></ul>
-        </details>
-        <details class="policy-disclosure" id="policyCdnExclusionDetails">
-            <summary class="policy-disclosure-summary">{{ _ "policy_cdn_entries_details" }}</summary>
-            <div class="info-card-grid policy-facts">
-                <div class="info-card-item">
-                    <span class="info-card-label">{{ _ "policy_cdn_source_label" }}</span>
-                    <span class="info-card-value font-mono" id="policyCdnSourceDetails" dir="ltr">…</span>
-                </div>
-            </div>
             <p class="policy-raw" id="policyCdnNotice" dir="auto"></p>
-        </details>
-    </section>
-
-    <!-- P4 · Latest sync error: did the latest rule sync fail, and what can I
-         do? The raw server text is kept verbatim behind Error details. -->
-    <section class="policy-panel" id="policyPanelSyncError" aria-labelledby="policySyncErrorTitle">
-        <h4 class="settings-subheading policy-panel-title" id="policySyncErrorTitle" tabindex="-1">{{ _ "policy_status_last_error" }}</h4>
-        <p class="policy-panel-question">{{ _ "policy_sync_error_question" }}</p>
-        <div class="policy-answer" id="policySyncErrorAnswer" data-state="loading">
-            <svg class="policy-answer-icon" aria-hidden="true" focusable="false"><use id="policySyncErrorAnswerIcon" href="#policy-glyph-info"></use></svg>
-            <div class="policy-answer-text">
-                <p class="policy-answer-headline" id="policySyncErrorAnswerHeadline">{{ _ "policy_panel_loading" }}</p>
-                <p class="policy-answer-body" id="policySyncErrorAnswerBody" hidden></p>
-                <div class="policy-answer-actions" id="policySyncErrorActions" hidden>
-                    <button type="button" class="btn btn-secondary" id="policySyncNowBtn" data-policy-action>{{ _ "policy_sync_now" }}</button>
-                </div>
-            </div>
-        </div>
-        <details class="policy-disclosure" id="policyErrorDetails">
-            <summary class="policy-disclosure-summary">{{ _ "policy_sync_error_details" }}</summary>
-            <p class="policy-raw font-mono" id="policyLastError" dir="auto">…</p>
         </details>
     </section>
 

@@ -819,7 +819,6 @@
   "policy_status_last_success": "最近成功同步",
   "policy_status_last_error": "最近同步错误",
   "policy_status_rule_count": "已加载的 PROXY 规则",
-  "policy_status_sync_state": "同步状态",
   "policy_never": "从未",
   "policy_none": "无",
   "policy_semantics_notice": "PROXY 列表中的目标使用 PROXY；分配集之内、CDN 排除集之外的目标走 DIRECT，除非目标被禁止、属于内部地址或无效，或者流量不是 TCP 或 UDP；未知目标使用 PROXY；代理故障绝不会回退到 DIRECT。",
@@ -1140,5 +1139,6 @@
   "policy_sync_error_reported_body": "分离出口未启用。请查看错误详情和服务器日志。",
   "policy_sync_error_details": "错误详情",
   "policy_no_error_detail": "未报告错误详情",
-  "policy_sync_now": "立即同步"
+  "policy_sync_now": "立即同步",
+  "policy_sync_unavailable_hint": "分离出口未启用，规则同步无法启动它。请先启用策略路由。"
 }

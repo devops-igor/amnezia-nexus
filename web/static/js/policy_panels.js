@@ -80,20 +80,21 @@
         return panelText(base + (count === 1 ? '_one' : '_other'));
     }
 
+    // panelCount renders a count the server reported, and only that. `Number(null)`
+    // and `Number('')` are zero, so a payload field the server omitted would be
+    // rendered as a factual zero; a count is a number or it is not reported.
     function panelCount(value) {
-        var count = Number(value);
-        if (!isFinite(count) || count < 0) {
+        if (typeof value !== 'number' || !isFinite(value) || value < 0) {
             return panelText('policy_not_available');
         }
-        return String(Math.round(count));
+        return String(Math.round(value));
     }
 
     function panelDays(value) {
-        var days = Number(value);
-        if (!isFinite(days) || days < 0) {
+        if (typeof value !== 'number' || !isFinite(value) || value < 0) {
             return panelText('policy_not_available');
         }
-        return panelPlural('policy_days', days).replace('{days}', String(Math.round(days)));
+        return panelPlural('policy_days', value).replace('{days}', String(Math.round(value)));
     }
 
     // panelTimestamp formats a server instant in the portal's language, with the
@@ -264,14 +265,31 @@
 
     // renderPolicyInventory answers P2. Freshness is the server's verdict: the
     // client neither measures the age nor promotes a rounded day count into it.
-    // An unusable artifact keeps its reported threshold and override and reports
-    // the missing facts as unavailable, never as a zero prefix count.
+    //
+    // The error is honoured before any other field is consumed. The producer of an
+    // unusable artifact sets `error`, the threshold and the configured override but
+    // not the age, and `age_days` has no omitempty, so the payload necessarily
+    // carries `age_days: 0` for a set it could not read. Rendering that zero would
+    // describe a broken artifact as fresh-looking numeric data, which is the one
+    // thing this panel exists to prevent.
     function renderPolicyInventory(record, snapshot) {
         var inventory = snapshot && snapshot.inventory ? snapshot.inventory : null;
         var errorText = inventory && inventory.error ? String(inventory.error) : '';
+        var ageReported = !!inventory && !errorText && typeof inventory.age_days === 'number';
+        var limitReported = !!inventory && typeof inventory.max_age_days === 'number';
+        var prefixReported = !!inventory && !errorText && typeof inventory.prefix_count === 'number';
         var overrideCount = inventory && typeof inventory.override_prefix_count === 'number'
             ? inventory.override_prefix_count
             : null;
+        // "Current" is a provenance claim, not only a freshness flag: without a
+        // named source and a retrieval date the panel cannot say which list was
+        // judged, so it reports that the freshness is unconfirmed instead.
+        var provenance = !!inventory
+            && !!inventory.source
+            && !!inventory.retrieved_at
+            && prefixReported
+            && ageReported
+            && limitReported;
 
         if (!inventory) {
             setPanelAnswer('policyInventoryAnswer', 'policyInventoryAnswerHeadline', 'policyInventoryAnswerBody',
@@ -288,14 +306,14 @@
                 'policyInventoryAnswerIcon', 'warning',
                 panelText('policy_inventory_update_needed'), panelText('policy_inventory_update_needed_body'));
             setPanelActions('policyInventoryActions', ['policyInventoryActionOverride']);
-        } else if (inventory.stale === false && typeof inventory.age_days === 'number') {
+        } else if (inventory.stale === false && provenance) {
             setPanelAnswer('policyInventoryAnswer', 'policyInventoryAnswerHeadline', 'policyInventoryAnswerBody',
                 'policyInventoryAnswerIcon', 'success',
                 panelText('policy_inventory_current'), panelText('policy_inventory_current_body'));
             setPanelActions('policyInventoryActions', ['policyInventoryActionOverride']);
         } else {
-            // The artifact is present but the freshness verdict is not, so the
-            // panel says so instead of guessing from the date.
+            // The artifact is present but the verdict or the provenance behind it
+            // is not, so the panel says so instead of guessing from the date.
             setPanelAnswer('policyInventoryAnswer', 'policyInventoryAnswerHeadline', 'policyInventoryAnswerBody',
                 'policyInventoryAnswerIcon', 'info',
                 panelText('policy_inventory_freshness_not_reported'),
@@ -303,19 +321,18 @@
             setPanelActions('policyInventoryActions', ['policyInventoryActionOverride']);
         }
 
-        setPanelText('policyInventoryAge', inventory && typeof inventory.age_days === 'number'
-            ? panelDays(inventory.age_days)
-            : panelText('policy_not_available'));
-        setPanelText('policyInventoryLimit', inventory && typeof inventory.max_age_days === 'number'
-            ? panelDays(inventory.max_age_days)
-            : panelText('policy_not_available'));
+        setPanelText('policyInventoryAge', ageReported ? panelDays(inventory.age_days) : panelText('policy_not_available'));
+        setPanelText('policyInventoryLimit', limitReported ? panelDays(inventory.max_age_days) : panelText('policy_not_available'));
         if (!inventory) {
             setPanelText('policyInventoryOverrideStatus', panelText('policy_not_available'));
-        } else if (overrideCount && overrideCount > 0) {
+        } else if (overrideCount === 0) {
+            setPanelText('policyInventoryOverrideStatus', panelText('policy_inventory_override_none'));
+        } else if (overrideCount > 0) {
             setPanelText('policyInventoryOverrideStatus',
                 panelPlural('policy_inventory_override_count', overrideCount).replace('{count}', String(overrideCount)));
         } else {
-            setPanelText('policyInventoryOverrideStatus', panelText('policy_inventory_override_none'));
+            // The count itself was not reported: that is not "no override configured".
+            setPanelText('policyInventoryOverrideStatus', panelText('policy_not_available'));
         }
 
         // Provenance describes the shipped artifact, not its freshness, so it is
@@ -323,7 +340,7 @@
         setPanelText('policyInventorySource', inventory && inventory.source
             ? String(inventory.source)
             : panelText('policy_none'));
-        setPanelText('policyInventoryPrefixes', inventory && !errorText
+        setPanelText('policyInventoryPrefixes', prefixReported
             ? panelCount(inventory.prefix_count)
             : panelText('policy_not_available'));
         setPanelText('policyInventoryRetrieved', inventory && inventory.retrieved_at
@@ -332,7 +349,7 @@
 
         // The digest repeats only with an override, and only its reading-length
         // prefix: it exists to tell two same-size overrides apart.
-        var digest = overrideCount && overrideCount > 0 && inventory.override_sha256
+        var digest = overrideCount > 0 && inventory.override_sha256
             ? String(inventory.override_sha256).slice(0, 12)
             : '';
         setPanelText('policyInventoryDigest', digest);
@@ -357,7 +374,7 @@
         return provider + ' · ' + asn;
     }
 
-    function renderPanelCDNEntries(entries) {
+    function renderPanelCDNEntries(entries, errorText) {
         var list = panelElement('policyCdnEntries');
         if (!list) {
             return;
@@ -366,9 +383,14 @@
             list.removeChild(list.firstChild);
         }
         if (!entries || entries.length === 0) {
+            // The placeholder names this list's own state: reported and empty, not
+            // reported at all, or reported but unusable. "Not reported" would be a
+            // false statement about a set the server did try to describe.
+            var placeholderState = entries ? 'policy_cdn_empty'
+                : (errorText ? 'policy_cdn_answer_unusable' : 'policy_cdn_unavailable');
             var placeholder = root.document.createElement('li');
             placeholder.className = 'text-muted';
-            placeholder.textContent = panelText(entries ? 'policy_cdn_empty' : 'policy_cdn_unavailable');
+            placeholder.textContent = panelText(placeholderState);
             list.appendChild(placeholder);
             return;
         }
@@ -407,23 +429,28 @@
                 panelText('policy_cdn_not_reported'), panelText('policy_cdn_not_reported_body'));
         }
 
-        // The populated set reveals its source and every network; every other
-        // state reveals the reported source and, when it exists, the raw reason.
+        // One disclosure answers every state, so an operator who opened it keeps it
+        // open (and keeps focus on its summary) when the state changes under them.
+        // Only the label and the contents change.
         var hasList = !errorText && !!entries && entries.length > 0;
-        setPanelVisible(panelElement('policyCdnNetworksDetails'), hasList);
-        setPanelVisible(panelElement('policyCdnExclusionDetails'), !hasList);
+        var label = panelElement('policyCdnDisclosureLabel');
+        if (label) {
+            label.textContent = panelText(hasList ? 'policy_cdn_view_networks' : 'policy_cdn_entries_details');
+        }
 
-        var source = cdn && cdn.source ? String(cdn.source) : panelText('policy_none');
-        setPanelText('policyCdnSource', source);
-        setPanelText('policyCdnSourceDetails', source);
+        setPanelText('policyCdnSource', cdn && cdn.source ? String(cdn.source) : panelText('policy_none'));
         setPanelText('policyCdnCount', entries ? panelCount(entries.length) : panelText('policy_not_available'));
-        renderPanelCDNEntries(errorText ? null : entries);
+        renderPanelCDNEntries(errorText ? null : entries, errorText);
         setPanelText('policyCdnNotice', errorText);
     }
 
     // renderPolicySyncError answers P4: did the latest sync fail, and what can the
     // operator do about it. A retry is offered only where retrying can help; a
     // startup failure is not a failed download and gets no retry control.
+    //
+    // "No sync error reported" is a success only when a successful sync was
+    // confirmed. An active runtime that reported no sync state at all is
+    // unconfirmed — P1 already says so, and the two readouts must not disagree.
     function renderPolicySyncError(record, snapshot) {
         var failure = panelFailure(snapshot);
         if (!snapshot) {
@@ -457,7 +484,7 @@
                 'policySyncErrorAnswerIcon', 'info',
                 panelText('policy_sync_error_none'), panelText('policy_sync_error_pending_body'));
             setPanelActions('policySyncErrorActions', []);
-        } else if (snapshot.enabled) {
+        } else if (snapshot.enabled && snapshot.sync_state === 'synced') {
             var when = snapshot.last_success ? panelTimestamp(snapshot.last_success) : '';
             setPanelAnswer('policySyncErrorAnswer', 'policySyncErrorAnswerHeadline', 'policySyncErrorAnswerBody',
                 'policySyncErrorAnswerIcon', 'success',
@@ -465,6 +492,12 @@
                 when
                     ? panelText('policy_sync_error_none_body').replace('{when}', when)
                     : panelText('policy_sync_error_none_body_no_time'));
+            setPanelActions('policySyncErrorActions', []);
+        } else if (snapshot.enabled) {
+            // Active, no error reported, but no confirmed successful sync either.
+            setPanelAnswer('policySyncErrorAnswer', 'policySyncErrorAnswerHeadline', 'policySyncErrorAnswerBody',
+                'policySyncErrorAnswerIcon', 'info',
+                panelText('policy_sync_error_none'), panelText('policy_sync_error_pending_body'));
             setPanelActions('policySyncErrorActions', []);
         } else {
             setPanelAnswer('policySyncErrorAnswer', 'policySyncErrorAnswerHeadline', 'policySyncErrorAnswerBody',
@@ -474,10 +507,16 @@
         }
 
         // The raw server string is preserved verbatim, never reworded. A failure
-        // with no text still says so instead of showing an empty detail block.
-        var detail = snapshot && snapshot.last_error
-            ? String(snapshot.last_error)
-            : panelText(failure ? 'policy_no_error_detail' : 'policy_none');
+        // with no text still says so; a deployment that reported no snapshot at
+        // all says that, rather than "None", which would read as an observation.
+        var detail;
+        if (!snapshot) {
+            detail = panelText('policy_not_available');
+        } else if (snapshot.last_error) {
+            detail = String(snapshot.last_error);
+        } else {
+            detail = panelText(failure ? 'policy_no_error_detail' : 'policy_none');
+        }
         setPanelText('policyLastError', detail);
     }
 

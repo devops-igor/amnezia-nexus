@@ -819,7 +819,6 @@
   "policy_status_last_success": "آخرین همگام‌سازی موفق",
   "policy_status_last_error": "آخرین خطای همگام‌سازی",
   "policy_status_rule_count": "قواعد PROXY بارگذاری‌شده",
-  "policy_status_sync_state": "وضعیت همگام‌سازی",
   "policy_never": "هرگز",
   "policy_none": "هیچ",
   "policy_semantics_notice": "مقصدی که در فهرست PROXY است از PROXY استفاده می‌کند؛ مقصدی در مجموعهٔ تخصیص و بیرون از مجموعهٔ استثنای CDN DIRECT می‌رود، مگر آنکه ممنوع، داخلی یا نامعتبر باشد یا جریان TCP یا UDP نباشد؛ مقصدهای ناشناخته از PROXY استفاده می‌کنند؛ قطعی پروکسی هرگز به DIRECT برنمی‌گردد.",
@@ -1140,5 +1139,6 @@
   "policy_sync_error_reported_body": "خروج جداگانه فعال نیست. جزئیات خطا و گزارش‌های سرور را بررسی کنید.",
   "policy_sync_error_details": "جزئیات خطا",
   "policy_no_error_detail": "جزئیات خطایی گزارش نشده",
-  "policy_sync_now": "همگام‌سازی"
+  "policy_sync_now": "همگام‌سازی اکنون",
+  "policy_sync_unavailable_hint": "خروج جداگانه فعال نیست، بنابراین همگام‌سازی قواعد نمی‌تواند آن را راه‌اندازی کند. ابتدا مسیریابی خط‌مشی را فعال کنید."
 }

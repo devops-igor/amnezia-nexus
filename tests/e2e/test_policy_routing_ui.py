@@ -152,41 +152,42 @@ def test_policy_exception_entry_saves_and_survives_reload(
 
 
 @pytest.mark.e2e
-def test_policy_sync_failure_is_reported_with_the_server_reason(
-    authenticated_page: Page, base_url: str
+def test_policy_sync_control_matches_what_the_operation_can_do(
+    authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """A sync the panel cannot perform is reported truthfully, never as success."""
+    """A sync cannot start a stopped runtime, so the form does not offer it.
+
+    The backend refuses a sync while policy routing has no runtime, and this
+    deployment runs with the policy off. The control is therefore disabled and
+    explains why, the readouts keep reporting the runtime's own state, and the
+    request itself is still refused with a reason — the disabled control is not a
+    guess about a server that might have accepted it.
+    """
     page = authenticated_page
     _open_settings(page, base_url)
     page.fill(EXCEPTIONS, "198.51.100.0/24")
     assert _save(page).status == 200
 
-    with page.expect_response(lambda r: r.url.endswith(SYNC_ENDPOINT)) as info:
-        page.click(SYNC_BTN)
-    response = info.value
-    assert response.status >= 400, (
-        "the panel-only deployment has no dataplane, so the sync must be refused; "
-        f"got {response.status}"
-    )
-    detail = response.json().get("detail", "")
-    assert detail, "the refused sync carried no detail to display"
+    expect(page.locator(SYNC_BTN)).to_be_disabled()
+    expect(page.locator("#policySyncUnavailableHint")).to_be_visible()
+    assert "Enable policy routing first" in page.locator("#policySyncUnavailableHint").inner_text()
 
-    text = _alert_text(page)
-    assert detail in text, f"the backend reason must be shown verbatim; banner={text!r}"
-    expect(page.locator(ALERT)).to_have_attribute("data-state", "error")
-    # The action returns to a usable state instead of staying stuck or claiming success.
-    expect(page.locator(SYNC_BTN)).to_be_enabled()
-    expect(page.locator("#policySyncSpinner")).to_have_class("spinner hidden")
-
-    # The readout answers about the runtime snapshot, and the snapshot reports no
-    # failed sync: a refused request is not the runtime's last_error, so the
-    # failure belongs to the banner above and the readout must not invent a
-    # failure state (or a retry) of its own. This is the separation the contract
-    # draws between a request error and a recorded sync failure.
-    expect(page.locator("#policySyncErrorAnswer")).to_have_attribute("data-state", "info")
+    # The readout answers about the runtime snapshot; a refused request is not the
+    # runtime's last_error, so the failure belongs to the request, not to this panel.
     expect(page.locator("#policySyncErrorAnswerHeadline")).to_have_text("No sync error reported")
-    expect(page.locator("#policySyncErrorAnswerBody")).to_have_text("Split egress is off.")
     expect(page.locator("#policySyncNowBtn")).to_be_hidden()
+
+    # Independent read of the same contract: the operation really is refused, and
+    # says why, so the disabled control states a fact about the server.
+    refused = page.request.post(
+        f"{base_url}{SYNC_ENDPOINT}",
+        data={},
+        headers={"X-CSRF-Token": csrf_token, "Content-Type": "application/json"},
+    )
+    assert refused.status >= 400, (
+        "the panel-only deployment must refuse a policy sync; " f"got {refused.status}"
+    )
+    assert refused.json().get("detail"), "the refused sync carried no detail"
 
 
 @pytest.mark.e2e
@@ -440,6 +441,7 @@ def test_policy_cdn_disclosure_lists_every_excluded_network(
     expect(page.locator("#policyCdnAnswerHeadline")).to_have_text(
         f"{len(entries)} networks excluded from direct routing"
     )
+    expect(page.locator("#policyCdnDisclosureLabel")).to_have_text("View excluded networks")
 
 
 @pytest.mark.e2e

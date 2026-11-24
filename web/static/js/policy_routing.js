@@ -54,6 +54,10 @@
     // was issued, so a slow earlier GET cannot overwrite a newer accepted result.
     var requestSeq = 0;
     var lastAcceptedMutation = 0;
+    // Whether the rule-sync operation is known to be available. The backend refuses
+    // a sync while policy routing has no runtime ("policy routing is not started"),
+    // so a control that offers it in that state cannot do what it says.
+    var syncEligible = true;
 
     function policyText(key) {
         if (typeof root._ === 'function') {
@@ -70,6 +74,27 @@
             return null;
         }
         return root.document.getElementById(id);
+    }
+
+    function setPolicyVisible(el, visible) {
+        if (!el) {
+            return;
+        }
+        if (visible) {
+            el.removeAttribute('hidden');
+            return;
+        }
+        el.setAttribute('hidden', 'hidden');
+    }
+
+    // policyControlUsable reports whether a control can still take focus: an element
+    // that the last render hid, or disabled, cannot, and focusing it is a silent
+    // no-op that strands the keyboard operator on the document body.
+    function policyControlUsable(el) {
+        if (!el || el.disabled || el.hidden) {
+            return false;
+        }
+        return !(el.closest && el.closest('[hidden]'));
     }
 
     function policyRequest(url, options) {
@@ -160,14 +185,24 @@
             if (busy && root.document && root.document.activeElement === button) {
                 busyFocus = button;
             }
-            button.disabled = !!busy;
+            var unavailable = id === 'policySyncBtn' && !syncEligible;
+            button.disabled = !!busy || unavailable;
             button.setAttribute('aria-busy', busy ? 'true' : 'false');
         });
         // Disabling a focused control moves focus to the document body, so a
         // keyboard operator would lose their place for the whole request.
         if (!busy) {
+            // Only a control that can still take focus is restored. A successful retry
+            // hides its own button before this runs, and restoring to a hidden control
+            // is a silent no-op: the operator would be left on the document body. They
+            // land on the readout's answer heading instead — and only when focus was
+            // lost, so a deliberate move is never overridden.
             if (busyFocus && root.document && root.document.activeElement === root.document.body) {
-                busyFocus.focus();
+                if (policyControlUsable(busyFocus)) {
+                    busyFocus.focus();
+                } else {
+                    focusPolicyTarget('policySyncErrorTitle');
+                }
             }
             busyFocus = null;
         }
@@ -293,6 +328,21 @@
         if (root.PolicyPanels && typeof root.PolicyPanels.render === 'function') {
             root.PolicyPanels.render(accepted, snapshot);
         }
+        setPolicySyncEligibility(snapshot);
+    }
+
+    // setPolicySyncEligibility reconciles the form's sync control with the operation
+    // the server would perform. Only a snapshot that reports the runtime as off makes
+    // the operation unavailable; with no snapshot the eligibility is unknown, and the
+    // backend's own refusal stays the honest answer rather than a disabled control
+    // that hides whether the page even read the state.
+    function setPolicySyncEligibility(snapshot) {
+        syncEligible = !(snapshot && snapshot.enabled === false);
+        var button = policyElement('policySyncBtn');
+        if (button && !inFlight.sync) {
+            button.disabled = !syncEligible;
+        }
+        setPolicyVisible(policyElement('policySyncUnavailableHint'), !syncEligible);
     }
 
     // refreshPolicyStatus re-reads the server's own snapshot. A failed read never
@@ -560,8 +610,11 @@
 
         loadPolicySettings().catch(function (err) {
             // A failed initial read leaves the section read-only and says why: with
-            // the stored record unknown there is nothing safe to submit.
+            // the stored record unknown there is nothing safe to submit. The four
+            // readouts are settled as well: once the read has failed, claiming they
+            // are still loading would describe a request that is not running.
             setPolicyReady(false);
+            renderPolicyPanels(null, null);
             setPolicyAlert('error', policyText('policy_load_failed') + ': '
                 + policyErrorDetail(err) + ' ' + policyText('policy_not_ready'));
         });

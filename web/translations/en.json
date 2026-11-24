@@ -819,7 +819,6 @@
   "policy_status_last_success": "Last successful sync",
   "policy_status_last_error": "Latest sync error",
   "policy_status_rule_count": "Loaded PROXY rules",
-  "policy_status_sync_state": "Sync state",
   "policy_never": "Never",
   "policy_none": "None",
   "policy_semantics_notice": "A destination on the PROXY list uses PROXY; an allocation match outside the CDN exclusion set uses DIRECT unless the destination is prohibited, internal or invalid, or the flow is not TCP or UDP; unknown destinations use PROXY; a proxy outage never falls back to DIRECT.",
@@ -1140,5 +1139,6 @@
   "policy_sync_error_reported_body": "Split egress is not active. Check the error details and server logs.",
   "policy_sync_error_details": "Error details",
   "policy_no_error_detail": "No error detail reported",
-  "policy_sync_now": "Sync now"
+  "policy_sync_now": "Sync now",
+  "policy_sync_unavailable_hint": "Split egress is not active, so a rule sync cannot start it. Enable policy routing first."
 }

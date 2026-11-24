@@ -47,6 +47,7 @@ var policySectionIDs = []string{
 	"policy_proxy_exceptions",
 	"policySaveBtn",
 	"policySyncBtn",
+	"policySyncUnavailableHint",
 	"policy_sync_interval",
 	// The four readouts (#971). Each panel is a question, an answer inset, its
 	// supporting facts and the disclosures that hold the detail.
@@ -92,11 +93,10 @@ var policySectionIDs = []string{
 	"policyCdnActions",
 	"policyCdnActionDiagnosis",
 	"policyCdnNetworksDetails",
+	"policyCdnDisclosureLabel",
 	"policyCdnSource",
 	"policyCdnCount",
 	"policyCdnEntries",
-	"policyCdnExclusionDetails",
-	"policyCdnSourceDetails",
 	"policyCdnNotice",
 	"policyPanelSyncError",
 	"policySyncErrorTitle",
@@ -322,6 +322,65 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		}
 	})
 
+	t.Run("PanelsFollowTheContractOrder", func(t *testing.T) {
+		// The accepted order puts the sync-error readout second, so the answer to
+		// "is it active" is next to the answer to "did its rules load". A page that
+		// buries it after two provenance panels makes the operator scroll past the
+		// recovery step it points at.
+		order := []string{
+			`id="policyPanelStatus"`,
+			`id="policyPanelSyncError"`,
+			`id="policyPanelInventory"`,
+			`id="policyPanelCdn"`,
+		}
+		last := -1
+		for _, marker := range order {
+			at := strings.Index(adminBody, marker)
+			if at < 0 {
+				t.Fatalf("the section does not define %s", marker)
+			}
+			if at < last {
+				t.Errorf("%s is rendered before the panel that must precede it; the contract order is %v", marker, order)
+			}
+			last = at
+		}
+	})
+
+	t.Run("OneCDNDisclosureForEveryState", func(t *testing.T) {
+		// A disclosure per variant cannot carry its open state or the operator's
+		// focus across the change, so the section ships one element whose label and
+		// contents vary. Counted here so a second one cannot reappear beside it.
+		if got := strings.Count(adminBody, `id="policyCdnNetworksDetails"`); got != 1 {
+			t.Errorf("the CDN readout ships %d list disclosures, want exactly 1", got)
+		}
+		if got := strings.Count(adminBody, `class="policy-disclosure" id="policyCdn`); got != 1 {
+			t.Errorf("the CDN readout ships %d disclosure blocks, want exactly 1", got)
+		}
+		if !strings.Contains(adminBody, `id="policyCdnDisclosureLabel"`) {
+			t.Error("the CDN disclosure has no labelled summary element for the readout to relabel")
+		}
+	})
+
+	t.Run("FormSyncControlExplainsWhenItCannotRun", func(t *testing.T) {
+		// The backend refuses a sync while policy routing has no runtime, so the
+		// form control must be reconcilable with that state and must ship the
+		// explanation beside it rather than a button that cannot do what it says.
+		tag := regexp.MustCompile(`<button[^>]*id="policySyncBtn"[^>]*>`).FindString(adminBody)
+		if tag == "" {
+			t.Fatal("admin settings page has no #policySyncBtn")
+		}
+		if !strings.Contains(tag, `aria-describedby="policySyncUnavailableHint"`) {
+			t.Errorf("the sync control is not described by its availability hint, got %q", tag)
+		}
+		hint := regexp.MustCompile(`<p[^>]*id="policySyncUnavailableHint"[^>]*>`).FindString(adminBody)
+		if hint == "" {
+			t.Fatal("admin settings page has no #policySyncUnavailableHint")
+		}
+		if !strings.Contains(hint, "hidden") {
+			t.Errorf("the availability hint ships visible; with no snapshot yet the eligibility is unknown, got %q", hint)
+		}
+	})
+
 	t.Run("AccessibleControlsAndLiveRegion", func(t *testing.T) {
 		// The master toggle is a native checkbox exposed as a switch (the fallback
 		// the switch pattern prescribes where the switch attribute is unsupported),
@@ -423,6 +482,22 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	for _, base := range []string{"policy_days", "policy_inventory_override_count", "policy_cdn_count_answer"} {
 		keys[base+"_one"] = true
 		keys[base+"_other"] = true
+	}
+	// The runtime sync-state labels are composed from the token the server sent
+	// ("policy_sync_state_" + state), and the CDN placeholders are chosen inside a
+	// conditional. A regex over literal call arguments cannot see any of them, so
+	// they are pinned by name: six prior existence pins were lost when the list
+	// became an extraction, and a bundle that dropped one of these would still have
+	// passed every parity check.
+	for _, key := range []string{
+		"policy_sync_state_disabled", "policy_sync_state_error",
+		"policy_sync_state_pending", "policy_sync_state_synced",
+		"policy_cdn_empty", "policy_cdn_unavailable", "policy_cdn_answer_unusable",
+	} {
+		keys[key] = true
+	}
+	if len(keys) < 90 {
+		t.Fatalf("only %d policy keys are guarded; the extraction or the pins are wrong", len(keys))
 	}
 
 	locales := []string{"en.json", "ru.json", "fr.json", "fa.json", "zh.json"}

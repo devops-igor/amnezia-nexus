@@ -819,7 +819,6 @@
   "policy_status_last_success": "Dernière synchronisation réussie",
   "policy_status_last_error": "Dernière erreur de synchronisation",
   "policy_status_rule_count": "Règles PROXY chargées",
-  "policy_status_sync_state": "État de la synchronisation",
   "policy_never": "Jamais",
   "policy_none": "Aucun",
   "policy_semantics_notice": "Une destination de la liste PROXY utilise PROXY ; une destination de l'ensemble d'allocation hors de l'ensemble d'exclusion CDN passe en DIRECT, sauf si elle est interdite, interne ou invalide, ou si le flux n'est pas TCP ou UDP ; les destinations inconnues utilisent PROXY ; une panne du proxy ne bascule jamais en DIRECT.",
@@ -1140,5 +1139,6 @@
   "policy_sync_error_reported_body": "Le split egress n'est pas actif. Consultez les détails de l'erreur et les journaux du serveur.",
   "policy_sync_error_details": "Détails de l'erreur",
   "policy_no_error_detail": "Aucun détail d'erreur signalé",
-  "policy_sync_now": "Synchroniser"
+  "policy_sync_now": "Synchroniser",
+  "policy_sync_unavailable_hint": "Le split egress n'est pas actif : une synchronisation des règles ne peut pas le démarrer. Activez d'abord le routage par politique."
 }
