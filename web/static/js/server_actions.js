@@ -28,7 +28,19 @@ function switchCategory(cat) {
     const activeTab = document.getElementById('tab-' + cat);
 
     if (activeGrid) activeGrid.classList.remove('hidden');
-    if (activeTab) activeTab.classList.add('active');
+    if (activeTab) {
+        activeTab.classList.add('active');
+        // The current tab is named as well as painted: .active carries the
+        // styling, and aria-current exposes the same button to assistive
+        // technology. The page renders the first tab marked, so this keeps the
+        // attribute in step with the class instead of adding a second state.
+        tabs.forEach(t => {
+            const el = document.getElementById(t);
+            if (!el) return;
+            if (el === activeTab) el.setAttribute('aria-current', 'true');
+            else el.removeAttribute('aria-current');
+        });
+    }
 }
 
 function getProtoTitle(proto) {

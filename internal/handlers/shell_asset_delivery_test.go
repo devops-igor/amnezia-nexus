@@ -595,3 +595,168 @@ func TestRegeneratedStylesheetBundleHasNoShellReader(t *testing.T) {
 		}
 	}
 }
+
+// renderServerShellWithIdentityRoot renders the shipped server page with
+// asset_url bound to root, so a check can vary the controller's bytes and read
+// the URL the same template logic emits. It parses the set the production engine
+// parses for a layout page — the shell, the layout partials and the page — so a
+// section defined elsewhere cannot silently drop out of the render.
+func renderServerShellWithIdentityRoot(t *testing.T, root fs.FS) string {
+	t.Helper()
+	templatesFS, err := web.GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS: %v", err)
+	}
+	files := make([]string, 0, len(web.LayoutPartials)+2)
+	files = append(files, "base.html")
+	files = append(files, web.LayoutPartials...)
+	files = append(files, "server.html")
+
+	funcs := baseFuncMap()
+	funcs["asset_url"] = func(path string) (string, error) {
+		return web.AssetURLFor(root, path)
+	}
+	tmpl, err := template.New("base.html").Funcs(funcs).ParseFS(templatesFS, files...)
+	if err != nil {
+		t.Fatalf("parse the server page template set: %v", err)
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, map[string]any{
+		"lang":              "en",
+		"active_page":       "servers",
+		"csrf_token":        "csrf-test-token",
+		"translations_json": "{}",
+		"app_version":       config.AppVersion,
+		"app_codename":      config.AppCodename,
+		"current_user":      map[string]any{"Username": "admin", "Role": "admin"},
+		"site_settings":     map[string]any{"Title": "Amnezia", "Subtitle": "Nexus"},
+		"server": map[string]any{
+			"ID": 1, "Name": "asset-identity-server", "Host": "127.0.0.1",
+			"SSHPort": 22, "SSHUser": "root",
+		},
+		"server_id": 1,
+		"users":     []any{},
+	}); err != nil {
+		t.Fatalf("execute the server page: %v", err)
+	}
+	return buf.String()
+}
+
+// TestServerPageControllerURLMovesWithTheBytes is the identity regression for the
+// server page's controller, and it is the case the release version cannot pass.
+//
+// The controller writes the current panel (aria-current) and this delivery
+// changed its bytes inside one release, so the URL a browser cached the
+// predecessor under is the URL this build would serve it at if the page still
+// asked for ?v=<release>. A returning browser then keeps a controller that cannot
+// move aria-current while the page it runs against is the new one, and the
+// programmatic current tab stays on the first panel after a switch.
+//
+// Three facts, each failing for a different reason:
+//
+//   - the rendered page requests the controller at the digest of its own bytes,
+//     not at the release version;
+//   - changing those bytes moves the URL on the rendered page, while the other
+//     delivered URL the page emits stays put;
+//   - the delivery rule rejects the predecessor's forms (bare and
+//     release-versioned) for this asset on this rendered page, so the assertions
+//     above cannot be green because the rule ignores the reference.
+func TestServerPageControllerURLMovesWithTheBytes(t *testing.T) {
+	const controller = "/static/js/server_actions.js"
+	const other = "/static/css/vpn.css"
+
+	// The page inherits the shell's links, so the root has to hold every asset
+	// base.html asks for through the identity. Only the controller's URL is
+	// followed here.
+	root := deliveredStaticCopy(t, controller, other, "/static/css/settings.css", "/static/js/tables.js")
+	before := renderServerShellWithIdentityRoot(t, root)
+	beforeURL := urlForAsset(t, before, controller)
+	if beforeURL == "" {
+		t.Fatalf("the server page does not request %s at all, so its cache identity is not "+
+			"exercised", controller)
+	}
+	if release := controller + "?v=" + config.AppVersion; beforeURL == release {
+		t.Fatalf("the server page requests its controller at the release version (%s): a browser "+
+			"that cached the predecessor under that URL keeps the old controller against the new "+
+			"page, and the predecessor cannot write the current panel for assistive technology",
+			beforeURL)
+	}
+	if want := controller + "?v=" + shippedAssetDigest(t, controller); beforeURL != want {
+		t.Fatalf("the server page requests %s at %q, want %q (the digest of the shipped bytes)",
+			controller, beforeURL, want)
+	}
+	if !slices.Contains(web.DeliveredAssets, controller) {
+		t.Fatalf("%s carries a content identity but is absent from web.DeliveredAssets; the shell "+
+			"enumeration consumes that list, so no check would notice this page losing it again",
+			controller)
+	}
+
+	// The production helper and the fixture root must agree on the shipped bytes,
+	// or the byte change below would prove a second implementation.
+	production, err := web.AssetURL(controller)
+	if err != nil {
+		t.Fatalf("AssetURL(%s): %v", controller, err)
+	}
+	if production != beforeURL {
+		t.Fatalf("the page requests %s at %q but the production helper emits %q",
+			controller, beforeURL, production)
+	}
+
+	otherBefore := urlForAsset(t, before, other)
+	if otherBefore == "" {
+		t.Fatalf("the server page does not request %s, so the unchanged-URL control below proves "+
+			"nothing", other)
+	}
+
+	// Change exactly one asset's bytes, the way editing that file does.
+	name := strings.TrimPrefix(controller, "/")
+	root[name] = &fstest.MapFile{
+		Data: append(append([]byte{}, root[name].Data...), []byte("\n// delivered change\n")...),
+	}
+
+	after := renderServerShellWithIdentityRoot(t, root)
+	afterURL := urlForAsset(t, after, controller)
+	t.Logf("%s before the byte change: %s", controller, beforeURL)
+	t.Logf("%s after  the byte change: %s", controller, afterURL)
+	if afterURL == beforeURL {
+		t.Fatalf("%s is requested at %q before and after its bytes changed, so the URL is not "+
+			"derived from the bytes: a browser keeps the predecessor controller under it",
+			controller, beforeURL)
+	}
+	changedSum := sha256.Sum256(root[name].Data)
+	if want := controller + "?v=" + hex.EncodeToString(changedSum[:]); afterURL != want {
+		t.Fatalf("%s is requested at %q after its bytes changed, want %q", controller, afterURL, want)
+	}
+	if got := urlForAsset(t, after, other); got != otherBefore {
+		t.Fatalf("%s moved from %q to %q when another asset's bytes changed; an unchanged asset "+
+			"must keep its URL or every visit refetches the whole set", other, otherBefore, got)
+	}
+
+	// Positive control: the shipped render is accepted, so a rejection below is
+	// attributable to the mutation rather than to the rule failing always.
+	if findings := shellAssetFindings(t, "server.html", before); len(findings) != 0 {
+		t.Fatalf("the shipped server page is reported as broken, so the control below would prove "+
+			"nothing: %v", findings)
+	}
+
+	reverted := map[string]string{
+		"no cache identity":   `src="` + controller + `"`,
+		"the release version": `src="` + controller + `?v=` + config.AppVersion + `"`,
+	}
+	for name, replacement := range reverted {
+		mutated := strings.Replace(before, `src="`+beforeURL+`"`, replacement, 1)
+		if mutated == before {
+			t.Fatalf("could not rewrite the controller reference to %s; the control would pass "+
+				"without exercising the rule", name)
+		}
+		findings := shellAssetFindings(t, "server.html", mutated)
+		if len(findings) == 0 {
+			t.Fatalf("the server page requesting %s under %s was accepted; the delivery rule cannot "+
+				"fail on the defect this test exists to catch", controller, name)
+		}
+		if !strings.Contains(strings.Join(findings, "\n"), controller) {
+			t.Fatalf("the finding for the %s form does not name %s: %v", name, controller, findings)
+		}
+	}
+}

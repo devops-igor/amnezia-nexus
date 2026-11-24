@@ -822,7 +822,7 @@
   "policy_never": "从未",
   "policy_none": "无",
   "policy_semantics_notice": "PROXY 列表中的目标使用 PROXY；分配集之内、CDN 排除集之外的目标走 DIRECT，除非目标被禁止、属于内部地址或无效，或者流量不是 TCP 或 UDP；未知目标使用 PROXY；代理故障绝不会回退到 DIRECT。",
-  "policy_limits_notice": "加密 DNS 和直连 IP 的连接可能无法归类为直连路由；v1 不支持 IPv6 PBR。",
+  "policy_limits_notice": "策略规则匹配目标的 IPv4 地址，而不是 DNS 查询。策略路由不支持 IPv6 目标。",
   "policy_saved": "策略设置已保存",
   "policy_save_failed": "设置未保存",
   "policy_save_refused": "服务器拒绝了此更改。表单已从已保存的配置重新加载。",

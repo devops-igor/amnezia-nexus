@@ -39,8 +39,8 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	}
 	telemetryJS := string(telemetryBytes)
 
-	// 1. Assert server.html contains <script src="/static/js/server_actions.js..."> and <script src="/static/js/server_telemetry.js..."> before the inline <script> block.
-	const scriptTagPrefix = `<script src="/static/js/server_actions.js`
+	// 1. Assert server.html requests its controller through the content-derived identity, and telemetry, before the inline <script> block.
+	const scriptTagPrefix = `<script src="{{ asset_url "/static/js/server_actions.js" }}"`
 	const telemetryScriptTagPrefix = `<script src="/static/js/server_telemetry.js`
 	scriptIdx := strings.Index(serverHTML, scriptTagPrefix)
 	if scriptIdx == -1 {
@@ -104,9 +104,9 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	sb.WriteString("const serverTelemetryJs = " + string(telemetryJSJSON) + ";\n")
 	sb.WriteString("const expectedFunctions = " + string(expectedFunctionsJSON) + ";\n")
 	sb.WriteString(`
-const scriptTagPrefix = '<script src="/static/js/server_actions.js';
+const scriptTagPrefix = '{{ asset_url "/static/js/server_actions.js" }}';
 const telemetryScriptTagPrefix = '<script src="/static/js/server_telemetry.js';
-assert(serverHtmlRaw.includes(scriptTagPrefix), 'serverHtmlRaw must contain server_actions.js script tag');
+assert(serverHtmlRaw.includes(scriptTagPrefix), 'serverHtmlRaw must request server_actions.js through asset_url');
 assert(serverHtmlRaw.includes(telemetryScriptTagPrefix), 'serverHtmlRaw must contain server_telemetry.js script tag');
 
 // Render template with realistic substitutions
@@ -128,11 +128,11 @@ for (const [k, v] of Object.entries(subs)) {
 }
 rendered = rendered.replace(/\{\{\s*_\s+"([^"]+)"\s*\}\}/g, 'T:$1');
 rendered = rendered.replace(/\{\{slice_str[^}]*\}\}/g, '12:00:00');
-// Remove any remaining Go control tags
-rendered = rendered.replace(/\{\{[^}]*\}\}/g, '');
+// Resolve the controller's asset_url action the way the engine does, then strip any remaining Go control tags.
+rendered = rendered.replace(/\{\{\s*asset_url\s+"([^"]+)"\s*\}\}/g, (m, p) => p + '?v=asset-bytes').replace(/\{\{[^}]*\}\}/g, '');
 
 assert(!rendered.includes('{{'), 'all template directives must be resolved');
-assert(rendered.includes(scriptTagPrefix), 'scriptTagPrefix must remain intact before script replacement');
+assert(rendered.includes('<script src="/static/js/server_actions.js?v=asset-bytes"'), 'the resolved controller tag must remain intact before script replacement');
 assert(rendered.includes(telemetryScriptTagPrefix), 'telemetryScriptTagPrefix must remain intact before script replacement');
 
 // Replace script tags with inlined server_actions.js and server_telemetry.js

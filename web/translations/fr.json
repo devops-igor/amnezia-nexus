@@ -822,7 +822,7 @@
   "policy_never": "Jamais",
   "policy_none": "Aucun",
   "policy_semantics_notice": "Une destination de la liste PROXY utilise PROXY ; une destination de l'ensemble d'allocation hors de l'ensemble d'exclusion CDN passe en DIRECT, sauf si elle est interdite, interne ou invalide, ou si le flux n'est pas TCP ou UDP ; les destinations inconnues utilisent PROXY ; une panne du proxy ne bascule jamais en DIRECT.",
-  "policy_limits_notice": "Le DNS chiffré et les connexions par IP directe peuvent ne pas être classés pour le routage direct ; le PBR IPv6 n'est pas pris en charge en v1.",
+  "policy_limits_notice": "Les règles de politique comparent l'adresse IPv4 de destination, pas les requêtes DNS. Le routage par politique ne prend pas en charge les destinations IPv6.",
   "policy_saved": "Paramètres de politique enregistrés",
   "policy_save_failed": "Les paramètres n'ont pas été enregistrés",
   "policy_save_refused": "Le serveur a refusé ce changement. Le formulaire a été rechargé depuis la configuration enregistrée.",

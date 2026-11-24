@@ -2,12 +2,98 @@
 
 {{ define "head_extra" }}
 <style>
+    /* Everything here describes this page's own surfaces: the protocol tab row
+       and the Management grid. They are page-local, so they belong beside the
+       markup that renders them rather than in a shared sheet. */
     .client-actions { display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; gap: var(--space-xs) !important; align-items: center; justify-content: flex-end; }
+
+    /* The tab row carries the section spacing and the divider at every width.
+       Its layout lives here rather than in an inline style so the phone
+       breakpoint below can replace the single line with a wrapping row. */
+    .server-tabs { margin-bottom: var(--space-xl); border-bottom: 1px solid var(--border-color); padding-bottom: 2px; }
+
     .nav-tab { background: none; border: none; padding: 10px 16px; font-size: 0.95rem; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; font-weight: 500; display: inline-flex; align-items: center; gap: 8px; transition: var(--transition-fast); }
     .nav-tab:hover { color: var(--text-primary); }
     .nav-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 600; }
+
+    /* A live count is telemetry beside its label, not a control of its own. The
+       offset is logical so it sits after the label in either direction. */
+    .nav-tab-count { font-size: 0.8rem; opacity: 0.6; margin-inline-start: 4px; }
+
+    /* The Management panel's track is bounded by the column it sits in: the
+       400 px intent applies wherever the page is wide enough, and a phone width
+       fits the single column instead of widening the document. */
+    #management-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(400px, 100%), 1fr)); gap: var(--space-lg); align-items: start; margin-bottom: var(--space-xl); }
+
     .conn-name-cell { display: flex; align-items: center; gap: var(--space-sm); }
     .traffic-cell { display: flex; flex-direction: column; gap: 2px; font-size: 0.8rem; }
+
+    /* Phone widths: the three full labels are wider than the content column, so
+       the row wraps whole buttons instead of widening the page. The row keeps
+       the Settings in-page navigation's vocabulary — a pill per entry, the
+       current one filled — on this page's own larger control tier. One row is a
+       property of the English strings, not a requirement: a longer translation
+       takes another line, and a label may wrap inside its own pill. */
+    @media (max-width: 767px) {
+        .server-tabs {
+            flex-wrap: wrap;
+            gap: var(--space-sm);
+            border-bottom: 0;
+            padding-bottom: 0;
+        }
+
+        .nav-tab {
+            max-inline-size: 100%;
+            padding-inline: 12px;
+            border-bottom: 0;
+            border-radius: var(--radius-full);
+            font-weight: 500;
+            color: var(--text-secondary);
+            white-space: normal;
+            overflow-wrap: anywhere;
+            text-align: start;
+            /* Focus must bring a tab clear of the two 60 px shell bars: eight
+               pixels from the button's edge keep four clear of its outline. */
+            scroll-margin-block: calc(var(--bottombar-height) + var(--space-sm));
+        }
+
+        /* Hover answers an inactive tab only, so it never dilutes the current
+           pill, and nothing moves or grows. */
+        .nav-tab:not(.active):hover {
+            background: rgba(139, 92, 246, 0.08);
+            color: var(--text-primary);
+        }
+
+        /* The current panel is the filled pill and the heavier type, so the
+           state is carried by shape and weight rather than by hue alone. The
+           8% black layer over the accent gradient keeps white text above the
+           4.5:1 minimum. */
+        .nav-tab.active {
+            color: #fff;
+            font-weight: 600;
+            background: linear-gradient(rgb(0 0 0 / 8%), rgb(0 0 0 / 8%)), var(--accent-gradient);
+            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+        }
+
+        /* White text on the filled pill: the desktop counter's translucency
+           would leave the count under the contrast minimum, so it keeps the
+           label's own colour and weight of coverage. */
+        .nav-tab-count { opacity: 1; }
+    }
+
+    /* Forced colors drops the gradient, which is the shape that carries the
+       current state, so the phone pill keeps an underline as a second cue. */
+    @media (max-width: 767px) and (forced-colors: active) {
+        .nav-tab.active { text-decoration: underline; }
+    }
+
+    /* A reader who has asked for less motion gets the state change at once: the
+       fill, the shadow, the colour and the underline all arrive without a
+       transition. The ordinary transition above stays for everyone else, and
+       nothing here reaches a shared rule. */
+    @media (prefers-reduced-motion: reduce) {
+        .nav-tab { transition: none; }
+    }
 </style>
 {{ end }}
 
@@ -72,18 +158,17 @@
 </div>
 
 <!-- Protocol Installation Section -->
-<div class="flex items-center gap-md"
-    style="margin-bottom: var(--space-xl); border-bottom: 1px solid var(--border-color); padding-bottom: 2px;">
-    <button class="nav-tab active" id="tab-protocols" onclick="switchCategory('protocols')">
-        <svg class="icon"><use href="#icon-shield"></use></svg> {{ _ "protocols" }}
-        <span id="protocols-count" style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/2</span>
+<div class="flex items-center gap-md server-tabs">
+    <button class="nav-tab active" id="tab-protocols" onclick="switchCategory('protocols')" aria-current="true">
+        <svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg> {{ _ "protocols" }}
+        <span id="protocols-count" class="nav-tab-count">0/2</span>
     </button>
     <button class="nav-tab" id="tab-services" onclick="switchCategory('services')">
-        <svg class="icon"><use href="#icon-network"></use></svg> {{ _ "services" }}
-        <span id="services-count" style="font-size: 0.8rem; opacity: 0.6; margin-left: 4px;">0/1</span>
+        <svg class="icon" aria-hidden="true"><use href="#icon-network"></use></svg> {{ _ "services" }}
+        <span id="services-count" class="nav-tab-count">0/1</span>
     </button>
     <button class="nav-tab" id="tab-management" onclick="switchCategory('management')">
-        <svg class="icon"><use href="#icon-settings"></use></svg> {{ _ "management" }}
+        <svg class="icon" aria-hidden="true"><use href="#icon-settings"></use></svg> {{ _ "management" }}
     </button>
 </div>
 
@@ -167,7 +252,7 @@
     </div>
 </div>
 
-<div class="hidden" id="management-grid" style="margin-bottom: var(--space-xl); display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: var(--space-lg); align-items: start;">
+<div class="hidden" id="management-grid">
     <div class="card" style="width:100%;">
         <div class="card-title">{{ _ "server_management" }}</div>
         <div class="card-subtitle" style="margin-bottom: var(--space-md);">
@@ -513,7 +598,7 @@
 
 {{ define "scripts" }}
 <!-- Server Actions & Telemetry Scripts -->
-<script src="/static/js/server_actions.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/server_actions.js" }}"></script>
 <script src="/static/js/server_telemetry.js?v={{ .app_version }}"></script>
 <script>
     // Server Page Telemetry Bootstrap

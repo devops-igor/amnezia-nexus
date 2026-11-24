@@ -825,7 +825,7 @@ jobs:
 
       - name: Run panel-only browser contracts
         env:
-          E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_hint_contrast.py tests/e2e/test_settings.py tests/e2e/test_settings_confirmations.py tests/e2e/test_settings_navigation.py tests/e2e/test_notifications.py tests/e2e/test_policy_routing_ui.py
+          E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_hint_contrast.py tests/e2e/test_server_page_width.py tests/e2e/test_settings.py tests/e2e/test_settings_confirmations.py tests/e2e/test_settings_navigation.py tests/e2e/test_notifications.py tests/e2e/test_policy_routing_ui.py
           # The one expected skip, named by identity rather than counted: the
           # rate-limit case is skipped while E2E_TESTING is on, and run_e2e.sh
           # then reruns it against a server started without the flag and requires

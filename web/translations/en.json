@@ -822,7 +822,7 @@
   "policy_never": "Never",
   "policy_none": "None",
   "policy_semantics_notice": "A destination on the PROXY list uses PROXY; an allocation match outside the CDN exclusion set uses DIRECT unless the destination is prohibited, internal or invalid, or the flow is not TCP or UDP; unknown destinations use PROXY; a proxy outage never falls back to DIRECT.",
-  "policy_limits_notice": "Encrypted DNS and direct-IP connections may not be classified for direct routing; IPv6 PBR is unsupported in v1.",
+  "policy_limits_notice": "Policy rules match the destination's IPv4 address, not DNS lookups. Policy routing does not support IPv6 destinations.",
   "policy_saved": "Policy settings saved",
   "policy_save_failed": "Settings were not saved",
   "policy_save_refused": "The server refused this change. The form was reloaded from the saved configuration.",
