@@ -56,12 +56,27 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 
 	tunnelParams := o.resolveTunnelProbeParams(ctx, tunnels)
 
+	// A tunnel whose server the provider's inventory no longer lists is not probed
+	// at all: no handshake, and no health classification either, because a
+	// classification would feed failover decisions with a measurement of an
+	// address the panel has durable evidence is gone. The tunnel row is kept, as
+	// the whole absence design intends; only the dialing stops.
+	absentServers, err := o.providerAbsentServerIDs(ctx)
+	if err != nil {
+		return err
+	}
+
 	var degradedTunnels []int64
 	var healthyTunnels []*models.BackendTunnel
 
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
+		if _, absent := absentServers[t.ServerID]; absent {
+			slog.Debug("Skipping backend tunnel probe for a server absent from the provider inventory",
+				"tunnel_id", t.ID, "server_id", t.ServerID)
+			continue
+		}
 		if !t.Enabled {
 			// Administratively disabled backends are ineligible altogether.
 			continue

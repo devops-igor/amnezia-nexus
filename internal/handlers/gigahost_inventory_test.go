@@ -512,3 +512,95 @@ func TestProviderBackedServerID(t *testing.T) {
 		})
 	}
 }
+
+// An inventory answer that contains an entry the panel cannot identify is not a
+// complete answer about the account, and must never become durable evidence that a
+// server is gone.
+//
+// Three shapes reach the panel this way: a null element, an element without a
+// server id, and an element whose id the client cannot parse. In each case the
+// good entry beside it names a real server, so a filter-the-bad-entries
+// implementation would silently conclude that every other row is absent. The
+// control beside each case proves the same fixture and pass DO record absence when
+// every entry is identified, so the refusal is about identity rather than a pass
+// that never runs.
+func TestReconcileGigahostInventory_UnidentifiableEntryMarksNothingAbsent(t *testing.T) {
+	cases := []struct {
+		name      string
+		inventory string
+	}{
+		{
+			name:      "null element beside an identified one",
+			inventory: `{"meta":{"page":1,"total_pages":1,"total":2},"data":[null,{"srv_id":501,"status":"active"}]}`,
+		},
+		{
+			name:      "element without a server id",
+			inventory: `{"meta":{"page":1,"total_pages":1,"total":2},"data":[{"status":"active"},{"srv_id":501,"status":"active"}]}`,
+		},
+		{
+			name:      "element with an unparseable server id",
+			inventory: `{"meta":{"page":1,"total_pages":1,"total":2},"data":[{"srv_id":"not-a-number","status":"active"},{"srv_id":501,"status":"active"}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newInventoryFixture(t)
+			listed := f.seedServer("Listed", providerProtocols(501))
+			unlisted := f.seedServer("Not listed", providerProtocols(502))
+
+			f.provider.set(tc.inventory)
+			if err := f.reconcile(context.Background()); err == nil {
+				t.Fatal("an inventory containing an unidentifiable entry was accepted as a complete answer")
+			}
+
+			for _, id := range []int64{listed, unlisted} {
+				if f.row(id).ProviderAbsent() {
+					t.Fatalf("server %d was marked provider-absent from an answer that could not identify every entry", id)
+				}
+			}
+
+			// Control: the identical fixture, with every entry identified, records the
+			// absence of the row it does not list. Without this, the assertions above
+			// would also pass if the pass never wrote anything at all.
+			f.provider.set(inventoryJSON(501))
+			if err := f.reconcile(context.Background()); err != nil {
+				t.Fatalf("control pass failed: %v", err)
+			}
+			if f.row(listed).ProviderAbsent() {
+				t.Fatal("the control pass marked a listed server absent")
+			}
+			if !f.row(unlisted).ProviderAbsent() {
+				t.Fatal("the control pass did not mark the unlisted server absent, so the refusal assertions above prove nothing")
+			}
+		})
+	}
+}
+
+// The identity gate itself, so the rule is pinned independently of the provider
+// transport: an entry without a positive server id refuses the whole answer, while
+// a complete answer (including a legitimately empty account) is accepted.
+func TestGigahostIdentifiedServerIDs(t *testing.T) {
+	identified, err := gigahostIdentifiedServerIDs([]gigahost.ServerInfo{{ID: 501}, {ID: 502}})
+	if err != nil {
+		t.Fatalf("a fully identified answer was refused: %v", err)
+	}
+	if len(identified) != 2 {
+		t.Fatalf("identified ids = %d, want 2", len(identified))
+	}
+	for _, id := range []int64{501, 502} {
+		if _, ok := identified[id]; !ok {
+			t.Fatalf("id %d missing from the identified set", id)
+		}
+	}
+
+	if _, err := gigahostIdentifiedServerIDs(nil); err != nil {
+		t.Fatalf("an enumerated empty account was refused: %v", err)
+	}
+
+	for _, entry := range []gigahost.ServerInfo{{ID: 0}, {ID: -7}} {
+		if _, err := gigahostIdentifiedServerIDs([]gigahost.ServerInfo{{ID: 501}, entry}); err == nil {
+			t.Fatalf("an answer containing entry %+v was accepted", entry)
+		}
+	}
+}

@@ -18,6 +18,11 @@ type mockStatusProtocolManager struct {
 	proto           string
 	containerExists bool
 	returnError     bool
+	mu              sync.Mutex
+	// statusQueries and clientQueries record the server id of every remote read,
+	// so a test can show that a server was not dialled at all.
+	statusQueries []int64
+	clientQueries []int64
 }
 
 func (m *mockStatusProtocolManager) Protocol() string {
@@ -33,6 +38,11 @@ func (m *mockStatusProtocolManager) Uninstall(ctx context.Context, server *model
 }
 
 func (m *mockStatusProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if server != nil {
+		m.clientQueries = append(m.clientQueries, server.ID)
+	}
 	return nil, nil
 }
 
@@ -49,6 +59,11 @@ func (m *mockStatusProtocolManager) GetClientConfig(ctx context.Context, server 
 }
 
 func (m *mockStatusProtocolManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	m.mu.Lock()
+	if server != nil {
+		m.statusQueries = append(m.statusQueries, server.ID)
+	}
+	m.mu.Unlock()
 	if m.returnError {
 		return nil, errors.New("remote check error")
 	}

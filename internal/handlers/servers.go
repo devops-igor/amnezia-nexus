@@ -804,6 +804,46 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 	h.JSONOK(w)
 }
 
+// measureServerReachability dials the server's SSH port and reports what it
+// measured: whether the port answered, the latency, and the status that follows.
+//
+// It is the only place the detail-page poll opens a connection, and the caller
+// decides whether it may be called at all (a server the provider no longer lists
+// is never dialed). A failed measurement keeps the stored status unless nothing is
+// known about it yet; a successful one records the new observation.
+func (h *Handlers) measureServerReachability(
+	ctx context.Context, server *models.Server, status models.ReachabilityStatus,
+) (reachable bool, latencyMS int, measured models.ReachabilityStatus) {
+	sshPort := server.SSHPort
+	if sshPort <= 0 {
+		sshPort = 22
+	}
+
+	dialFn := h.dialTimeout
+	if dialFn == nil {
+		dialFn = net.DialTimeout
+	}
+
+	start := time.Now()
+	// #nosec G704 -- connecting to managed server host for latency probe
+	serverHost := strings.Trim(strings.TrimSpace(server.Host), "[]")
+	conn, err := dialFn("tcp", net.JoinHostPort(serverHost, strconv.Itoa(sshPort)), 3*time.Second)
+	if err != nil {
+		if status == models.ReachabilityUnknown {
+			status = models.ReachabilityOffline
+		}
+		return false, 0, status
+	}
+	_ = conn.Close()
+
+	latencyMS = int(time.Since(start).Milliseconds())
+	if latencyMS <= 0 {
+		latencyMS = 1
+	}
+	_ = h.db.UpdateServerReachability(ctx, server.ID, models.ReachabilityOnline)
+	return true, latencyMS, models.ReachabilityOnline
+}
+
 // GetServerReachabilityHandler returns server connectivity and latency status.
 func (h *Handlers) GetServerReachabilityHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -821,40 +861,33 @@ func (h *Handlers) GetServerReachabilityHandler(w http.ResponseWriter, r *http.R
 
 	status, _ := h.db.GetServerStatus(ctx, serverID)
 
-	sshPort := server.SSHPort
-	if sshPort <= 0 {
-		sshPort = 22
-	}
-
-	// Measure real TCP latency to the server (SSH port).
-	latencyMS := 0
-	reachable := false
-
-	dialFn := h.dialTimeout
-	if dialFn == nil {
-		dialFn = net.DialTimeout
-	}
-
-	start := time.Now()
-	// #nosec G704 -- connecting to managed server host for latency probe
-	serverHost := strings.Trim(strings.TrimSpace(server.Host), "[]")
-	conn, err := dialFn("tcp", net.JoinHostPort(serverHost, strconv.Itoa(sshPort)), 3*time.Second)
-	if err == nil {
-		_ = conn.Close()
-		latencyMS = int(time.Since(start).Milliseconds())
-		if latencyMS <= 0 {
-			latencyMS = 1
+	// A server the provider's inventory no longer lists is not dialed at all: the
+	// page poll would otherwise open a TCP connection to an address the panel
+	// already has durable evidence is not the provider's. Nothing is measured and
+	// the stored reachability observation is left as it was, so this answer stays
+	// distinguishable from a measurement that failed.
+	if server.ProviderAbsent() {
+		absentNow := time.Now().UTC().Format(time.RFC3339)
+		absentReach := map[string]any{
+			"reachable":       false,
+			"latency_ms":      0,
+			"status":          string(status),
+			"last_checked":    absentNow,
+			"provider_absent": true,
 		}
-		reachable = true
-		status = models.ReachabilityOnline
-		_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
-	} else {
-		reachable = false
-		latencyMS = 0
-		if status == models.ReachabilityUnknown {
-			status = models.ReachabilityOffline
-		}
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":          "ok",
+			"reachable":       false,
+			"reachability":    absentReach,
+			"server_status":   string(status),
+			"latency_ms":      0,
+			"last_checked":    absentNow,
+			"provider_absent": true,
+		})
+		return
 	}
+
+	reachable, latencyMS, status := h.measureServerReachability(ctx, server, status)
 
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	reachMap := map[string]any{

@@ -28,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
 // gigahostInventoryProvider is the provider name a deployment records in a
@@ -154,11 +156,29 @@ func positiveID(id int64) (int64, bool) {
 // gigahostInventoryServerIDs performs the inventory read and returns the
 // provider server ids it lists.
 //
+// Three outcomes are deliberately distinguished, and only one of them is
+// evidence about a server the panel holds:
+//
+//   - an IDENTIFIED entry carries a positive provider server id. Only identified
+//     entries contribute to the returned set.
+//   - an UNIDENTIFIED entry carries no usable id: a null element, a missing id,
+//     or an id the provider client could not parse. Such an entry names no
+//     server, so a read containing one cannot say which servers the account
+//     holds. The whole read is refused instead of dropping the entry, because a
+//     dropped entry turns "this answer could not identify one row" into "the
+//     provider does not have it" for every panel row the entry might have named -
+//     a durable false deletion, which is the direction this must never fail in.
+//   - an ABSENT ORDER is a panel row whose recorded provider server id is not in
+//     the returned set of a fully identified read. Only that case is recorded
+//     absent, by the caller. A read that enumerates the account and lists zero
+//     servers is complete and identified, so it keeps this meaning: every
+//     provider row is genuinely absent.
+//
 // A read that failed, timed out, or enumerated the account incompletely is
-// returned as an error rather than as a shorter list: an unanswered or partial
-// inventory is not evidence that any server is gone. The client already fails
-// closed on a page that contradicts its own pagination metadata or a total that
-// does not match what it aggregated.
+// reported the same way - as an error, with nothing written - because an
+// unanswered or partial inventory is not evidence that any server is gone. The
+// client already fails closed on a page that contradicts its own pagination
+// metadata or a total that does not match what it aggregated.
 func (h *Handlers) gigahostInventoryServerIDs(ctx context.Context) (map[int64]struct{}, error) {
 	client, err := h.getGigahostClient(ctx, nil)
 	if err != nil {
@@ -173,11 +193,25 @@ func (h *Handlers) gigahostInventoryServerIDs(ctx context.Context) (map[int64]st
 		return nil, fmt.Errorf("gigahost inventory read failed; server rows unchanged: %w", err)
 	}
 
+	return gigahostIdentifiedServerIDs(inventory)
+}
+
+// gigahostIdentifiedServerIDs returns the provider server ids of an inventory
+// answer, or an error when any entry cannot be identified.
+//
+// It is the identity gate for the whole pass, and it is separate from the read so
+// the rule is testable without a provider: every entry must name a positive
+// provider server id, otherwise the answer is not usable as evidence about the
+// account and nothing may be concluded from it.
+func gigahostIdentifiedServerIDs(inventory []gigahost.ServerInfo) (map[int64]struct{}, error) {
 	listed := make(map[int64]struct{}, len(inventory))
-	for _, s := range inventory {
-		if s.ID > 0 {
-			listed[s.ID] = struct{}{}
+	for i, s := range inventory {
+		if s.ID <= 0 {
+			return nil, fmt.Errorf(
+				"gigahost inventory entry %d of %d has no usable server id; server rows unchanged",
+				i+1, len(inventory))
 		}
+		listed[s.ID] = struct{}{}
 	}
 	return listed, nil
 }
