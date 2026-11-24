@@ -211,17 +211,53 @@ func TestServersPageTellsSupportWhoFinishesSetup(t *testing.T) {
 	if strings.Contains(supportCard, `href="/settings#gigahostCard"`) {
 		t.Fatalf("a support user was offered the Settings action whose page refuses them")
 	}
-	if !strings.Contains(supportCard, "Only an administrator can finish the setup.") {
-		t.Fatalf("the card does not say who has to finish the setup")
+	if strings.Contains(strings.ToLower(supportCard), "<a ") {
+		t.Fatalf("the support card must carry no link at all, got one")
+	}
+	if !strings.Contains(supportCard, "An administrator must finish the setup.") {
+		t.Fatalf("the card must name the role that finishes the setup")
 	}
 
-	// Control: the administrator still gets the action, so the difference is the role.
+	// Control: the administrator keeps the copy and the action they had, so the
+	// difference is the role and nothing else.
 	adminCard := deploymentCard(t, renderServersPage(t, h), "ord_970_support_view")
 	if !strings.Contains(adminCard, `href="/settings#gigahostCard"`) {
 		t.Fatalf("an administrator must still be offered the Settings action")
 	}
-	if strings.Contains(adminCard, "Only an administrator can finish the setup.") {
-		t.Fatalf("the administrator is offered the action and needs no note about who acts")
+	if !strings.Contains(adminCard, "Request setup in Settings") {
+		t.Fatalf("the administrator's copy must be unchanged")
+	}
+	if strings.Contains(adminCard, "An administrator must finish the setup.") {
+		t.Fatalf("the administrator is offered the action and needs no handoff sentence")
+	}
+}
+
+// TestSupportCardDoesNotSendASupportUserToSettings pins the copy correction: the removed
+// link was only half the dead end, because the sentence beside it still directed a support
+// user to a page that refuses them. The card now says who acts, never where to go.
+func TestSupportCardDoesNotSendASupportUserToSettings(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	insertServersPageOrder(t, db, models.GigahostOrder{
+		OrderID: "ord_970_support_copy", Status: "active", PlanID: 1, RegionID: 1,
+	})
+
+	supportCard := deploymentCard(t, renderServersPageAs(t, h, models.RoleSupport), "ord_970_support_copy")
+
+	for _, deadEnd := range []string{"Request setup in Settings", "Settings > Gigahost Cloud Hosting"} {
+		if strings.Contains(supportCard, deadEnd) {
+			t.Fatalf("the support card still sends the reader to a page they cannot open (%q)", deadEnd)
+		}
+	}
+	// The state label and the recorded state keep the deployment identifiable without
+	// the action, so the card is not merely an apology.
+	if !strings.Contains(supportCard, ">Not set up</span>") {
+		t.Fatalf("the support card lost its state label")
+	}
+	if !strings.Contains(supportCard, "Recorded state: active") {
+		t.Fatalf("the support card lost the recorded state")
+	}
+	if !strings.Contains(supportCard, "Gigahost-ord_970_support_copy") {
+		t.Fatalf("the support card lost the deployment's identity")
 	}
 }
 

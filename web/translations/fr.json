@@ -752,7 +752,7 @@
   "gigahost_status_provider_error": "Erreur du fournisseur",
   "gigahost_status_vpn_setup": "Installation VPN",
   "gigahost_status_backend_health": "État du backend",
-  "gigahost_deployments_admin_only": "Seul un administrateur peut terminer l'installation.",
+  "gigahost_deployment_not_set_up_admin_handoff": "Pas encore utilisable - aucun serveur dans le panneau. Un administrateur doit terminer l'installation.",
   "gigahost_deployments_desc": "Déploiements commandés par ce panneau qui n'ont pas encore de serveur. Aucun ne peut transporter de trafic avant l'installation dans les paramètres ; l'état enregistré par le panneau pour chacun est affiché à côté.",
   "gigahost_deployment_no_address": "Pas encore d'adresse",
   "gigahost_deployment_not_set_up": "Pas encore utilisable - aucun serveur dans le panneau. Demandez l'installation dans Paramètres > Gigahost Cloud Hosting.",
