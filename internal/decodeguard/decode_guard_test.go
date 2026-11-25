@@ -23,6 +23,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,19 +33,20 @@ import (
 // losslessDecoder is the only decoder a pass that can carry an identity may use.
 const losslessDecoder = "decodeJSONUseNumber"
 
-// toleratedDecodeFiles are files the guard reads but where a plain decode cannot lose an
+// toleratedDecodeFunctions are named functions where a plain decode cannot lose an
 // identity, each with the reason it was accepted.
-var toleratedDecodeFiles = map[string]string{
-	// Account identity decodes through its own Identity type, which parses the raw token.
-	"internal/provider/gigahost/account_decode.go": "identity is decoded by its own raw-token parser",
-	"internal/provider/gigahost/identity.go":       "the raw-token identity parser itself",
-	"internal/provider/gigahost/dashboard.go":      "counts and statuses only; no identifier reaches a durable row",
-	"internal/provider/gigahost/keys.go":           "API-key metadata; no server or order identifier",
-	// Catalog and price data are not identities: they are compared and rendered, never
-	// written as the durable identity of a row.
-	"internal/provider/gigahost/catalog.go": "catalog/price data; no durable identity",
-	// The error-envelope readers only extract a human-readable message.
-	"internal/provider/gigahost/client.go": "checked separately below: only its envelope-message readers use a plain decode",
+//
+// The exemption is per FUNCTION, never per file. A file-level exemption is exactly how the
+// lossless requirement was lost once before: `client.go` was exempted on the rationale that
+// it "only extracts a human-readable message", while the same file held the partial-order
+// reader that feeds order identity into tracking. An exemption keyed on a function cannot
+// cover a reader added beside it later, and every entry must still name a real function.
+var toleratedDecodeFunctions = map[string]string{
+	// Empty, deliberately. Every pass that can carry an identity now decodes losslessly, and
+	// the readers that genuinely carry none decode into typed fields (an account identifier
+	// has its own raw-token parser; catalog prices and statuses are strings and floats), so
+	// they are not loose at all and need no exemption. The map stays because a future reader
+	// may have a real reason, and an entry has to name a function that actually needs it.
 }
 
 // toleratedIdentityFields are `any`-typed JSON fields the guard does not require to be exact,
@@ -64,6 +66,7 @@ var toleratedIdentityFields = map[string]string{
 	"PerPage":        "pagination metadata",
 	"Total":          "pagination metadata",
 	"OSID":           "a catalog label used for a request parameter",
+	"DCID":           "a datacenter label used as a request parameter; never a stored identity",
 	"DistID":         "a catalog label used for a request parameter",
 	"OrderIDs":       "a list of order identifiers: decoded losslessly by the order decoder, checked below",
 }
@@ -165,6 +168,19 @@ func TestIdentityDecodePassesAreLossless(t *testing.T) {
 				}
 				if valueType := typeName(derefType(field.Type)); valueType != "" {
 					nested[key] = append(nested[key], valueType)
+					continue
+				}
+				// An ANONYMOUS nested struct cannot be named by another type, so its untyped
+				// fields must be folded in here or they are invisible to the whole check. Every
+				// one of them is recorded as declared, so a tolerance entry for a field that
+				// only appears here is still observed.
+				for _, anonymousName := range anonymousUntypedFields(field.Type) {
+					seenFields[anonymousName] = true
+				}
+				if offender := anonymousLooseField(field.Type); offender != "" {
+					if _, already := looseField[key]; !already {
+						looseField[key] = fieldName + ".<anonymous>." + offender
+					}
 				}
 			}
 		}
@@ -210,11 +226,14 @@ func TestIdentityDecodePassesAreLossless(t *testing.T) {
 		}
 	}
 
+	seenFunctions := make(map[string]bool)
+
 	// Pass 2: every decode into a loose struct must use the lossless decoder. The target is
 	// usually a local VARIABLE (`&env`), so its declared type has to be resolved first: a
 	// guard that only understands `&SomeType{}` misses the exact shape this defect used.
 	for _, pf := range parsed {
 		var plainDecodes []string
+		fnName := ""
 		var walkDecodes func(fn string, node ast.Node)
 		walkDecodes = func(fn string, node ast.Node) {
 			// Local variable types, so `&env` can be resolved to `envelope`.
@@ -249,7 +268,9 @@ func TestIdentityDecodePassesAreLossless(t *testing.T) {
 			ast.Inspect(node, func(child ast.Node) bool {
 				if fnDecl, ok := child.(*ast.FuncDecl); ok {
 					if fnDecl.Body != nil && fn == "" {
-						walkDecodes(scopeName(fnDecl), fnDecl.Body)
+						fnName = scopeName(fnDecl)
+						walkDecodes(fnName, fnDecl.Body)
+						fnName = ""
 					}
 					return false
 				}
@@ -275,26 +296,29 @@ func TestIdentityDecodePassesAreLossless(t *testing.T) {
 						continue
 					}
 					if offends, isLoose := looseField[target]; isLoose {
-						plainDecodes = append(plainDecodes, fmt.Sprintf("line %d decodes %s (loose via %s)",
-							fset.Position(call.Pos()).Line, wanted, offends))
+						plainDecodes = append(plainDecodes, fmt.Sprintf("%s:%d decodes %s (loose via %s)",
+							fnName, fset.Position(call.Pos()).Line, wanted, offends))
 						break
 					}
 				}
 				return true
 			})
 		}
+		fnName = ""
 		walkDecodes("", pf.file)
 
-		if len(plainDecodes) == 0 {
-			continue
-		}
-		if reason, tolerated := toleratedDecodeFiles[pf.rel]; tolerated {
-			if strings.TrimSpace(reason) == "" {
-				t.Errorf("%s is tolerated without a reason", pf.rel)
-			}
-			continue
-		}
 		for _, detail := range plainDecodes {
+			// detail is "<function>:<line> decodes <type> ..."; the exemption key is
+			// "<file>:<function>", so a reader added beside an exempt one is still caught.
+			fnPart, _, _ := strings.Cut(detail, ":")
+			key := path.Base(pf.rel) + ":" + fnPart
+			if reason, tolerated := toleratedDecodeFunctions[key]; tolerated {
+				if strings.TrimSpace(reason) == "" {
+					t.Errorf("%s is tolerated without a reason", key)
+				}
+				seenFunctions[key] = true
+				continue
+			}
 			t.Errorf("%s: %s without %s: a numeric identity there becomes a float64 instead of its exact value",
 				pf.rel, detail, losslessDecoder)
 		}
@@ -307,15 +331,15 @@ func TestIdentityDecodePassesAreLossless(t *testing.T) {
 		}
 	}
 
-	// Tolerated files must still exist, and tolerated fields must still be declared.
-	files := make([]string, 0, len(toleratedDecodeFiles))
-	for rel := range toleratedDecodeFiles {
-		files = append(files, rel)
+	// Every exemption must match a real function that still needs it.
+	keys := make([]string, 0, len(toleratedDecodeFunctions))
+	for key := range toleratedDecodeFunctions {
+		keys = append(keys, key)
 	}
-	sort.Strings(files)
-	for _, rel := range files {
-		if _, statErr := os.Stat(filepath.Join(root, rel)); statErr != nil {
-			t.Errorf("tolerated file %s no longer exists and must be removed from the list", rel)
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !seenFunctions[key] {
+			t.Errorf("exemption %q matches no loose decode and must be removed", key)
 		}
 	}
 	for fieldName, reason := range toleratedIdentityFields {
@@ -368,6 +392,60 @@ func receiverText(expr ast.Expr) string {
 		return t.Name
 	}
 	return "?"
+}
+
+// anonymousUntypedFields lists every untyped JSON field name inside an anonymous struct,
+// whether or not it is tolerated.
+func anonymousUntypedFields(expr ast.Expr) []string {
+	var names []string
+	switch t := expr.(type) {
+	case *ast.StarExpr:
+		return anonymousUntypedFields(t.X)
+	case *ast.ArrayType:
+		return anonymousUntypedFields(t.Elt)
+	case *ast.StructType:
+		for _, field := range t.Fields.List {
+			if len(field.Names) == 0 || field.Tag == nil {
+				continue
+			}
+			if isUntypedJSONField(field.Type) {
+				names = append(names, field.Names[0].Name)
+				continue
+			}
+			names = append(names, anonymousUntypedFields(field.Type)...)
+		}
+	}
+	return names
+}
+
+// anonymousLooseField returns the first untyped JSON field inside an anonymous struct
+// (possibly behind a pointer or a slice), or "" when there is none.
+func anonymousLooseField(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.StarExpr:
+		return anonymousLooseField(t.X)
+	case *ast.ArrayType:
+		return anonymousLooseField(t.Elt)
+	case *ast.StructType:
+		for _, field := range t.Fields.List {
+			if len(field.Names) == 0 || field.Tag == nil {
+				continue
+			}
+			if isUntypedJSONField(field.Type) {
+				name := field.Names[0].Name
+				// A tolerated field is tolerated wherever it is declared: two copies of one
+				// rule would drift the moment a field moves between structs.
+				if _, tolerated := toleratedIdentityFields[name]; tolerated {
+					continue
+				}
+				return name
+			}
+			if nested := anonymousLooseField(field.Type); nested != "" {
+				return nested
+			}
+		}
+	}
+	return ""
 }
 
 // isUntypedJSONField reports whether a field's type is `any` or `[]any`, the two shapes where

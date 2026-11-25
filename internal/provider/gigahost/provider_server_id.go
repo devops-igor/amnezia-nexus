@@ -95,7 +95,7 @@ func exactServerID(text string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	scaled, err := scaleServerIDDigits(digits, exponent)
+	scaled, err := scaleServerIDDigits(text, digits, exponent)
 	if err != nil {
 		return 0, err
 	}
@@ -177,7 +177,7 @@ func joinServerIDDigits(text, mantissa string) (string, int, error) {
 // scaleServerIDDigits applies a decimal exponent to a digit string, refusing a value whose
 // fractional digits are not zeros: those are exactly the ids that cannot be represented
 // without changing which server they name.
-func scaleServerIDDigits(digits string, exponent int) (string, error) {
+func scaleServerIDDigits(text, digits string, exponent int) (string, error) {
 	switch {
 	case exponent < 0:
 		drop := -exponent
@@ -188,7 +188,7 @@ func scaleServerIDDigits(digits string, exponent int) (string, error) {
 			return "0", nil
 		}
 		if strings.Trim(digits[len(digits)-drop:], "0") != "" {
-			return "", fmt.Errorf("server id %s is not a whole number", digits)
+			return "", fmt.Errorf("server id %s is not a whole number", text)
 		}
 		digits = digits[:len(digits)-drop]
 	case exponent > 0:
