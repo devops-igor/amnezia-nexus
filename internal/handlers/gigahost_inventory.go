@@ -183,7 +183,7 @@ func (h *Handlers) confirmRepeatedOmissions(accountID string, listedCount, accou
 	return confirmed
 }
 
-// ReconcileGigahostServerInventory records, for every Gigahost-provisioned// ReconcileGigahostServerInventory records, for every Gigahost-provisioned
+// ReconcileGigahostServerInventory records, for every Gigahost-provisioned
 // server row, whether the provider's inventory still lists it.
 //
 // Nothing here is on a request path: the panel's periodic background pass calls

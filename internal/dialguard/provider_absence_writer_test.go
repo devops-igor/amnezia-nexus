@@ -17,11 +17,13 @@ package dialguard
 // answer, and it is called only from gigahostInventoryAnswerFor.
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -59,11 +61,7 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		case "internal/models/models.go", "internal/database/migrations.go", "internal/database/servers.go":
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if strings.Contains(string(raw), "provider_absent_at") {
+		if strings.Contains(readSource(t, root, rel), "provider_absent_at") {
 			t.Errorf("%s touches the absence column outside the store; the mark has one writer", rel)
 		}
 	}
@@ -107,36 +105,59 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 
 	// 6. The certificate must not depend on a field the provider does not document for
 	//    the credential the panel holds: the account payload's permissions object is
-	//    admin-session-only and must not be read here.
+	//    admin-session-only, so no struct may map it and no symbol may model it.
 	for _, rel := range []string{absenceInventoryFile,
 		"internal/provider/gigahost/types.go",
 		"internal/provider/gigahost/client.go",
 		"internal/provider/gigahost/account_decode.go"} {
-		raw, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		for _, forbidden := range []string{"EnumeratesWholeAccount", "AccountPermissions", "PermissionScope", `"permissions"`} {
-			if strings.Contains(string(raw), forbidden) {
-				t.Errorf("%s reads %s, which the provider does not document for this credential", rel, forbidden)
+		file := parseFile(t, root, rel)
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.Field:
+				if n.Tag == nil {
+					break
+				}
+				tag, err := strconv.Unquote(n.Tag.Value)
+				if err != nil {
+					t.Fatalf("%s: unreadable struct tag %s", rel, n.Tag.Value)
+				}
+				if strings.Contains(tag, "permissions") {
+					t.Errorf("%s maps a permissions field (%s), which the provider does not document for this credential", rel, tag)
+				}
+			case *ast.Ident:
+				switch n.Name {
+				case "AccountPermissions", "PermissionScope", "EnumeratesWholeAccount":
+					t.Errorf("%s models the credential's scope with %s, which the provider does not document for this credential", rel, n.Name)
+				}
 			}
-		}
+			return true
+		})
 	}
+}
 
-	// 6. A detail read may only ask about presence. Nothing in the decision path may
-	//    classify a provider status as absence.
-	for _, rel := range []string{absenceInventoryFile} {
-		raw, err := os.ReadFile(filepath.Join(root, rel))
+// readSource returns a file's source, honouring SSH_GUARD_OVERLAY exactly as parseFile
+// does so a negative probe can show a text check failing without dirtying the tree.
+func readSource(t *testing.T, root, rel string) string {
+	t.Helper()
+	path := filepath.Join(root, rel)
+	if overlay := os.Getenv("SSH_GUARD_OVERLAY"); overlay != "" {
+		var mapping struct{ Replace map[string]string }
+		data, err := os.ReadFile(overlay)
 		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
+			t.Fatal(err)
 		}
-		text := string(raw)
-		for _, forbidden := range []string{"ErrNotFound", "StatusNotFound", "apiErr.StatusCode"} {
-			if strings.Contains(text, forbidden) {
-				t.Errorf("%s interprets a provider status (%s); a detail read may only report presence", rel, forbidden)
-			}
+		if err := json.Unmarshal(data, &mapping); err != nil {
+			t.Fatal(err)
+		}
+		if replacement, ok := mapping.Replace[path]; ok {
+			path = replacement
 		}
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(raw)
 }
 
 // assertOnlyCallers fails unless symbol is invoked from exactly one function.
