@@ -43,7 +43,19 @@ func decodeJSONUseNumber(data []byte, target any) error {
 }
 
 // decodeProviderServerID reads one provider server id from a decoded JSON value.
+//
+// It is decodeExactInteger at an identity site: the name says what the value identifies, so
+// a reader can tell a site that must be exact from a site that tolerates a string.
 func decodeProviderServerID(val any) (int64, error) {
+	return decodeExactInteger(val)
+}
+
+// decodeExactInteger reads a whole identifier from a decoded JSON value without coercing it.
+//
+// Every caller that turns provider JSON into a durable identifier uses this: a server id, an
+// order id. The distinction that matters is not what the number means but that it must not
+// silently change, so there is one implementation and no second convention.
+func decodeExactInteger(val any) (int64, error) {
 	switch v := val.(type) {
 	case nil:
 		// An absent or null id names no server; the caller's identity gate refuses it.

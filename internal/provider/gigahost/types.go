@@ -452,8 +452,12 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	if err := decodeJSONUseNumber(data, &raw); err != nil {
 		return err
 	}
+	// The envelope pass carries the SAME identity fields as the flat pass, so it must decode
+	// the same way: json.Unmarshal into an `any` field yields float64, and the strict identity
+	// decoder refuses that dynamic type even for a small integer, which turned an accepted
+	// purchase into an uncertain one. decodeJSONUseNumber keeps every number exact here too.
 	var env envelope
-	if err := json.Unmarshal(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || (env.Data.Success != nil && *env.Data.Success)) {
+	if err := decodeJSONUseNumber(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || (env.Data.Success != nil && *env.Data.Success)) {
 		raw = env.Data
 	}
 
