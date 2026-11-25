@@ -143,6 +143,13 @@ func (h *Handlers) gigahostAccountServerCount(ctx context.Context, client gigaho
 	return dashboard.Services.ServerCount(), true
 }
 
+// agreesWith reports whether carried evidence describes this pass's own counts for the
+// same account. Two passes agree only when the same account saw the same listing size
+// against the same account-wide count, and the row was omitted in both.
+func (c absenceCandidate) agreesWith(accountID string, listedCount, accountServers int) bool {
+	return c.accountID == accountID && c.listedCount == listedCount && c.accountServers == accountServers
+}
+
 // confirmRepeatedOmissions turns a repeated omission into a confirmed absence.
 //
 // Absence is concluded only on evidence that repeats: the row must be omitted in two
@@ -159,10 +166,7 @@ func (h *Handlers) confirmRepeatedOmissions(accountID string, listedCount, accou
 	next := make(map[int64]absenceCandidate, len(candidates))
 	if credible {
 		for _, id := range candidates {
-			if previous, ok := h.absenceCandidates[id]; ok &&
-				previous.accountID == accountID &&
-				previous.listedCount == listedCount &&
-				previous.accountServers == accountServers {
+			if previous, ok := h.absenceCandidates[id]; ok && previous.agreesWith(accountID, listedCount, accountServers) {
 				confirmed[id] = struct{}{}
 				continue
 			}
