@@ -57,8 +57,13 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		t.Fatalf("absence-mark writers = %v, want exactly [%s]", callers, want)
 	}
 
-	// 2. Nothing outside the store may touch the column itself: no UPDATE, INSERT or
-	//    raw literal can write the mark around the method.
+	// 2. Nothing outside the store may WRITE the column: no UPDATE or INSERT and no raw
+	//    literal can set the mark around the method.
+	//
+	//    READING it elsewhere is allowed and is a different fact: a destination predicate has
+	//    to consult the mark as part of a statement that decides whether a write may happen
+	//    (see the durable session-move writers). Banning the name outright would forbid exactly
+	//    the fence those writers need, so the rule is stated on assignment and tested as such.
 	for _, rel := range productionFiles(t, root) {
 		switch rel {
 		case "internal/models/models.go", "internal/database/migrations.go", "internal/database/servers.go":
@@ -66,9 +71,23 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		}
 		source := readSource(t, root, rel)
 		for _, column := range []string{"provider_absent_at", "provider_absent_account_id"} {
-			if strings.Contains(source, column) {
-				t.Errorf("%s touches %s outside the store; the mark has one writer", rel, column)
+			if writesColumn(source, column) {
+				t.Errorf("%s assigns %s outside the store; the mark has one writer", rel, column)
 			}
+		}
+	}
+
+	// 2b. A read of the mark outside the store must be a predicate on a write, not a free
+	//     lookup: the only permitted shape is the destination fence in the session-move
+	//     writers, and it must appear in a NOT EXISTS/EXISTS clause rather than a bare select
+	//     used to make a decision in Go and then write separately.
+	for _, rel := range productionFiles(t, root) {
+		if rel != "internal/database/vpn.go" {
+			continue
+		}
+		source := readSource(t, root, rel)
+		if !strings.Contains(source, "providerAbsentDestinationPredicate") {
+			t.Errorf("%s reads the absence column without the shared destination predicate", rel)
 		}
 	}
 
@@ -192,4 +211,26 @@ func assertOnlyCallers(t *testing.T, root, symbol, want string) {
 	if len(callers) != 1 || callers[0] != want {
 		t.Fatalf("%s callers = %v, want exactly [%s]", symbol, callers, want)
 	}
+}
+
+// writesColumn reports whether source ASSIGNS the column, as opposed to merely reading it.
+// The shapes counted are the ones that could set the mark: an UPDATE ... SET, an INSERT column
+// list that names it, or an explicit assignment to the model field.
+func writesColumn(source, column string) bool {
+	for _, line := range strings.Split(source, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, column) {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.Contains(lower, "set ") && strings.Contains(lower, column):
+			return true
+		case strings.Contains(lower, "insert into servers") && strings.Contains(lower, column):
+			return true
+		case strings.Contains(trimmed, "ProviderAbsentAt =") || strings.Contains(trimmed, "ProviderAbsentAccountID ="):
+			return true
+		}
+	}
+	return false
 }
