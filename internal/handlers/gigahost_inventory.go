@@ -309,6 +309,54 @@ func gigahostIdentifiedServerIDs(inventory []gigahost.ServerInfo) (map[int64]str
 	return listed, nil
 }
 
+// gigahostRowDecision is what one pass concluded about one row.
+type gigahostRowDecision int
+
+const (
+	gigahostRowUnknownAccount gigahostRowDecision = iota
+	gigahostRowOtherAccount
+	gigahostRowUnmeasured
+	gigahostRowPresent
+	gigahostRowAbsent
+	gigahostRowScopeEvidence
+)
+
+// presence reports whether the decision names an existence answer and, if it does,
+// whether the server exists.
+func (d gigahostRowDecision) presence() (present, measured bool) {
+	switch d {
+	case gigahostRowPresent, gigahostRowScopeEvidence:
+		return true, true
+	case gigahostRowAbsent:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// decideGigahostRow applies the rule for one row against one answer: only a row of
+// the answering account is judged, and only a per-server answer may say a server is
+// gone.
+func decideGigahostRow(ctx context.Context, row providerBackedServer, answer gigahostInventoryAnswer) gigahostRowDecision {
+	if row.accountID == "" {
+		return gigahostRowUnknownAccount
+	}
+	if row.accountID != answer.accountID {
+		return gigahostRowOtherAccount
+	}
+	if _, listed := answer.listed[row.providerServerID]; listed {
+		return gigahostRowPresent
+	}
+	switch gigahostServerState(ctx, answer.client, row.providerServerID) {
+	case gigahostServerAbsent:
+		return gigahostRowAbsent
+	case gigahostServerPresent:
+		return gigahostRowScopeEvidence
+	default:
+		return gigahostRowUnmeasured
+	}
+}
+
 // applyGigahostInventoryPresence writes the provider's answer onto the rows whose
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
@@ -316,77 +364,59 @@ func gigahostIdentifiedServerIDs(inventory []gigahost.ServerInfo) (map[int64]str
 // A listed row is positive evidence and the only way the state is cleared. An
 // unlisted row is never treated as absence on the strength of the listing: the
 // provider is asked about that server, because a key that cannot see a server gets
-// a refusal rather than a 404 and a refusal proves nothing.
+// a refusal rather than a 404, and a refusal proves nothing.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
 	var failures []error
-	var unknownAccount, otherAccount, unmeasured, scopeEvidence int
+	counts := make(map[gigahostRowDecision]int, len(rows))
 	for _, row := range rows {
-		if row.accountID == "" {
-			// The association is unknown, so this row's absence is unprovable.
-			// Its state is preserved: not marked absent, not cleared either.
-			unknownAccount++
+		decision := decideGigahostRow(ctx, row, answer)
+		counts[decision]++
+		present, measured := decision.presence()
+		if !measured {
 			continue
 		}
-		if row.accountID != answer.accountID {
-			// This answer is about another account. It says nothing about a row
-			// provisioned under this one, so the row keeps its state.
-			otherAccount++
-			continue
+		if err := h.writeProviderAbsence(ctx, row, present, now); err != nil {
+			failures = append(failures, err)
 		}
-
-		present := false
-		if _, listed := answer.listed[row.providerServerID]; listed {
-			present = true
-		} else {
-			// The listing did not enumerate this server. Ask the provider about the
-			// server itself: only an authoritative 404 is absence.
-			switch gigahostServerState(ctx, answer.client, row.providerServerID) {
-			case gigahostServerAbsent:
-				present = false
-			case gigahostServerPresent:
-				present = true
-				scopeEvidence++
-			default:
-				// Unmeasured: a refusal, a timeout or an unusable answer. The row
-				// keeps exactly the state it had.
-				unmeasured++
-				continue
-			}
-		}
-
-		if present == (row.absentAt == "") {
-			// The row already states what the provider says; nothing to write.
-			continue
-		}
-		absentAt := now
-		if present {
-			absentAt = time.Time{}
-		}
-		if err := h.db.SetServerProviderAbsence(ctx, row.serverID, absentAt); err != nil {
-			failures = append(failures, fmt.Errorf("server %d: %w", row.serverID, err))
-			continue
-		}
-		slog.Info("Provider inventory changed a server's existence state",
-			"server_id", row.serverID,
-			"provider_server_id", row.providerServerID,
-			"provider_absent", !present)
 	}
-	if unknownAccount > 0 || otherAccount > 0 || unmeasured > 0 {
+
+	if left := counts[gigahostRowUnknownAccount] + counts[gigahostRowOtherAccount] + counts[gigahostRowUnmeasured]; left > 0 {
 		// Observable without naming an account or a credential: why rows were
 		// left alone, and how many.
 		slog.Info("Provider inventory left server existence state unchanged for rows it cannot speak for",
-			"unknown_account_rows", unknownAccount,
-			"other_account_rows", otherAccount,
-			"unmeasured_rows", unmeasured)
+			"unknown_account_rows", counts[gigahostRowUnknownAccount],
+			"other_account_rows", counts[gigahostRowOtherAccount],
+			"unmeasured_rows", counts[gigahostRowUnmeasured])
 	}
-	if scopeEvidence > 0 {
+	if filtered := counts[gigahostRowScopeEvidence]; filtered > 0 {
 		// The key's visibility is narrower than the account: these servers exist but
 		// the listing did not enumerate them, so the listing is not evidence.
 		slog.Info("Provider inventory did not enumerate servers that still exist; no absence was recorded for them",
-			"rows", scopeEvidence)
+			"rows", filtered)
 	}
 	return errors.Join(failures...)
+}
+
+// writeProviderAbsence stores one row's observation when it differs from the stored
+// one.
+func (h *Handlers) writeProviderAbsence(ctx context.Context, row providerBackedServer, present bool, now time.Time) error {
+	if present == (row.absentAt == "") {
+		// The row already states what the provider says; nothing to write.
+		return nil
+	}
+	absentAt := now
+	if present {
+		absentAt = time.Time{}
+	}
+	if err := h.db.SetServerProviderAbsence(ctx, row.serverID, absentAt); err != nil {
+		return fmt.Errorf("server %d: %w", row.serverID, err)
+	}
+	slog.Info("Provider inventory changed a server's existence state",
+		"server_id", row.serverID,
+		"provider_server_id", row.providerServerID,
+		"provider_absent", !present)
+	return nil
 }
