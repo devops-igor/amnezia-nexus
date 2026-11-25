@@ -69,6 +69,10 @@ type inventoryProvider struct {
 	// detailBody, when set, is served verbatim for any successful per-server read,
 	// so a test can hand the client a shape it must refuse.
 	detailBody string
+	// accountServers is the account-wide server count the summary reports. Negative
+	// (the default) means the summary carries no service counts, which certifies
+	// nothing and therefore records no absence.
+	accountServers int
 }
 
 // set serves the given /servers body and clears any previous failure mode.
@@ -136,6 +140,14 @@ func (p *inventoryProvider) setDetailArray(array bool) {
 	p.detailArray = array
 }
 
+// setAccountServers reports an account-wide server count in the summary, which is
+// what certifies an inventory answer as the account's whole enumeration.
+func (p *inventoryProvider) setAccountServers(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountServers = n
+}
+
 // setDetailBody serves the given body verbatim for successful per-server reads.
 func (p *inventoryProvider) setDetailBody(body string) {
 	p.mu.Lock()
@@ -197,6 +209,7 @@ func (p *inventoryProvider) inventoryCallCount() int {
 func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	account, accountStatus, accountStall := p.account, p.accountStatus, p.accountStall
+	accountServers := p.accountServers
 	accountNumeric, accountBody := p.accountNumeric, p.accountBody
 	if r.URL.Path == "/servers" {
 		p.inventoryCalls++
@@ -210,6 +223,11 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	body, status, stall := p.body, p.status, p.stall
 	p.mu.Unlock()
 
+	if r.URL.Path == "/dashboard" {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(dashboardJSON(accountServers)))
+		return
+	}
 	if r.URL.Path == "/account" {
 		if accountStall {
 			<-r.Context().Done()
@@ -257,6 +275,23 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(body))
+}
+
+// dashboardJSON renders GET /dashboard. A negative count means the summary reports no
+// service counts at all, which certifies nothing.
+func dashboardJSON(accountServers int) string {
+	payload := map[string]any{"meta": map[string]any{"status": 200}, "data": map[string]any{}}
+	data := payload["data"].(map[string]any)
+	if accountServers >= 0 {
+		data["services"] = map[string]any{"virtual": accountServers, "dedicated": 0, "dns_zones": 0, "registered_domains": 0}
+	} else {
+		data["billing"] = map[string]any{"unpaid": 0}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return `{"data":{}}`
+	}
+	return string(encoded)
 }
 
 // perServerPathID reads the provider server id out of a GET /servers/{id} path.
@@ -386,7 +421,7 @@ func newInventoryFixture(t *testing.T) *inventoryFixture {
 	if err != nil {
 		t.Fatalf("failed to open the test store: %v", err)
 	}
-	provider := &inventoryProvider{body: inventoryJSON(), account: fixtureAccount}
+	provider := &inventoryProvider{body: inventoryJSON(), account: fixtureAccount, accountServers: -1}
 	server := httptest.NewServer(http.HandlerFunc(provider.handle))
 
 	f := &inventoryFixture{
@@ -535,8 +570,10 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 		"awg": map[string]any{"installed": true},
 	})
 
-	// The provider enumerates the account and lists only 501.
+	// The provider enumerates the account and lists only 501, which is also the
+	// account-wide count: this answer covers the whole account.
 	f.provider.set(inventoryJSON(501))
+	f.provider.setAccountServers(1)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}
@@ -675,6 +712,7 @@ func TestReconcileGigahostInventory_FailedOrPartialReadsChangeNothing(t *testing
 			// answers. Without it, "nothing changed" above would be
 			// indistinguishable from a pass that never ran.
 			f.provider.set(inventoryJSON(599))
+			f.provider.setAccountServers(1)
 			if err := f.reconcile(context.Background()); err != nil {
 				t.Fatalf("control pass failed: %v", err)
 			}
@@ -692,6 +730,7 @@ func TestReconcileGigahostInventory_CorrectsAServerThatReappears(t *testing.T) {
 	// A successful read of an account that holds no servers at all is still an
 	// answer: the row it provisioned is absent.
 	f.provider.set(inventoryJSON())
+	f.provider.setAccountServers(0)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}
@@ -805,6 +844,7 @@ func TestReconcileGigahostInventory_UnidentifiableEntryMarksNothingAbsent(t *tes
 			// absence of the row it does not list. Without this, the assertions above
 			// would also pass if the pass never wrote anything at all.
 			f.provider.set(inventoryJSON(501))
+			f.provider.setAccountServers(1)
 			if err := f.reconcile(context.Background()); err != nil {
 				t.Fatalf("control pass failed: %v", err)
 			}

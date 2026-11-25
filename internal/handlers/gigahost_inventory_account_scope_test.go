@@ -39,6 +39,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	// The panel points at the north account, whose inventory lists 501 only.
 	f.provider.setAccount(fixtureAccount)
 	f.provider.set(inventoryJSON(501))
+	f.provider.setAccountServers(1)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}
@@ -63,6 +64,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	// not in this answer at all.
 	f.provider.setAccount(otherAccount)
 	f.provider.set(inventoryJSON(601))
+	f.provider.setAccountServers(1)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass after the account swap failed: %v", err)
 	}
@@ -127,6 +129,7 @@ func TestReconcileGigahostInventory_UnattributableAccountChangesNothing(t *testi
 			// pass applied it without an account, it would either rewrite the
 			// absence or mark the listed row absent.
 			f.provider.set(inventoryJSON(501))
+			f.provider.setAccountServers(1)
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
 			if err := f.reconcile(ctx); err == nil {
@@ -188,6 +191,7 @@ func TestReconcileGigahostInventory_UnknownAccountPreservesStateBothWays(t *test
 	}
 
 	f.provider.set(inventoryJSON(702))
+	f.provider.setAccountServers(1)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}

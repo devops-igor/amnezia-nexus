@@ -12,6 +12,10 @@ import (
 
 // GetServer answers for one server. The tracker fixture defines no per-server
 // answer, so an unexpected call refuses rather than inventing ownership.
+func (p *fakeProvider) GetDashboard(_ context.Context) (*gigahost.Dashboard, error) {
+	return &gigahost.Dashboard{ServicesPresent: false}, nil
+}
+
 func (p *fakeProvider) GetServer(_ context.Context, serverID int64) (*gigahost.ServerInfo, error) {
 	return nil, fmt.Errorf("tracker fixture defines no per-server answer for server %d", serverID)
 }

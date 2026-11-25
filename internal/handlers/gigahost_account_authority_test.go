@@ -115,9 +115,10 @@ func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testi
 	genuinelyGone := f.seedServer("Actually deleted", providerProtocols(503))
 
 	// The filtered listing: one server, self-consistent pagination and totals. The
-	// detail endpoint reports 502 (so the listing is demonstrably filtered) and says
-	// nothing about 503.
+	// account summary says the account holds three servers, so this listing is
+	// certified as incomplete and may conclude nothing.
 	f.provider.set(inventoryJSON(501))
+	f.provider.setAccountServers(3)
 	f.provider.answerPerServer(502, http.StatusOK)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
@@ -136,8 +137,10 @@ func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testi
 		t.Fatalf("per-server reads = %d, want 2 (one per unlisted server)", calls)
 	}
 
-	// Control in the same run: with nothing left that narrows the listing, the same
-	// pass records both servers as genuinely absent.
+	// Control in the same run: the summary now says the account holds one server, which
+	// is what the listing enumerated, so the same pass records both omitted servers as
+	// genuinely absent. The detail answers are unchanged between the two passes.
+	f.provider.setAccountServers(1)
 	f.provider.answerPerServer(502, http.StatusNotFound)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("control pass failed: %v", err)
@@ -163,6 +166,7 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 
 	// The documented numeric shape, with no text form supplied.
 	f.provider.set(inventoryJSON(501))
+	f.provider.setAccountServers(1)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation refused a documented numeric account identifier: %v", err)
 	}
@@ -184,6 +188,7 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 	textListed := text.seedServer("Listed", providerProtocols(501))
 	textGone := text.seedServer("Gone", providerProtocols(502))
 	text.provider.set(inventoryJSON(501))
+	text.provider.setAccountServers(1)
 	if err := text.reconcile(context.Background()); err != nil {
 		t.Fatalf("control pass failed: %v", err)
 	}

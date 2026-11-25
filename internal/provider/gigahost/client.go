@@ -32,6 +32,10 @@ type Client interface {
 	// provider refuses a server outside the key's visibility with an authorization
 	// error, so "not found" here proves absence while a refusal proves nothing.
 	GetServer(ctx context.Context, serverID int64) (*ServerInfo, error)
+	// GetDashboard reads the account summary, whose service counts are account-wide
+	// even for a permission-limited key. It is the only key-reachable statement about
+	// how many servers the account has.
+	GetDashboard(ctx context.Context) (*Dashboard, error)
 }
 
 // Config provides configuration settings for creating a Gigahost client.

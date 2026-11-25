@@ -577,6 +577,10 @@ func (p *trackerFakeProvider) GetDeployStatus(_ context.Context, orderID string)
 
 // GetServer answers for one server. This fixture defines no per-server answer,
 // so an unexpected call refuses rather than inventing ownership.
+func (p *trackerFakeProvider) GetDashboard(_ context.Context) (*gigahost.Dashboard, error) {
+	return &gigahost.Dashboard{ServicesPresent: false}, nil
+}
+
 func (p *trackerFakeProvider) GetServer(_ context.Context, serverID int64) (*gigahost.ServerInfo, error) {
 	return nil, fmt.Errorf("fixture defines no per-server answer for server %d", serverID)
 }

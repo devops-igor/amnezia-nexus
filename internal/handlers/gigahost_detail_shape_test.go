@@ -192,9 +192,10 @@ func TestReconcileGigahostInventory_DetailReadNeverConcludesAbsence(t *testing.T
 	refused := f.seedServer("Outside this key", providerProtocols(502))
 	gone := f.seedServer("Deleted", providerProtocols(503))
 
-	// A filtered listing, an explicit refusal for the out-of-scope server, and a
-	// "not reported" answer for the deleted one.
+	// A filtered listing of a three-server account, an explicit refusal for the
+	// out-of-scope server, and a "not reported" answer for the deleted one.
 	f.provider.set(inventoryJSON(501))
+	f.provider.setAccountServers(3)
 	f.provider.answerPerServer(502, http.StatusForbidden)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
@@ -210,9 +211,10 @@ func TestReconcileGigahostInventory_DetailReadNeverConcludesAbsence(t *testing.T
 		t.Fatal("a detail 404 recorded absence while the key's visibility was narrower than the account")
 	}
 
-	// Control in the same run: once nothing narrows the listing, a server the inventory
-	// does not list is recorded absent again. The listing is the evidence; the detail
-	// "not reported" answers are unchanged between the two passes.
+	// Control in the same run: the account summary now reports one server, which is what
+	// the listing enumerated, so the answer is certified complete and both omitted
+	// servers are recorded absent. The detail answers are unchanged between the passes.
+	f.provider.setAccountServers(1)
 	f.provider.answerPerServer(502, http.StatusNotFound)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("control pass failed: %v", err)
