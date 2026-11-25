@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,6 +12,19 @@ import (
 // the database; transports without a stored row retain the config observation.
 type ProviderPresenceStore interface {
 	IsServerProviderAbsent(context.Context, int64) (bool, error)
+}
+
+// errPresenceUnavailable marks a failed read of the durable observation. It is
+// not a transport failure: nothing is known about the connection, so a
+// validation that meets it must decline to measure without reporting the
+// connection as dead or unhealthy.
+var errPresenceUnavailable = errors.New("provider presence could not be read")
+
+// isPresenceBlocked reports whether err came from the presence gate rather than
+// from the transport. Every layer that inspects the outcome of an exchange must
+// use it before concluding that a connection is dead.
+func isPresenceBlocked(err error) bool {
+	return errors.Is(err, ErrProviderAbsent) || errors.Is(err, errPresenceUnavailable)
 }
 
 func checkProviderPresence(ctx context.Context, cfg Config) error {
@@ -28,7 +42,7 @@ func checkProviderPresence(ctx context.Context, cfg Config) error {
 	defer cancel()
 	absent, err := store.IsServerProviderAbsent(ctx, *cfg.ServerID)
 	if err != nil {
-		return fmt.Errorf("check SSH provider presence: %w", err)
+		return fmt.Errorf("%w: %w", errPresenceUnavailable, err)
 	}
 	if absent {
 		return ErrProviderAbsent

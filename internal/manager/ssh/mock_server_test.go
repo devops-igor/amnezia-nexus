@@ -40,6 +40,9 @@ type MockSSHServer struct {
 	channels     atomic.Int64
 	commands     atomic.Int64
 	keepalives   atomic.Int64
+	// connects counts accepted TCP connections, so a test can tell a reused
+	// transport from a replacement handshake.
+	connects atomic.Int64
 }
 
 func NewMockSSHServer(t *testing.T, user, password string) *MockSSHServer {
@@ -218,6 +221,7 @@ func (s *MockSSHServer) acceptLoop() {
 		if err != nil {
 			return
 		}
+		s.connects.Add(1)
 
 		s.mu.Lock()
 		if s.closed {

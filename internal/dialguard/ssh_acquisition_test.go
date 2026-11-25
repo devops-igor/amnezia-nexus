@@ -116,6 +116,50 @@ func admissionGuard(stmt ast.Stmt) bool {
 	return ok && len(ret.Results) == 2 && mentions(ret.Results[0], "nil") && mentions(ret.Results[1], "err")
 }
 
+// hasPresenceInitGuard reports an `if err := checkProviderPresence(…); err != nil { … return err }`,
+// the form that consults the durable observation rather than only the config
+// snapshot. Like hasPlainGuard it rejects a disabled condition and a body that
+// drops the refusal.
+func hasPresenceInitGuard(body *ast.BlockStmt, callee string) bool {
+	for _, stmt := range ifStatements(body) {
+		init, ok := stmt.Init.(*ast.AssignStmt)
+		if !ok || len(init.Rhs) != 1 {
+			continue
+		}
+		call, ok := init.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok || name.Name != callee {
+			continue
+		}
+		cond, ok := stmt.Cond.(*ast.BinaryExpr)
+		if !ok || cond.Op != token.NEQ || !mentions(cond.Y, "nil") {
+			continue
+		}
+		if mentions(stmt.Body, "err") {
+			return true
+		}
+	}
+	return false
+}
+
+// refusesBeforeDial reports that the presence guard is a statement before the
+// first TCP dial in the body, so the refusal cannot be reached after a socket.
+func refusesBeforeDial(body *ast.BlockStmt) bool {
+	guard, dial := -1, -1
+	for i, stmt := range body.List {
+		if guard < 0 && (mentions(stmt, "checkProviderPresence") || mentions(stmt, "ProviderAbsent")) {
+			guard = i
+		}
+		if dial < 0 && mentions(stmt, "DialContext") {
+			dial = i
+		}
+	}
+	return guard >= 0 && dial >= 0 && guard < dial
+}
+
 func checkSSHConstruction(t *testing.T, rel string, file *ast.File, fn *ast.FuncDecl) {
 	t.Helper()
 	aliases := map[string]string{}

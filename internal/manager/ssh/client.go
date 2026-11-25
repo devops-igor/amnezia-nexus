@@ -150,13 +150,14 @@ func (c *Client) connect(ctx context.Context) error {
 		return nil
 	}
 
-	if c.cfg.ProviderAbsent {
-		// Refuse before any socket is created: the provider's inventory says this
-		// server no longer exists, so there is no host to authenticate against and
-		// nothing to measure. No connection is attempted and no error about the
-		// network is produced, so a caller cannot mistake this for an unreachable
-		// host.
-		return ErrProviderAbsent
+	// Refuse before any socket is created: the provider's inventory says this
+	// server no longer exists, so there is no host to authenticate against and
+	// nothing to measure. The durable observation is authoritative here, not only
+	// the config snapshot the connection was built from: a snapshot taken before
+	// the observation was written is exactly how a replacement handshake would
+	// otherwise reach a removed address.
+	if err := checkProviderPresence(ctx, c.cfg); err != nil {
+		return err
 	}
 
 	if c.cfg.Host == "" {
@@ -491,6 +492,12 @@ func (c *Client) IsAlive() bool {
 
 // alive distinguishes a refused check from a dead transport so the pool never
 // evicts an in-use connection merely because its observation became absent.
+//
+// The request wrapper re-reads the observation, so the refusal can arrive here
+// as the keepalive's own error even when this validation's first read still saw
+// the row listed. That outcome is a refusal, not a dead connection, and it is
+// returned as one: maintenance parks the entry and checkout refuses it, while a
+// genuine transport failure still reports the connection dead.
 func (c *Client) alive(ctx context.Context) (bool, error) {
 	if err := checkProviderPresence(ctx, c.cfg); err != nil {
 		return false, err
@@ -511,6 +518,9 @@ func (c *Client) alive(ctx context.Context) (bool, error) {
 
 	select {
 	case err := <-doneCh:
+		if isPresenceBlocked(err) {
+			return false, err
+		}
 		return err == nil, nil
 	case <-time.After(5 * time.Second):
 		return false, nil

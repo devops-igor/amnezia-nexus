@@ -230,8 +230,14 @@ func TestBoundariesStillRefuse(t *testing.T) {
 
 	t.Run("SSH transport refuses before dialing", func(t *testing.T) {
 		body := functionBody(t, root, sshClientFile, "*Client", "connect")
-		if !hasPlainGuard(body, "ProviderAbsent", "ErrProviderAbsent") {
-			t.Fatal("Client.Connect no longer has a plain `if …ProviderAbsent` guard that returns ErrProviderAbsent")
+		// The refusal may read the row's observation from the config snapshot or
+		// from the durable store, but it must be present as a guard that returns
+		// its error, and it must run before the socket exists.
+		if !hasPlainGuard(body, "ProviderAbsent", "ErrProviderAbsent") && !hasPresenceInitGuard(body, "checkProviderPresence") {
+			t.Fatal("Client.connect no longer has a plain provider-absence guard that returns the refusal")
+		}
+		if !refusesBeforeDial(body) {
+			t.Fatal("Client.connect reaches its TCP dial before the provider-absence guard")
 		}
 	})
 
