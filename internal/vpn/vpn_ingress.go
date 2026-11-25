@@ -121,6 +121,11 @@ func (s *Service) EnsureBackendSessionForIngress(ctx context.Context, o ingress.
 //nolint:gocyclo // one serialized admission preserves capacity and rollback invariants.
 func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.PeerOwnership, path *forwarder.ReturnPath) (*models.VPNSession, *models.BackendTunnel, forwarder.Retirement, error) {
 	var retirement forwarder.Retirement
+	// Read the provider-absence marks BEFORE the admission lock: this is the only
+	// database read the selection needs, and no I/O may run inside s.mu. A backend the
+	// provider has deleted is then disqualified for NEW assignment while its row, status
+	// and any already-admitted session stay untouched.
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
@@ -203,7 +208,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 
 	// New admission: select through the existing sticky/LB/capacity
 	// primitives (all under s.mu — issue #86).
-	activeTunnels := s.admissibleIngressCandidatesLocked()
+	activeTunnels := s.admissibleIngressCandidatesLocked(providerAbsent)
 	if len(activeTunnels) == 0 {
 		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
 	}
@@ -377,13 +382,20 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 // A blocked backend without recorded fresh evidence, or whose attached device
 // changed since that evidence was produced, is simply not a candidate: new
 // clients are refused there while established routes keep running.
-func (s *Service) admissibleIngressCandidatesLocked() []*models.BackendTunnel {
-	active := s.pool.GetActiveTunnels()
+func (s *Service) admissibleIngressCandidatesLocked(providerAbsent map[int64]struct{}) []*models.BackendTunnel {
+	// Provider absence disqualifies a destination even when its last health sample is
+	// still active: the provider said the server is gone, and health has not run since.
+	active := withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent)
 	if s.prober == nil {
 		return active
 	}
 	var candidates []*models.BackendTunnel
 	for _, t := range s.pool.ListTunnels() {
+		if _, isAbsent := providerAbsent[t.ServerID]; isAbsent {
+			// The handshake-blocked branch is a second admission release point, so the
+			// same disqualification applies to it.
+			continue
+		}
 		if candidate, ok := s.admissibleBlockedCandidateLocked(t); ok {
 			candidates = append(candidates, candidate)
 		}

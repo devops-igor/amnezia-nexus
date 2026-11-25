@@ -23,10 +23,14 @@ var ErrStaleCandidate = errors.New("vpn: candidate credentials mismatch current 
 
 // DisableBackend disables a backend server and initiates connection draining.
 func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
+	// The draining sessions are migrated, so this path chooses destinations: the
+	// provider-absence marks are read before the lock (no I/O inside it) and a backend
+	// the provider has deleted is never a target.
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.disableBackendLocked(ctx, serverID)
+	return s.disableBackendLocked(ctx, serverID, providerAbsent)
 }
 
 // withdrawObservedBackendLocked withdraws the backend generation an observation
@@ -43,7 +47,7 @@ func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 //
 // A retired generation is inert — ErrTunnelGenerationRetired and no mutation.
 // An already-removed slot is also inert: there is nothing left to withdraw.
-func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *models.BackendTunnel) error {
+func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *models.BackendTunnel, providerAbsent map[int64]struct{}) error {
 	if s.pool == nil {
 		return errors.New("tunnel pool not initialized")
 	}
@@ -70,7 +74,7 @@ func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *m
 			s.prober.MarkEnrollmentForGeneration(observed.ServerID, observed.ID)
 		}
 	}
-	return s.disableBackendLocked(ctx, observed.ServerID)
+	return s.disableBackendLocked(ctx, observed.ServerID, providerAbsent)
 }
 
 // disableBackendLocked applies DisableBackend semantics; the caller must hold
@@ -78,7 +82,7 @@ func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *m
 // forwarder device, and fails over active sessions (sticky affinities, DB
 // rows, live forwarder routes, pool counters) onto healthy backends so
 // traffic keeps flowing before any further mutation by the caller.
-func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) error {
+func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, providerAbsent map[int64]struct{}) error {
 	if s.pool == nil {
 		return errors.New("tunnel pool not initialized")
 	}
@@ -125,7 +129,10 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 
 	// Trigger failover for active sessions on this backend
 	if s.stickyMgr != nil {
-		activeTunnels := s.pool.GetActiveTunnels()
+		// A backend the provider has deleted is not a failover destination: its
+		// "active" status is only the last health sample, and moving sessions there
+		// would strand them again.
+		activeTunnels := withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent)
 		// Issue #85: HandleFailover returns a result with successful
 		// migrations AND explicitly reported skipped peers — every peer left
 		// on the disabled backend is logged here so stranding is visible.
@@ -705,6 +712,8 @@ func (s *Service) ClearServerDeletedTombstone(serverID int64) {
 // persisted row) and a defensive DB sweep catches any leftover row the pool
 // could not see (missing row is not an error: log and continue).
 func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
+	// Deleting a backend migrates its sessions, so the same destination rule applies.
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -732,7 +741,7 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 				return fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, dbErr)
 			}
 			if len(tunnels) > 0 {
-				return s.sweepLeftoverBackendLocked(ctx, serverID, 0)
+				return s.sweepLeftoverBackendLocked(ctx, serverID, 0, providerAbsent)
 			}
 		}
 		return err
@@ -762,7 +771,7 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	// Phase 1 — drain: disable + failover while the tunnel is still in the
 	// pool, so HandleFailover's session migration has healthy targets and
 	// the caller's sessions never orphan onto a removed tunnel ID.
-	if err := s.disableBackendLocked(ctx, serverID); err != nil {
+	if err := s.disableBackendLocked(ctx, serverID, providerAbsent); err != nil {
 		return err
 	}
 
@@ -779,7 +788,7 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	// reassigns any connected sessions still on it to a surviving active
 	// backend, deletes the leftover row, and never fails the delete: a
 	// missing row is the expected path.
-	return s.sweepLeftoverBackendLocked(ctx, serverID, tunnel.ID)
+	return s.sweepLeftoverBackendLocked(ctx, serverID, tunnel.ID, providerAbsent)
 }
 
 var (
@@ -814,7 +823,7 @@ func (s *Service) isLivePoolTunnel(serverID int64, tunnelID int64) bool {
 	return false
 }
 
-func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64) error {
+func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64, providerAbsent map[int64]struct{}) error {
 	if s.db == nil {
 		return nil
 	}
@@ -824,7 +833,7 @@ func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64
 	// the orphan. Zero means no healthy target exists — HandleFailover
 	// already hit the same terminal state and logged it.
 	failoverTarget := int64(0)
-	for _, tun := range s.pool.GetActiveTunnels() {
+	for _, tun := range withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent) {
 		if tun.ID != excludedTunnelID {
 			failoverTarget = tun.ID
 			break

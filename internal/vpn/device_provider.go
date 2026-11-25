@@ -152,9 +152,10 @@ func (s *Service) WithdrawObservedEnrollment(ctx context.Context, observed *mode
 		return tunnel.ErrTunnelGenerationRetired
 	}
 
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.withdrawObservedBackendLocked(ctx, observed)
+	return s.withdrawObservedBackendLocked(ctx, observed, providerAbsent)
 }
 
 // SetPendingEnrollment sets whether a backend server is undergoing initial enrollment qualification.

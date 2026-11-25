@@ -78,6 +78,38 @@ func (d *DB) IsServerProviderAbsent(ctx context.Context, id int64) (bool, error)
 	return observed.Valid && strings.TrimSpace(observed.String) != "", nil
 }
 
+// ListProviderAbsentServerIDs returns the ids of the servers the provider's own
+// inventory has already contradicted.
+//
+// It is the narrow read a selection path needs: one indexed column, no credential
+// decryption, no row materialisation, and no interpretation. An empty result means
+// "nothing is confirmed absent", which is also what a caller must assume when the read
+// fails - absence is a positive observation, never a default.
+func (d *DB) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.sqlDB.QueryContext(ctx,
+		"SELECT id FROM servers WHERE provider_absent_at IS NOT NULL AND TRIM(provider_absent_at) <> '' ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list provider-absent servers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to read provider-absent server id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list provider-absent servers: %w", err)
+	}
+	return ids, nil
+}
+
 // GetServerCount returns the total number of configured servers.
 func (d *DB) GetServerCount(ctx context.Context) (int, error) {
 	d.mu.RLock()

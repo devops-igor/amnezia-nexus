@@ -330,6 +330,56 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 	}
 }
 
+// The narrow list a selection path reads: only marked servers, and nothing at all when no
+// mark exists. An empty result is the "nothing confirmed absent" answer a caller needs.
+func TestServersListProviderAbsentServerIDs(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	ids := make([]int64, 0, 3)
+	for _, name := range []string{"Present A", "Absent B", "Absent C"} {
+		id, err := db.CreateServer(ctx, &models.Server{Name: name, Host: "198.51.100.9"})
+		if err != nil {
+			t.Fatalf("CreateServer(%s) failed: %v", name, err)
+		}
+		ids = append(ids, id)
+	}
+
+	listed, err := db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing with no marks failed: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("an unmarked store listed %v; absence is a positive observation", listed)
+	}
+
+	observed := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
+	for _, id := range ids[1:] {
+		if err := db.SetServerProviderAbsence(ctx, id, observed, "acct-north"); err != nil {
+			t.Fatalf("marking server %d failed: %v", id, err)
+		}
+	}
+	listed, err = db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing marks failed: %v", err)
+	}
+	if len(listed) != 2 || listed[0] != ids[1] || listed[1] != ids[2] {
+		t.Fatalf("listed %v, want %v (ordered, marks only)", listed, ids[1:])
+	}
+
+	// Clearing one mark removes exactly that server from the list.
+	if err := db.SetServerProviderAbsence(ctx, ids[1], time.Time{}, ""); err != nil {
+		t.Fatalf("clearing server %d failed: %v", ids[1], err)
+	}
+	listed, err = db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing after a clear failed: %v", err)
+	}
+	if len(listed) != 1 || listed[0] != ids[2] {
+		t.Fatalf("after clearing one mark, listed %v, want [%d]", listed, ids[2])
+	}
+}
+
 // The narrow provider-absence read the background prober and the deploy path use.
 // A missing row must not read as "provider-confirmed absent": nothing is known
 // about it, and a caller must not turn that into a refusal.

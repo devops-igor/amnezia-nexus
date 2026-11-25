@@ -79,7 +79,7 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 		s.recordHealthFailoverDebt(live)
 		return fmt.Errorf("list established sessions on health-disabled backend %d: %w", live.ID, err)
 	}
-	targets := s.healthDisableTargets(live)
+	targets := s.healthDisableTargets(opCtx, live)
 	if len(targets) == 0 {
 		// F16: no alternative right now. The sessions stay pinned (correct for
 		// this instant) but the obligation is NOT discharged — record it so a
@@ -207,13 +207,19 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 // healthy backends instead of piling onto one. The disabled backend itself is
 // never a candidate: it is no longer in the active set, but the identity check
 // keeps that guarantee explicit.
-func (s *Service) healthDisableTargets(disabled *models.BackendTunnel) []*models.BackendTunnel {
+//
+// A backend the provider has confirmed absent is not a destination either: moving
+// stranded sessions onto a deleted server would strand them again, and its "active"
+// status is only the last health sample. Called without Service.mu held (the caller
+// already performs database work here), so the marks are read here.
+func (s *Service) healthDisableTargets(ctx context.Context, disabled *models.BackendTunnel) []*models.BackendTunnel {
 	if s == nil || s.pool == nil || disabled == nil {
 		return nil
 	}
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	family := models.NormalizeTunnelProtocol(disabled.Protocol)
 	var targets []*models.BackendTunnel
-	for _, candidate := range s.pool.GetActiveTunnels() {
+	for _, candidate := range withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent) {
 		if candidate == nil || candidate.ID == disabled.ID {
 			continue
 		}
