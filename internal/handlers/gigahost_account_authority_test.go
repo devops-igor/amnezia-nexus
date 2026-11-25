@@ -14,6 +14,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -104,21 +105,20 @@ func TestRegistrationRecordsTheServersOwnAccountNotNullTheConfiguredOne(t *testi
 
 // A key limited to some servers returns a successful, self-consistent inventory of
 // what it can see. The servers outside its visibility are still running, so the
-// listing must not become durable absence: only a per-server answer of "not found"
-// may.
+// listing must not become durable absence - and because such a listing is not the
+// account's whole answer, the pass records no absence at all while it is narrowed.
 func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testing.T) {
 	f := newInventoryFixture(t)
 
 	inScope := f.seedServer("In scope", providerProtocols(501))
-	outOfScope := f.seedServer("Outside this key's visibility", providerProtocols(502))
+	filtered := f.seedServer("Present but not listed", providerProtocols(502))
 	genuinelyGone := f.seedServer("Actually deleted", providerProtocols(503))
 
-	// The filtered listing: one server, self-consistent pagination and totals.
+	// The filtered listing: one server, self-consistent pagination and totals. The
+	// detail endpoint reports 502 (so the listing is demonstrably filtered) and says
+	// nothing about 503.
 	f.provider.set(inventoryJSON(501))
-	// 502 exists but this key may not see it: the provider refuses that read.
-	f.provider.answerPerServer(502, 403)
-	// 503 has no per-server answer, i.e. the provider says it does not exist.
-
+	f.provider.answerPerServer(502, http.StatusOK)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}
@@ -126,26 +126,27 @@ func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testi
 	if f.row(inScope).ProviderAbsent() {
 		t.Fatal("a server the key can see was marked absent")
 	}
-	if f.row(outOfScope).ProviderAbsent() {
-		t.Fatal("a server outside the key's visibility was marked absent: a filtered listing is not an inventory")
+	if f.row(filtered).ProviderAbsent() {
+		t.Fatal("a server outside the listing was marked absent although the detail endpoint reports it")
 	}
-	// Live control in the same run: the untouched, authoritative path still records
-	// a server the provider genuinely does not have.
-	if !f.row(genuinelyGone).ProviderAbsent() {
-		t.Fatal("a genuinely deleted server was not recorded absent, so the refusal above proves nothing")
+	if f.row(genuinelyGone).ProviderAbsent() {
+		t.Fatal("a listing that does not enumerate the account concluded absence")
 	}
 	if calls := f.provider.perServerCallCount(); calls != 2 {
 		t.Fatalf("per-server reads = %d, want 2 (one per unlisted server)", calls)
 	}
 
-	// The same pass with the key's visibility widened: the server really is gone
-	// now, and the row is corrected.
-	f.provider.answerPerServer(502, 404)
+	// Control in the same run: with nothing left that narrows the listing, the same
+	// pass records both servers as genuinely absent.
+	f.provider.answerPerServer(502, http.StatusNotFound)
 	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("second reconciliation pass failed: %v", err)
+		t.Fatalf("control pass failed: %v", err)
 	}
-	if !f.row(outOfScope).ProviderAbsent() {
-		t.Fatal("a server the provider now reports as not found was not recorded absent")
+	if !f.row(filtered).ProviderAbsent() || !f.row(genuinelyGone).ProviderAbsent() {
+		t.Fatal("the control pass did not record the absent servers, so the refusals above prove nothing")
+	}
+	if f.row(inScope).ProviderAbsent() {
+		t.Fatal("the control pass marked a listed server absent")
 	}
 }
 

@@ -508,6 +508,12 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 // ErrUnauthorized or an APIError with 403, which says the key cannot see the
 // server — that is not evidence it is gone, and callers must treat the two
 // outcomes differently.
+// GetServer reads one server by its provider server id.
+//
+// The answer is used only when it names the server that was asked for. The
+// documented shapes are accepted strictly (see decodeServerDetail); anything else
+// is refused, so a malformed or unrelated answer can never be read as "this server
+// exists", and a refusal keeps its own identity for the caller to classify.
 func (c *client) GetServer(ctx context.Context, serverID int64) (*ServerInfo, error) {
 	if serverID <= 0 {
 		return nil, fmt.Errorf("invalid server id %d", serverID)
@@ -516,25 +522,11 @@ func (c *client) GetServer(ctx context.Context, serverID int64) (*ServerInfo, er
 	if err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/servers/%d", serverID), nil, &rawData); err != nil {
 		return nil, fmt.Errorf("failed to read server %d: %w", serverID, err)
 	}
-
-	var wrapped struct {
-		Data *ServerInfo `json:"data"`
+	server, err := decodeServerDetail(rawData, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("server %d: %w", serverID, err)
 	}
-	if err := json.Unmarshal(rawData, &wrapped); err == nil && wrapped.Data != nil {
-		if wrapped.Data.ID <= 0 {
-			return nil, fmt.Errorf("server %d answer carries no usable server id", serverID)
-		}
-		return wrapped.Data, nil
-	}
-
-	var server ServerInfo
-	if err := json.Unmarshal(rawData, &server); err != nil {
-		return nil, fmt.Errorf("failed to parse server %d: %w", serverID, err)
-	}
-	if server.ID <= 0 {
-		return nil, fmt.Errorf("server %d answer carries no usable server id", serverID)
-	}
-	return &server, nil
+	return server, nil
 }
 
 func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {

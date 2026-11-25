@@ -84,36 +84,49 @@ type gigahostInventoryAnswer struct {
 	client    gigahost.Client
 }
 
-// gigahostServerVerdict is what one per-server read concluded about a server the
-// inventory did not list.
+// gigahostServerVerdict is what one per-server (detail) read said about a server
+// the inventory did not list.
 type gigahostServerVerdict int
 
 const (
-	// gigahostServerUnmeasured means the provider did not answer for this server:
-	// a refusal, a timeout, or an unusable answer. A refusal is what a key sees
-	// for a server outside its visibility, so this says nothing about existence.
+	// gigahostServerUnmeasured means the provider did not answer usefully: a
+	// timeout, a malformed payload, a rate limit, a server error.
 	gigahostServerUnmeasured gigahostServerVerdict = iota
-	// gigahostServerAbsent means the provider answered that the server does not
-	// exist for it. This is the only authoritative absence.
-	gigahostServerAbsent
-	// gigahostServerPresent means the provider answered about the server, so it
+	// gigahostServerNotReported means the provider answered that it does not report
+	// this server (404). It is deliberately NOT an absence verdict: the provider
+	// documents that a server outside a key's visibility is refused rather than
+	// reported missing, so a "not reported" answer cannot be told apart from a
+	// server this key may not see. It adds nothing to either direction.
+	gigahostServerNotReported
+	// gigahostServerPresent means the provider answered with the server, so it
 	// exists: the listing simply did not enumerate it for this key.
 	gigahostServerPresent
+	// gigahostServerRefused means the provider refused this key access to the
+	// server (401/403, and the documented 400/405 forms). That is positive evidence
+	// that this key's visibility is narrower than the account.
+	gigahostServerRefused
 )
 
-// gigahostServerState asks the provider about one server.
+// gigahostServerState asks the provider about one server and classifies the answer.
 //
-// Only a 404 is absence. Every other failure - an authorization refusal for a
-// server outside the key's visibility, a timeout, a malformed answer - is
-// unmeasured, because those outcomes are exactly what a restricted key produces
-// for a server that is running perfectly well.
+// No outcome here is an absence verdict: a detail read may only say "the server
+// exists" or "this key cannot see it". Absence comes from the inventory answer
+// alone, because only that answer is about the account.
 func gigahostServerState(ctx context.Context, client gigahost.Client, serverID int64) gigahostServerVerdict {
 	if client == nil || serverID <= 0 {
 		return gigahostServerUnmeasured
 	}
 	if _, err := client.GetServer(ctx, serverID); err != nil {
-		if errors.Is(err, gigahost.ErrNotFound) {
-			return gigahostServerAbsent
+		switch {
+		case errors.Is(err, gigahost.ErrUnauthorized):
+			return gigahostServerRefused
+		case errors.Is(err, gigahost.ErrNotFound):
+			return gigahostServerNotReported
+		}
+		var apiErr *gigahost.APIError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == 400 || apiErr.StatusCode == 405) {
+			// The documented refusal statuses for a server outside a key's scope.
+			return gigahostServerRefused
 		}
 		return gigahostServerUnmeasured
 	}
@@ -315,28 +328,41 @@ type gigahostRowDecision int
 const (
 	gigahostRowUnknownAccount gigahostRowDecision = iota
 	gigahostRowOtherAccount
+	// gigahostRowUnmeasured: the row could not be judged (a failed detail read).
 	gigahostRowUnmeasured
-	gigahostRowPresent
-	gigahostRowAbsent
-	gigahostRowScopeEvidence
+	// gigahostRowListed: the inventory lists it.
+	gigahostRowListed
+	// gigahostRowDetailPresent: the inventory did not list it but the detail read
+	// returned it. It exists, and the listing did not enumerate the whole account.
+	gigahostRowDetailPresent
+	// gigahostRowUnlisted: the inventory omitted it and the detail read added
+	// nothing. Only a complete inventory answer may turn this into absence.
+	gigahostRowUnlisted
+	// gigahostRowRefused: the detail read was refused for this key, which proves the
+	// key's visibility is narrower than the account.
+	gigahostRowRefused
 )
 
-// presence reports whether the decision names an existence answer and, if it does,
-// whether the server exists.
+// presence reports whether the decision holds a positive existence answer.
 func (d gigahostRowDecision) presence() (present, measured bool) {
 	switch d {
-	case gigahostRowPresent, gigahostRowScopeEvidence:
+	case gigahostRowListed, gigahostRowDetailPresent:
 		return true, true
-	case gigahostRowAbsent:
+	case gigahostRowUnlisted:
 		return false, true
 	default:
 		return false, false
 	}
 }
 
-// decideGigahostRow applies the rule for one row against one answer: only a row of
-// the answering account is judged, and only a per-server answer may say a server is
-// gone.
+// gigahostRowNarrowsVisibility reports decisions that prove the inventory answer
+// did not enumerate the account: a server it omitted exists, or the provider
+// refused this key access to one.
+func gigahostRowNarrowsVisibility(d gigahostRowDecision) bool {
+	return d == gigahostRowDetailPresent || d == gigahostRowRefused
+}
+
+// decideGigahostRow applies the rule for one row against one answer.
 func decideGigahostRow(ctx context.Context, row providerBackedServer, answer gigahostInventoryAnswer) gigahostRowDecision {
 	if row.accountID == "" {
 		return gigahostRowUnknownAccount
@@ -345,13 +371,15 @@ func decideGigahostRow(ctx context.Context, row providerBackedServer, answer gig
 		return gigahostRowOtherAccount
 	}
 	if _, listed := answer.listed[row.providerServerID]; listed {
-		return gigahostRowPresent
+		return gigahostRowListed
 	}
 	switch gigahostServerState(ctx, answer.client, row.providerServerID) {
-	case gigahostServerAbsent:
-		return gigahostRowAbsent
 	case gigahostServerPresent:
-		return gigahostRowScopeEvidence
+		return gigahostRowDetailPresent
+	case gigahostServerRefused:
+		return gigahostRowRefused
+	case gigahostServerNotReported:
+		return gigahostRowUnlisted
 	default:
 		return gigahostRowUnmeasured
 	}
@@ -361,22 +389,45 @@ func decideGigahostRow(ctx context.Context, row providerBackedServer, answer gig
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
 //
-// A listed row is positive evidence and the only way the state is cleared. An
-// unlisted row is never treated as absence on the strength of the listing: the
-// provider is asked about that server, because a key that cannot see a server gets
-// a refusal rather than a 404, and a refusal proves nothing.
+// Absence has one source: the inventory answer, and only when that answer can be
+// treated as the account's own. A positive detail read clears a mark immediately
+// (the server exists); a refused detail read, or a server the listing omitted but
+// the detail read returned, proves this key does not see the whole account, and then
+// the pass records no absence at all rather than guess which omissions were
+// deletions. A detail "not found" is not evidence in either direction.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
-	var failures []error
+	decisions := make([]gigahostRowDecision, len(rows))
 	counts := make(map[gigahostRowDecision]int, len(rows))
-	for _, row := range rows {
-		decision := decideGigahostRow(ctx, row, answer)
-		counts[decision]++
-		present, measured := decision.presence()
+	narrowed := false
+	for i, row := range rows {
+		decisions[i] = decideGigahostRow(ctx, row, answer)
+		counts[decisions[i]]++
+		if gigahostRowNarrowsVisibility(decisions[i]) {
+			narrowed = true
+		}
+	}
+
+	// The listing may only conclude absence when nothing in this pass showed it does
+	// not enumerate the account.
+	listingComplete := !narrowed
+	if narrowed && counts[gigahostRowUnlisted] > 0 {
+		slog.Info("Provider inventory is narrower than the account; no absence recorded in this pass",
+			"unlisted_rows", counts[gigahostRowUnlisted],
+			"detail_present_rows", counts[gigahostRowDetailPresent],
+			"refused_rows", counts[gigahostRowRefused])
+	}
+
+	var failures []error
+	for i, row := range rows {
+		present, measured := decisions[i].presence()
 		if !measured {
 			continue
+		}
+		if decisions[i] == gigahostRowUnlisted && !listingComplete {
+			continue // Omitted by a listing that is not the account's whole answer.
 		}
 		if err := h.writeProviderAbsence(ctx, row, present, now); err != nil {
 			failures = append(failures, err)
@@ -390,12 +441,6 @@ func (h *Handlers) applyGigahostInventoryPresence(
 			"unknown_account_rows", counts[gigahostRowUnknownAccount],
 			"other_account_rows", counts[gigahostRowOtherAccount],
 			"unmeasured_rows", counts[gigahostRowUnmeasured])
-	}
-	if filtered := counts[gigahostRowScopeEvidence]; filtered > 0 {
-		// The key's visibility is narrower than the account: these servers exist but
-		// the listing did not enumerate them, so the listing is not evidence.
-		slog.Info("Provider inventory did not enumerate servers that still exist; no absence was recorded for them",
-			"rows", filtered)
 	}
 	return errors.Join(failures...)
 }

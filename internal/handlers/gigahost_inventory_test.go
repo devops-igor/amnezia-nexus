@@ -63,6 +63,12 @@ type inventoryProvider struct {
 	// what the provider says about a server that is gone.
 	perServerCalls int
 	perServer      map[int64]int
+	// detailArray serves GET /servers/{id} in the documented array shape
+	// ({"meta":…,"data":[{…}]}) instead of the object envelope.
+	detailArray bool
+	// detailBody, when set, is served verbatim for any successful per-server read,
+	// so a test can hand the client a shape it must refuse.
+	detailBody string
 }
 
 // set serves the given /servers body and clears any previous failure mode.
@@ -121,6 +127,20 @@ func (p *inventoryProvider) setAccountBody(body string) {
 	p.accountBody = body
 	p.accountStatus = 0
 	p.accountStall = false
+}
+
+// setDetailArray serves the documented data-array shape for GET /servers/{id}.
+func (p *inventoryProvider) setDetailArray(array bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.detailArray = array
+}
+
+// setDetailBody serves the given body verbatim for successful per-server reads.
+func (p *inventoryProvider) setDetailBody(body string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.detailBody = body
 }
 
 // answerPerServer registers how GET /servers/{id} answers for one id. A status of
@@ -182,6 +202,7 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 		p.inventoryCalls++
 	}
 	perServerStatus := 0
+	detailArray, detailBody := p.detailArray, p.detailBody
 	if id, ok := perServerPathID(r.URL.Path); ok {
 		p.perServerCalls++
 		perServerStatus = p.perServer[id]
@@ -210,7 +231,11 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 		switch perServerStatus {
 		case http.StatusOK:
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(perServerJSON(id, account)))
+			if detailBody != "" {
+				_, _ = w.Write([]byte(detailBody))
+				return
+			}
+			_, _ = w.Write([]byte(perServerJSON(id, account, detailArray)))
 		case 0:
 			http.NotFound(w, r)
 		default:
@@ -247,14 +272,19 @@ func perServerPathID(path string) (int64, bool) {
 	return id, true
 }
 
-// perServerJSON renders GET /servers/{id}: the documented server object, carrying
-// the account it belongs to.
-func perServerJSON(id int64, account string) string {
+// perServerJSON renders GET /servers/{id}: the documented server object carrying
+// the account it belongs to, inside the data array the provider documents (or the
+// object envelope, which is also accepted).
+func perServerJSON(id int64, account string, array bool) string {
 	entry := map[string]any{"srv_id": id, "status": "active"}
 	if account != "" {
 		entry["cust_id"] = account
 	}
-	encoded, err := json.Marshal(map[string]any{"meta": map[string]any{"status": 200}, "data": entry})
+	var data any = entry
+	if array {
+		data = []any{entry}
+	}
+	encoded, err := json.Marshal(map[string]any{"meta": map[string]any{"status": 200}, "data": data})
 	if err != nil {
 		return `{"data":{"srv_id":0}}`
 	}
