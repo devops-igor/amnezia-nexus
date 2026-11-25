@@ -108,21 +108,9 @@ type serverInserter interface {
 }
 
 func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Server) (int64, error) {
-	encPass := s.SSHPass
-	encKey := s.SSHKey
-	if s.SSHPass != "" && !security.LooksLikeFernetToken(s.SSHPass) {
-		ep, err := security.EncryptCredential(s.SSHPass, d.secretKey)
-		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt ssh password: %w", err)
-		}
-		encPass = ep
-	}
-	if s.SSHKey != "" && !security.LooksLikeFernetToken(s.SSHKey) {
-		ek, err := security.EncryptCredential(s.SSHKey, d.secretKey)
-		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt ssh key: %w", err)
-		}
-		encKey = ek
+	encPass, encKey, err := d.encryptedCredentials(s.SSHPass, s.SSHKey)
+	if err != nil {
+		return 0, err
 	}
 
 	cleanedProtocols := security.StripSensitiveProtocolFields(s.Protocols)
@@ -162,6 +150,35 @@ func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Serv
 	}
 	s.ID = id
 	return id, nil
+}
+
+// encryptedCredentials encrypts the credentials a row is inserted with. A value
+// that is empty or already carries a Fernet token is passed through unchanged, so
+// a caller that decrypted a stored credential does not wrap it twice.
+//
+// It is separate from the insert so both credentials follow one rule and the
+// insert statement itself stays readable.
+func (d *DB) encryptedCredentials(pass, key string) (string, string, error) {
+	encPass, err := d.encryptCredentialIfNeeded(pass, "ssh password")
+	if err != nil {
+		return "", "", err
+	}
+	encKey, err := d.encryptCredentialIfNeeded(key, "ssh key")
+	if err != nil {
+		return "", "", err
+	}
+	return encPass, encKey, nil
+}
+
+func (d *DB) encryptCredentialIfNeeded(value, what string) (string, error) {
+	if value == "" || security.LooksLikeFernetToken(value) {
+		return value, nil
+	}
+	encrypted, err := security.EncryptCredential(value, d.secretKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt %s: %w", what, err)
+	}
+	return encrypted, nil
 }
 
 // UpdateServer dynamically updates fields on a server, validating against the column allowlist.
