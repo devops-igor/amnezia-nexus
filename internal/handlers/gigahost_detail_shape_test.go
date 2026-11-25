@@ -82,7 +82,7 @@ func TestRegistrationRecordsOwnerFromTheDocumentedDetailShapes(t *testing.T) {
 				switch {
 				case r.URL.Path == "/account":
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(accountJSON(fixtureAccount, false)))
+					_, _ = w.Write([]byte(accountJSON(fixtureAccount, false, "")))
 				case isDetailPath(r.URL.Path):
 					detailPath = r.URL.Path
 					if tc.status != 0 {

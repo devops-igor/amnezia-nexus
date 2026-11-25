@@ -26,7 +26,7 @@ package handlers
 //     inconclusive and changes nothing;
 //   - absence is concluded only from an inventory answer certified as the account's
 //     whole enumeration, which the account summary's service counts establish (see
-//     gigahostInventoryAccountWide). Without that certification nothing is marked
+//     gigahostInventoryCertified). Without that certification nothing is marked
 //     absent, and every row keeps the state it had.
 //
 // A server the provider lists again has the state cleared rather than staying
@@ -88,7 +88,7 @@ type gigahostInventoryAnswer struct {
 	client    gigahost.Client
 	// accountWide reports whether this answer is certified as the account's whole
 	// enumeration, which is the only thing that may conclude absence. It is set by
-	// gigahostInventoryAccountWide and nowhere else.
+	// gigahostInventoryCertified and nowhere else.
 	accountWide bool
 }
 
@@ -99,7 +99,7 @@ type gigahostInventoryAnswer struct {
 // either direction and therefore decides nothing here. In particular, this panel does
 // not model what a "not found" status means for a provider whose key may be limited
 // to some servers: absence is decided by the inventory answer alone (see
-// gigahostInventoryAccountWide).
+// gigahostInventoryCertified).
 func gigahostServerReported(ctx context.Context, client gigahost.Client, serverID int64) bool {
 	if client == nil || serverID <= 0 {
 		return false
@@ -108,21 +108,49 @@ func gigahostServerReported(ctx context.Context, client gigahost.Client, serverI
 	return err == nil
 }
 
-// gigahostInventoryAccountWide certifies that a listing enumerated the whole account.
+// gigahostCredentialScope reads the credential's own scope out of the account payload.
 //
-// The evidence is the account summary's service counts (GET /dashboard): the provider
-// documents that endpoint as available "to every valid token and API key, regardless
-// of its permissions", and its `services` figures count the account's own servers
-// rather than the servers one key may see. A listing whose size equals that count
-// enumerated the account; a smaller listing is filtered and a larger one contradicts
-// the account, so neither certifies anything.
+// The provider's documented permissions object is the only place it can state what a
+// credential may enumerate; a servers scope with all:true and no ids means the key sees
+// every server on the account. A payload without that object states nothing, and a
+// payload with a restriction states that the key is limited - both certify nothing.
+func gigahostCredentialScope(account *gigahost.AccountInfo) (accountWide, stated bool) {
+	if account == nil {
+		return false, false
+	}
+	return account.EnumeratesWholeAccount()
+}
+
+// gigahostInventoryCertified certifies that a listing enumerated the whole account.
 //
-// A summary that cannot be read, or that carries no service counts, certifies nothing
-// either: absence then waits for a pass that can prove coverage, and every row keeps
-// the state it had. A detail read is never consulted here - the provider's per-server
-// statuses say nothing about the key's scope, and modeling them as if they did would
+// Two conditions, in this order, and neither is sufficient alone:
+//
+//  1. Authority, from the credential's own scope: the account payload must state that
+//     this credential may enumerate the whole account (permissions.servers.all true,
+//     no id restriction). No statement, or a restriction, certifies nothing. This is
+//     the certificate's basis, because it is evidence about the credential that
+//     produced the listing rather than about a different moment in time.
+//  2. Corroboration, from the account summary: the listing's size must equal the
+//     account-wide server count (GET /dashboard, documented as available to every
+//     valid token and API key regardless of permissions). This may only confirm an
+//     answer whose authority is already established - two counts taken at different
+//     times can coincide after an unrelated change - and a mismatch always withholds.
+//
+// Nothing here consults a per-server answer: the provider's per-server statuses say
+// nothing about the credential's scope, and modeling them as if they did would
 // replace one wrong conclusion with another.
-func (h *Handlers) gigahostInventoryAccountWide(ctx context.Context, client gigahost.Client, listed int) bool {
+func (h *Handlers) gigahostInventoryCertified(
+	ctx context.Context, client gigahost.Client, listed int, credentialAccountWide, scopeStated bool,
+) bool {
+	if !scopeStated {
+		slog.Warn("Provider account payload states no scope for this credential; no absence recorded in this pass")
+		return false
+	}
+	if !credentialAccountWide {
+		slog.Info("Provider account payload restricts this credential's visibility; no absence recorded in this pass")
+		return false
+	}
+
 	dashboard, err := client.GetDashboard(ctx)
 	switch {
 	case err != nil:
@@ -134,7 +162,7 @@ func (h *Handlers) gigahostInventoryAccountWide(ctx context.Context, client giga
 	}
 	accountServers := dashboard.Services.ServerCount()
 	if listed != accountServers {
-		slog.Info("Provider inventory does not cover the account; no absence recorded in this pass",
+		slog.Info("Provider inventory does not corroborate the account summary; no absence recorded in this pass",
 			"listed_servers", listed, "account_servers", accountServers)
 		return false
 	}
@@ -307,13 +335,15 @@ func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInve
 	if err != nil {
 		return gigahostInventoryAnswer{}, err
 	}
+	credentialAccountWide, scopeStated := gigahostCredentialScope(account)
 	return gigahostInventoryAnswer{
 		listed:    listed,
 		accountID: accountID,
 		client:    client,
-		// Absence is only ever concluded from a certified-complete answer; the
-		// certification is computed here, from evidence independent of any detail read.
-		accountWide: h.gigahostInventoryAccountWide(callCtx, client, len(listed)),
+		// Absence is only ever concluded from a certified-complete answer. The
+		// certificate's basis is this credential's own stated scope, corroborated by
+		// the account summary; nothing here reads a per-server answer.
+		accountWide: h.gigahostInventoryCertified(callCtx, client, len(listed), credentialAccountWide, scopeStated),
 	}, nil
 }
 
@@ -410,7 +440,7 @@ func decideGigahostRows(ctx context.Context, rows []providerBackedServer, answer
 // Absence has exactly one source: a certified-complete inventory answer. A row the
 // account's own enumeration does not list is absent, and the pass writes that only
 // when the answer is certified as the account's whole enumeration (see
-// gigahostInventoryAccountWide). A detail read is never an absence observation; it
+// gigahostInventoryCertified). A detail read is never an absence observation; it
 // can only add presence, which clears a mark immediately.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,

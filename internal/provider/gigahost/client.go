@@ -165,6 +165,9 @@ func accountFromDocument(rawData []byte) (*AccountInfo, bool) {
 			Credit      float64  `json:"credit"`
 			Currency    string   `json:"currency"`
 			Status      string   `json:"status"`
+			// Permissions is the credential's documented scope when the payload
+			// carries it; absent, the account states nothing about visibility.
+			Permissions *AccountPermissions `json:"permissions"`
 			Eligibility struct {
 				QualifiesArrears bool    `json:"qualifies_arrears"`
 				CreditNOK        float64 `json:"credit_nok"`
@@ -190,6 +193,7 @@ func accountFromDocument(rawData []byte) (*AccountInfo, bool) {
 		QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
 		Currency:         doc.Data.Currency,
 		Status:           doc.Data.Status,
+		Permissions:      doc.Data.Permissions,
 	}
 	if account.Email == "" {
 		account.Email = doc.Data.Email

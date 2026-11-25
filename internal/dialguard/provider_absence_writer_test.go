@@ -99,8 +99,38 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		t.Fatal("the pass writes the observation before checking the certification")
 	}
 
-	// 5. Certification is computed in exactly one place, from the inventory answer.
-	assertOnlyCallers(t, root, "gigahostInventoryAccountWide", absenceInventoryFile+":gigahostInventoryAnswerFor")
+	// 5. Certification is computed in exactly one place, from the inventory answer, and
+	//    its authority input is read in exactly one place.
+	assertOnlyCallers(t, root, "gigahostInventoryCertified", absenceInventoryFile+":gigahostInventoryAnswerFor")
+	assertOnlyCallers(t, root, "gigahostCredentialScope", absenceInventoryFile+":gigahostInventoryAnswerFor")
+	assertOnlyCallers(t, root, "EnumeratesWholeAccount", absenceInventoryFile+":gigahostCredentialScope")
+
+	// 5b. The credential's scope is checked before the count corroboration: the summary
+	//     read may only confirm an answer whose authority is already established.
+	certify := functionBody(t, root, absenceInventoryFile, "*Handlers", "gigahostInventoryCertified")
+	scope, summary := token.NoPos, token.NoPos
+	ast.Inspect(certify, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.IfStmt:
+			if scope == token.NoPos && mentions(n.Cond, "scopeStated") && returns(n.Body) {
+				scope = n.Pos()
+			}
+		case *ast.CallExpr:
+			if summary == token.NoPos && mentions(n.Fun, "GetDashboard") {
+				summary = n.Pos()
+			}
+		}
+		return true
+	})
+	if scope == token.NoPos {
+		t.Fatal("the certificate no longer checks the credential's stated scope")
+	}
+	if summary == token.NoPos {
+		t.Fatal("the certificate no longer corroborates with the account summary")
+	}
+	if scope > summary {
+		t.Fatal("the certificate reads the account summary before the credential's scope")
+	}
 
 	// 6. A detail read may only ask about presence. Nothing in the decision path may
 	//    classify a provider status as absence.
@@ -116,6 +146,18 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 			}
 		}
 	}
+}
+
+// returns reports whether the body exits, which is how a guard refuses.
+func returns(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		if _, ok := node.(*ast.ReturnStmt); ok {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 // assertOnlyCallers fails unless symbol is invoked from exactly one function.
