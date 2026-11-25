@@ -6,16 +6,19 @@ package web
 // labels. None may be restated as a hand-kept list; the retired DNS-evidence labels
 // survived every other check because those compare the bundles to each other.
 //
-// The rule is fail-closed where a reason is recorded. A struct field declared with
-// type EgressReason is a governed reason field, and every write to one must be a
-// declared EgressReason constant named directly, or a selector on the closed
-// transfer list below — a value whose origin is a write this guard also judges.
-// Anything else (a local, a literal, a call, a conversion, an expression it cannot
-// read) is reported, because the guard cannot prove which token the record would
-// hold. Enumerating the expressions a reason may arrive in is open-ended, so the
-// next ordinary Go construct passes in silence; refusing what cannot be resolved is
-// closed. A string-typed reason field is not governed: the drop ledger aggregates
-// refusals by its own token family, which this vocabulary never renders.
+// Within the source forms this check recognizes, a struct field declared with
+// type EgressReason is a governed reason field. A recognized write must name a
+// declared EgressReason constant directly, or a selector on the closed transfer
+// list below. Other values at those writes (a local, a literal, a call, a conversion,
+// an expression it cannot read) are reported. This is a bounded source check, not a
+// proof of every reason that can reach a recorder or of a transfer's runtime value.
+// A string-typed reason field is not governed: the drop ledger aggregates refusals
+// by its own token family, which this vocabulary never renders.
+//
+// This source check does not validate reasons introduced through type-elided
+// positional record literals or trace whole-record copies, so use keyed reason
+// fields with declared constants in new producers and add a focused recorder
+// regression when changing how a reason reaches the recorder.
 
 import (
 	"fmt"
@@ -40,12 +43,12 @@ const (
 	dropReasonPrefix = "DropReason"   // drop tokens are untyped, so the name is the mark
 )
 
-// decisionReasonTransfers is the closed list of selectors a governed reason field
-// may be filled from, each with the datum it carries. Checked in both directions: a
-// listed transfer no write uses fails the guard, and an unlisted selector is
-// reported, so the list cannot rot or widen silently. Each origin is validated by
-// the rule set, not by this list: every write to a field of type EgressReason in the
-// package is judged here, so a transfer can only carry a judged write's value.
+// decisionReasonTransfers is the closed list of selectors a recognized reason
+// write may be filled from, each with the datum it is intended to carry. Checked in
+// both directions: a listed transfer no recognized write uses fails the guard, and
+// an unlisted selector at a recognized write is reported, so list entries cannot
+// rot or widen silently. The source check judges recognized writes to reason fields;
+// it does not trace whole-record copies or prove what an allowlisted selector holds.
 var decisionReasonTransfers = map[string]string{
 	"decision.reason": "the routing contract's answer, returned by decideEgress",
 	"decision.Reason": "the decision handed to a recording call",
@@ -85,10 +88,10 @@ type reasonVocabulary struct {
 	problems []string
 }
 
-// TestEveryDeclaredEgressReasonIsProduced fails when a declared reason cannot be
-// recorded, and when a write to a reason field carries a value the guard cannot
-// resolve — a local, a literal, a call — instead of a declared constant or an
-// allowlisted transfer.
+// TestEveryDeclaredEgressReasonIsProduced fails when a declared reason has no
+// producer recognized by this bounded source check, and when a recognized reason
+// write uses an unresolved value instead of a declared constant or allowlisted
+// transfer. It does not prove runtime recordability; see the file-level limits.
 func TestEveryDeclaredEgressReasonIsProduced(t *testing.T) {
 	vocabulary := forwarderReasonVocabulary(t)
 	for _, problem := range vocabulary.problems {
@@ -114,9 +117,10 @@ func TestEveryDeclaredEgressReasonIsProduced(t *testing.T) {
 	}
 }
 
-// TestEveryDecisionReasonTokenHasALabel fails when a recordable token has no entry
-// in the controller's label map, when an entry names a label no bundle defines, and
-// when an entry names a token nothing can record.
+// TestEveryDecisionReasonTokenHasALabel fails when a token from a recognized
+// producer has no controller map entry, an entry names a label no bundle defines,
+// or an entry has neither a recognized producer nor a declared drop reason. Producer
+// discovery has the file-level limits; this is not runtime reachability analysis.
 func TestEveryDecisionReasonTokenHasALabel(t *testing.T) {
 	vocabulary := forwarderReasonVocabulary(t)
 	labels, _ := controllerReasonLabels(t)
@@ -444,8 +448,8 @@ func stringConstants(files []forwarderFile) ([]reasonConstant, []string) {
 	return constants, problems
 }
 
-// reasonWrites judges every write to a governed reason field and reports the declared
-// reasons that can reach one.
+// reasonWrites judges writes recognized by the bounded source check and reports
+// the declared reasons they name, not all reasons that can reach a recorder.
 func reasonWrites(files []forwarderFile, governed map[string]bool, constants map[string]reasonConstant) ([]reasonConstant, map[string]bool, []string) {
 	scan := &reasonScan{
 		constants: constants,
@@ -488,9 +492,9 @@ type reasonScan struct {
 	seen      map[string]bool
 }
 
-// literal inspects the reason field of one record literal. A literal naming no type
-// is judged by field name alone: the guard cannot see which record it builds and
-// must not assume that record is harmless.
+// literal inspects keyed reason fields, using field names alone when the type is
+// elided. It refuses positional literals with an explicit governed type, but does
+// not resolve type-elided positional literals from their enclosing context.
 func (scan *reasonScan) literal(file string, literal *ast.CompositeLit) {
 	record := exprName(literal.Type)
 	for _, element := range literal.Elts {
@@ -568,9 +572,9 @@ func (scan *reasonScan) refuseTargets(file string, target ast.Expr, operation st
 	}
 }
 
-// write is the whole rule: a declared reason constant, or an allowlisted transfer.
-// Anything else is a problem, because nothing else proves which token the record
-// would hold.
+// write applies the value rule at recognized writes: a declared reason constant
+// or an allowlisted transfer. Other expressions are reported as unresolved; accepting
+// a selector by spelling does not prove its value after a whole-record copy.
 func (scan *reasonScan) write(file, site string, value ast.Expr) {
 	if paren, isParen := value.(*ast.ParenExpr); isParen {
 		scan.write(file, site, paren.X)
