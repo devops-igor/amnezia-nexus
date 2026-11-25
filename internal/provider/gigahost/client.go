@@ -108,11 +108,42 @@ func NewClient(cfg Config) (Client, error) {
 // GetAccount queries account credit and balance via GET /account.
 func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodGet, "/account", nil, &rawData)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/account", nil, &rawData); err != nil {
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
+	return decodeAccount(rawData)
+}
 
+// decodeAccount reads an account payload in the shapes the provider documents: the
+// nested document (which is the only shape that carries eligibility), an
+// {account|data} envelope, and a flat object.
+func decodeAccount(rawData []byte) (*AccountInfo, error) {
+	if account, ok := accountFromDocument(rawData); ok {
+		return account, nil
+	}
+	if account := accountFromEnvelope(rawData); account != nil {
+		return account, nil
+	}
+
+	// The account was not in a shape this client could decode. If the body carries
+	// an identifier it cannot read, say so: "the identifier is unreadable" and "the
+	// account has no identifier" must not look the same to a caller, because one is
+	// a protocol problem and the other disables the identity-dependent paths.
+	if err := rejectUnreadableIdentity(rawData); err != nil {
+		return nil, err
+	}
+
+	var flat AccountInfo
+	if err := json.Unmarshal(rawData, &flat); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal account response: %w", err)
+	}
+	return flat.withIdentityFallback(), nil
+}
+
+// accountFromDocument reads the documented {"meta":…,"data":{…}} account document,
+// which is the shape that carries eligibility. It reports false when the body is
+// not that shape or names no account.
+func accountFromDocument(rawData []byte) (*AccountInfo, bool) {
 	type docAccount struct {
 		Meta struct {
 			Status int `json:"status"`
@@ -137,56 +168,44 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 		} `json:"data"`
 	}
 	var doc docAccount
-	decodeErr := json.Unmarshal(rawData, &doc)
-	custID, accountID := doc.Data.CustID.String(), doc.Data.ID.String()
-	if decodeErr == nil && (custID != "" || accountID != "" || doc.Data.CustName != "" || doc.Data.Eligibility.QualifiesArrears) {
-		acc := &AccountInfo{
-			ID:               accountID,
-			CustID:           custID,
-			CustName:         doc.Data.CustName,
-			Email:            doc.Data.CustEmail,
-			Balance:          doc.Data.Balance,
-			Credit:           doc.Data.Credit,
-			CreditNOK:        doc.Data.Eligibility.CreditNOK,
-			QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
-			Currency:         doc.Data.Currency,
-			Status:           doc.Data.Status,
-		}
-		if acc.ID == "" {
-			acc.ID = custID
-		}
-		if acc.Email == "" {
-			acc.Email = doc.Data.Email
-		}
-		return acc, nil
+	if err := json.Unmarshal(rawData, &doc); err != nil {
+		return nil, false
 	}
+	custID, accountID := doc.Data.CustID.String(), doc.Data.ID.String()
+	if custID == "" && accountID == "" && doc.Data.CustName == "" && !doc.Data.Eligibility.QualifiesArrears {
+		return nil, false
+	}
+	account := &AccountInfo{
+		ID:               accountID,
+		CustID:           custID,
+		CustName:         doc.Data.CustName,
+		Email:            doc.Data.CustEmail,
+		Balance:          doc.Data.Balance,
+		Credit:           doc.Data.Credit,
+		CreditNOK:        doc.Data.Eligibility.CreditNOK,
+		QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
+		Currency:         doc.Data.Currency,
+		Status:           doc.Data.Status,
+	}
+	if account.Email == "" {
+		account.Email = doc.Data.Email
+	}
+	return account.withIdentityFallback(), true
+}
 
-	var wrapped struct {
+// accountFromEnvelope reads an account nested under "account" or "data".
+func accountFromEnvelope(rawData []byte) *AccountInfo {
+	var envelope struct {
 		Account *AccountInfo `json:"account"`
 		Data    *AccountInfo `json:"data"`
 	}
-	if wrapErr := json.Unmarshal(rawData, &wrapped); wrapErr == nil {
-		if wrapped.Account != nil {
-			return wrapped.Account.withIdentityFallback(), nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data.withIdentityFallback(), nil
-		}
+	if err := json.Unmarshal(rawData, &envelope); err != nil {
+		return nil
 	}
-
-	// The account was not in a shape this client could decode. If the body carries
-	// an identifier it cannot read, say so: "the identifier is unreadable" and "the
-	// account has no identifier" must not look the same to a caller, because one is
-	// a protocol problem and the other disables the identity-dependent paths.
-	if err := rejectUnreadableIdentity(rawData); err != nil {
-		return nil, err
+	if envelope.Account != nil {
+		return envelope.Account.withIdentityFallback()
 	}
-
-	var acc AccountInfo
-	if err := json.Unmarshal(rawData, &acc); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal account response: %w", err)
-	}
-	return acc.withIdentityFallback(), nil
+	return envelope.Data.withIdentityFallback()
 }
 
 // withIdentityFallback gives a decoded account whose only identifier is cust_id the

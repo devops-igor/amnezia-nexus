@@ -190,3 +190,55 @@ func accountFromBody(t *testing.T, body string) (*AccountInfo, error) {
 	}
 	return client.GetAccount(context.Background())
 }
+
+// A per-server answer that names no server, or a request for an impossible id, is
+// refused rather than returned as an empty server: an answer without an id would
+// make "the provider says nothing" look like "the server exists".
+func TestGetServer_RefusesAnswersWithoutAServer(t *testing.T) {
+	cases := []struct {
+		name string
+		id   int64
+		body string
+	}{
+		{name: "null data", id: 3523, body: `{"meta":{"status":200},"data":null}`},
+		{name: "answer without a server id", id: 3523, body: `{"meta":{"status":200},"data":{"cust_id":19998}}`},
+		{name: "unparseable answer", id: 3523, body: `not-json`},
+		{name: "impossible server id", id: 0, body: `{"data":{"srv_id":1}}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			client, err := NewClient(Config{BaseURL: server.URL, APIKey: "flux_live_" + strings.Repeat("a", 64)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info, err := client.GetServer(context.Background(), tc.id); err == nil {
+				t.Fatalf("answer %q was accepted as server %+v", tc.body, info)
+			}
+		})
+	}
+
+	// Control: a bare server object, which the endpoint may also answer with, is a
+	// usable answer and carries the account.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"srv_id":3523,"cust_id":"19998"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "flux_live_" + strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := client.GetServer(context.Background(), 3523)
+	if err != nil {
+		t.Fatalf("bare server object refused: %v", err)
+	}
+	if info.CustID.String() != "19998" {
+		t.Fatalf("bare object cust_id = %q, want 19998", info.CustID.String())
+	}
+}
