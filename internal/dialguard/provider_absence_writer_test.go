@@ -22,6 +22,7 @@ package dialguard
 import (
 	"encoding/json"
 	"go/ast"
+	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
@@ -87,6 +88,18 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		if mentions(body, forbidden) {
 			t.Fatalf("the writer gates on %s; the count is a diagnostic and one listing decides", forbidden)
 		}
+	}
+	// The writer may skip a row only when it has no measurement at all. Any second skip is
+	// a condition on acting - a pass counter, a count, a confirmation - which the owner's
+	// decision removed.
+	skips := 0
+	for _, stmt := range ifStatements(body) {
+		if branches(stmt.Body, token.CONTINUE) {
+			skips++
+		}
+	}
+	if skips != 1 {
+		t.Fatalf("the writer has %d skip conditions, want exactly 1 (the unmeasured row)", skips)
 	}
 	assertOnlyCallers(t, root, "writeProviderAbsence", absenceInventoryFile+":writeDecidedRows")
 
