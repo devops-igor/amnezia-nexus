@@ -14,6 +14,14 @@ package handlers
 // enumerated the account may set or clear the state, and a server the provider
 // lists again has the state cleared rather than staying marked absent.
 //
+// A successful read is evidence about one account only: the account that
+// answered it. Each server row records the provider account it was provisioned
+// under, and a read may judge a row only when the two agree. Pointing the panel
+// at a second account therefore says nothing about the first account's rows -
+// they keep their state - while a row whose association is unknown (it predates
+// this rule, or the provider could not name the account at registration) is
+// never judged by any read at all.
+//
 // This file reads the provider and writes one observation column per changed row.
 // It never deletes a row, never rewrites an address or a credential, and never
 // touches a session. It is safe to run repeatedly: in steady state no row
@@ -46,8 +54,19 @@ const gigahostInventoryTimeout = 30 * time.Second
 type providerBackedServer struct {
 	serverID         int64
 	providerServerID int64
+	// accountID is the provider account the row was provisioned under. Empty
+	// means unknown, which no read may treat as a match.
+	accountID string
 	// absentAt is the stored observation, empty when the row is not marked absent.
 	absentAt string
+}
+
+// gigahostInventoryAnswer is one successful inventory read: the provider server
+// ids the account holds, and the account that answered. The account is part of
+// the answer because it decides which rows the answer may judge.
+type gigahostInventoryAnswer struct {
+	listed    map[int64]struct{}
+	accountID string
 }
 
 // ReconcileGigahostServerInventory records, for every Gigahost-provisioned
@@ -73,11 +92,11 @@ func (h *Handlers) ReconcileGigahostServerInventory(ctx context.Context) error {
 		// for anything and the read is not worth making.
 		return nil
 	}
-	listed, err := h.gigahostInventoryServerIDs(ctx)
+	answer, err := h.gigahostInventoryAnswerFor(ctx)
 	if err != nil {
 		return err
 	}
-	return h.applyGigahostInventoryPresence(ctx, rows, listed)
+	return h.applyGigahostInventoryPresence(ctx, rows, answer)
 }
 
 // providerBackedServerRows returns the panel rows this provider's inventory can
@@ -99,6 +118,7 @@ func (h *Handlers) providerBackedServerRows(ctx context.Context) ([]providerBack
 		rows = append(rows, providerBackedServer{
 			serverID:         s.ID,
 			providerServerID: providerServerID,
+			accountID:        strings.TrimSpace(s.ProviderAccountID),
 			absentAt:         s.ProviderAbsentAt,
 		})
 	}
@@ -179,21 +199,39 @@ func positiveID(id int64) (int64, bool) {
 // unanswered or partial inventory is not evidence that any server is gone. The
 // client already fails closed on a page that contradicts its own pagination
 // metadata or a total that does not match what it aggregated.
-func (h *Handlers) gigahostInventoryServerIDs(ctx context.Context) (map[int64]struct{}, error) {
+func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInventoryAnswer, error) {
 	client, err := h.getGigahostClient(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("gigahost inventory reconciliation skipped; server rows unchanged: %w", err)
+		return gigahostInventoryAnswer{}, fmt.Errorf("gigahost inventory reconciliation skipped; server rows unchanged: %w", err)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, gigahostInventoryTimeout)
 	defer cancel()
 
-	inventory, err := client.GetServers(callCtx)
+	// The account identity is resolved before the inventory because it decides
+	// which rows this answer may judge. A read that cannot be attributed to an
+	// account proves nothing about any row, so it is refused whole rather than
+	// applied to every provider-backed row.
+	account, err := client.GetAccount(callCtx)
 	if err != nil {
-		return nil, fmt.Errorf("gigahost inventory read failed; server rows unchanged: %w", err)
+		return gigahostInventoryAnswer{}, fmt.Errorf("gigahost account identity unavailable; server rows unchanged: %w", err)
+	}
+	accountID := gigahostAccountIdentity(account)
+	if accountID == "" {
+		return gigahostInventoryAnswer{}, errors.New(
+			"gigahost account identity not reported; server rows unchanged: an inventory read that cannot be attributed to an account proves nothing")
 	}
 
-	return gigahostIdentifiedServerIDs(inventory)
+	inventory, err := client.GetServers(callCtx)
+	if err != nil {
+		return gigahostInventoryAnswer{}, fmt.Errorf("gigahost inventory read failed; server rows unchanged: %w", err)
+	}
+
+	listed, err := gigahostIdentifiedServerIDs(inventory)
+	if err != nil {
+		return gigahostInventoryAnswer{}, err
+	}
+	return gigahostInventoryAnswer{listed: listed, accountID: accountID}, nil
 }
 
 // gigahostIdentifiedServerIDs returns the provider server ids of an inventory
@@ -220,12 +258,25 @@ func gigahostIdentifiedServerIDs(inventory []gigahost.ServerInfo) (map[int64]str
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
 func (h *Handlers) applyGigahostInventoryPresence(
-	ctx context.Context, rows []providerBackedServer, listed map[int64]struct{},
+	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
 	var failures []error
+	var unknownAccount, otherAccount int
 	for _, row := range rows {
-		_, present := listed[row.providerServerID]
+		if row.accountID == "" {
+			// The association is unknown, so this row's absence is unprovable.
+			// Its state is preserved: not marked absent, not cleared either.
+			unknownAccount++
+			continue
+		}
+		if row.accountID != answer.accountID {
+			// This answer is about another account. It says nothing about a row
+			// provisioned under this one, so the row keeps its state.
+			otherAccount++
+			continue
+		}
+		_, present := answer.listed[row.providerServerID]
 		if present == (row.absentAt == "") {
 			// The row already states what the provider says; nothing to write.
 			continue
@@ -242,6 +293,13 @@ func (h *Handlers) applyGigahostInventoryPresence(
 			"server_id", row.serverID,
 			"provider_server_id", row.providerServerID,
 			"provider_absent", !present)
+	}
+	if unknownAccount > 0 || otherAccount > 0 {
+		// Observable without naming an account or a credential: why rows were
+		// left alone, and how many.
+		slog.Info("Provider inventory left server existence state unchanged for rows it cannot speak for",
+			"unknown_account_rows", unknownAccount,
+			"other_account_rows", otherAccount)
 	}
 	return errors.Join(failures...)
 }

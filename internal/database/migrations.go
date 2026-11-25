@@ -61,6 +61,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateServersProviderAbsence(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateServersProviderAccount(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
 }
 
@@ -70,6 +73,26 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 // inventory read has judged them yet, so nothing may claim they are absent. The
 // column's presence is the migration marker.
 func (d *DB) migrateServersProviderAbsence(ctx context.Context) error {
+	return d.ensureServerTextColumn(ctx, "provider_absent_at",
+		`ALTER TABLE servers ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`)
+}
+
+// migrateServersProviderAccount adds the provider_account_id column to servers.
+//
+// It records which provider account a server row was provisioned under, so an
+// inventory read may only judge rows of the account that answered. Existing rows
+// start empty, which is the fail-safe value: their association is unknown, so no
+// read may mark them absent. The column's presence is the migration marker.
+func (d *DB) migrateServersProviderAccount(ctx context.Context) error {
+	return d.ensureServerTextColumn(ctx, "provider_account_id",
+		`ALTER TABLE servers ADD COLUMN provider_account_id TEXT NOT NULL DEFAULT ''`)
+}
+
+// ensureServerTextColumn runs ddl when the servers table does not already carry
+// the named column. Both callers add a NOT NULL TEXT column whose default is the
+// empty string, and for both an empty value means "not recorded", which is the
+// reading that never invents a fact.
+func (d *DB) ensureServerTextColumn(ctx context.Context, column, ddl string) error {
 	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(servers)")
 	if err != nil {
 		return fmt.Errorf("failed to inspect servers schema: %w", err)
@@ -84,7 +107,7 @@ func (d *DB) migrateServersProviderAbsence(ctx context.Context) error {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
 			return err
 		}
-		if strings.EqualFold(name, "provider_absent_at") {
+		if strings.EqualFold(name, column) {
 			hasColumn = true
 			break
 		}
@@ -95,10 +118,8 @@ func (d *DB) migrateServersProviderAbsence(ctx context.Context) error {
 	if hasColumn {
 		return nil
 	}
-	if _, err := d.sqlDB.ExecContext(ctx,
-		`ALTER TABLE servers ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`,
-	); err != nil {
-		return fmt.Errorf("failed to add servers provider_absent_at column: %w", err)
+	if _, err := d.sqlDB.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("failed to add servers %s column: %w", column, err)
 	}
 	return nil
 }

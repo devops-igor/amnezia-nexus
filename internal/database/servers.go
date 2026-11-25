@@ -19,7 +19,7 @@ func (d *DB) GetAllServers(ctx context.Context) ([]models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at FROM servers ORDER BY id")
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_account_id FROM servers ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query servers: %w", err)
 	}
@@ -42,7 +42,7 @@ func (d *DB) GetServer(ctx context.Context, id int64) (*models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at FROM servers WHERE id = ?", id)
+	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_account_id FROM servers WHERE id = ?", id)
 	s, err := d.scanServerRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -142,13 +142,13 @@ func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Serv
 	var res sql.Result
 	if s.ID > 0 {
 		res, err = db.ExecContext(ctx,
-			"INSERT INTO servers (id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			s.ID, s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
+			"INSERT INTO servers (id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			s.ID, s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr, s.ProviderAccountID,
 		)
 	} else {
 		res, err = db.ExecContext(ctx,
-			"INSERT INTO servers (name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
+			"INSERT INTO servers (name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr, s.ProviderAccountID,
 		)
 	}
 
@@ -397,7 +397,7 @@ type scannable interface {
 
 func (d *DB) scanServer(s scannable) (models.Server, error) {
 	var srv models.Server
-	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt sql.NullString
+	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID sql.NullString
 
 	err := s.Scan(
 		&srv.ID,
@@ -410,12 +410,13 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 		&protoJSON,
 		&createdAt,
 		&providerAbsentAt,
+		&providerAccountID,
 	)
 	if err != nil {
 		return srv, err
 	}
 
-	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt)
+	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID)
 
 	d.reachabilityMu.RLock()
 	if st, ok := d.reachabilityCache[srv.ID]; ok {
@@ -432,10 +433,13 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 // value: credentials are decrypted, the protocols blob is decoded and sanitized,
 // and the optional timestamps are parsed only when present.
 func (d *DB) decodeServerColumns(
-	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt sql.NullString,
+	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID sql.NullString,
 ) {
 	if providerAbsentAt.Valid {
 		srv.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
+	}
+	if providerAccountID.Valid {
+		srv.ProviderAccountID = strings.TrimSpace(providerAccountID.String)
 	}
 
 	if sshPass.Valid && sshPass.String != "" {

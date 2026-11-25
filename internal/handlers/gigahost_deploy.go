@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -289,7 +290,7 @@ func (h *Handlers) registerDeployServer(
 	req GigahostDeployRequest,
 	order *GigahostOrderRecord,
 	nexusServerID, providerServerID int64,
-	assignedIP, fingerprint string,
+	assignedIP, fingerprint, accountID string,
 ) (*models.Server, error) {
 	if h.db == nil {
 		return nil, errors.New("database not available")
@@ -323,6 +324,10 @@ func (h *Handlers) registerDeployServer(
 		sshUser = "root"
 	}
 
+	// The account the deployment acts for is recorded beside the provider server
+	// id, so a later inventory read can only judge this row when it answers for the
+	// same account. An empty association is recorded as unknown rather than
+	// guessed: the row then stays out of every absence decision.
 	newServer := &models.Server{
 		Name:    serverName,
 		Host:    assignedIP,
@@ -334,7 +339,12 @@ func (h *Handlers) registerDeployServer(
 			"provider":           "gigahost",
 			"provider_server_id": providerServerID,
 		},
-		CreatedAt: time.Now().UTC(),
+		ProviderAccountID: strings.TrimSpace(accountID),
+		CreatedAt:         time.Now().UTC(),
+	}
+	if newServer.ProviderAccountID == "" {
+		slog.Warn("Provider account unknown at registration; this server's existence will not be judged by the provider inventory",
+			"provider", gigahostInventoryProvider, "server_id", nexusServerID)
 	}
 
 	if err := validateFingerprintFormat(fingerprint); err != nil {
@@ -657,7 +667,10 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 
 	// 3. Server Registration & Deduplication
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
-	server, err := h.registerDeployServer(ctx, req, order, nexusServerID, providerServerID, assignedIP, fingerprint)
+	// 3. Server Registration & Deduplication. The account identity is resolved
+	// here, where the deployment's own client is in hand, and recorded with the row.
+	accountID := h.gigahostAccountFor(ctx, client)
+	server, err := h.registerDeployServer(ctx, req, order, nexusServerID, providerServerID, assignedIP, fingerprint, accountID)
 	if err != nil {
 		return h.failDeployStatus(ctx, req.OrderID, "server_registration", err, providerServerID, nexusServerID, assignedIP, "", "")
 	}

@@ -184,7 +184,11 @@ func (h *Handlers) registerServerForInstall(
 	if orderErr != nil {
 		return nil, fmt.Errorf("failed to load order %s: %w", req.OrderID, orderErr)
 	}
-	server, err := h.registerDeployServer(ctx, req, order, 0, req.ProviderServerID, req.AssignedIP, fingerprint)
+	accountID := ""
+	if client, clientErr := h.getGigahostClient(ctx, nil); clientErr == nil {
+		accountID = h.gigahostAccountFor(ctx, client)
+	}
+	server, err := h.registerDeployServer(ctx, req, order, 0, req.ProviderServerID, req.AssignedIP, fingerprint, accountID)
 	if err != nil {
 		return nil, err
 	}

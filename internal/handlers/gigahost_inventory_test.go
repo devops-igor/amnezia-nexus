@@ -40,6 +40,17 @@ type inventoryProvider struct {
 	status int
 	stall  bool
 	calls  int
+	// account is the identity the provider reports for /account. It decides
+	// which server rows the fixture's inventory read may judge, so a test can
+	// point the panel at a second account by changing it.
+	account string
+	// accountStatus, when set, makes /account fail with that HTTP status and
+	// accountStall makes it never answer.
+	accountStatus int
+	accountStall  bool
+	// inventoryCalls counts /servers reads only, so "one inventory read per
+	// pass" stays measurable now that each pass also resolves the account.
+	inventoryCalls int
 }
 
 // set serves the given /servers body and clears any previous failure mode.
@@ -73,12 +84,70 @@ func (p *inventoryProvider) callCount() int {
 	return p.calls
 }
 
+// setAccount changes the identity the provider reports, which is how a test
+// points the panel at another Gigahost account.
+func (p *inventoryProvider) setAccount(account string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.account = account
+	p.accountStatus = 0
+	p.accountStall = false
+}
+
+// failAccount answers /account with the given HTTP error.
+func (p *inventoryProvider) failAccount(status int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountStatus = status
+	p.accountStall = false
+}
+
+// hideAccountIdentity answers /account successfully but names no account.
+func (p *inventoryProvider) hideAccountIdentity() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.account = ""
+	p.accountStatus = 0
+	p.accountStall = false
+}
+
+// stallAccount accepts the account request and never answers it.
+func (p *inventoryProvider) stallAccount() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountStall = true
+	p.accountStatus = 0
+}
+
+func (p *inventoryProvider) inventoryCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inventoryCalls
+}
+
 func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	p.calls++
+	account, accountStatus, accountStall := p.account, p.accountStatus, p.accountStall
+	if r.URL.Path == "/servers" {
+		p.inventoryCalls++
+	}
 	body, status, stall := p.body, p.status, p.stall
 	p.mu.Unlock()
 
+	if r.URL.Path == "/account" {
+		if accountStall {
+			<-r.Context().Done()
+			return
+		}
+		if accountStatus != 0 {
+			w.WriteHeader(accountStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(accountJSON(account)))
+		return
+	}
 	if r.URL.Path != "/servers" {
 		http.NotFound(w, r)
 		return
@@ -93,6 +162,24 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(body))
+}
+
+// accountJSON renders the provider's /account answer. An empty id names no
+// account, which the client reports as an account without an identity.
+func accountJSON(account string) string {
+	payload := map[string]any{"meta": map[string]any{"status": 200}, "data": map[string]any{}}
+	data := payload["data"].(map[string]any)
+	data["balance"] = 100.0
+	data["currency"] = "NOK"
+	if account != "" {
+		data["id"] = account
+		data["cust_id"] = account
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return `{"data":{"balance":0}}`
+	}
+	return string(encoded)
 }
 
 // inventoryJSON renders the provider's /servers answer for the given provider
@@ -144,7 +231,17 @@ type inventoryFixture struct {
 	provider *inventoryProvider
 	server   *httptest.Server
 	closed   bool
+	// account is the provider account the fixture's seeded rows are registered
+	// under, and the one the provider reports until a test changes it.
+	account string
 }
+
+// fixtureAccount is the default account the fixture reports and seeds under.
+const fixtureAccount = "acct-north"
+
+// otherAccount is a second account, used to show that one account's inventory
+// answers nothing about another account's rows.
+const otherAccount = "acct-south"
 
 func newInventoryFixture(t *testing.T) *inventoryFixture {
 	t.Helper()
@@ -153,7 +250,7 @@ func newInventoryFixture(t *testing.T) *inventoryFixture {
 	if err != nil {
 		t.Fatalf("failed to open the test store: %v", err)
 	}
-	provider := &inventoryProvider{body: inventoryJSON()}
+	provider := &inventoryProvider{body: inventoryJSON(), account: fixtureAccount}
 	server := httptest.NewServer(http.HandlerFunc(provider.handle))
 
 	f := &inventoryFixture{
@@ -162,6 +259,7 @@ func newInventoryFixture(t *testing.T) *inventoryFixture {
 		dbPath:   dbPath,
 		provider: provider,
 		server:   server,
+		account:  fixtureAccount,
 	}
 	f.build()
 	t.Cleanup(func() {
@@ -210,15 +308,22 @@ func (f *inventoryFixture) restart() {
 	f.build()
 }
 
-// seedServer registers a server row and returns its id.
+// seedServer registers a server row and returns its id. A row carrying a
+// provider server id is registered under f.account, which is what a real
+// deployment records; a row without one is not the provider's to judge.
 func (f *inventoryFixture) seedServer(name string, protocols map[string]any) int64 {
 	f.t.Helper()
+	account := ""
+	if _, ok := providerBackedServerID(protocols); ok {
+		account = f.account
+	}
 	id, err := f.db.CreateServer(context.Background(), &models.Server{
-		Name:      name,
-		Host:      "198.51.100.10",
-		SSHUser:   "root",
-		SSHPort:   22,
-		Protocols: protocols,
+		Name:              name,
+		Host:              "198.51.100.10",
+		SSHUser:           "root",
+		SSHPort:           22,
+		Protocols:         protocols,
+		ProviderAccountID: account,
 	})
 	if err != nil {
 		f.t.Fatalf("failed to seed server %q: %v", name, err)
@@ -333,7 +438,7 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 	if got := f.row(gone).ProviderAbsentAt; got != firstObserved {
 		t.Fatalf("a repeated pass rewrote the observation time: %q, want %q", got, firstObserved)
 	}
-	if calls := f.provider.callCount(); calls != 2 {
+	if calls := f.provider.inventoryCallCount(); calls != 2 {
 		t.Fatalf("expected one inventory read per pass, got %d reads over two passes", calls)
 	}
 

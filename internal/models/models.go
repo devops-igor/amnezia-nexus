@@ -201,6 +201,14 @@ type Server struct {
 	// an observation about the provider's view, never a deletion: the row, its
 	// address, its credentials and its sessions are untouched.
 	ProviderAbsentAt string `json:"-" db:"provider_absent_at"`
+	// ProviderAccountID is the provider-issued identifier of the account this
+	// row was provisioned under, recorded when the deployment registered it. It is
+	// an opaque account id, never the API key, a secret or a request header, so
+	// holding it cannot replay a credential. Empty means the association is
+	// unknown: the row predates the association or the provider could not name the
+	// account. An unknown association never matches an inventory read, so such a
+	// row is never marked absent.
+	ProviderAccountID string `json:"-" db:"provider_account_id"`
 }
 
 // Reachable returns true if the server status is not offline.
@@ -217,6 +225,13 @@ func (s Server) Reachable() bool {
 // observation, so consumers that filter on existence must ask this, not Status.
 func (s Server) ProviderAbsent() bool {
 	return strings.TrimSpace(s.ProviderAbsentAt) != ""
+}
+
+// ProviderAccountKnown reports whether the row records the provider account it
+// was provisioned under. Absence may only be recorded for a row whose account is
+// known, because an inventory read is evidence about the account that answered.
+func (s Server) ProviderAccountKnown() bool {
+	return strings.TrimSpace(s.ProviderAccountID) != ""
 }
 
 // User represents an authenticated dashboard user or VPN client subscriber.
