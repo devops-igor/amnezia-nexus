@@ -456,15 +456,9 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 func (d *DB) decodeServerColumns(
 	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID sql.NullString,
 ) {
-	if providerAbsentAt.Valid {
-		srv.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
-	}
-	if providerAbsentAccountID.Valid {
-		srv.ProviderAbsentAccountID = strings.TrimSpace(providerAbsentAccountID.String)
-	}
-	if providerAccountID.Valid {
-		srv.ProviderAccountID = strings.TrimSpace(providerAccountID.String)
-	}
+	assignOptionalText(&srv.ProviderAbsentAt, providerAbsentAt)
+	assignOptionalText(&srv.ProviderAbsentAccountID, providerAbsentAccountID)
+	assignOptionalText(&srv.ProviderAccountID, providerAccountID)
 
 	if sshPass.Valid && sshPass.String != "" {
 		srv.SSHPass = security.DecryptCredentialSafe(sshPass.String, d.secretKey)
@@ -477,6 +471,15 @@ func (d *DB) decodeServerColumns(
 
 	if createdAt.Valid && createdAt.String != "" {
 		srv.CreatedAt = parseTime(createdAt.String)
+	}
+}
+
+// assignOptionalText stores a nullable text column on its target when the row carried
+// it, trimmed. The three provider columns are all "empty means not recorded", so they
+// share one rule instead of three copies of it.
+func assignOptionalText(target *string, value sql.NullString) {
+	if value.Valid {
+		*target = strings.TrimSpace(value.String)
 	}
 }
 

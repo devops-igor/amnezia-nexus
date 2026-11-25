@@ -284,7 +284,7 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 	}
 
 	observed := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
-	if err := db.SetServerProviderAbsence(ctx, id, observed, ""); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, observed, "acct-north"); err != nil {
 		t.Fatalf("SetServerProviderAbsence failed: %v", err)
 	}
 	marked, err := db.GetServer(ctx, id)
@@ -297,13 +297,18 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 	if got, want := marked.ProviderAbsentAt, observed.Format(time.RFC3339); got != want {
 		t.Fatalf("recorded observation = %q, want %q", got, want)
 	}
+	// The account the listing was read from is stored with the observation, so a later
+	// key change is visible rather than silent.
+	if got := marked.ProviderAbsentAccountID; got != "acct-north" {
+		t.Fatalf("recorded observing account = %q, want acct-north", got)
+	}
 
 	all, err := db.GetAllServers(ctx)
 	if err != nil || len(all) != 1 {
 		t.Fatalf("GetAllServers = %d rows, err=%v", len(all), err)
 	}
-	if !all[0].ProviderAbsent() {
-		t.Fatal("GetAllServers did not read the recorded absence")
+	if !all[0].ProviderAbsent() || all[0].ProviderAbsentAccountID != "acct-north" {
+		t.Fatal("GetAllServers did not read the recorded absence and its account")
 	}
 
 	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
@@ -315,6 +320,9 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 	}
 	if cleared.ProviderAbsent() {
 		t.Fatalf("a cleared observation still reads as absent: %q", cleared.ProviderAbsentAt)
+	}
+	if cleared.ProviderAbsentAccountID != "" {
+		t.Fatalf("clearing left the observing account behind: %q", cleared.ProviderAbsentAccountID)
 	}
 	// The rest of the row is untouched by both writes.
 	if cleared.Name != "Provider server" || cleared.Host != "198.51.100.9" {
