@@ -160,6 +160,52 @@ func refusesBeforeDial(body *ast.BlockStmt) bool {
 	return guard >= 0 && dial >= 0 && guard < dial
 }
 
+// branches reports whether the body contains the given branch statement, which
+// is how a skip is written (`continue`, `break`) without an identifier to read.
+func branches(body *ast.BlockStmt, kind token.Token) bool {
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		if branch, ok := node.(*ast.BranchStmt); ok && branch.Tok == kind {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// TestPoolMaintenanceNeverClosesInFlightWork pins the ordering rule, not a word:
+// the retirement branch of a maintenance cycle must consult InUse and skip the
+// entry before it deletes or closes anything. A dead verdict on a transport that
+// is still carrying a command would otherwise take that command's exit status
+// with it.
+func TestPoolMaintenanceNeverClosesInFlightWork(t *testing.T) {
+	root := repoRoot(t)
+	body := functionBody(t, root, sshPoolFile, "*SSHClientPool", "pingAll")
+	inUse, closed := token.NoPos, token.NoPos
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.IfStmt:
+			if inUse == token.NoPos && mentions(n.Cond, "InUse") && branches(n.Body, token.CONTINUE) {
+				inUse = n.Pos()
+			}
+		case *ast.CallExpr:
+			if closed == token.NoPos && mentions(n.Fun, "Close") {
+				closed = n.Pos()
+			}
+		}
+		return true
+	})
+	if inUse == token.NoPos {
+		t.Fatal("maintenance no longer skips a connection with work in flight")
+	}
+	if closed == token.NoPos {
+		t.Fatal("maintenance no longer retires dead connections")
+	}
+	if inUse > closed {
+		t.Fatal("maintenance closes a connection before checking whether work is in flight")
+	}
+}
+
 func checkSSHConstruction(t *testing.T, rel string, file *ast.File, fn *ast.FuncDecl) {
 	t.Helper()
 	aliases := map[string]string{}

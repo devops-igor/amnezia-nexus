@@ -55,14 +55,19 @@ var ErrProviderAbsent = errors.New("ssh refused: the provider's inventory no lon
 
 // Config specifies the connection parameters for an SSH client.
 type Config struct {
-	Host                      string
-	Port                      int
-	User                      string
-	Password                  string
-	PrivateKey                string
-	Passphrase                string
-	Timeout                   time.Duration
-	KeepAlivePeriod           time.Duration
+	Host            string
+	Port            int
+	User            string
+	Password        string
+	PrivateKey      string
+	Passphrase      string
+	Timeout         time.Duration
+	KeepAlivePeriod time.Duration
+	// ReplyTimeout bounds one liveness exchange: the presence gate, the
+	// keepalive request and the peer's reply. Expiry is reported as "not
+	// measured", never as a dead connection, because the budget can be spent
+	// waiting for the durable observation rather than for the peer.
+	ReplyTimeout              time.Duration
 	ServerID                  *int64
 	Store                     HostKeyStore
 	RequireFingerprintConfirm bool
@@ -73,6 +78,9 @@ type Config struct {
 	ProviderAbsent bool
 	presenceStore  ProviderPresenceStore
 }
+
+// defaultReplyTimeout bounds a liveness exchange when the caller sets none.
+const defaultReplyTimeout = 5 * time.Second
 
 // Client implements the SSHClient interface with pooling, sudo, and SFTP support.
 type Client struct {
@@ -101,6 +109,9 @@ func NewClient(cfg Config) *Client {
 	}
 	if cfg.KeepAlivePeriod <= 0 {
 		cfg.KeepAlivePeriod = 30 * time.Second
+	}
+	if cfg.ReplyTimeout <= 0 {
+		cfg.ReplyTimeout = defaultReplyTimeout
 	}
 
 	client := &Client{
@@ -488,14 +499,21 @@ func (c *Client) IsAlive() bool {
 	return alive
 }
 
-// alive distinguishes a refused check from a dead transport so the pool never
-// evicts an in-use connection merely because its observation became absent.
+// alive distinguishes a refused or unanswered check from a dead transport so the
+// pool never evicts an in-use connection merely because its observation became
+// absent, or because the observation was slow to answer.
 //
 // The request wrapper re-reads the observation, so the refusal can arrive here
 // as the keepalive's own error even when this validation's first read still saw
 // the row listed. That outcome is a refusal, not a dead connection, and it is
 // returned as one: maintenance parks the entry and checkout refuses it, while a
 // genuine transport failure still reports the connection dead.
+//
+// The reply budget covers the wrapper's own presence read as well as the peer's
+// answer, and an observation lookup legitimately waits on the database. A
+// budget that expires therefore means the exchange was not measured — the
+// lookup may still be pending — so it is reported as unknown and nothing is
+// retired on the strength of it. Only a completed exchange decides.
 func (c *Client) alive(ctx context.Context) (bool, error) {
 	if err := checkProviderPresence(ctx, c.cfg); err != nil {
 		return false, err
@@ -506,6 +524,7 @@ func (c *Client) alive(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	client := c.sshClient
+	budget := c.cfg.ReplyTimeout
 	c.mu.Unlock()
 
 	doneCh := make(chan error, 1)
@@ -514,14 +533,19 @@ func (c *Client) alive(ctx context.Context) (bool, error) {
 		doneCh <- err
 	}()
 
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
 	select {
 	case err := <-doneCh:
 		if isPresenceBlocked(err) {
 			return false, err
 		}
 		return err == nil, nil
-	case <-time.After(5 * time.Second):
-		return false, nil
+	case <-timer.C:
+		// The gate may be blocked on the store, so no keepalive need have been
+		// sent. Unknown leaves the entry exactly as it is.
+		return false, fmt.Errorf("%w after %s (presence gate may be pending)", errLivenessUnknown, budget)
 	}
 }
 

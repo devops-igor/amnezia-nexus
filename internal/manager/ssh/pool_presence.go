@@ -20,6 +20,13 @@ type ProviderPresenceStore interface {
 // connection as dead or unhealthy.
 var errPresenceUnavailable = errors.New("provider presence could not be read")
 
+// errLivenessUnknown marks a validation that ran out of budget before the
+// exchange completed. The presence gate and the peer's reply share that budget,
+// so an expired one proves nothing about the connection: it is unknown, which
+// leaves the entry alone and decides later. Only a completed answer — a reply, a
+// refusal, or a transport error — decides.
+var errLivenessUnknown = errors.New("SSH liveness not measured")
+
 // isPresenceBlocked reports whether err came from the presence gate rather than
 // from the transport. Every layer that inspects the outcome of an exchange must
 // use it before concluding that a connection is dead.

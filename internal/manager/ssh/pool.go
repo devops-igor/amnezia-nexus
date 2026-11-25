@@ -20,6 +20,7 @@ type PoolConfig struct {
 	IdleTimeout     time.Duration // Duration after which idle connections are closed (default 5m)
 	KeepAlivePeriod time.Duration // Interval to send keepalive pings (default 30s)
 	SweepInterval   time.Duration // Interval to sweep expired connections (default 1m)
+	ReplyTimeout    time.Duration // Budget for one liveness exchange (default 5s)
 }
 
 type pooledEntry struct {
@@ -53,6 +54,9 @@ func NewSSHClientPool(cfg PoolConfig, store HostKeyStore) *SSHClientPool {
 	}
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = 1 * time.Minute
+	}
+	if cfg.ReplyTimeout <= 0 {
+		cfg.ReplyTimeout = defaultReplyTimeout
 	}
 
 	p := &SSHClientPool{
@@ -104,6 +108,7 @@ func (p *SSHClientPool) Get(ctx context.Context, server *models.Server) (SSHClie
 		Store:           p.store,
 		Timeout:         15 * time.Second,
 		KeepAlivePeriod: p.cfg.KeepAlivePeriod,
+		ReplyTimeout:    p.cfg.ReplyTimeout,
 		// Checkout refuses before validating or returning a cached connection.
 		ProviderAbsent: server.ProviderAbsent(),
 	}
@@ -184,6 +189,13 @@ func (p *SSHClientPool) cachedClient(ctx context.Context, key string) (*Client, 
 		return nil, nil
 	}
 	if !alive {
+		// A dead verdict may not cut off a command this connection is carrying,
+		// so a busy entry is parked and this checkout is refused: a later cycle
+		// retires it once idle and the next checkout replaces it then.
+		if entry.client.InUse() {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: the connection is carrying work in flight", errLivenessUnknown)
+		}
 		delete(p.conns, key)
 		p.mu.Unlock()
 		_ = entry.client.Close()
@@ -306,7 +318,9 @@ func (p *SSHClientPool) pingAll() {
 	for _, entry := range entries {
 		alive, err := entry.client.alive(ctx)
 		if err != nil {
-			continue // Park without traffic, eviction or interrupting existing work.
+			// A refusal or an unanswered observation is unknown, not dead:
+			// park without traffic, eviction or interrupting existing work.
+			continue
 		}
 		if !alive {
 			deadEntries = append(deadEntries, entry)
@@ -314,6 +328,13 @@ func (p *SSHClientPool) pingAll() {
 	}
 
 	for _, entry := range deadEntries {
+		// Even a completed dead verdict may not cut off work that is already
+		// running: retiring the transport here would destroy the exit status of
+		// the command it is carrying. A later cycle retires it once idle, and the
+		// idle sweep is the backstop.
+		if entry.client.InUse() {
+			continue
+		}
 		p.mu.Lock()
 		if p.conns[entry.key] == entry {
 			delete(p.conns, entry.key)
