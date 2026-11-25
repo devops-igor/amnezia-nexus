@@ -35,7 +35,7 @@ func TestGetServerReachabilityHandler_ProviderAbsentSkipsDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to seed the listed server: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 	// A previous observation exists and must survive: refusing to dial is not a

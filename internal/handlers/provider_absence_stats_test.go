@@ -68,7 +68,7 @@ func TestServerStatsHandler_ProviderAbsentIsNotMeasured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seeding the listed server: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("recording the provider absence: %v", err)
 	}
 

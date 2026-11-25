@@ -47,7 +47,7 @@ func TestServerCheckHandler_ColdAndWarmAbsenceNotMeasured(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+			if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 				t.Fatal(err)
 			}
 			before, err := db.GetServer(ctx, id)
@@ -80,7 +80,7 @@ func TestServerCheckHandler_ColdAndWarmAbsenceNotMeasured(t *testing.T) {
 				t.Error("refusal changed row, credentials, protocols or prior observation")
 			}
 			// A listed control in both runs must still acquire and attempt commands.
-			if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+			if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
 				t.Fatal(err)
 			}
 			body = callServerCheck(t, h, id)
@@ -106,7 +106,7 @@ func TestServerCheckHandler_AbsenceDuringOperationPreservesObservation(t *testin
 		t.Fatal(err)
 	}
 	client.cmdFunc = func(context.Context, string) (string, string, int, error) {
-		if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+		if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 			t.Error(err)
 		}
 		return "Docker version test", "", 0, nil

@@ -25,7 +25,7 @@ func TestSetupProxyAbsenceIsNotMeasuredPause(t *testing.T) {
 		if server == nil {
 			t.Fatal("registered server not found")
 		}
-		if err := env.db.SetServerProviderAbsence(context.Background(), server.ID, time.Now().UTC()); err != nil {
+		if err := env.db.SetServerProviderAbsence(context.Background(), server.ID, time.Now().UTC(), ""); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -68,7 +68,7 @@ func TestProxyQualificationRefusal_PreservesEnrollment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 		t.Fatal(err)
 	}
 	var calls int

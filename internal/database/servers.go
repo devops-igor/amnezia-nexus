@@ -19,7 +19,7 @@ func (d *DB) GetAllServers(ctx context.Context) ([]models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_account_id FROM servers ORDER BY id")
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_absent_account_id, provider_account_id FROM servers ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query servers: %w", err)
 	}
@@ -42,7 +42,7 @@ func (d *DB) GetServer(ctx context.Context, id int64) (*models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_account_id FROM servers WHERE id = ?", id)
+	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_absent_account_id, provider_account_id FROM servers WHERE id = ?", id)
 	s, err := d.scanServerRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -305,21 +305,24 @@ func (d *DB) UpdateServerSSHStatus(ctx context.Context, id int64, status string)
 // inventory confirmed the server no longer exists; a zero observedAt clears that
 // state, which is what a server the provider lists again must end up with.
 //
-// Only the observation column is written: the row's address, credentials,
-// sessions and reachability state are left exactly as they were, because this is
-// a statement about the provider's inventory rather than a deletion or a health
-// verdict.
-func (d *DB) SetServerProviderAbsence(ctx context.Context, id int64, observedAt time.Time) error {
-	value := ""
+// Only the observation columns are written, together: which account the listing was read
+// from is part of the observation, so a later key change is visible rather than silent.
+// The row's address, credentials, sessions and reachability state are left exactly as
+// they were, because this is a statement about the provider's inventory rather than a
+// deletion or a health verdict.
+func (d *DB) SetServerProviderAbsence(ctx context.Context, id int64, observedAt time.Time, accountID string) error {
+	value, account := "", ""
 	if !observedAt.IsZero() {
 		value = formatTime(observedAt.UTC())
+		account = strings.TrimSpace(accountID)
 	}
 
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
 	if _, err := d.sqlDB.ExecContext(ctx,
-		"UPDATE servers SET provider_absent_at = ? WHERE id = ?", value, id); err != nil {
+		"UPDATE servers SET provider_absent_at = ?, provider_absent_account_id = ? WHERE id = ?",
+		value, account, id); err != nil {
 		return fmt.Errorf("failed to record provider absence for server %d: %w", id, err)
 	}
 	return nil
@@ -414,7 +417,7 @@ type scannable interface {
 
 func (d *DB) scanServer(s scannable) (models.Server, error) {
 	var srv models.Server
-	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID sql.NullString
+	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID sql.NullString
 
 	err := s.Scan(
 		&srv.ID,
@@ -427,13 +430,14 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 		&protoJSON,
 		&createdAt,
 		&providerAbsentAt,
+		&providerAbsentAccountID,
 		&providerAccountID,
 	)
 	if err != nil {
 		return srv, err
 	}
 
-	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID)
+	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID)
 
 	d.reachabilityMu.RLock()
 	if st, ok := d.reachabilityCache[srv.ID]; ok {
@@ -450,10 +454,13 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 // value: credentials are decrypted, the protocols blob is decoded and sanitized,
 // and the optional timestamps are parsed only when present.
 func (d *DB) decodeServerColumns(
-	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAccountID sql.NullString,
+	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID sql.NullString,
 ) {
 	if providerAbsentAt.Valid {
 		srv.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
+	}
+	if providerAbsentAccountID.Valid {
+		srv.ProviderAbsentAccountID = strings.TrimSpace(providerAbsentAccountID.String)
 	}
 	if providerAccountID.Valid {
 		srv.ProviderAccountID = strings.TrimSpace(providerAccountID.String)

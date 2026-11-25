@@ -36,7 +36,7 @@ func TestAbsentBackendRefusesNativeReadinessWithoutMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.EnableBackendWithConfig(ctx, id); !errors.Is(err, tunnel.ErrProviderAbsent) {
@@ -52,7 +52,7 @@ func TestAbsentBackendRefusesNativeReadinessWithoutMutation(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Error("refusal changed tunnel ownership or health")
 	}
-	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.refuseAbsentReadiness(ctx, id); err != nil {

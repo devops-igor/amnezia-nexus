@@ -40,6 +40,8 @@ type inventoryProvider struct {
 	body   string
 	status int
 	stall  bool
+	// inventoryStatus, when set, refuses GET /servers alone.
+	inventoryStatus int
 	// account is the identity the provider reports for /account. It decides
 	// which server rows the fixture's inventory read may judge, so a test can
 	// point the panel at a second account by changing it.
@@ -82,6 +84,15 @@ func (p *inventoryProvider) set(body string) {
 	p.body = body
 	p.status = 0
 	p.stall = false
+	p.inventoryStatus = 0
+}
+
+// failInventory answers GET /servers with the given HTTP error while /account and
+// /dashboard keep answering, so a test can refuse the listing alone.
+func (p *inventoryProvider) failInventory(status int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inventoryStatus = status
 }
 
 // fail answers every request with the given HTTP error.
@@ -167,12 +178,6 @@ func (p *inventoryProvider) answerPerServer(id int64, status int) {
 	p.perServer[id] = status
 }
 
-func (p *inventoryProvider) perServerCallCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.perServerCalls
-}
-
 // failAccount answers /account with the given HTTP error.
 func (p *inventoryProvider) failAccount(status int) {
 	p.mu.Lock()
@@ -221,6 +226,7 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 		perServerStatus = p.perServer[id]
 	}
 	body, status, stall := p.body, p.status, p.stall
+	inventoryStatus := p.inventoryStatus
 	p.mu.Unlock()
 
 	if r.URL.Path == "/dashboard" {
@@ -263,6 +269,10 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path != "/servers" {
 		http.NotFound(w, r)
+		return
+	}
+	if inventoryStatus != 0 {
+		w.WriteHeader(inventoryStatus)
 		return
 	}
 	if stall {
@@ -557,17 +567,6 @@ func (f *inventoryFixture) listingBody() []byte {
 	return rec.Body.Bytes()
 }
 
-// confirm runs the reconciliation twice: absence needs two consecutive credible passes,
-// so this is the shortest sequence that can record one.
-func (f *inventoryFixture) confirm(ctx context.Context) {
-	f.t.Helper()
-	for i := 0; i < 2; i++ {
-		if err := f.h.ReconcileGigahostServerInventory(ctx); err != nil {
-			f.t.Fatalf("reconciliation pass %d failed: %v", i+1, err)
-		}
-	}
-}
-
 func (f *inventoryFixture) reconcile(ctx context.Context) error {
 	f.t.Helper()
 	return f.h.ReconcileGigahostServerInventory(ctx)
@@ -586,7 +585,7 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 	// what absence requires.
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
+	f.reconcile(context.Background())
 
 	goneRow := f.row(gone)
 	if !goneRow.ProviderAbsent() {
@@ -621,8 +620,8 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 	if got := f.row(gone).ProviderAbsentAt; got != firstObserved {
 		t.Fatalf("a repeated pass rewrote the observation time: %q, want %q", got, firstObserved)
 	}
-	if calls := f.provider.inventoryCallCount(); calls != 3 {
-		t.Fatalf("expected one inventory read per pass, got %d reads over three passes", calls)
+	if calls := f.provider.inventoryCallCount(); calls != 2 {
+		t.Fatalf("expected one inventory read per pass, got %d reads over two passes", calls)
 	}
 
 	// The listing carries the state, so a later consumer can filter on it.
@@ -688,7 +687,7 @@ func TestReconcileGigahostInventory_FailedOrPartialReadsChangeNothing(t *testing
 			// A previous successful read recorded 502 as gone; this pass must not
 			// disturb that either way.
 			recorded := time.Now().UTC().Add(-time.Hour)
-			if err := f.db.SetServerProviderAbsence(context.Background(), knownAbsent, recorded); err != nil {
+			if err := f.db.SetServerProviderAbsence(context.Background(), knownAbsent, recorded, ""); err != nil {
 				t.Fatalf("failed to seed the recorded absence: %v", err)
 			}
 			before := f.row(knownAbsent).ProviderAbsentAt
@@ -723,7 +722,7 @@ func TestReconcileGigahostInventory_FailedOrPartialReadsChangeNothing(t *testing
 			// indistinguishable from a pass that never ran.
 			f.provider.set(inventoryJSON(599))
 			f.provider.setAccountServers(1)
-			f.confirm(context.Background())
+			f.reconcile(context.Background())
 			if !f.row(listed).ProviderAbsent() {
 				t.Fatal("the reconciliation never changes state on this fixture, so its 'nothing changed' assertions prove nothing")
 			}
@@ -739,7 +738,7 @@ func TestReconcileGigahostInventory_CorrectsAServerThatReappears(t *testing.T) {
 	// answer: the row it provisioned is absent.
 	f.provider.set(inventoryJSON())
 	f.provider.setAccountServers(0)
-	f.confirm(context.Background())
+	f.reconcile(context.Background())
 	if !f.row(gone).ProviderAbsent() {
 		t.Fatal("a server absent from an enumerated empty account was not recorded absent")
 	}
@@ -851,7 +850,7 @@ func TestReconcileGigahostInventory_UnidentifiableEntryMarksNothingAbsent(t *tes
 			// would also pass if the pass never wrote anything at all.
 			f.provider.set(inventoryJSON(501))
 			f.provider.setAccountServers(1)
-			f.confirm(context.Background())
+			f.reconcile(context.Background())
 			if f.row(listed).ProviderAbsent() {
 				t.Fatal("the control pass marked a listed server absent")
 			}

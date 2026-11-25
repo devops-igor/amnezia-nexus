@@ -284,7 +284,7 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 	}
 
 	observed := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
-	if err := db.SetServerProviderAbsence(ctx, id, observed); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, observed, ""); err != nil {
 		t.Fatalf("SetServerProviderAbsence failed: %v", err)
 	}
 	marked, err := db.GetServer(ctx, id)
@@ -306,7 +306,7 @@ func TestServersProviderAbsenceRoundTrip(t *testing.T) {
 		t.Fatal("GetAllServers did not read the recorded absence")
 	}
 
-	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
 		t.Fatalf("clearing the absence failed: %v", err)
 	}
 	cleared, err := db.GetServer(ctx, id)
@@ -338,14 +338,14 @@ func TestServersIsProviderAbsent(t *testing.T) {
 		t.Fatalf("IsServerProviderAbsent(%d) = (%v, %v), want (false, nil)", id, absent, err)
 	}
 
-	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("SetServerProviderAbsence failed: %v", err)
 	}
 	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || !absent {
 		t.Fatalf("IsServerProviderAbsent(%d) after recording = (%v, %v), want (true, nil)", id, absent, err)
 	}
 
-	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
 		t.Fatalf("clearing the absence failed: %v", err)
 	}
 	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || absent {

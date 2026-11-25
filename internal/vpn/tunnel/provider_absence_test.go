@@ -55,7 +55,7 @@ func TestHealthProber_ProbeAll_RefusesProviderAbsentServer(t *testing.T) {
 	if _, err := pool.AddTunnel(ctx, liveID, "192.0.2.102:51820", "live-key"); err != nil {
 		t.Fatalf("seeding the listed server's tunnel: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("recording the provider absence: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestHealthProber_SelfHealing_RefusesProviderAbsentServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seeding the tunnel: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("recording the provider absence: %v", err)
 	}
 
@@ -164,7 +164,7 @@ func TestReconnectManager_RefusesProviderAbsentServer(t *testing.T) {
 	if err := pool.SetTunnelStatus(ctx, absentID, models.TunnelStatusDegraded, 0); err != nil {
 		t.Fatalf("marking the tunnel degraded: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("recording the provider absence: %v", err)
 	}
 

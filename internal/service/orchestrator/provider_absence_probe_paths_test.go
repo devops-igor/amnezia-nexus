@@ -90,7 +90,7 @@ func TestOrchestrator_CheckBackendTunnelHealth_SkipsProviderAbsentServer(t *test
 	}
 
 	// The observation is recorded, never inferred from the tunnel's own fields.
-	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestOrchestrator_SyncTraffic_SkipsProviderAbsentServer(t *testing.T) {
 		}
 	}
 
-	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 
@@ -247,7 +247,7 @@ func TestOrchestrator_CheckAutoTrialHandshakes_SkipsProviderAbsentServer(t *test
 		}
 	}
 
-	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentServerID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 

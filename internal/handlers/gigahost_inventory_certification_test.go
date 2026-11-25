@@ -1,16 +1,18 @@
 package handlers
 
-// F989-05 (remaining): absence is concluded only from evidence that repeats.
+// The owner's decision: the configured Gigahost key sees every running VPS, so ONE
+// successful, fully paginated account listing is authoritative.
 //
-// Two consecutive reconciliation passes must agree: each reads its own listing and its
-// own account-wide count, and in each the count must equal the listing's size. Only then
-// may a repeated omission become a durable absence. A single pass - however consistent
-// its own numbers look - can never record one, which is what stops a filtered listing
-// that happens to match the account count after an unrelated deletion.
+//	"Key has permissions to view all running VPSs if it is not in the list then it is
+//	 DELETED"
 //
-// F989-08: the certificate uses only fields the provider documents on a response this
-// credential can read - the listing itself and the account summary's service counts.
-// No permissions object is read, because the panel's key cannot see one.
+// Consequences pinned here: a known server the listing does not contain is deleted; a
+// server it contains has any mark cleared; a listing that fails, is refused, is
+// incomplete across its pages or cannot be decoded changes nothing; and a per-server read
+// only ever adds presence. The declared limit - a key that does not in fact see every VPS
+// makes an unlisted but working server look deleted - is stated in the code and in the
+// handover; the panel cannot detect it from the provider, so the account-wide count is
+// logged as a diagnostic and never gates.
 
 import (
 	"context"
@@ -19,220 +21,156 @@ import (
 	"time"
 )
 
-// The review's replay: a filtered key's listing matches the account count after an
-// unrelated deletion. One pass cannot conclude it, and two passes cannot either, because
-// the second pass disagrees. The positive control uses the documented payload exactly as
-// the provider documents it - no fixture-only field - and marks a genuinely deleted
-// server once two passes agree.
-func TestReconcileGigahostInventory_MatchingCountsDoNotCertifyARestrictedKey(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		detailStatus int
+// One complete listing is enough: the deleted server is marked, the server the same
+// listing contains is cleared, and the account the listing was read from is recorded with
+// the mark.
+func TestReconcileGigahostInventory_OneCompleteListingDecides(t *testing.T) {
+	f := newInventoryFixture(t)
+	deleted := f.seedServer("Deleted", providerProtocols(502))
+	returned := f.seedServer("Returned", providerProtocols(503))
+
+	// The returned server carries an earlier mark; the deleted one does not.
+	earlier := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	if err := f.db.SetServerProviderAbsence(context.Background(), returned, earlier, ""); err != nil {
+		t.Fatalf("failed to seed the mark: %v", err)
+	}
+
+	// One listing of the account: it contains 503 and not 502.
+	f.provider.set(inventoryJSON(503))
+	if err := f.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconciliation pass failed: %v", err)
+	}
+
+	if !f.row(deleted).ProviderAbsent() {
+		t.Fatal("a server the complete listing does not contain was not recorded as deleted")
+	}
+	if f.row(returned).ProviderAbsent() {
+		t.Fatal("a server the listing contains kept its mark")
+	}
+	// The account the listing was read from is recorded with the mark, so a later key
+	// change is visible rather than silent.
+	if got := f.row(deleted).ProviderAbsentAccountID; got != fixtureAccount {
+		t.Fatalf("recorded account = %q, want %q", got, fixtureAccount)
+	}
+	if got := f.row(returned).ProviderAbsentAccountID; got != "" {
+		t.Fatalf("clearing left an account id behind: %q", got)
+	}
+}
+
+// A repeated pass with the same answer is idempotent: the observation time survives.
+func TestReconcileGigahostInventory_RepeatedPassKeepsTheObservation(t *testing.T) {
+	f := newInventoryFixture(t)
+	deleted := f.seedServer("Deleted", providerProtocols(502))
+	f.provider.set(inventoryJSON(501))
+
+	if err := f.reconcile(context.Background()); err != nil {
+		t.Fatalf("first pass failed: %v", err)
+	}
+	first := f.row(deleted).ProviderAbsentAt
+	if first == "" {
+		t.Fatal("the first pass recorded nothing")
+	}
+	if err := f.reconcile(context.Background()); err != nil {
+		t.Fatalf("second pass failed: %v", err)
+	}
+	if got := f.row(deleted).ProviderAbsentAt; got != first {
+		t.Fatalf("a repeated pass rewrote the observation: %q, want %q", got, first)
+	}
+}
+
+// Nothing may be concluded from a listing that is not a complete, decoded answer.
+func TestReconcileGigahostInventory_UnusableListingChangesNothing(t *testing.T) {
+	cases := []struct {
+		name    string
+		arrange func(f *inventoryFixture)
 	}{
-		{name: "detail answers 403", detailStatus: http.StatusForbidden},
-		{name: "detail answers 404", detailStatus: http.StatusNotFound},
-	} {
+		{name: "listing refused", arrange: func(f *inventoryFixture) { f.provider.failInventory(http.StatusForbidden) }},
+		{name: "listing fails", arrange: func(f *inventoryFixture) { f.provider.failInventory(http.StatusInternalServerError) }},
+		{name: "listing undecodable", arrange: func(f *inventoryFixture) { f.provider.set("not-json") }},
+		{name: "listing enumerates the account incompletely", arrange: func(f *inventoryFixture) {
+			f.provider.set(partialInventoryJSON(501))
+		}},
+		{name: "listing has an unidentifiable entry", arrange: func(f *inventoryFixture) {
+			f.provider.set(`{"meta":{"page":1,"total_pages":1,"total":2},"data":[null,{"srv_id":501}]}`)
+		}},
+	}
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newInventoryFixture(t)
-			active := f.seedServer("Listed", providerProtocols(501))
-			hidden := f.seedServer("Working but hidden", providerProtocols(502))
+			marked := f.seedServer("Marked", providerProtocols(502))
 
-			// Pass one: the key lists 501 only, and the account-wide count happens to be 1
-			// because the account's other server (502, which this key cannot see) is not
-			// listed and the account's visible member is the only one the summary counts.
-			f.provider.set(inventoryJSON(501))
-			f.provider.setAccountServers(1)
-			f.provider.answerPerServer(502, tc.detailStatus)
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("first pass failed: %v", err)
-			}
-			if f.row(hidden).ProviderAbsent() {
-				t.Fatal("a single coincidental equality recorded absence")
-			}
-
-			// Pass two: 501 is terminated, so the account holds 502 only and the key sees
-			// nothing. The listing (0) and the count (1) disagree, so the carried evidence
-			// is cleared and no absence is recorded.
-			f.provider.set(inventoryJSON())
-			f.provider.setAccountServers(1)
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("second pass failed: %v", err)
-			}
-			if f.row(hidden).ProviderAbsent() {
-				t.Fatal("two passes certified a listing that did not enumerate the account")
-			}
-			if f.row(active).ProviderAbsent() {
-				t.Fatal("a listed server was marked absent")
-			}
-
-			// A pre-existing observation is untouched through both passes.
 			recorded := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-			if err := f.db.SetServerProviderAbsence(context.Background(), hidden, recorded); err != nil {
+			if err := f.db.SetServerProviderAbsence(context.Background(), marked, recorded, fixtureAccount); err != nil {
 				t.Fatalf("failed to seed the mark: %v", err)
 			}
-			before := f.row(hidden).ProviderAbsentAt
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("third pass failed: %v", err)
+			before := f.row(marked)
+
+			tc.arrange(f)
+			if err := f.reconcile(context.Background()); err == nil {
+				t.Fatal("an unusable listing was accepted as an answer")
 			}
-			if got := f.row(hidden).ProviderAbsentAt; got != before {
-				t.Fatalf("an uncertified pass rewrote the observation: %q, want %q", got, before)
+			after := f.row(marked)
+			if after.ProviderAbsentAt != before.ProviderAbsentAt || after.ProviderAbsentAccountID != before.ProviderAbsentAccountID {
+				t.Fatalf("an unusable listing rewrote the mark: %+v -> %+v", before, after)
 			}
 
-			// Positive control, documented payload only: the same server is the account's
-			// whole enumeration (one server, one listed) for two consecutive passes, so it
-			// is recorded absent.
-			f.provider.set(inventoryJSON(501))
-			f.provider.setAccountServers(1)
-			f.confirm(context.Background())
-			if !f.row(hidden).ProviderAbsent() {
-				t.Fatal("two agreeing documented passes did not record a genuinely absent server")
+			// Control: the same fixture with a complete listing does change state, so the
+			// assertion above is not a pass that never runs.
+			f.provider.set(inventoryJSON(502))
+			if err := f.reconcile(context.Background()); err != nil {
+				t.Fatalf("control pass failed: %v", err)
 			}
-			if f.row(active).ProviderAbsent() {
-				t.Fatal("the control pass marked a listed server absent")
+			if f.row(marked).ProviderAbsent() {
+				t.Fatal("the control pass kept a mark on a server its listing contains")
 			}
 		})
 	}
 }
 
-// One pass never records absence, two agreeing passes do, and a disagreement between them
-// resets the carried evidence.
-func TestReconcileGigahostInventory_AbsenceNeedsTwoAgreeingPasses(t *testing.T) {
+// The account-wide count is a diagnostic, not a gate: a disagreement is logged and the
+// authoritative listing still decides.
+func TestReconcileGigahostInventory_CountDisagreementDoesNotGate(t *testing.T) {
 	f := newInventoryFixture(t)
-	gone := f.seedServer("Gone", providerProtocols(502))
+	deleted := f.seedServer("Deleted", providerProtocols(502))
 	f.provider.set(inventoryJSON(501))
-	f.provider.setAccountServers(1)
+	// The summary says the account holds more servers than this listing enumerated. Under
+	// the owner's decision the listing still decides; the disagreement is the visible sign
+	// that the configured key may not see everything.
+	f.provider.setAccountServers(7)
 
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("first pass failed: %v", err)
-	}
-	if f.row(gone).ProviderAbsent() {
-		t.Fatal("a single pass recorded absence")
-	}
-
-	// A pass whose own evidence disagrees clears the evidence carried so far.
-	f.provider.setAccountServers(2)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("second pass failed: %v", err)
-	}
-	if f.row(gone).ProviderAbsent() {
-		t.Fatal("a pass whose counts disagreed recorded absence")
-	}
-
-	// Two credible passes in a row then agree, and the absence is recorded on the second.
-	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("third pass failed: %v", err)
-	}
-	if f.row(gone).ProviderAbsent() {
-		t.Fatal("the first pass after a reset recorded absence")
-	}
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("fourth pass failed: %v", err)
-	}
-	if !f.row(gone).ProviderAbsent() {
-		t.Fatal("two consecutive agreeing passes did not record absence")
-	}
-}
-
-// A pass that lists the server again is presence, and it also clears the carried
-// evidence: the next absence needs two fresh passes.
-func TestReconcileGigahostInventory_ReappearanceResetsThePassCount(t *testing.T) {
-	f := newInventoryFixture(t)
-	server := f.seedServer("Server", providerProtocols(501))
-
-	f.provider.set(inventoryJSON())
-	f.provider.setAccountServers(0)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("first pass failed: %v", err)
-	}
-	if f.row(server).ProviderAbsent() {
-		t.Fatal("a single pass recorded absence")
-	}
-
-	// The server is listed again: it is present, so the streak is void.
-	f.provider.set(inventoryJSON(501))
-	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("second pass failed: %v", err)
-	}
-	if f.row(server).ProviderAbsent() {
-		t.Fatal("a listed server was marked absent")
-	}
-
-	// Omitted once more: this is a first pass again, so nothing is recorded yet.
-	f.provider.set(inventoryJSON())
-	f.provider.setAccountServers(0)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("third pass failed: %v", err)
-	}
-	if f.row(server).ProviderAbsent() {
-		t.Fatal("the pass after a reappearance recorded absence on its own")
-	}
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("fourth pass failed: %v", err)
-	}
-	if !f.row(server).ProviderAbsent() {
-		t.Fatal("two consecutive omissions after a reappearance did not record absence")
-	}
-}
-
-// The account summary's count is part of every pass: a pass that cannot read it is not
-// credible, records nothing and clears the carried evidence. A server the detail endpoint
-// still reports is unparked regardless, because presence needs no certificate.
-func TestReconcileGigahostInventory_SummaryOutageKeepsRowsAndStillUnparks(t *testing.T) {
-	f := newInventoryFixture(t)
-	marked := f.seedServer("Marked", providerProtocols(501))
-	returned := f.seedServer("Returned", providerProtocols(502))
-
-	recorded := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	if err := f.db.SetServerProviderAbsence(context.Background(), marked, recorded); err != nil {
-		t.Fatalf("failed to seed the mark: %v", err)
-	}
-	before := f.row(marked).ProviderAbsentAt
-
-	// The summary carries no service counts, so this pass is not credible.
-	f.provider.set(inventoryJSON())
-	f.provider.setAccountServers(-1)
-	f.provider.answerPerServer(502, http.StatusOK)
 	if err := f.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconciliation pass failed: %v", err)
 	}
-	if got := f.row(marked).ProviderAbsentAt; got != before {
-		t.Fatalf("an incredible pass rewrote a mark: %q, want %q", got, before)
-	}
-	if f.row(returned).ProviderAbsent() {
-		t.Fatal("presence did not clear a mark, although it needs no certificate")
-	}
-
-	// Control: once the summary is readable and matches the listing, two passes record the
-	// absence.
-	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
-	if !f.row(marked).ProviderAbsent() {
-		t.Fatal("two credible passes did not record the absent server")
+	if !f.row(deleted).ProviderAbsent() {
+		t.Fatal("a count disagreement gated the authoritative listing")
 	}
 }
 
-// A detail refusal is not an absence observation and does not decide the pass: the
-// repeated omission and the counts do. Presence from a detail read still clears a mark.
-func TestReconcileGigahostInventory_DetailRefusalDoesNotDecideThePass(t *testing.T) {
+// A per-server read adds presence only: it clears a mark and can never set one.
+func TestReconcileGigahostInventory_DetailReadIsPresenceOnly(t *testing.T) {
 	f := newInventoryFixture(t)
-	gone := f.seedServer("Gone", providerProtocols(502))
+	missing := f.seedServer("Missing", providerProtocols(502))
+	listed := f.seedServer("Listed", providerProtocols(501))
 	f.provider.set(inventoryJSON(501))
-	f.provider.setAccountServers(1)
-	f.provider.answerPerServer(502, http.StatusForbidden)
-
-	f.confirm(context.Background())
-	if !f.row(gone).ProviderAbsent() {
-		t.Fatal("a confirmed repeated omission was withheld because a detail read was refused")
-	}
-
-	// Presence clears it again, and the detail answer is the only evidence for that.
+	// The detail endpoint still reports a server the listing omits: it is present, so any
+	// mark is cleared even though the listing does not contain it.
 	f.provider.answerPerServer(502, http.StatusOK)
+
 	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reappearance pass failed: %v", err)
+		t.Fatalf("reconciliation pass failed: %v", err)
 	}
-	if f.row(gone).ProviderAbsent() {
-		t.Fatal("a server the detail endpoint reports stayed marked absent")
+	if f.row(missing).ProviderAbsent() {
+		t.Fatal("a server the detail endpoint reports was recorded as deleted")
+	}
+
+	// A refusal on the detail read does not make a listed server appear deleted, and a
+	// detail read never sets a mark of its own.
+	f.provider.answerPerServer(501, http.StatusForbidden)
+	if err := f.reconcile(context.Background()); err != nil {
+		t.Fatalf("second pass failed: %v", err)
+	}
+	if f.row(listed).ProviderAbsent() {
+		t.Fatal("a refused detail read marked a listed server as deleted")
 	}
 }

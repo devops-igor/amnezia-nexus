@@ -64,6 +64,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateServersProviderAccount(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateServersProviderAbsenceAccount(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
 }
 
@@ -75,6 +78,14 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 func (d *DB) migrateServersProviderAbsence(ctx context.Context) error {
 	return d.ensureServerTextColumn(ctx, "provider_absent_at",
 		`ALTER TABLE servers ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`)
+}
+
+// migrateServersProviderAbsenceAccount adds the column that records which provider
+// account the absence observation was read from. Existing rows start empty, which is
+// correct: a mark made before this column existed has no recorded source.
+func (d *DB) migrateServersProviderAbsenceAccount(ctx context.Context) error {
+	return d.ensureServerTextColumn(ctx, "provider_absent_account_id",
+		`ALTER TABLE servers ADD COLUMN provider_absent_account_id TEXT NOT NULL DEFAULT ''`)
 }
 
 // migrateServersProviderAccount adds the provider_account_id column to servers.

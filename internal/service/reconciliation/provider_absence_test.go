@@ -61,7 +61,7 @@ func TestReconciliation_SkipsProviderAbsentServerRemoteAudits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to seed the listed server: %v", err)
 	}
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 

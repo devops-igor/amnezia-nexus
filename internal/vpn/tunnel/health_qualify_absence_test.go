@@ -52,7 +52,7 @@ func TestProxyQualification_AbsentOpensNoConnection(t *testing.T) {
 	tun := &models.BackendTunnel{ServerID: id, Protocol: models.ProtocolVLESS, Endpoint: listener.Addr().String(), ProtocolParams: params, Status: models.TunnelStatusActive, Enabled: true, LatencyMS: 17}
 	before := *tun
 	hp := NewHealthProber(NewPool(db), db, HealthConfig{Timeout: time.Second})
-	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 		t.Fatal(err)
 	}
 	latency, err := hp.QualifyProxyTraffic(ctx, tun)
@@ -65,7 +65,7 @@ func TestProxyQualification_AbsentOpensNoConnection(t *testing.T) {
 	if !reflect.DeepEqual(before, *tun) {
 		t.Error("refusal changed prior tunnel observation")
 	}
-	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	_, err = hp.QualifyProxyTraffic(ctx, tun)
@@ -75,7 +75,7 @@ func TestProxyQualification_AbsentOpensNoConnection(t *testing.T) {
 	if accepts.Load() != 1 {
 		t.Errorf("listed control connection count = %d, want 1", accepts.Load())
 	}
-	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
 		t.Fatal(err)
 	}
 	var hooks int

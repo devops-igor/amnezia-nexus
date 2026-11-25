@@ -79,11 +79,6 @@ type Handlers struct {
 	notificationSvc *notifications.Service
 	gigahostClient  gigahost.Client
 	gigahostMu      sync.RWMutex
-	// absenceMu guards the pass-to-pass evidence that lets a repeated omission become a
-	// durable absence. It only ever holds in-process state: a restart simply requires
-	// two fresh passes, and nothing stale is ever trusted.
-	absenceMu         sync.Mutex
-	absenceCandidates map[int64]absenceCandidate
 	// purchaseMu serializes the duplicate-purchase check with the durable intent
 	// row that makes its decision visible, so two concurrent order attempts cannot
 	// both pass the check. It is deliberately released before the provider call:

@@ -86,12 +86,11 @@ type gigahostInventoryAnswer struct {
 	listed    map[int64]struct{}
 	accountID string
 	client    gigahost.Client
-	// accountServers is the account-wide server count this pass read from the summary,
-	// and listingCredible reports whether this pass's own evidence is consistent: the
-	// listing's size equals that count. Only a credible pass contributes evidence, and a
-	// row needs two consecutive credible passes to be recorded absent.
-	accountServers  int
-	listingCredible bool
+	// accountServers and counted carry the account-wide server count for the diagnostic
+	// log only: the listing is authoritative by the owner's decision, and the count never
+	// gates a write.
+	accountServers int
+	counted        bool
 }
 
 // gigahostServerReported reports whether the provider answered with this server.
@@ -110,81 +109,18 @@ func gigahostServerReported(ctx context.Context, client gigahost.Client, serverI
 	return err == nil
 }
 
-// absenceCandidate is the evidence one pass records so the next one can confirm it.
-//
-// It carries the account the omission belongs to and the two counts that made the pass
-// credible, so a confirmation compares like with like. It is in memory on purpose: the
-// rule is about consecutive reconciliation passes in this process, a restart simply
-// requires two fresh passes, and no stale snapshot is ever trusted.
-type absenceCandidate struct {
-	accountID        string
-	providerServerID int64
-	listedCount      int
-	accountServers   int
-	seenAt           time.Time
-}
-
 // gigahostAccountServerCount reads the account-wide server count the summary reports.
 //
-// GET /dashboard is documented as available "to every valid token and API key,
-// regardless of its permissions", and its services figures count the account's own
-// servers. It is the only documented account-wide count the panel can read with the
-// credential it holds.
+// It is a diagnostic, never a gate. The owner decided that the configured key sees every
+// running VPS, so one complete listing is authoritative on its own; the count is read only
+// to make a disagreement visible in the operator log, because it is the earliest sign that
+// the configured key may not see the whole account after all.
 func (h *Handlers) gigahostAccountServerCount(ctx context.Context, client gigahost.Client) (int, bool) {
 	dashboard, err := client.GetDashboard(ctx)
-	switch {
-	case err != nil:
-		slog.Warn("Provider account summary unavailable; absence not recorded in this pass", "err", err)
-		return 0, false
-	case dashboard == nil || !dashboard.ServicesPresent:
-		slog.Warn("Provider account summary carried no service counts; absence not recorded in this pass")
+	if err != nil || dashboard == nil || !dashboard.ServicesPresent {
 		return 0, false
 	}
 	return dashboard.Services.ServerCount(), true
-}
-
-// agreesWith reports whether carried evidence describes this pass's own counts for the
-// same account. Two passes agree only when the same account saw the same listing size
-// against the same account-wide count, and the row was omitted in both.
-func (c absenceCandidate) agreesWith(accountID string, listedCount, accountServers int) bool {
-	return c.accountID == accountID && c.listedCount == listedCount && c.accountServers == accountServers
-}
-
-// confirmRepeatedOmissions turns a repeated omission into a confirmed absence.
-//
-// Absence is concluded only on evidence that repeats: the row must be omitted in two
-// consecutive passes, and each of those passes must be credible on its own - its own
-// listing's size equal to its own account-wide count. Anything else clears the carried
-// evidence: a mismatch, a missing count, an unreadable summary, or a pass in which the
-// row was listed or reported. Two consecutive agreements are what a single coincidental
-// equality cannot produce.
-func (h *Handlers) confirmRepeatedOmissions(accountID string, listedCount, accountServers int, credible bool, candidates []int64) map[int64]struct{} {
-	h.absenceMu.Lock()
-	defer h.absenceMu.Unlock()
-
-	confirmed := make(map[int64]struct{}, len(candidates))
-	next := make(map[int64]absenceCandidate, len(candidates))
-	if credible {
-		for _, id := range candidates {
-			if previous, ok := h.absenceCandidates[id]; ok && previous.agreesWith(accountID, listedCount, accountServers) {
-				confirmed[id] = struct{}{}
-				continue
-			}
-			next[id] = absenceCandidate{
-				accountID:        accountID,
-				providerServerID: id,
-				listedCount:      listedCount,
-				accountServers:   accountServers,
-				seenAt:           time.Now().UTC(),
-			}
-		}
-	}
-	h.absenceCandidates = next
-	if len(confirmed) == 0 && len(candidates) > 0 && !credible {
-		slog.Info("Provider inventory was not credible in this pass; carried absence evidence cleared",
-			"unlisted_rows", len(candidates), "listed_servers", listedCount, "account_servers", accountServers)
-	}
-	return confirmed
 }
 
 // ReconcileGigahostServerInventory records, for every Gigahost-provisioned
@@ -354,17 +290,16 @@ func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInve
 		return gigahostInventoryAnswer{}, err
 	}
 
-	// Credibility is a property of this pass's own evidence: its listing's size against
-	// the account-wide count read in the same pass. A missing or unreadable summary makes
-	// the pass incredible, which clears the carried evidence rather than concluding
-	// anything from it.
+	// The account-wide count is read for the diagnostic log only. It never decides
+	// anything: the owner decided the configured key sees every running VPS, so one
+	// complete listing is authoritative.
 	accountServers, counted := h.gigahostAccountServerCount(callCtx, client)
 	return gigahostInventoryAnswer{
-		listed:          listed,
-		accountID:       accountID,
-		client:          client,
-		accountServers:  accountServers,
-		listingCredible: counted && len(listed) == accountServers,
+		listed:         listed,
+		accountID:      accountID,
+		client:         client,
+		accountServers: accountServers,
+		counted:        counted,
 	}, nil
 }
 
@@ -454,46 +389,35 @@ func decideGigahostRows(ctx context.Context, rows []providerBackedServer, answer
 	return outcome
 }
 
-// unlistedProviderIDs returns the provider server ids of the rows this pass saw omitted,
-// which are the only rows that may become an absence candidate. Presence was already
-// decided per row, so a server a detail read returned is not among them.
-func unlistedProviderIDs(rows []providerBackedServer, decisions []gigahostRowDecision) []int64 {
-	ids := make([]int64, 0, len(rows))
-	for i, row := range rows {
-		if decisions[i] == gigahostRowUnlisted {
-			ids = append(ids, row.providerServerID)
-		}
-	}
-	return ids
-}
-
 // applyGigahostInventoryPresence writes the provider's answer onto the rows whose
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
 //
-// Absence has exactly one source: an omission that repeats across two consecutive
-// credible passes (see confirmRepeatedOmissions). A single pass - however consistent its
-// own counts look - can never record it. A detail read is never an absence observation;
-// it can only add presence, which clears a mark immediately.
+// Authority: the owner decided that the configured key sees every running VPS, so one
+// successful, fully paginated listing is authoritative on its own. A known server of the
+// answering account that the listing does not contain is deleted; a server it contains is
+// present and any mark is cleared. A per-server read is never an absence observation - it
+// can only add presence, which clears a mark immediately.
+//
+// The declared limit sits in this rule, not in a hidden assumption: if the configured key
+// does not in fact see every VPS, an unlisted but working server looks deleted, and the
+// panel cannot detect that from the provider. The count diagnostic below is the earliest
+// visible sign of it.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
 	outcome := decideGigahostRows(ctx, rows, answer)
 
-	candidates := unlistedProviderIDs(rows, outcome.decisions)
-	confirmed := h.confirmRepeatedOmissions(answer.accountID, len(answer.listed), answer.accountServers, answer.listingCredible, candidates)
-	if len(candidates) > 0 && len(confirmed) == 0 {
-		// Every candidate keeps the state it had: this pass either was not credible or is
-		// the first of the two that must agree.
-		slog.Info("Provider inventory recorded no absence in this pass",
-			"unlisted_rows", len(candidates),
-			"listing_credible", answer.listingCredible,
-			"listed_servers", len(answer.listed),
-			"account_servers", answer.accountServers)
+	if answer.counted && len(answer.listed) != answer.accountServers {
+		// Diagnostic only, never a gate: the listing is authoritative by the owner's
+		// decision, but a disagreement is the sign that the key may not see the whole
+		// account.
+		slog.Warn("Provider listing and account summary disagree; a scope-limited key would look like a deletion",
+			"listed_servers", len(answer.listed), "account_servers", answer.accountServers)
 	}
 
-	failures := h.writeDecidedRows(ctx, rows, outcome.decisions, confirmed, now)
+	failures := h.writeDecidedRows(ctx, rows, outcome.decisions, answer.accountID, now)
 	if left := outcome.counts[gigahostRowUnknownAccount] + outcome.counts[gigahostRowOtherAccount]; left > 0 {
 		// Observable without naming an account or a credential: why rows were
 		// left alone, and how many.
@@ -506,11 +430,10 @@ func (h *Handlers) applyGigahostInventoryPresence(
 
 // writeDecidedRows stores the decisions that hold an existence answer.
 //
-// The only write that can hide a server is the absence write, and it is gated by the
-// confirmation a repeated omission produced: without it, an omitted row keeps whatever
-// state it had.
+// The account the listing was read from is written with the observation, so a later key
+// change is visible rather than silent.
 func (h *Handlers) writeDecidedRows(
-	ctx context.Context, rows []providerBackedServer, decisions []gigahostRowDecision, confirmed map[int64]struct{}, now time.Time,
+	ctx context.Context, rows []providerBackedServer, decisions []gigahostRowDecision, accountID string, now time.Time,
 ) []error {
 	var failures []error
 	for i, row := range rows {
@@ -518,13 +441,7 @@ func (h *Handlers) writeDecidedRows(
 		if !measured {
 			continue
 		}
-		if !present {
-			if _, ok := confirmed[row.providerServerID]; !ok {
-				// Absence may only come from an omission confirmed by two agreeing passes.
-				continue
-			}
-		}
-		if err := h.writeProviderAbsence(ctx, row, present, now); err != nil {
+		if err := h.writeProviderAbsence(ctx, row, present, accountID, now); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -533,7 +450,7 @@ func (h *Handlers) writeDecidedRows(
 
 // writeProviderAbsence stores one row's observation when it differs from the stored
 // one.
-func (h *Handlers) writeProviderAbsence(ctx context.Context, row providerBackedServer, present bool, now time.Time) error {
+func (h *Handlers) writeProviderAbsence(ctx context.Context, row providerBackedServer, present bool, accountID string, now time.Time) error {
 	if present == (row.absentAt == "") {
 		// The row already states what the provider says; nothing to write.
 		return nil
@@ -542,7 +459,7 @@ func (h *Handlers) writeProviderAbsence(ctx context.Context, row providerBackedS
 	if present {
 		absentAt = time.Time{}
 	}
-	if err := h.db.SetServerProviderAbsence(ctx, row.serverID, absentAt); err != nil {
+	if err := h.db.SetServerProviderAbsence(ctx, row.serverID, absentAt, accountID); err != nil {
 		return fmt.Errorf("server %d: %w", row.serverID, err)
 	}
 	slog.Info("Provider inventory changed a server's existence state",

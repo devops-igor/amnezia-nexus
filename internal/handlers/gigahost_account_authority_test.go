@@ -103,20 +103,25 @@ func TestRegistrationRecordsTheServersOwnAccountNotNullTheConfiguredOne(t *testi
 	}
 }
 
-// A key limited to some servers returns a successful, self-consistent inventory of
-// what it can see. The servers outside its visibility are still running, so the
-// listing must not become durable absence - and because such a listing is not the
-// account's whole answer, the pass records no absence at all while it is narrowed.
-func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testing.T) {
+// DECLARED LIMIT (owner decision, R15): the panel assumes the configured key sees every
+// running VPS. This test states the consequence plainly rather than asserting the earlier
+// "a filtered listing must not certify" rule, which the owner's decision replaced:
+//
+//   - a server the listing omits and no per-server read reports is recorded as deleted,
+//     even if a filtered key simply could not see it;
+//   - a server the per-server read still reports is presence, so it is not marked.
+//
+// The panel cannot tell those two cases apart from the provider, which is exactly the
+// limit: it is visible here and in the handover, not hidden behind an assumption.
+func TestReconcileGigahostInventory_DeclaredLimitFilteredKeyLooksLikeDeletion(t *testing.T) {
 	f := newInventoryFixture(t)
 
 	inScope := f.seedServer("In scope", providerProtocols(501))
-	filtered := f.seedServer("Present but not listed", providerProtocols(502))
-	genuinelyGone := f.seedServer("Actually deleted", providerProtocols(503))
+	reportedByDetail := f.seedServer("Reported by the detail endpoint", providerProtocols(502))
+	notReported := f.seedServer("Not reported anywhere", providerProtocols(503))
 
-	// The filtered listing: one server, self-consistent pagination and totals. The
-	// account summary says the account holds three servers, so this listing is
-	// certified as incomplete and may conclude nothing.
+	// A listing of one server. The account summary disagrees (it says three), which is the
+	// diagnostic sign that the key may not see everything - and it does not gate.
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(3)
 	f.provider.answerPerServer(502, http.StatusOK)
@@ -125,29 +130,16 @@ func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testi
 	}
 
 	if f.row(inScope).ProviderAbsent() {
-		t.Fatal("a server the key can see was marked absent")
+		t.Fatal("a listed server was marked absent")
 	}
-	if f.row(filtered).ProviderAbsent() {
-		t.Fatal("a server outside the listing was marked absent although the detail endpoint reports it")
+	if f.row(reportedByDetail).ProviderAbsent() {
+		t.Fatal("a server the per-server read reports was marked absent")
 	}
-	if f.row(genuinelyGone).ProviderAbsent() {
-		t.Fatal("a listing that does not enumerate the account concluded absence")
+	if !f.row(notReported).ProviderAbsent() {
+		t.Fatal("a server neither listed nor reported was not recorded as deleted: the single-listing rule did not act")
 	}
-	if calls := f.provider.perServerCallCount(); calls != 2 {
-		t.Fatalf("per-server reads = %d, want 2 (one per unlisted server)", calls)
-	}
-
-	// Control in the same run: the summary now says the account holds one server, which
-	// is what the listing enumerated, so the same pass records both omitted servers as
-	// genuinely absent. The detail answers are unchanged between the two passes.
-	f.provider.setAccountServers(1)
-	f.provider.answerPerServer(502, http.StatusNotFound)
-	f.confirm(context.Background())
-	if !f.row(filtered).ProviderAbsent() || !f.row(genuinelyGone).ProviderAbsent() {
-		t.Fatal("the control pass did not record the absent servers, so the refusals above prove nothing")
-	}
-	if f.row(inScope).ProviderAbsent() {
-		t.Fatal("the control pass marked a listed server absent")
+	if got := f.row(notReported).ProviderAbsentAccountID; got != fixtureAccount {
+		t.Fatalf("recorded account = %q, want %q", got, fixtureAccount)
 	}
 }
 
@@ -165,9 +157,9 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 	// The documented numeric shape, with no text form supplied.
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
-	if calls := f.provider.inventoryCallCount(); calls != 2 {
-		t.Fatalf("inventory reads = %d, want 2: one per agreeing pass", calls)
+	f.reconcile(context.Background())
+	if calls := f.provider.inventoryCallCount(); calls != 1 {
+		t.Fatalf("inventory reads = %d, want 1", calls)
 	}
 	if !f.row(gone).ProviderAbsent() {
 		t.Fatal("a genuinely absent server was not recorded absent under a numeric account identifier")
@@ -185,7 +177,7 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 	textGone := text.seedServer("Gone", providerProtocols(502))
 	text.provider.set(inventoryJSON(501))
 	text.provider.setAccountServers(1)
-	text.confirm(context.Background())
+	text.reconcile(context.Background())
 	if text.row(textListed).ProviderAbsent() || !text.row(textGone).ProviderAbsent() {
 		t.Fatal("the text-shape control recorded a different state than the numeric shape")
 	}

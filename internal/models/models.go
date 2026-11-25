@@ -201,6 +201,11 @@ type Server struct {
 	// an observation about the provider's view, never a deletion: the row, its
 	// address, its credentials and its sessions are untouched.
 	ProviderAbsentAt string `json:"-" db:"provider_absent_at"`
+	// ProviderAbsentAccountID records which provider account the listing that produced
+	// this observation was read from. It is written and cleared together with the
+	// observation, so a later key change is visible rather than silent: a mark carrying
+	// a different account than the configured key is a mark made by another credential.
+	ProviderAbsentAccountID string `json:"-" db:"provider_absent_account_id"`
 	// ProviderAccountID is the provider-issued identifier of the account this
 	// row was provisioned under, recorded when the deployment registered it. It is
 	// an opaque account id, never the API key, a secret or a request header, so

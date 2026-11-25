@@ -145,7 +145,7 @@ func TestReconcileGigahostInventory_UnparksDetailOnlyReappearance(t *testing.T) 
 	control := f.seedServer("Listed control", providerProtocols(502))
 
 	// The row was marked absent by an earlier pass.
-	if err := f.db.SetServerProviderAbsence(context.Background(), returned, time.Now().UTC().Add(-time.Hour)); err != nil {
+	if err := f.db.SetServerProviderAbsence(context.Background(), returned, time.Now().UTC().Add(-time.Hour), ""); err != nil {
 		t.Fatalf("failed to seed the mark: %v", err)
 	}
 
@@ -170,7 +170,7 @@ func TestReconcileGigahostInventory_UnparksDetailOnlyReappearance(t *testing.T) 
 
 	// Control in the same run: the same fixture with the detail endpoint answering
 	// "not reported" leaves the mark alone, so the unpark above is about the answer.
-	if err := f.db.SetServerProviderAbsence(context.Background(), returned, time.Now().UTC()); err != nil {
+	if err := f.db.SetServerProviderAbsence(context.Background(), returned, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to re-mark: %v", err)
 	}
 	f.provider.answerPerServer(501, http.StatusNotFound)
@@ -182,58 +182,12 @@ func TestReconcileGigahostInventory_UnparksDetailOnlyReappearance(t *testing.T) 
 	}
 }
 
-// No detail read may conclude absence. While this key's visibility is demonstrably
-// narrower than the account, the pass records no absence at all - including for a row
-// whose detail read says "not reported" - and it records absence again once nothing
-// contradicts the listing.
-func TestReconcileGigahostInventory_DetailReadNeverConcludesAbsence(t *testing.T) {
-	f := newInventoryFixture(t)
-	inScope := f.seedServer("In scope", providerProtocols(501))
-	refused := f.seedServer("Outside this key", providerProtocols(502))
-	gone := f.seedServer("Deleted", providerProtocols(503))
-
-	// A filtered listing of a three-server account, an explicit refusal for the
-	// out-of-scope server, and a "not reported" answer for the deleted one.
-	f.provider.set(inventoryJSON(501))
-	f.provider.setAccountServers(3)
-	f.provider.answerPerServer(502, http.StatusForbidden)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass failed: %v", err)
-	}
-
-	if f.row(inScope).ProviderAbsent() {
-		t.Fatal("a listed server was marked absent")
-	}
-	if f.row(refused).ProviderAbsent() {
-		t.Fatal("a server outside the key's visibility was marked absent")
-	}
-	if f.row(gone).ProviderAbsent() {
-		t.Fatal("a detail 404 recorded absence while the key's visibility was narrower than the account")
-	}
-
-	// Control in the same run: the account summary now reports one server, which is what
-	// the listing enumerated, so the answer is certified complete and both omitted
-	// servers are recorded absent. The detail answers are unchanged between the passes.
-	f.provider.setAccountServers(1)
-	f.provider.answerPerServer(502, http.StatusNotFound)
-	f.confirm(context.Background())
-	if !f.row(refused).ProviderAbsent() {
-		t.Fatal("the control pass did not record an absent server, so the refusal above proves nothing")
-	}
-	if !f.row(gone).ProviderAbsent() {
-		t.Fatal("the control pass did not record the second absent server")
-	}
-	if f.row(inScope).ProviderAbsent() {
-		t.Fatal("the control pass marked a listed server absent")
-	}
-}
-
 // A detail answer the client cannot parse changes nothing: it is not "present", and it
 // is not "absent".
 func TestReconcileGigahostInventory_UnparseableDetailChangesNothing(t *testing.T) {
 	f := newInventoryFixture(t)
 	marked := f.seedServer("Marked", providerProtocols(501))
-	if err := f.db.SetServerProviderAbsence(context.Background(), marked, time.Now().UTC().Add(-time.Hour)); err != nil {
+	if err := f.db.SetServerProviderAbsence(context.Background(), marked, time.Now().UTC().Add(-time.Hour), ""); err != nil {
 		t.Fatalf("failed to seed the mark: %v", err)
 	}
 	recorded := f.row(marked).ProviderAbsentAt

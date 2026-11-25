@@ -40,7 +40,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	f.provider.setAccount(fixtureAccount)
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
+	f.reconcile(context.Background())
 
 	// Same account: a genuinely absent row is marked, the listed row is not.
 	if !f.row(northGone).ProviderAbsent() {
@@ -63,7 +63,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	f.provider.setAccount(otherAccount)
 	f.provider.set(inventoryJSON(601))
 	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
+	f.reconcile(context.Background())
 	if f.row(northListed).ProviderAbsent() {
 		t.Fatal("swapping the provider account marked the first account's operational server absent")
 	}
@@ -115,7 +115,7 @@ func TestReconcileGigahostInventory_UnattributableAccountChangesNothing(t *testi
 			gone := f.seedServer("Recorded absent", providerProtocols(502))
 
 			recorded := time.Now().UTC().Add(-time.Hour)
-			if err := f.db.SetServerProviderAbsence(context.Background(), gone, recorded); err != nil {
+			if err := f.db.SetServerProviderAbsence(context.Background(), gone, recorded, ""); err != nil {
 				t.Fatalf("failed to seed the recorded absence: %v", err)
 			}
 			before := f.row(gone).ProviderAbsentAt
@@ -155,7 +155,7 @@ func TestReconcileGigahostInventory_UnattributableAccountChangesNothing(t *testi
 				t.Fatalf("the control pass rewrote an already-correct absence: %q, want %q", got, before)
 			}
 			missing := f.seedServer("Missing", providerProtocols(599))
-			f.confirm(context.Background())
+			f.reconcile(context.Background())
 			if !f.row(missing).ProviderAbsent() {
 				t.Fatal("the control pass did not record an absent server, so the refusals above prove nothing")
 			}
@@ -180,13 +180,13 @@ func TestReconcileGigahostInventory_UnknownAccountPreservesStateBothWays(t *test
 	// A previous build had marked the listed legacy row absent; nothing in this
 	// round may guess that it belongs to the answering account.
 	recorded := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
-	if err := f.db.SetServerProviderAbsence(context.Background(), listed, mustParseTime(t, recorded)); err != nil {
+	if err := f.db.SetServerProviderAbsence(context.Background(), listed, mustParseTime(t, recorded), ""); err != nil {
 		t.Fatalf("failed to seed the recorded absence: %v", err)
 	}
 
 	f.provider.set(inventoryJSON(702))
 	f.provider.setAccountServers(1)
-	f.confirm(context.Background())
+	f.reconcile(context.Background())
 
 	if f.row(unlisted).ProviderAbsent() {
 		t.Fatal("a row of unknown account was marked absent")

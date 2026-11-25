@@ -5,21 +5,23 @@ package dialguard
 // where it may live, so a new writer cannot appear silently and cannot skip the
 // gate:
 //
-//	the column provider_absent_at   -  touched only by the store and its migration
-//	  <- DB.SetServerProviderAbsence  -  called only by writeProviderAbsence
+//	the columns provider_absent_at / provider_absent_account_id
+//	                                -  touched only by the store and its migration
+//	  <- DB.SetServerProviderAbsence  -  called only by writeProviderAbsence, which
+//	                                     records the account the listing was read from
 //	    <- writeProviderAbsence       -  called only by writeDecidedRows
-//	      <- writeDecidedRows         -  writes absence only behind the
-//	                                     account-wide certification
+//	      <- writeDecidedRows         -  writes from the decision alone: the owner
+//	                                     decided one complete listing is authoritative,
+//	                                     so no count or pass-to-pass condition may gate it
 //	        <- applyGigahostInventoryPresence (the only caller)
 //	          <- ReconcileGigahostServerInventory (the only caller)
 //
-// gigahostInventoryAccountWide is the single place that certifies the inventory
-// answer, and it is called only from gigahostInventoryAnswerFor.
+// The account-wide count is a diagnostic: it is read in one place and may not appear as
+// a condition in the writer.
 
 import (
 	"encoding/json"
 	"go/ast"
-	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,8 +63,11 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		case "internal/models/models.go", "internal/database/migrations.go", "internal/database/servers.go":
 			continue
 		}
-		if strings.Contains(readSource(t, root, rel), "provider_absent_at") {
-			t.Errorf("%s touches the absence column outside the store; the mark has one writer", rel)
+		source := readSource(t, root, rel)
+		for _, column := range []string{"provider_absent_at", "provider_absent_account_id"} {
+			if strings.Contains(source, column) {
+				t.Errorf("%s touches %s outside the store; the mark has one writer", rel, column)
+			}
 		}
 	}
 
@@ -71,37 +76,31 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 	assertOnlyCallers(t, root, "writeDecidedRows", absenceInventoryFile+":applyGigahostInventoryPresence")
 	assertOnlyCallers(t, root, "applyGigahostInventoryPresence", absenceInventoryFile+":ReconcileGigahostServerInventory")
 
-	// 4. The absence direction is gated before it is written, by the confirmation a
-	//    repeated omission produced.
+	// 4. The writer records which account the listing was read from, and applies no
+	//    count or pass-to-pass condition: the owner's decision makes one complete listing
+	//    authoritative.
 	body := functionBody(t, root, absenceInventoryFile, "*Handlers", "writeDecidedRows")
-	gate, write := token.NoPos, token.NoPos
-	ast.Inspect(body, func(node ast.Node) bool {
-		switch n := node.(type) {
-		case *ast.IfStmt:
-			if gate == token.NoPos && (mentions(n.Cond, "confirmed") || (n.Init != nil && mentions(n.Init, "confirmed"))) && branches(n.Body, token.CONTINUE) {
-				gate = n.Pos()
-			}
-		case *ast.CallExpr:
-			if write == token.NoPos && mentions(n.Fun, "writeProviderAbsence") {
-				write = n.Pos()
+	if !mentions(body, "accountID") {
+		t.Fatal("the writer no longer records the account the listing was read from")
+	}
+	for _, forbidden := range []string{"accountServers", "counted", "confirmed", "credible"} {
+		if mentions(body, forbidden) {
+			t.Fatalf("the writer gates on %s; the count is a diagnostic and one listing decides", forbidden)
+		}
+	}
+	assertOnlyCallers(t, root, "writeProviderAbsence", absenceInventoryFile+":writeDecidedRows")
+
+	// 5. The diagnostic count is read in one place and the decision path keeps no
+	//    pass-to-pass state.
+	assertOnlyCallers(t, root, "gigahostAccountServerCount", absenceInventoryFile+":gigahostInventoryAnswerFor")
+	for _, rel := range productionFiles(t, root) {
+		source := readSource(t, root, rel)
+		for _, forbidden := range []string{"confirmRepeatedOmissions", "absenceCandidate", "absenceCandidates", "absenceMu", "listingCredible"} {
+			if strings.Contains(source, forbidden) {
+				t.Errorf("%s still carries %s; one complete listing decides and no pass-to-pass gate may return", rel, forbidden)
 			}
 		}
-		return true
-	})
-	if gate == token.NoPos {
-		t.Fatal("the absence write is no longer gated by the repeated-omission confirmation")
 	}
-	if write == token.NoPos {
-		t.Fatal("the pass no longer writes an observation at all")
-	}
-	if gate > write {
-		t.Fatal("the pass writes the observation before checking the certification")
-	}
-
-	// 5. The pass-to-pass confirmation is computed in exactly one place, from the two
-	//    counts a pass read, and the account-wide count in one place.
-	assertOnlyCallers(t, root, "confirmRepeatedOmissions", absenceInventoryFile+":applyGigahostInventoryPresence")
-	assertOnlyCallers(t, root, "gigahostAccountServerCount", absenceInventoryFile+":gigahostInventoryAnswerFor")
 
 	// 6. The certificate must not depend on a field the provider does not document for
 	//    the credential the panel holds: the account payload's permissions object is

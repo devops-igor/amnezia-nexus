@@ -83,7 +83,7 @@ func TestOrchestrator_CheckServerReachability_SkipsProviderAbsentServer(t *testi
 	}
 
 	// The provider's inventory no longer lists one of them.
-	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC()); err != nil {
+	if err := db.SetServerProviderAbsence(ctx, absentID, time.Now().UTC(), ""); err != nil {
 		t.Fatalf("failed to record the provider absence: %v", err)
 	}
 	atomic.StoreInt32(&accepted, 0)
