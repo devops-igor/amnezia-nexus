@@ -28,6 +28,10 @@ type Client interface {
 	OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error)
 	GetServers(ctx context.Context) ([]ServerInfo, error)
+	// GetServer reads one server. It is the authoritative per-server answer: the
+	// provider refuses a server outside the key's visibility with an authorization
+	// error, so "not found" here proves absence while a refusal proves nothing.
+	GetServer(ctx context.Context, serverID int64) (*ServerInfo, error)
 }
 
 // Config provides configuration settings for creating a Gigahost client.
@@ -114,15 +118,18 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 			Status int `json:"status"`
 		} `json:"meta"`
 		Data struct {
-			CustID      string  `json:"cust_id"`
-			CustName    string  `json:"cust_name"`
-			CustEmail   string  `json:"cust_email"`
-			ID          string  `json:"id"`
-			Email       string  `json:"email"`
-			Balance     float64 `json:"balance"`
-			Credit      float64 `json:"credit"`
-			Currency    string  `json:"currency"`
-			Status      string  `json:"status"`
+			// Identity fields tolerate the documented numeric shape and the text
+			// shape, so a numeric cust_id still takes this rich decode (which maps
+			// eligibility) instead of falling through to the flat fallbacks.
+			CustID      Identity `json:"cust_id"`
+			CustName    string   `json:"cust_name"`
+			CustEmail   string   `json:"cust_email"`
+			ID          Identity `json:"id"`
+			Email       string   `json:"email"`
+			Balance     float64  `json:"balance"`
+			Credit      float64  `json:"credit"`
+			Currency    string   `json:"currency"`
+			Status      string   `json:"status"`
 			Eligibility struct {
 				QualifiesArrears bool    `json:"qualifies_arrears"`
 				CreditNOK        float64 `json:"credit_nok"`
@@ -130,10 +137,12 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 		} `json:"data"`
 	}
 	var doc docAccount
-	if err := json.Unmarshal(rawData, &doc); err == nil && (doc.Data.CustID != "" || doc.Data.ID != "" || doc.Data.CustName != "" || doc.Data.Eligibility.QualifiesArrears) {
+	decodeErr := json.Unmarshal(rawData, &doc)
+	custID, accountID := doc.Data.CustID.String(), doc.Data.ID.String()
+	if decodeErr == nil && (custID != "" || accountID != "" || doc.Data.CustName != "" || doc.Data.Eligibility.QualifiesArrears) {
 		acc := &AccountInfo{
-			ID:               doc.Data.ID,
-			CustID:           doc.Data.CustID,
+			ID:               accountID,
+			CustID:           custID,
 			CustName:         doc.Data.CustName,
 			Email:            doc.Data.CustEmail,
 			Balance:          doc.Data.Balance,
@@ -144,7 +153,7 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 			Status:           doc.Data.Status,
 		}
 		if acc.ID == "" {
-			acc.ID = doc.Data.CustID
+			acc.ID = custID
 		}
 		if acc.Email == "" {
 			acc.Email = doc.Data.Email
@@ -158,18 +167,63 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	}
 	if wrapErr := json.Unmarshal(rawData, &wrapped); wrapErr == nil {
 		if wrapped.Account != nil {
-			return wrapped.Account, nil
+			return wrapped.Account.withIdentityFallback(), nil
 		}
 		if wrapped.Data != nil {
-			return wrapped.Data, nil
+			return wrapped.Data.withIdentityFallback(), nil
 		}
+	}
+
+	// The account was not in a shape this client could decode. If the body carries
+	// an identifier it cannot read, say so: "the identifier is unreadable" and "the
+	// account has no identifier" must not look the same to a caller, because one is
+	// a protocol problem and the other disables the identity-dependent paths.
+	if err := rejectUnreadableIdentity(rawData); err != nil {
+		return nil, err
 	}
 
 	var acc AccountInfo
 	if err := json.Unmarshal(rawData, &acc); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal account response: %w", err)
 	}
-	return &acc, nil
+	return acc.withIdentityFallback(), nil
+}
+
+// withIdentityFallback gives a decoded account whose only identifier is cust_id the
+// same value in ID, so a caller reading either field sees the account. It returns
+// the receiver so decode paths can return it directly.
+func (a *AccountInfo) withIdentityFallback() *AccountInfo {
+	if a == nil {
+		return nil
+	}
+	if strings.TrimSpace(a.ID) == "" {
+		a.ID = a.CustID
+	}
+	return a
+}
+
+// rejectUnreadableIdentity reports a body that names an account identifier this
+// client cannot read.
+func rejectUnreadableIdentity(rawData []byte) error {
+	var probe struct {
+		Data struct {
+			CustID json.RawMessage `json:"cust_id"`
+			ID     json.RawMessage `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rawData, &probe); err != nil {
+		return nil
+	}
+	for _, raw := range [][]byte{probe.Data.CustID, probe.Data.ID} {
+		if len(raw) == 0 {
+			continue
+		}
+		if _, ok := parseIdentity(raw); !ok {
+			return fmt.Errorf("gigahost /account returned an account identifier this client cannot read: %s",
+				strings.TrimSpace(string(raw)))
+		}
+	}
+	return nil
 }
 
 // orderBody is the documented POST /deploy/servers request body. Field order is
@@ -427,6 +481,43 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 }
 
 // GetServers queries active servers via GET /servers with pagination aggregation.
+// GetServer reads one server by its provider server id.
+//
+// The documented endpoint is GET /servers/{id} and answers with the same server
+// object the list carries, including the account it belongs to. A 404 comes back
+// as ErrNotFound (the resource is gone); an authorization refusal comes back as
+// ErrUnauthorized or an APIError with 403, which says the key cannot see the
+// server — that is not evidence it is gone, and callers must treat the two
+// outcomes differently.
+func (c *client) GetServer(ctx context.Context, serverID int64) (*ServerInfo, error) {
+	if serverID <= 0 {
+		return nil, fmt.Errorf("invalid server id %d", serverID)
+	}
+	var rawData []byte
+	if err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/servers/%d", serverID), nil, &rawData); err != nil {
+		return nil, fmt.Errorf("failed to read server %d: %w", serverID, err)
+	}
+
+	var wrapped struct {
+		Data *ServerInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rawData, &wrapped); err == nil && wrapped.Data != nil {
+		if wrapped.Data.ID <= 0 {
+			return nil, fmt.Errorf("server %d answer carries no usable server id", serverID)
+		}
+		return wrapped.Data, nil
+	}
+
+	var server ServerInfo
+	if err := json.Unmarshal(rawData, &server); err != nil {
+		return nil, fmt.Errorf("failed to parse server %d: %w", serverID, err)
+	}
+	if server.ID <= 0 {
+		return nil, fmt.Errorf("server %d answer carries no usable server id", serverID)
+	}
+	return &server, nil
+}
+
 func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	var rawData []byte
 	if err := c.doRequest(ctx, http.MethodGet, "/servers?page=1", nil, &rawData); err != nil {

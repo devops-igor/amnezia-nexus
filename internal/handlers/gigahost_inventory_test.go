@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,9 +48,21 @@ type inventoryProvider struct {
 	// accountStall makes it never answer.
 	accountStatus int
 	accountStall  bool
+	// accountNumeric serves cust_id as a JSON number, which is the shape the
+	// provider documents for GET /account.
+	accountNumeric bool
+	// accountBody, when set, is served verbatim for GET /account so a test can
+	// hand the client a shape it must refuse.
+	accountBody string
 	// inventoryCalls counts /servers reads only, so "one inventory read per
 	// pass" stays measurable now that each pass also resolves the account.
 	inventoryCalls int
+	// perServerCalls counts GET /servers/{id} reads, and perServer holds the
+	// answers a test has registered: a status code per server id. An id with no
+	// registered answer answers like a server that does not exist (404), which is
+	// what the provider says about a server that is gone.
+	perServerCalls int
+	perServer      map[int64]int
 }
 
 // set serves the given /servers body and clears any previous failure mode.
@@ -83,8 +96,49 @@ func (p *inventoryProvider) setAccount(account string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.account = account
+	p.accountBody = ""
+	p.accountNumeric = false
 	p.accountStatus = 0
 	p.accountStall = false
+}
+
+// setNumericAccount reports cust_id as a JSON number and its text form as the
+// account identity, which is the provider's documented GET /account shape.
+func (p *inventoryProvider) setNumericAccount(custID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.account = strconv.FormatInt(custID, 10)
+	p.accountBody = ""
+	p.accountNumeric = true
+	p.accountStatus = 0
+	p.accountStall = false
+}
+
+// setAccountBody serves the given body verbatim for GET /account.
+func (p *inventoryProvider) setAccountBody(body string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountBody = body
+	p.accountStatus = 0
+	p.accountStall = false
+}
+
+// answerPerServer registers how GET /servers/{id} answers for one id. A status of
+// 200 answers with the server object (no registered status means 404, a server the
+// provider does not have); 403 is what a key limited to other servers receives.
+func (p *inventoryProvider) answerPerServer(id int64, status int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.perServer == nil {
+		p.perServer = make(map[int64]int)
+	}
+	p.perServer[id] = status
+}
+
+func (p *inventoryProvider) perServerCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.perServerCalls
 }
 
 // failAccount answers /account with the given HTTP error.
@@ -100,6 +154,8 @@ func (p *inventoryProvider) hideAccountIdentity() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.account = ""
+	p.accountBody = ""
+	p.accountNumeric = false
 	p.accountStatus = 0
 	p.accountStall = false
 }
@@ -121,8 +177,14 @@ func (p *inventoryProvider) inventoryCallCount() int {
 func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	account, accountStatus, accountStall := p.account, p.accountStatus, p.accountStall
+	accountNumeric, accountBody := p.accountNumeric, p.accountBody
 	if r.URL.Path == "/servers" {
 		p.inventoryCalls++
+	}
+	perServerStatus := 0
+	if id, ok := perServerPathID(r.URL.Path); ok {
+		p.perServerCalls++
+		perServerStatus = p.perServer[id]
 	}
 	body, status, stall := p.body, p.status, p.stall
 	p.mu.Unlock()
@@ -137,7 +199,23 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(accountJSON(account)))
+		if accountBody != "" {
+			_, _ = w.Write([]byte(accountBody))
+			return
+		}
+		_, _ = w.Write([]byte(accountJSON(account, accountNumeric)))
+		return
+	}
+	if id, ok := perServerPathID(r.URL.Path); ok {
+		switch perServerStatus {
+		case http.StatusOK:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(perServerJSON(id, account)))
+		case 0:
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(perServerStatus)
+		}
 		return
 	}
 	if r.URL.Path != "/servers" {
@@ -156,16 +234,52 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(body))
 }
 
+// perServerPathID reads the provider server id out of a GET /servers/{id} path.
+func perServerPathID(path string) (int64, bool) {
+	rest, ok := strings.CutPrefix(path, "/servers/")
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(rest, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+// perServerJSON renders GET /servers/{id}: the documented server object, carrying
+// the account it belongs to.
+func perServerJSON(id int64, account string) string {
+	entry := map[string]any{"srv_id": id, "status": "active"}
+	if account != "" {
+		entry["cust_id"] = account
+	}
+	encoded, err := json.Marshal(map[string]any{"meta": map[string]any{"status": 200}, "data": entry})
+	if err != nil {
+		return `{"data":{"srv_id":0}}`
+	}
+	return string(encoded)
+}
+
 // accountJSON renders the provider's /account answer. An empty id names no
-// account, which the client reports as an account without an identity.
-func accountJSON(account string) string {
+// account, which the client reports as an account without an identity. With
+// numeric set, cust_id is a JSON number, the shape the provider documents.
+func accountJSON(account string, numeric bool) string {
 	payload := map[string]any{"meta": map[string]any{"status": 200}, "data": map[string]any{}}
 	data := payload["data"].(map[string]any)
 	data["balance"] = 100.0
 	data["currency"] = "NOK"
 	if account != "" {
 		data["id"] = account
-		data["cust_id"] = account
+		if numeric {
+			id, err := strconv.ParseInt(account, 10, 64)
+			if err != nil {
+				panic("numeric account fixture needs a numeric id: " + account)
+			}
+			data["cust_id"] = id
+		} else {
+			data["cust_id"] = account
+		}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

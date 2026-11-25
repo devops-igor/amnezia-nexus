@@ -42,11 +42,13 @@ var ErrSSHKeyUnverified = errors.New("ssh key registration outcome unverified")
 // compared, because the documentation does not promise that the comment round
 // trips unchanged.
 type SSHKeyInfo struct {
-	KeyID    string `json:"key_id"`
-	CustID   string `json:"cust_id"`
-	KeyName  string `json:"key_name"`
-	KeyAdded string `json:"key_added"`
-	KeyData  string `json:"key_data"`
+	KeyID string `json:"key_id"`
+	// CustID is the account the key belongs to, in whichever shape the provider
+	// sends it. A numeric value must not fail the whole listing.
+	CustID   Identity `json:"cust_id"`
+	KeyName  string   `json:"key_name"`
+	KeyAdded string   `json:"key_added"`
+	KeyData  string   `json:"key_data"`
 }
 
 // ID parses the documented string key_id into the numeric id an order needs.

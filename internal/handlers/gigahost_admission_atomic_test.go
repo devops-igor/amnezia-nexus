@@ -91,6 +91,10 @@ func (b *barrierClient) OrderServerSafe(ctx context.Context, r gigahost.OrderReq
 func (b *barrierClient) GetDeployStatus(ctx context.Context, id string) (*gigahost.DeployStatusResponse, error) {
 	return b.inner.GetDeployStatus(ctx, id)
 }
+func (b *barrierClient) GetServer(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	return b.inner.GetServer(ctx, serverID)
+}
+
 func (b *barrierClient) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {
 	return b.inner.GetServers(ctx)
 }
@@ -504,6 +508,9 @@ func (p *purchaseBarrier) GetDeployStatus(ctx context.Context, id string) (*giga
 }
 func (p *purchaseBarrier) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {
 	return p.Client.GetServers(ctx)
+}
+func (p *purchaseBarrier) GetServer(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	return p.Client.GetServer(ctx, serverID)
 }
 
 // TestBoundHoldsWhenAllEntriesInFlight proves the cap is a real bound. The prior

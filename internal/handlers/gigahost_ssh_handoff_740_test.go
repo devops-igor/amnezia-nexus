@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,6 +127,12 @@ func (p *sshHandoffProvider) GetDeployStatus(_ context.Context, orderID string) 
 	// left permanently "in flight" and blocking the next attempt through the
 	// duplicate guard. The deploy path is not what these tests exercise.
 	return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusReady, AssignedIP: "198.51.100.7"}, nil
+}
+
+// GetServer answers for one server. This fixture defines no per-server answer,
+// so an unexpected call refuses rather than inventing ownership.
+func (p *sshHandoffProvider) GetServer(_ context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	return nil, fmt.Errorf("fixture defines no per-server answer for server %d", serverID)
 }
 
 func (p *sshHandoffProvider) GetServers(context.Context) ([]gigahost.ServerInfo, error) {

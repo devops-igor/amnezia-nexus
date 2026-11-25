@@ -10,9 +10,23 @@ package handlers
 //
 // The fail-safe direction is the whole point. An inventory read that failed,
 // timed out or enumerated the account incompletely is not evidence of absence,
-// and such a read changes nothing at all. Only a read that succeeded and
-// enumerated the account may set or clear the state, and a server the provider
-// lists again has the state cleared rather than staying marked absent.
+// and such a read changes nothing at all.
+//
+// A listing is also not the same thing as an account. A Gigahost API key can be
+// limited to a list of server ids (`servers: {mode: "r", all: false, ids: [...]}`),
+// and such a key's list endpoint is filtered: it answers 200 with a complete,
+// self-consistent inventory of everything that key may see. The provider exposes
+// no scope flag to a key-authenticated caller (key management is admin-only and
+// GET /account carries no permissions), so the panel cannot tell a filtered read
+// from an unfiltered one. It therefore never derives absence from a listing:
+//
+//   - a listed server is positive evidence and may clear a mark;
+//   - an unlisted server is decided by a per-server read, where the provider does
+//     distinguish "not there" (404, absence) from "not yours to see"
+//     (401/403/400/405, inconclusive, state preserved).
+//
+// A server the provider lists again has the state cleared rather than staying
+// marked absent.
 //
 // A successful read is evidence about one account only: the account that
 // answered it. Each server row records the provider account it was provisioned
@@ -62,11 +76,48 @@ type providerBackedServer struct {
 }
 
 // gigahostInventoryAnswer is one successful inventory read: the provider server
-// ids the account holds, and the account that answered. The account is part of
-// the answer because it decides which rows the answer may judge.
+// ids the account holds, the account that answered, and the client that answered
+// so a server outside the listing can be asked about individually.
 type gigahostInventoryAnswer struct {
 	listed    map[int64]struct{}
 	accountID string
+	client    gigahost.Client
+}
+
+// gigahostServerVerdict is what one per-server read concluded about a server the
+// inventory did not list.
+type gigahostServerVerdict int
+
+const (
+	// gigahostServerUnmeasured means the provider did not answer for this server:
+	// a refusal, a timeout, or an unusable answer. A refusal is what a key sees
+	// for a server outside its visibility, so this says nothing about existence.
+	gigahostServerUnmeasured gigahostServerVerdict = iota
+	// gigahostServerAbsent means the provider answered that the server does not
+	// exist for it. This is the only authoritative absence.
+	gigahostServerAbsent
+	// gigahostServerPresent means the provider answered about the server, so it
+	// exists: the listing simply did not enumerate it for this key.
+	gigahostServerPresent
+)
+
+// gigahostServerState asks the provider about one server.
+//
+// Only a 404 is absence. Every other failure - an authorization refusal for a
+// server outside the key's visibility, a timeout, a malformed answer - is
+// unmeasured, because those outcomes are exactly what a restricted key produces
+// for a server that is running perfectly well.
+func gigahostServerState(ctx context.Context, client gigahost.Client, serverID int64) gigahostServerVerdict {
+	if client == nil || serverID <= 0 {
+		return gigahostServerUnmeasured
+	}
+	if _, err := client.GetServer(ctx, serverID); err != nil {
+		if errors.Is(err, gigahost.ErrNotFound) {
+			return gigahostServerAbsent
+		}
+		return gigahostServerUnmeasured
+	}
+	return gigahostServerPresent
 }
 
 // ReconcileGigahostServerInventory records, for every Gigahost-provisioned
@@ -218,8 +269,12 @@ func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInve
 	}
 	accountID := gigahostAccountIdentity(account)
 	if accountID == "" {
+		// Not the same thing as an account without servers: the provider answered
+		// but the identifier could not be read, so the pass is skipped and the
+		// reason is returned for the background log rather than failing silently.
 		return gigahostInventoryAnswer{}, errors.New(
-			"gigahost account identity not reported; server rows unchanged: an inventory read that cannot be attributed to an account proves nothing")
+			"gigahost GET /account answered without a usable account identifier (expected cust_id as a number or text); " +
+				"server rows unchanged: an inventory read that cannot be attributed to an account proves nothing")
 	}
 
 	inventory, err := client.GetServers(callCtx)
@@ -231,7 +286,7 @@ func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInve
 	if err != nil {
 		return gigahostInventoryAnswer{}, err
 	}
-	return gigahostInventoryAnswer{listed: listed, accountID: accountID}, nil
+	return gigahostInventoryAnswer{listed: listed, accountID: accountID, client: client}, nil
 }
 
 // gigahostIdentifiedServerIDs returns the provider server ids of an inventory
@@ -257,12 +312,17 @@ func gigahostIdentifiedServerIDs(inventory []gigahost.ServerInfo) (map[int64]str
 // applyGigahostInventoryPresence writes the provider's answer onto the rows whose
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
+//
+// A listed row is positive evidence and the only way the state is cleared. An
+// unlisted row is never treated as absence on the strength of the listing: the
+// provider is asked about that server, because a key that cannot see a server gets
+// a refusal rather than a 404 and a refusal proves nothing.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
 	var failures []error
-	var unknownAccount, otherAccount int
+	var unknownAccount, otherAccount, unmeasured, scopeEvidence int
 	for _, row := range rows {
 		if row.accountID == "" {
 			// The association is unknown, so this row's absence is unprovable.
@@ -276,7 +336,27 @@ func (h *Handlers) applyGigahostInventoryPresence(
 			otherAccount++
 			continue
 		}
-		_, present := answer.listed[row.providerServerID]
+
+		present := false
+		if _, listed := answer.listed[row.providerServerID]; listed {
+			present = true
+		} else {
+			// The listing did not enumerate this server. Ask the provider about the
+			// server itself: only an authoritative 404 is absence.
+			switch gigahostServerState(ctx, answer.client, row.providerServerID) {
+			case gigahostServerAbsent:
+				present = false
+			case gigahostServerPresent:
+				present = true
+				scopeEvidence++
+			default:
+				// Unmeasured: a refusal, a timeout or an unusable answer. The row
+				// keeps exactly the state it had.
+				unmeasured++
+				continue
+			}
+		}
+
 		if present == (row.absentAt == "") {
 			// The row already states what the provider says; nothing to write.
 			continue
@@ -294,12 +374,19 @@ func (h *Handlers) applyGigahostInventoryPresence(
 			"provider_server_id", row.providerServerID,
 			"provider_absent", !present)
 	}
-	if unknownAccount > 0 || otherAccount > 0 {
+	if unknownAccount > 0 || otherAccount > 0 || unmeasured > 0 {
 		// Observable without naming an account or a credential: why rows were
 		// left alone, and how many.
 		slog.Info("Provider inventory left server existence state unchanged for rows it cannot speak for",
 			"unknown_account_rows", unknownAccount,
-			"other_account_rows", otherAccount)
+			"other_account_rows", otherAccount,
+			"unmeasured_rows", unmeasured)
+	}
+	if scopeEvidence > 0 {
+		// The key's visibility is narrower than the account: these servers exist but
+		// the listing did not enumerate them, so the listing is not evidence.
+		slog.Info("Provider inventory did not enumerate servers that still exist; no absence was recorded for them",
+			"rows", scopeEvidence)
 	}
 	return errors.Join(failures...)
 }

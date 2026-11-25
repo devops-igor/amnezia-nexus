@@ -344,7 +344,7 @@ func (h *Handlers) registerDeployServer(
 	}
 	if newServer.ProviderAccountID == "" {
 		slog.Warn("Provider account unknown at registration; this server's existence will not be judged by the provider inventory",
-			"provider", gigahostInventoryProvider, "server_id", nexusServerID)
+			"provider", gigahostInventoryProvider, "server_id", nexusServerID, "provider_server_id", providerServerID)
 	}
 
 	if err := validateFingerprintFormat(fingerprint); err != nil {
@@ -667,9 +667,11 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 
 	// 3. Server Registration & Deduplication
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
-	// 3. Server Registration & Deduplication. The account identity is resolved
-	// here, where the deployment's own client is in hand, and recorded with the row.
-	accountID := h.gigahostAccountFor(ctx, client)
+	// 3. Server Registration & Deduplication. The association recorded with the row
+	// is the account the provider says owns this server, read from the server
+	// itself. A key that cannot see it leaves the association unknown rather than
+	// labeling the row with whichever account is configured.
+	accountID := h.gigahostServerAccount(ctx, client, providerServerID)
 	server, err := h.registerDeployServer(ctx, req, order, nexusServerID, providerServerID, assignedIP, fingerprint, accountID)
 	if err != nil {
 		return h.failDeployStatus(ctx, req.OrderID, "server_registration", err, providerServerID, nexusServerID, assignedIP, "", "")

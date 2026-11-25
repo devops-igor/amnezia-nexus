@@ -372,6 +372,38 @@ type AccountInfo struct {
 	Status           string  `json:"status,omitempty"`
 }
 
+// UnmarshalJSON accepts the account identifier in either documented shape: the
+// provider sends cust_id as a number on GET /account and as text in other
+// payloads, and both name the same account.
+func (a *AccountInfo) UnmarshalJSON(data []byte) error {
+	shadow := struct {
+		ID               Identity `json:"id"`
+		CustID           Identity `json:"cust_id"`
+		CustName         string   `json:"cust_name"`
+		Email            string   `json:"email"`
+		Balance          float64  `json:"balance"`
+		Credit           float64  `json:"credit"`
+		CreditNOK        float64  `json:"credit_nok"`
+		QualifiesArrears bool     `json:"qualifies_arrears"`
+		Currency         string   `json:"currency"`
+		Status           string   `json:"status"`
+	}{}
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return err
+	}
+	a.ID = string(shadow.ID)
+	a.CustID = string(shadow.CustID)
+	a.CustName = shadow.CustName
+	a.Email = shadow.Email
+	a.Balance = shadow.Balance
+	a.Credit = shadow.Credit
+	a.CreditNOK = shadow.CreditNOK
+	a.QualifiesArrears = shadow.QualifiesArrears
+	a.Currency = shadow.Currency
+	a.Status = shadow.Status
+	return nil
+}
+
 // HasCredit checks if the account has positive balance, credit, or arrears qualification.
 func (a *AccountInfo) HasCredit() bool {
 	if a == nil {
@@ -728,18 +760,22 @@ func (m PaginationMeta) Validate(page, expectedPages int, hasExpectedTotal bool,
 
 // ServerInfo represents an existing server instance.
 type ServerInfo struct {
-	ID         int64  `json:"id"`
-	OrderID    string `json:"order_id,omitempty"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	IPv4       string `json:"ipv4,omitempty"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	RegionID   int    `json:"region_id,omitempty"`
-	PID        int    `json:"pid,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	SrvType    string `json:"srv_type,omitempty"`
-	SrvVPSType string `json:"srv_vps_type,omitempty"`
-	BwIsHourly *bool  `json:"bw_is_hourly,omitempty"`
+	ID int64 `json:"id"`
+	// CustID is the account the provider says this server belongs to. It is the
+	// authoritative ownership answer for a single server, in the same identifier
+	// shape the account read uses.
+	CustID     Identity `json:"cust_id,omitempty"`
+	OrderID    string   `json:"order_id,omitempty"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"`
+	IPv4       string   `json:"ipv4,omitempty"`
+	IPAddress  string   `json:"ip_address,omitempty"`
+	RegionID   int      `json:"region_id,omitempty"`
+	PID        int      `json:"pid,omitempty"`
+	CreatedAt  string   `json:"created_at,omitempty"`
+	SrvType    string   `json:"srv_type,omitempty"`
+	SrvVPSType string   `json:"srv_vps_type,omitempty"`
+	BwIsHourly *bool    `json:"bw_is_hourly,omitempty"`
 }
 
 // IsHourlyVPS checks if a server is relevant to hourly VPS budget calculations.
@@ -773,6 +809,7 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 	type rawServer struct {
 		ID         any      `json:"id"`
 		SrvID      any      `json:"srv_id"`
+		CustID     Identity `json:"cust_id"`
 		OrderID    any      `json:"order_id"`
 		Name       string   `json:"name"`
 		SrvName    string   `json:"srv_name"`
@@ -795,6 +832,7 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
+	s.CustID = raw.CustID
 	s.SrvType = raw.SrvType
 	s.SrvVPSType = raw.SrvVPSType
 	if raw.BwIsHourly != nil {

@@ -242,6 +242,12 @@ func (c *providerRecoveryClient) GetDeployStatus(context.Context, string) (*giga
 }
 
 // GetServers answers according to the configured mode, recording the outcome.
+// GetServer answers for one server. This fixture defines no per-server answer,
+// so an unexpected call refuses rather than inventing ownership.
+func (c *providerRecoveryClient) GetServer(_ context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	return nil, fmt.Errorf("fixture defines no per-server answer for server %d", serverID)
+}
+
 func (c *providerRecoveryClient) GetServers(context.Context) ([]gigahost.ServerInfo, error) {
 	if c.mode == providerModeDown {
 		recordProviderCall(c.journal, providerCallServers, providerOutcomeError)

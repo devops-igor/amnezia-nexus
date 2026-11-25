@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -107,6 +108,12 @@ func (p *catalogCountingProvider) OrderServerSafe(_ context.Context, req gigahos
 
 func (p *catalogCountingProvider) GetDeployStatus(_ context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
 	return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusPending}, nil
+}
+
+// GetServer answers for one server. This fixture defines no per-server answer,
+// so an unexpected call refuses rather than inventing ownership.
+func (p *catalogCountingProvider) GetServer(_ context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	return nil, fmt.Errorf("fixture defines no per-server answer for server %d", serverID)
 }
 
 func (p *catalogCountingProvider) GetServers(context.Context) ([]gigahost.ServerInfo, error) {
