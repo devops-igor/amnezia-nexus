@@ -37,9 +37,13 @@ type MockSSHServer struct {
 	activeConns  map[net.Conn]struct{}
 	closed       bool
 	hangCommands bool
-	channels     atomic.Int64
-	commands     atomic.Int64
-	keepalives   atomic.Int64
+	// ignoreKeepalives makes the peer accept a keepalive request and never
+	// answer it, which models an established session that stopped serving
+	// requests while its socket stays open.
+	ignoreKeepalives bool
+	channels         atomic.Int64
+	commands         atomic.Int64
+	keepalives       atomic.Int64
 	// connects counts accepted TCP connections, so a test can tell a reused
 	// transport from a replacement handshake.
 	connects atomic.Int64
@@ -98,6 +102,12 @@ func (s *MockSSHServer) SetHangCommands(hang bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hangCommands = hang
+}
+
+func (s *MockSSHServer) SetIgnoreKeepalives(ignore bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ignoreKeepalives = ignore
 }
 
 func (s *MockSSHServer) Addr() string {
@@ -255,6 +265,12 @@ func (s *MockSSHServer) handleConn(netConn net.Conn, config *gossh.ServerConfig)
 		for req := range reqs {
 			if req.Type == "keepalive@openssh.com" {
 				s.keepalives.Add(1)
+				s.mu.RLock()
+				ignore := s.ignoreKeepalives
+				s.mu.RUnlock()
+				if ignore {
+					continue // Received, deliberately not answered.
+				}
 				_ = req.Reply(true, nil)
 			} else {
 				_ = req.Reply(false, nil)

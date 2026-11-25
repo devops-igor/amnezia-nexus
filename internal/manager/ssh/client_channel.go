@@ -43,9 +43,23 @@ func (c *presenceChannel) SendRequest(name string, reply bool, data []byte) (boo
 	return c.Channel.SendRequest(name, reply, data)
 }
 
-func (c *presenceConn) SendRequest(name string, reply bool, data []byte) (bool, []byte, error) {
+// SendGatedRequest evaluates the observation gate and then sends one request.
+//
+// The admitted callback runs after the gate has admitted the exchange and before
+// the request is written, so a caller that must tell "the gate never answered"
+// from "the request was written and the peer stayed silent" can observe the
+// phase instead of guessing from elapsed time. This is the single admission seam
+// for new global requests; SendRequest delegates to it so nothing can bypass it.
+func (c *presenceConn) SendGatedRequest(name string, reply bool, data []byte, admitted func()) (bool, []byte, error) {
 	if err := checkProviderPresence(context.Background(), c.cfg); err != nil {
 		return false, nil, err
 	}
+	if admitted != nil {
+		admitted()
+	}
 	return c.Conn.SendRequest(name, reply, data)
+}
+
+func (c *presenceConn) SendRequest(name string, reply bool, data []byte) (bool, []byte, error) {
+	return c.SendGatedRequest(name, reply, data, nil)
 }

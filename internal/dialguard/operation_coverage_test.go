@@ -9,11 +9,21 @@ import (
 func TestOperationAndQualificationCoverage(t *testing.T) {
 	root := repoRoot(t)
 	channelFile := "internal/manager/ssh/client_channel.go"
-	for _, name := range []string{"OpenChannel", "SendRequest"} {
+	// New global requests have exactly one admission seam: SendGatedRequest
+	// admits presence before it writes anything, and SendRequest may only delegate
+	// to it, so neither a caller nor a retained method value can skip the gate.
+	for _, name := range []string{"OpenChannel", "SendGatedRequest"} {
 		body := functionBody(t, root, channelFile, "*presenceConn", name)
 		if len(body.List) == 0 || !isPresenceAdmission(body.List[0]) {
 			t.Errorf("%s must admit presence before issuing a new exchange", name)
 		}
+	}
+	sendBody := functionBody(t, root, channelFile, "*presenceConn", "SendRequest")
+	if !mentions(sendBody, "SendGatedRequest") {
+		t.Error("SendRequest no longer delegates to the guarded admission seam")
+	}
+	if len(ifStatements(sendBody)) > 0 {
+		t.Error("SendRequest re-implements the gate instead of delegating to SendGatedRequest")
 	}
 	channelBody := functionBody(t, root, channelFile, "*presenceChannel", "SendRequest")
 	for _, stmt := range ifStatements(channelBody) {
@@ -41,10 +51,27 @@ func TestOperationAndQualificationCoverage(t *testing.T) {
 		t.Error("opened sessions must retain request admission")
 	}
 	body := functionBody(t, root, sshClientFile, "*Client", "connect")
+	wrappers := map[string]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		if assignment, ok := node.(*ast.AssignStmt); ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 {
+			if name, ok := assignment.Lhs[0].(*ast.Ident); ok && mentions(assignment.Rhs[0], "presenceConn") {
+				wrappers[name.Name] = true
+			}
+		}
+		return true
+	})
 	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if ok && mentions(call.Fun, "NewClient") {
-			if len(call.Args) == 0 || !mentions(call.Args[0], "presenceConn") {
+			if len(call.Args) == 0 {
+				t.Error("raw SSH client must carry presenceConn, including retained method values")
+				return true
+			}
+			guarded := mentions(call.Args[0], "presenceConn")
+			if ident, ok := call.Args[0].(*ast.Ident); ok && wrappers[ident.Name] {
+				guarded = true
+			}
+			if !guarded {
 				t.Error("raw SSH client must carry presenceConn, including retained method values")
 			}
 		}
@@ -97,6 +124,9 @@ func checkNewExchangeRoutes(t *testing.T, rel string, fn *ast.FuncDecl) {
 	allowed := map[string]bool{
 		"internal/manager/ssh/client_channel.go:OpenChannel:OpenChannel":                              true,
 		"internal/manager/ssh/client_channel.go:SendRequest:SendRequest":                              true,
+		"internal/manager/ssh/client_channel.go:SendGatedRequest:SendRequest":                         true,
+		"internal/manager/ssh/client_channel.go:SendRequest:SendGatedRequest":                         true,
+		"internal/manager/ssh/client.go:alive:SendGatedRequest":                                       true,
 		"internal/manager/ssh/client.go:alive:SendRequest":                                            true,
 		"internal/manager/ssh/exec.go:RunSession:NewSession":                                          true,
 		"internal/vpn/tunnel/health_qualify.go:QualifyProxyTraffic:qualifyProxyTraffic":               true,
@@ -108,7 +138,7 @@ func checkNewExchangeRoutes(t *testing.T, rel string, fn *ast.FuncDecl) {
 		"internal/vpn/tunnel/health_canary_proxy.go:probeVLESSViaEgress:ProbeVLESSTrafficViaDialer":   true,
 		"internal/manager/xray/xray.go:NewXrayManager:ProbeVLESSTraffic":                              true,
 	}
-	watched := map[string]bool{"OpenChannel": true, "SendRequest": true, "NewSession": true, "ProbeVLESSTraffic": true, "ProbeVLESSTrafficWithTarget": true, "ProbeVLESSTrafficViaDialer": true, "ProbeVLESSTrafficViaDialerTo": true, "ProbeNaiveProxyTunnel": true, "EnsureReady": true, "qualifyProxyTraffic": true, "qualifyVLESS": true}
+	watched := map[string]bool{"OpenChannel": true, "SendRequest": true, "SendGatedRequest": true, "NewSession": true, "ProbeVLESSTraffic": true, "ProbeVLESSTrafficWithTarget": true, "ProbeVLESSTrafficViaDialer": true, "ProbeVLESSTrafficViaDialerTo": true, "ProbeNaiveProxyTunnel": true, "EnsureReady": true, "qualifyProxyTraffic": true, "qualifyVLESS": true}
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		if ident, ok := node.(*ast.Ident); ok && (ident.Name == "qualifyVLESS" || ident.Name == "qualifyProxyTraffic") {
 			if !allowed[rel+":"+fn.Name.Name+":"+ident.Name] {

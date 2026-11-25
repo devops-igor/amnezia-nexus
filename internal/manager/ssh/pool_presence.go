@@ -21,11 +21,19 @@ type ProviderPresenceStore interface {
 var errPresenceUnavailable = errors.New("provider presence could not be read")
 
 // errLivenessUnknown marks a validation that ran out of budget before the
-// exchange completed. The presence gate and the peer's reply share that budget,
-// so an expired one proves nothing about the connection: it is unknown, which
-// leaves the entry alone and decides later. Only a completed answer — a reply, a
-// refusal, or a transport error — decides.
+// exchange was admitted. The presence gate and the peer's reply share that
+// budget, so an expired budget on its own proves nothing about the connection:
+// the observation read may still be pending. Unknown leaves the entry alone and
+// decides later.
 var errLivenessUnknown = errors.New("SSH liveness not measured")
+
+// errLivenessUnresponsive marks a validation whose presence gate admitted the
+// exchange and wrote the request, but whose peer did not complete it within the
+// budget. That is the socket's own failure: it is retired from the pool and
+// replaced on the next acquisition, not parked like an unanswered lookup. Keeping
+// the two apart is the point — a pending database read must never retire a
+// healthy socket, and a hung socket must never be kept as if it were unmeasured.
+var errLivenessUnresponsive = errors.New("SSH connection unresponsive")
 
 // isPresenceBlocked reports whether err came from the presence gate rather than
 // from the transport. Every layer that inspects the outcome of an exchange must

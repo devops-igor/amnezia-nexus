@@ -84,8 +84,11 @@ const defaultReplyTimeout = 5 * time.Second
 
 // Client implements the SSHClient interface with pooling, sudo, and SFTP support.
 type Client struct {
-	cfg                 Config
-	sshClient           *gossh.Client
+	cfg       Config
+	sshClient *gossh.Client
+	// presence is the same wrapper the gossh client uses, kept so validation can
+	// observe which phase of an exchange its budget covered.
+	presence            *presenceConn
 	sftpClient          *sftp.Client
 	isRoot              bool
 	capturedFingerprint string
@@ -200,7 +203,9 @@ func (c *Client) connect(ctx context.Context) error {
 		c.sftpClient = nil
 	}
 
-	c.sshClient = gossh.NewClient(&presenceConn{Conn: sshConn, cfg: c.cfg}, chans, reqs)
+	presence := &presenceConn{Conn: sshConn, cfg: c.cfg}
+	c.presence = presence
+	c.sshClient = gossh.NewClient(presence, chans, reqs)
 	c.closed = false
 	c.lastActive.Store(time.Now().UnixNano())
 
@@ -499,9 +504,9 @@ func (c *Client) IsAlive() bool {
 	return alive
 }
 
-// alive distinguishes a refused or unanswered check from a dead transport so the
-// pool never evicts an in-use connection merely because its observation became
-// absent, or because the observation was slow to answer.
+// alive distinguishes a refused, unanswered or unresponsive check from a dead
+// transport so the pool never evicts an in-use connection merely because its
+// observation became absent, and never hoards a socket that stopped answering.
 //
 // The request wrapper re-reads the observation, so the refusal can arrive here
 // as the keepalive's own error even when this validation's first read still saw
@@ -510,26 +515,32 @@ func (c *Client) IsAlive() bool {
 // genuine transport failure still reports the connection dead.
 //
 // The reply budget covers the wrapper's own presence read as well as the peer's
-// answer, and an observation lookup legitimately waits on the database. A
-// budget that expires therefore means the exchange was not measured — the
-// lookup may still be pending — so it is reported as unknown and nothing is
-// retired on the strength of it. Only a completed exchange decides.
+// answer, and an observation lookup legitimately waits on the database. The
+// wrapper reports when its gate admits the exchange, which separates the two
+// outcomes that share the budget:
+//
+//   - the gate never answered: the exchange was not measured. The lookup may
+//     still be pending, so this is unknown and nothing is retired on it;
+//   - the gate admitted and the request was written, but the peer did not
+//     complete the exchange: the socket itself is unresponsive and must be
+//     replaced on the next acquisition.
 func (c *Client) alive(ctx context.Context) (bool, error) {
 	if err := checkProviderPresence(ctx, c.cfg); err != nil {
 		return false, err
 	}
 	c.mu.Lock()
-	if c.closed || c.sshClient == nil {
+	if c.closed || c.sshClient == nil || c.presence == nil {
 		c.mu.Unlock()
 		return false, nil
 	}
-	client := c.sshClient
+	presence := c.presence
 	budget := c.cfg.ReplyTimeout
 	c.mu.Unlock()
 
+	admitted := make(chan struct{})
 	doneCh := make(chan error, 1)
 	go func() {
-		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		_, _, err := presence.SendGatedRequest("keepalive@openssh.com", true, nil, func() { close(admitted) })
 		doneCh <- err
 	}()
 
@@ -543,9 +554,16 @@ func (c *Client) alive(ctx context.Context) (bool, error) {
 		}
 		return err == nil, nil
 	case <-timer.C:
-		// The gate may be blocked on the store, so no keepalive need have been
-		// sent. Unknown leaves the entry exactly as it is.
-		return false, fmt.Errorf("%w after %s (presence gate may be pending)", errLivenessUnknown, budget)
+		select {
+		case <-admitted:
+			// The gate admitted and the request was written; the peer did not
+			// answer within its own budget. The socket is unresponsive.
+			return false, fmt.Errorf("%w after %s", errLivenessUnresponsive, budget)
+		default:
+			// The gate may be blocked on the store, so no request need have been
+			// sent. Unknown leaves the entry exactly as it is.
+			return false, fmt.Errorf("%w after %s (presence gate may be pending)", errLivenessUnknown, budget)
+		}
 	}
 }
 
@@ -557,6 +575,7 @@ func (c *Client) Close() error {
 	ssh := c.sshClient
 	c.sftpClient = nil
 	c.sshClient = nil
+	c.presence = nil
 	c.mu.Unlock()
 
 	var errs []error

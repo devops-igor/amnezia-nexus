@@ -181,7 +181,25 @@ func (p *SSHClientPool) cachedClient(ctx context.Context, key string) (*Client, 
 	}
 	alive, err := entry.client.alive(ctx)
 	if err != nil {
-		return nil, err // A refused validation parks rather than retires the entry.
+		if !errors.Is(err, errLivenessUnresponsive) {
+			return nil, err // A refused or unmeasured validation parks rather than retires the entry.
+		}
+		// The socket admitted the exchange and never completed it. Drop it so this
+		// checkout makes a fresh attempt instead of being refused, unless work is
+		// still running on it — that is not interrupted, and the next acquisition
+		// replaces it once idle.
+		if entry.client.InUse() {
+			return nil, fmt.Errorf("%w: the unresponsive connection is carrying work in flight", errLivenessUnknown)
+		}
+		p.mu.Lock()
+		if p.closed || p.conns[key] != entry {
+			p.mu.Unlock()
+			return nil, ErrPoolClosed
+		}
+		delete(p.conns, key)
+		p.mu.Unlock()
+		_ = entry.client.Close()
+		return nil, nil // A cache miss: checkout dials a fresh, validated connection.
 	}
 	p.mu.Lock()
 	if p.closed || p.conns[key] != entry {
@@ -318,6 +336,13 @@ func (p *SSHClientPool) pingAll() {
 	for _, entry := range entries {
 		alive, err := entry.client.alive(ctx)
 		if err != nil {
+			if errors.Is(err, errLivenessUnresponsive) {
+				// The socket admitted the exchange and never completed it: it is
+				// replaceable, so retire it through the same in-flight-safe path as a
+				// completed dead verdict.
+				deadEntries = append(deadEntries, entry)
+				continue
+			}
 			// A refusal or an unanswered observation is unknown, not dead:
 			// park without traffic, eviction or interrupting existing work.
 			continue
