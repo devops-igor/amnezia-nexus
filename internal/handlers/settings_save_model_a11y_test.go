@@ -16,12 +16,14 @@ import (
 	"testing"
 )
 
-// settingsA11yHelpers is shared scenario code: the eight cards, a test of whether
-// a node is exposed, and an observer that records every text change of the three
-// live nodes of a card.
+// settingsA11yHelpers is shared scenario code: the cards the page under test
+// renders, a test of whether a node is exposed, and an observer that records every
+// text change of the three live nodes of a card. The card list is read from the
+// document rather than listed here, so the same scenario covers the Settings cards
+// and the policy card that moved to Routing (#987) without a second copy of "which
+// card lives where".
 const settingsA11yHelpers = `
-const CARDS = ['appearanceCard', 'captchaCard', 'sslCard', 'limitsCard', 'telegramCard', 'gigahostCard',
-  'notificationsCard', 'policyRoutingCard'];
+const CARDS = Array.from(doc.querySelectorAll('[data-settings-card]')).map(el => el.id);
 function exposed(el) {
   for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
     if (n.hidden || n.getAttribute('aria-hidden') === 'true') return false;
@@ -32,8 +34,8 @@ function exposed(el) {
   return true;
 }
 // Every card has the same three live nodes: the unsaved badge, one status region
-// and one alert region. The two policy cards carry theirs inside a wrapper above
-// the form, which is the only difference in where they sit.
+// and one alert region. The policy card carries theirs inside a wrapper under its
+// header, which is the only difference in where they sit.
 const liveNodes = id => ({
   dirty: card(id).querySelector('[data-dirty]'),
   status: card(id).querySelector('[data-status]'),
@@ -124,7 +126,7 @@ assert.ok(log.some(e => e.node === 'error' && e.text !== ''), 'the failure text 
 // banner that switches semantics in the same update as its text.
 func TestSettingsA11y_PolicyCardsUseFixedStatusAndAlertRegions(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
-	runSettingsScenario(t, h, settingsA11yHelpers+`
+	runRoutingScenario(t, h, settingsA11yHelpers+`
 await sleep(400);
 for (const [cardId, wrapperId] of [['policyRoutingCard', 'policyAlert']]) {
   const wrapper = doc.getElementById(wrapperId);
@@ -162,9 +164,22 @@ function wrapperState() { return doc.getElementById('policyAlert').getAttribute(
 // the operation ends, puts keyboard focus back, and leaves every other card's
 // state alone. The save is held at the network so the busy interval is observable.
 func TestSettingsA11y_BusyAndFocusHoldOnAllEightCards(t *testing.T) {
-	h, _, _ := setupTestHandlers(t)
-	runSettingsScenarioWith(t, h, settingsHarnessOptions{liveNotifications: true}, settingsA11yHelpers+`
-await until(() => !card('notificationsCard').querySelector('#notificationHistory .text-muted').textContent.startsWith('Loading'), 'notifications to load');
+	// Every card that carries a commit control, on the page that renders it: the
+	// Settings cards and the policy card on Routing.
+	for _, page := range []struct {
+		name string
+		path string
+	}{
+		{"settings", ""},
+		{"routing", "/routing"},
+	} {
+		t.Run(page.name, func(t *testing.T) {
+			h, _, _ := setupTestHandlers(t)
+			runSettingsScenarioWith(t, h, settingsHarnessOptions{liveNotifications: true, path: page.path}, settingsA11yHelpers+`
+const notificationsCard = card('notificationsCard');
+if (notificationsCard) {
+  await until(() => !notificationsCard.querySelector('#notificationHistory .text-muted').textContent.startsWith('Loading'), 'notifications to load');
+}
 await sleep(300);
 
 const edits = {
@@ -221,6 +236,8 @@ for (const id of CARDS) {
   assert.ok(resultText(id) !== '', id + ' must report a completion or an error in its own card');
 }
 `)
+		})
+	}
 }
 
 // TestSettingsA11y_LateCompletionNeverTakesFocusFromAnotherCard is the regression the

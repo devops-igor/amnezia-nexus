@@ -368,7 +368,7 @@ def test_settings_layout_matches_token_derived_geometry(
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-section-card').length >= 11"
+        "document.querySelectorAll('.settings-section-card').length >= 9"
     )
     probe = page.evaluate(SETTINGS_PROBE)
 
@@ -435,10 +435,11 @@ def test_settings_layout_matches_token_derived_geometry(
             assert abs(distance - gap) <= 0.5, (grid["id"], distance, gap)
 
     if columns == 2:
-        # The cases are not vacuous: the page still has paired rows and rows that
-        # hold one full-width card.
+        # Not vacuous: four paired rows, plus the System group's lone backup card.
+        # The two policy cards that used to span here moved to the Routing page
+        # (#987), whose card geometry the routing suite measures at both widths.
         assert paired >= 4, paired
-        assert spanning >= 3, spanning
+        assert spanning >= 1, spanning
 
 
 @pytest.mark.e2e
@@ -452,7 +453,7 @@ def test_settings_last_row_leaves_no_unused_track(
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-section-card').length >= 11"
+        "document.querySelectorAll('.settings-section-card').length >= 9"
     )
     probe = page.evaluate(SETTINGS_PROBE)
     expected = geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
@@ -508,7 +509,6 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
     assert (large, small) == (40, 32)
     expected = {
         "#appearanceCard [data-commit]": large,
-        "#policyClientRefreshBtn": large,
         "#upstreamCheckBtn": small,
     }
     for selector, px in expected.items():
@@ -547,7 +547,7 @@ def test_settings_every_staged_card_commits_from_inside_itself(
     assert page.locator(".settings-actions").count() == 0
     cards = [
         "appearanceCard", "sslCard", "captchaCard", "limitsCard", "telegramCard",
-        "notificationsCard", "policyRoutingCard", "gigahostCard",
+        "notificationsCard", "gigahostCard",
     ]
     labels = set()
     for card in cards:
@@ -770,11 +770,11 @@ def test_settings_two_tabs_do_not_undo_each_others_security_saves(
 # tests focus real controls on the real page and read the computed outline.
 
 # (control, element that carries the outline). A switch hides its input, so the
-# visible track beside it is what shows focus.
+# visible track beside it is what shows focus. The policy exceptions field left with
+# its card (#987); its focus ring is asserted in tests/e2e/test_routing_page.py.
 FOCUS_CONTROLS = [
     ("#app_title", "#app_title"),
     ("#appearance_language", "#appearance_language"),
-    ("#policy_proxy_exceptions", "#policy_proxy_exceptions"),
     ("#notificationSaveBtn", "#notificationSaveBtn"),
     ("#repoLink-amneziawg-go", "#repoLink-amneziawg-go"),
     ("#captcha_enabled", "#captcha_enabled + .switch-slider"),
@@ -806,7 +806,7 @@ def _open_settings(page: Page, base_url: str, theme: str) -> None:
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.wait_for_function(
-        "document.querySelectorAll('.settings-section-card').length >= 11"
+        "document.querySelectorAll('.settings-section-card').length >= 9"
     )
     page.add_style_tag(content=NO_TRANSITIONS)
     page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)

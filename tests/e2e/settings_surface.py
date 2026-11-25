@@ -67,16 +67,16 @@ SETTINGS_PROBE = """() => {
   };
 }"""
 
-# The four groups the accepted information architecture puts on the page, in DOM
+# The three groups the accepted information architecture leaves on the page, in DOM
 # order. The enumeration reads them from the page and compares, so a group that
-# loses its grid fails here instead of reducing what is checked.
-SETTINGS_GROUP_IDS = ["group-portal", "group-notifications", "group-network", "group-system"]
+# loses its grid fails here instead of reducing what is checked. The Network policy
+# group is not one of them: it is the Routing page since #987.
+SETTINGS_GROUP_IDS = ["group-portal", "group-notifications", "group-system"]
 
 
-# The groups whose last row holds one card, which is what the span rule exists
-# for: Network policy's two cards span by design, and System ends on the backup
-# card after one pair. The other two groups end on a pair.
-LONE_LAST_CARD_GROUPS = ["group-network", "group-system"]
+# The groups whose last row holds one card, which is what the span rule exists for:
+# System ends on the backup card after one pair. The other two groups end on a pair.
+LONE_LAST_CARD_GROUPS = ["group-system"]
 
 
 def rows(cards: list[dict]) -> list[list[dict]]:

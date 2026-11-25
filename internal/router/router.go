@@ -295,6 +295,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		// ordinary backup download deliberately stays outside this group (see
 		// the Support-reachable group below).
 		r.Get("/settings", h.SettingsPageHandler)
+		// The policy routing page (#987) answers the questions Settings used to
+		// hold, so it joins this group rather than the admin-or-support VPN one:
+		// the page and the API behind it are refused to the same roles, and the
+		// refusal is the existing RequireAdmin answer.
+		r.Get("/routing", h.RoutingPageHandler)
 		r.Route("/api/settings", func(r chi.Router) {
 			r.Get("/", h.GetSettingsHandler)
 			r.Post("/save", h.SaveSettingsHandler)

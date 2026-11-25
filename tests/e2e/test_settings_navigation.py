@@ -7,6 +7,10 @@ same sticky expectation and the same interactions.
 
 The probe it uses is shared with the layout cases through tests.e2e.settings_surface,
 so a page whose groups lose their ids fails both suites rather than one.
+
+The last two cases cover the move of the policy surface to its own page (#987): the
+old Settings fragments hand off to /routing in a real browser, Back is not trapped
+by the handoff, and the sidebar marks the page the reader is actually on.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ def test_settings_subnav_names_and_moves_between_groups(
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function("document.querySelectorAll('.settings-group').length === 4")
+    page.wait_for_function("document.querySelectorAll('.settings-group').length === 3")
 
     probe = page.evaluate(SETTINGS_NAV_PROBE)
     # Presence first, and positively: the probe reports it on every path, so this is
@@ -34,7 +38,7 @@ def test_settings_subnav_names_and_moves_between_groups(
     # fields below, which only exist when there is one.
     assert probe["navPresent"] is True, probe
     assert probe["label"].strip(), probe
-    assert len(probe["links"]) == 4, probe
+    assert len(probe["links"]) == 3, probe
     for link in probe["links"]:
         assert link["href"].startswith("#"), link
         assert page.evaluate("sel => !!document.querySelector(sel)", link["href"]), link
@@ -84,9 +88,9 @@ def test_settings_subnav_names_and_moves_between_groups(
     )
 
     # Following a link moves focus into the group it names, and the state follows.
-    page.click("a[href='#group-network']")
+    page.click("a[href='#group-notifications']")
     page.wait_for_function(
-        "document.activeElement && document.activeElement.id === 'group-network-title'"
+        "document.activeElement && document.activeElement.id === 'group-notifications-title'"
     )
     # Wait for the requested group's OWN link to become the unique current link.
     # Waiting on a count of current links is satisfied by the previous group's mark,
@@ -98,17 +102,22 @@ def test_settings_subnav_names_and_moves_between_groups(
         """() => {
             const current = [...document.querySelectorAll('[aria-current="true"]')];
             return current.length === 1
-                && current[0].getAttribute('href') === '#group-network';
+                && current[0].getAttribute('href') === '#group-notifications';
         }"""
     )
     after = page.evaluate(SETTINGS_NAV_PROBE)
     assert after["activeTag"] == "H2", after
-    assert after["currentHref"] == "#group-network", after
+    assert after["currentHref"] == "#group-notifications", after
 
     # Stuck to the top from the width where the sidebar is in flow, and scrolled
-    # away below it: a third sticky band would eat a phone's viewport.
-    page.evaluate("window.scrollTo(0, 1200)")
-    page.wait_for_function("Math.abs(window.scrollY - 1200) < 2")
+    # away below it: a third sticky band would eat a phone's viewport. The offset is
+    # bounded by what the document can actually scroll, so a page that got shorter
+    # with the move does not make this case depend on a scroll that never happens.
+    page.evaluate(
+        "() => { const y = Math.min(1200, document.documentElement.scrollHeight - window.innerHeight - 5);"
+        " window.__scrolledTo = y; window.scrollTo(0, y); }"
+    )
+    page.wait_for_function("Math.abs(window.scrollY - window.__scrolledTo) < 2")
     page.wait_for_timeout(200)
     nav_top = page.evaluate(
         "() => document.querySelector('.app-main nav').getBoundingClientRect().top"
@@ -152,3 +161,169 @@ def test_settings_subnav_names_and_moves_between_groups(
     assert focus["outlineOffset"] == "2px", focus
     assert focus["boxShadow"] == "none", focus
     assert focus["backgroundImage"] == "none", focus
+
+
+def _wait_for_routing(page: Page) -> None:
+    """Wait for the real navigation and the page's own load, not for a fixed delay."""
+    page.wait_for_url("**/routing*")
+    page.wait_for_function("!!document.getElementById('policyRoutingCard')")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "fragment,expected_path,expected_hash",
+    [
+        # The old group anchor is consumed: the group does not exist on the new page,
+        # and forwarding the fragment would land on nothing a second time.
+        ("#group-network", "/routing", ""),
+        ("#group-network-title", "/routing", ""),
+        # The two card anchors keep their ids, so they are forwarded as fragments.
+        ("#policyRoutingCard", "/routing", "#policyRoutingCard"),
+        ("#policyClientCard", "/routing", "#policyClientCard"),
+    ],
+)
+def test_old_policy_fragment_hands_off_to_the_routing_page(
+    authenticated_page: Page, base_url: str, fragment: str, expected_path: str, expected_hash: str
+) -> None:
+    """A Settings bookmark written before the move reaches the page that owns it."""
+    page = authenticated_page
+    page.goto(f"{base_url}/settings{fragment}")
+    _wait_for_routing(page)
+
+    from urllib.parse import urlparse
+
+    landed = urlparse(page.url)
+    assert landed.path == expected_path, page.url
+    actual_hash = f"#{landed.fragment}" if landed.fragment else ""
+    assert actual_hash == expected_hash, page.url
+    # The destination is the real page, not a stub: the whole policy card renders.
+    assert page.evaluate("!!document.getElementById('policyRoutingCard')")
+    assert page.evaluate("!!document.getElementById('policyClientCard')")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "#group-portal",
+        "#group-system",
+        "#not-a-known-anchor",
+        "",
+        "?still=settings",
+    ],
+)
+def test_ordinary_settings_urls_are_not_redirected(
+    authenticated_page: Page, base_url: str, suffix: str
+) -> None:
+    """Only the four literal old policy fragments hand off; everything else stays."""
+    page = authenticated_page
+    page.goto(f"{base_url}/settings{suffix}")
+    page.wait_for_function("document.querySelectorAll('.settings-group').length === 3")
+    # Give a handoff the chance to happen before asserting that it did not.
+    page.wait_for_timeout(300)
+    from urllib.parse import urlparse
+
+    landed = urlparse(page.url)
+    assert landed.path == "/settings", page.url
+    assert page.evaluate("!!document.getElementById('settingsSubnav')")
+
+
+@pytest.mark.e2e
+def test_a_card_handoff_lands_focused_and_clear_of_the_sticky_bar(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The card anchor lands on the card itself, in view and with a destination focus."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{base_url}/settings#policyRoutingCard")
+    _wait_for_routing(page)
+
+    state = page.evaluate(
+        """() => {
+      const card = document.getElementById('policyRoutingCard');
+      const r = card.getBoundingClientRect();
+      const bar = document.querySelector('.mobile-topbar');
+      const barBottom = bar ? bar.getBoundingClientRect().bottom : 0;
+      return {top: r.top, barBottom: barBottom,
+              focused: document.activeElement === card,
+              activeId: document.activeElement ? document.activeElement.id : ''};
+    }"""
+    )
+    # The card is the reason the fragment exists, so it is what the reader lands on:
+    # focus is on the card itself, its top edge is on screen, and that edge is clear
+    # of the sticky bar rather than tucked underneath it. The band below the bar is
+    # 120 px, which is where a fragment target with a scroll margin lands; it is not
+    # a request that the card be tall.
+    assert state["focused"], state
+    assert state["activeId"] == "policyRoutingCard", state
+    assert state["top"] >= -1, state
+    assert state["top"] >= state["barBottom"] - 1, state
+    assert state["top"] <= state["barBottom"] + 120, state
+
+
+@pytest.mark.e2e
+def test_back_after_a_handoff_does_not_bounce(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The handoff replaces its history entry, so Back reaches the page before it."""
+    page = authenticated_page
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+    page.goto(f"{base_url}/settings#group-network")
+    _wait_for_routing(page)
+
+    page.go_back()
+    page.wait_for_load_state("networkidle")
+    from urllib.parse import urlparse
+
+    landed = urlparse(page.url)
+    assert landed.path == "/vpn", f"Back landed on {page.url}, so the handoff pushed a history entry"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width", [1440, 390])
+def test_sidebar_marks_the_routing_page_only_where_it_is(
+    authenticated_page: Page, base_url: str, width: int
+) -> None:
+    """Routing is a peer of VPN and the sidebar entry is current only on its own page."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+
+    def sidebar_state() -> dict:
+        return page.evaluate(
+            """() => {
+          const link = document.querySelector('.app-sidebar a[href="/routing"]');
+          const settings = document.querySelector('.app-sidebar a[href="/settings"]');
+          const vpn = document.querySelector('.app-sidebar a[href="/vpn"]');
+          return {
+            routing: link ? {current: link.getAttribute('aria-current'),
+                             active: link.classList.contains('active'),
+                             text: (link.textContent || '').trim()} : null,
+            settingsActive: settings ? settings.classList.contains('active') : null,
+            vpnActive: vpn ? vpn.classList.contains('active') : null,
+          };
+        }"""
+        )
+
+    page.goto(f"{base_url}/routing")
+    _wait_for_routing(page)
+    on_routing = sidebar_state()
+    assert on_routing["routing"] is not None, on_routing
+    assert on_routing["routing"]["current"] == "page", on_routing
+    assert on_routing["routing"]["active"] is True, on_routing
+    assert on_routing["routing"]["text"], on_routing
+    assert on_routing["vpnActive"] is False, on_routing
+    assert on_routing["settingsActive"] is False, on_routing
+
+    page.goto(f"{base_url}/settings")
+    page.wait_for_function("document.querySelectorAll('.settings-group').length === 3")
+    on_settings = sidebar_state()
+    assert on_settings["routing"] is not None, on_settings
+    assert on_settings["routing"]["current"] is None, on_settings
+    assert on_settings["routing"]["active"] is False, on_settings
+    assert on_settings["settingsActive"] is True, on_settings
+
+    # The routing page has no Settings sub-navigation and no second sticky band.
+    page.goto(f"{base_url}/routing")
+    _wait_for_routing(page)
+    assert page.evaluate("!document.getElementById('settingsSubnav')")

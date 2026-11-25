@@ -312,16 +312,9 @@ func TestSettingsPageControlsHaveAccessibleNames(t *testing.T) {
 		}
 	}
 
-	// A fieldset legend names the group, not the control inside it. The policy
-	// exceptions textarea is named by that same visible legend, so the name a
-	// screen reader announces is the label the operator can see.
-	exceptions := elementByID(doc, "policy_proxy_exceptions")
-	if exceptions == nil {
-		t.Fatal("the policy exceptions textarea is missing")
-	}
-	if name := referencedName(doc, exceptions); name == "" {
-		t.Errorf("the policy exceptions textarea has no accessible name (attrs: %v)", exceptions.Attr)
-	}
+	// The PROXY exceptions field used to be asserted here. It moved to the Routing
+	// page with its card (#987), and its accessible-name check moved with it, to
+	// TestRoutingPageProxyFieldKeepsItsAccessibleName.
 }
 
 // referencedName resolves the name a control gets from aria-labelledby, falling
@@ -379,6 +372,8 @@ func TestSettingsPageNewKeysExistInEveryLocale(t *testing.T) {
 		"deploy_vps_cost_hourly", "deploy_vps_cost_ceiling", "deploy_vps_cost_unknown",
 		// The per-card save model (#888).
 		"settings_unsaved", "settings_applies_now", "settings_save_read_failed", "settings_test_saves_first",
+		// The Routing page's navigation entry and page name (#987).
+		"nav_routing",
 		// The grouped page and its in-page navigation.
 		"settings_nav_label",
 		"settings_group_portal", "settings_group_portal_desc",

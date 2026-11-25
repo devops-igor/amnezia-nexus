@@ -23,6 +23,7 @@ paths = [
   "tests/e2e/test_settings_navigation.py",
   "tests/e2e/test_notifications.py",
   "tests/e2e/test_policy_routing_ui.py",
+  "tests/e2e/test_routing_page.py",
 ]
 rationale = """
 Login, session, CSRF, captcha, settings, backup and the admin policy routing
@@ -31,10 +32,16 @@ binary on a temporary SQLite database and runs these files against it, so the
 hosted run is the same contract rather than a weaker one. It runs on every pull
 request; the DEV run it replaces only ran after merge.
 
-The policy routing suite belongs here for the same reason: the section, its
+The policy routing suite belongs here for the same reason: the page, its
 controller and /api/vpn/policy are all panel-side. The panel-only deployment has
 no dataplane, which is exactly what makes its refusals (failed sync, rejected
 enablement) real server answers instead of simulated ones.
+
+The routing page suite holds the cases that measure the policy surface outside
+Settings — its button scale, its one-commit-per-card model and the focus ring of
+its exceptions field. They were inline blocks and one case inside test_settings.py
+until that file crossed its size ceiling; they measure the same page, against the
+same fixture, so they belong to this job rather than a weaker one.
 
 The hint-contrast suite measures text colour against the pixels behind it on the
 pages and dialogs the panel renders. Those surfaces are painted by the panel's own

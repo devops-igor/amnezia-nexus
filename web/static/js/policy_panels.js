@@ -336,16 +336,18 @@
         }
 
         // Provenance describes the shipped artifact, not its freshness, so it is
-        // detail rather than an answer.
+        // detail rather than an answer. A field the server did not report is not an
+        // answer of "none": saying so would state a fact nobody observed, so it
+        // reads as not available, the same word the other unreported facts use.
         setPanelText('policyInventorySource', inventory && inventory.source
             ? String(inventory.source)
-            : panelText('policy_none'));
+            : panelText('policy_not_available'));
         setPanelText('policyInventoryPrefixes', prefixReported
             ? panelCount(inventory.prefix_count)
             : panelText('policy_not_available'));
         setPanelText('policyInventoryRetrieved', inventory && inventory.retrieved_at
             ? String(inventory.retrieved_at)
-            : panelText('policy_none'));
+            : panelText('policy_not_available'));
 
         // The digest repeats only with an override, and only its reading-length
         // prefix: it exists to tell two same-size overrides apart.
@@ -438,7 +440,9 @@
             label.textContent = panelText(hasList ? 'policy_cdn_view_networks' : 'policy_cdn_entries_details');
         }
 
-        setPanelText('policyCdnSource', cdn && cdn.source ? String(cdn.source) : panelText('policy_none'));
+        // Same rule as the inventory provenance: an unreported source is not a
+        // source called "none".
+        setPanelText('policyCdnSource', cdn && cdn.source ? String(cdn.source) : panelText('policy_not_available'));
         setPanelText('policyCdnCount', entries ? panelCount(entries.length) : panelText('policy_not_available'));
         renderPanelCDNEntries(errorText ? null : entries, errorText);
         setPanelText('policyCdnNotice', errorText);

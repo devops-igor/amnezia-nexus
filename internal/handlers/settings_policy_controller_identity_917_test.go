@@ -40,7 +40,7 @@ import (
 // release version fails here even though every unit of the helper still works.
 func TestPolicyControllerURLIsDerivedFromItsBytes(t *testing.T) {
 	const controller = "/static/js/policy_routing.js"
-	body := renderSettingsPage(t, models.RoleAdmin)
+	body := renderRoutingPage(t, models.RoleAdmin)
 
 	emitted := ""
 	for _, src := range collectShellLinks(t, body).scripts {

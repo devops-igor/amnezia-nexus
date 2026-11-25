@@ -85,6 +85,20 @@ func (h *Handlers) VPNPageHandler(w http.ResponseWriter, r *http.Request) {
 	_ = RenderTemplate(w, r, h.db, "vpn.html", nil)
 }
 
+// RoutingPageHandler renders the policy routing page: the four readouts, the
+// configuration form and the per-client diagnosis card. It is its own page rather
+// than a Settings section, so it is registered in the admin-only route group and
+// marks the sidebar entry current server-side.
+//
+// The page renders no policy data of its own: every value on it is read from
+// /api/vpn/policy after load, exactly as it was when the same cards lived in
+// Settings.
+func (h *Handlers) RoutingPageHandler(w http.ResponseWriter, r *http.Request) {
+	_ = RenderTemplate(w, r, h.db, "routing.html", map[string]any{
+		"active_page": "routing",
+	})
+}
+
 // SanitizedServerForUser represents a safe server view for regular panel users.
 type SanitizedServerForUser struct {
 	ID        int64                      `json:"id"`
