@@ -1,19 +1,21 @@
 package web
 
-// A flow's recorded decision reason is rendered as one short label. Three facts
-// must agree, and none may be restated as a hand-kept list: the reasons this build
-// can record (the string constants of type EgressReason in internal/vpn/forwarder
-// that a write site assigns to a record's reason field), the label each token
-// renders (DECISION_REASON_LABELS in the controller), and the five bundles carrying
-// those labels.
+// A flow's recorded decision reason is rendered as one short label, and three facts
+// must agree: the reasons this build can record, the label each token renders
+// (DECISION_REASON_LABELS in the controller), and the five bundles carrying those
+// labels. None may be restated as a hand-kept list; the retired DNS-evidence labels
+// survived every other check because those compare the bundles to each other.
 //
-// This exists because the retired DNS-evidence labels survived every other check:
-// those compare the bundles to each other, and a dead key held by all five is
-// indistinguishable from a key something renders. So the forwarding package is
-// parsed as Go here — a declaration is a declaration and a write is a write. A name
-// in a comment is not a producer; the token must be written into a reason field, or
-// carried there from a field that was, and a raw token or a conversion from a
-// string literal fails in the other direction.
+// The rule is fail-closed where a reason is recorded. A struct field declared with
+// type EgressReason is a governed reason field, and every write to one must be a
+// declared EgressReason constant named directly, or a selector on the closed
+// transfer list below — a value whose origin is a write this guard also judges.
+// Anything else (a local, a literal, a call, a conversion, an expression it cannot
+// read) is reported, because the guard cannot prove which token the record would
+// hold. Enumerating the expressions a reason may arrive in is open-ended, so the
+// next ordinary Go construct passes in silence; refusing what cannot be resolved is
+// closed. A string-typed reason field is not governed: the drop ledger aggregates
+// refusals by its own token family, which this vocabulary never renders.
 
 import (
 	"fmt"
@@ -30,28 +32,35 @@ import (
 )
 
 // forwarderSourceDir is the package that creates and records a flow's reason. It is
-// a variable so a fixture can point the analysis at an edited copy of those
-// sources without touching the tree under review.
+// a variable so a fixture can point the analysis at an edited copy of the sources.
 var forwarderSourceDir = "../internal/vpn/forwarder"
 
 const (
-	reasonTypeName     = "EgressReason" // the type whose string constants are reasons
-	decisionRecordName = "egressDecision"
-	dropReasonPrefix   = "DropReason" // drop tokens are untyped, so the name is the mark
+	reasonTypeName   = "EgressReason" // the type whose constants are decision reasons
+	dropReasonPrefix = "DropReason"   // drop tokens are untyped, so the name is the mark
 )
 
+// decisionReasonTransfers is the closed list of selectors a governed reason field
+// may be filled from, each with the datum it carries. Checked in both directions: a
+// listed transfer no write uses fails the guard, and an unlisted selector is
+// reported, so the list cannot rot or widen silently. Each origin is validated by
+// the rule set, not by this list: every write to a field of type EgressReason in the
+// package is judged here, so a transfer can only carry a judged write's value.
+var decisionReasonTransfers = map[string]string{
+	"decision.reason": "the routing contract's answer, returned by decideEgress",
+	"decision.Reason": "the decision handed to a recording call",
+	"stats.reason":    "the stored flow's reason, copied from that decision",
+	"evidence.reason": "the evidence snapshot, copied from the stored flow",
+}
+
 var (
-	// One entry of the controller's label map: token: 'label key'.
-	decisionReasonMapEntry = regexp.MustCompile(`^[ \t]*([a-z0-9_]+):[ \t]*'(policy_client_decision_reason_[a-z0-9_]+)'`)
-	// Any decision-reason label key the controller resolves, including the two its
-	// fallbacks return without a map entry.
+	decisionReasonMapEntry     = regexp.MustCompile(`^[ \t]*([a-z0-9_]+):[ \t]*'(policy_client_decision_reason_[a-z0-9_]+)'`)
 	decisionReasonLabelLiteral = regexp.MustCompile(`'(policy_client_decision_reason_[a-z0-9_]+)'`)
-	// The retired per-token family: the controller selects a label from its map, not
-	// from a policy_client_reason_<token> key, so it labelled no rendering path.
+	// The retired per-token family: the controller selects a label from its map, so
+	// a policy_client_reason_<token> key labelled no rendering path.
 	retiredReasonLabelKey = regexp.MustCompile(`^policy_client_reason_[a-z0-9_]+$`)
 )
 
-// forwarderFile is one parsed production file of the forwarding package.
 type forwarderFile struct {
 	name string
 	file *ast.File
@@ -65,18 +74,21 @@ type reasonConstant struct {
 	file  string // the file that declares it
 }
 
-// reasonVocabulary is what the forwarding package says about reasons.
+// reasonVocabulary is what the package says about reasons, plus every write the
+// guard could not resolve.
 type reasonVocabulary struct {
 	declared []reasonConstant
 	produced []reasonConstant
 	consts   map[string]reasonConstant
 	drops    map[string]string
+	governed map[string]bool
 	problems []string
 }
 
-// TestEveryDeclaredEgressReasonIsProduced fails when a reason this build declares
-// cannot be written to a flow record, and when a write site names its reason as a
-// literal instead of a declared constant.
+// TestEveryDeclaredEgressReasonIsProduced fails when a declared reason cannot be
+// recorded, and when a write to a reason field carries a value the guard cannot
+// resolve — a local, a literal, a call — instead of a declared constant or an
+// allowlisted transfer.
 func TestEveryDeclaredEgressReasonIsProduced(t *testing.T) {
 	vocabulary := forwarderReasonVocabulary(t)
 	for _, problem := range vocabulary.problems {
@@ -102,12 +114,12 @@ func TestEveryDeclaredEgressReasonIsProduced(t *testing.T) {
 	}
 }
 
-// TestEveryDecisionReasonTokenHasALabel fails when a token a write site can record
-// has no entry in the controller's label map, when an entry names a label no bundle
-// defines, and when an entry names a token nothing can record.
+// TestEveryDecisionReasonTokenHasALabel fails when a recordable token has no entry
+// in the controller's label map, when an entry names a label no bundle defines, and
+// when an entry names a token nothing can record.
 func TestEveryDecisionReasonTokenHasALabel(t *testing.T) {
 	vocabulary := forwarderReasonVocabulary(t)
-	labels := decisionReasonLabelMap(t)
+	labels, _ := controllerReasonLabels(t)
 	dictionaries := policyDictionaries(t)
 
 	produced := make(map[string]bool, len(vocabulary.produced))
@@ -121,8 +133,7 @@ func TestEveryDecisionReasonTokenHasALabel(t *testing.T) {
 		}
 		for _, locale := range policyLocales {
 			if _, defined := dictionaries[locale][key]; !defined {
-				t.Errorf("%s.json does not define %q, the label %q is mapped to: the cell would show the key itself",
-					locale, key, reason.token)
+				t.Errorf("%s.json does not define %q, the label %q is mapped to: the cell would show the key itself", locale, key, reason.token)
 			}
 		}
 	}
@@ -145,7 +156,7 @@ func TestEveryDecisionReasonTokenHasALabel(t *testing.T) {
 // when the retired per-token family survives anywhere. Locale parity sees none of
 // these: it compares the bundles to each other.
 func TestEveryDecisionReasonLabelHasAToken(t *testing.T) {
-	consumed := decisionReasonLabelKeys(t)
+	_, consumed := controllerReasonLabels(t)
 	dictionaries := policyDictionaries(t)
 
 	for _, locale := range policyLocales {
@@ -185,10 +196,12 @@ func forwarderReasonVocabulary(t *testing.T) reasonVocabulary {
 	t.Helper()
 
 	files := forwarderFiles(t)
-	constants := stringConstants(files)
+	constants, problems := stringConstants(files)
 	vocabulary := reasonVocabulary{
-		consts: make(map[string]reasonConstant, len(constants)),
-		drops:  make(map[string]string),
+		consts:   make(map[string]reasonConstant, len(constants)),
+		drops:    make(map[string]string),
+		governed: reasonTypeFields(t, files),
+		problems: problems,
 	}
 	for _, constant := range constants {
 		vocabulary.consts[constant.name] = constant
@@ -205,11 +218,37 @@ func forwarderReasonVocabulary(t *testing.T) reasonVocabulary {
 	if len(vocabulary.drops) == 0 {
 		t.Fatalf("found no declared drop reasons in %s; the extraction is wrong", forwarderSourceDir)
 	}
-	vocabulary.produced, vocabulary.problems = reasonWrites(files, vocabulary.consts)
-	if len(vocabulary.produced) < 4 {
-		t.Fatalf("found only %d recorded egress reasons in %s; the extraction is wrong", len(vocabulary.produced), forwarderSourceDir)
+
+	produced, transfers, writeProblems := reasonWrites(files, vocabulary.governed, vocabulary.consts)
+	vocabulary.produced = produced
+	vocabulary.problems = append(vocabulary.problems, writeProblems...)
+	if len(produced) < 4 {
+		t.Fatalf("found only %d recorded egress reasons in %s; the extraction is wrong", len(produced), forwarderSourceDir)
 	}
+	vocabulary.problems = append(vocabulary.problems, transferListProblems(vocabulary.governed, transfers)...)
 	return vocabulary
+}
+
+// transferListProblems holds the transfer list to its own promise: an entry nothing
+// uses is stale, and an entry naming a field that is not a reason cannot have a
+// validated origin.
+func transferListProblems(governed, observed map[string]bool) []string {
+	transfers := make([]string, 0, len(decisionReasonTransfers))
+	for transfer := range decisionReasonTransfers {
+		transfers = append(transfers, transfer)
+	}
+	sort.Strings(transfers)
+
+	var problems []string
+	for _, transfer := range transfers {
+		if !observed[transfer] {
+			problems = append(problems, fmt.Sprintf("the allowlisted transfer %q (%s) is used by no write: remove it, or record why the writer changed", transfer, decisionReasonTransfers[transfer]))
+		}
+		if !carriesReason(governed, fieldNameOf(transfer)) {
+			problems = append(problems, fmt.Sprintf("the allowlisted transfer %q does not name a field of type %s, so its origin is not a validated reason", transfer, reasonTypeName))
+		}
+	}
+	return problems
 }
 
 // forwarderFiles parses the package's non-test files. A parse error is fatal: text that is not Go cannot be analysed, and an empty set would pass every assertion.
@@ -245,52 +284,113 @@ func forwarderFiles(t *testing.T) []forwarderFile {
 	return files
 }
 
-// stringConstants is every string constant the package declares, with the type it
-// was declared with. A spec repeating neither type nor value keeps the type above it.
-func stringConstants(files []forwarderFile) []reasonConstant {
+// reasonTypeFields is the governed boundary: every struct field the package declares
+// with type EgressReason, keyed "Type.field". The type itself must exist, or those
+// declarations would be names without a meaning.
+func reasonTypeFields(t *testing.T, files []forwarderFile) map[string]bool {
+	t.Helper()
+
+	fields := make(map[string]bool)
+	declared := false
+	for _, file := range files {
+		for _, declaration := range file.file.Decls {
+			group, isType := declaration.(*ast.GenDecl)
+			if !isType || group.Tok != token.TYPE {
+				continue
+			}
+			for _, entry := range group.Specs {
+				spec, isSpec := entry.(*ast.TypeSpec)
+				if !isSpec {
+					continue
+				}
+				declared = declared || spec.Name.Name == reasonTypeName
+				structure, isStruct := spec.Type.(*ast.StructType)
+				if !isStruct || structure.Fields == nil {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					if exprName(field.Type) != reasonTypeName {
+						continue
+					}
+					for _, name := range field.Names {
+						fields[spec.Name.Name+"."+name.Name] = true
+					}
+				}
+			}
+		}
+	}
+	if !declared {
+		t.Fatalf("found no %s type declaration in %s; the extraction is wrong", reasonTypeName, forwarderSourceDir)
+	}
+	if len(fields) == 0 {
+		t.Fatalf("found no field of type %s in %s; the extraction is wrong", reasonTypeName, forwarderSourceDir)
+	}
+	return fields
+}
+
+// stringConstants is every string constant the package declares. A spec with no
+// expression list repeats the one above it, type included, which is Go's rule; a
+// reason-typed constant whose value is not a string token is reported, not dropped.
+func stringConstants(files []forwarderFile) ([]reasonConstant, []string) {
 	var constants []reasonConstant
+	var problems []string
 	for _, file := range files {
 		for _, declaration := range file.file.Decls {
 			group, isConst := declaration.(*ast.GenDecl)
 			if !isConst || group.Tok != token.CONST {
 				continue
 			}
-			inherited := ""
+			var repeatedType string
+			var repeatedValues []ast.Expr
 			for _, entry := range group.Specs {
 				spec, isValue := entry.(*ast.ValueSpec)
 				if !isValue {
 					continue
 				}
-				typ := inherited
-				if spec.Type != nil {
+				typ, values := "", spec.Values
+				if len(values) == 0 {
+					typ, values = repeatedType, repeatedValues
+				} else if spec.Type != nil {
 					typ = exprName(spec.Type)
-					inherited = typ
 				}
-				if len(spec.Names) != len(spec.Values) {
+				if len(values) != 0 {
+					repeatedType, repeatedValues = typ, values
+				}
+				if len(values) != len(spec.Names) {
+					if typ == reasonTypeName {
+						problems = append(problems, fmt.Sprintf("%s: %s is declared as %s from an expression list the guard cannot pair with its names", file.name, spec.Names[0].Name, reasonTypeName))
+					}
 					continue
 				}
 				for index, name := range spec.Names {
-					literal, isLiteral := spec.Values[index].(*ast.BasicLit)
-					if !isLiteral || literal.Kind != token.STRING {
+					literal, isLiteral := values[index].(*ast.BasicLit)
+					readable := isLiteral && literal.Kind == token.STRING
+					if typ == reasonTypeName && !readable {
+						problems = append(problems, fmt.Sprintf("%s: %s is declared as %s from an expression the guard cannot read as a token, so the vocabulary cannot see it", file.name, name.Name, reasonTypeName))
 						continue
 					}
-					value, err := strconv.Unquote(literal.Value)
-					if err != nil {
+					if !readable {
 						continue
 					}
-					constants = append(constants, reasonConstant{name: name.Name, token: value, typ: typ, file: file.name})
+					if value, err := strconv.Unquote(literal.Value); err == nil {
+						constants = append(constants, reasonConstant{name: name.Name, token: value, typ: typ, file: file.name})
+					}
 				}
 			}
 		}
 	}
-	return constants
+	return constants, problems
 }
 
-// reasonWrites is the recording boundary: every reason-bearing field of a record
-// literal, every later assignment to one, and every conversion that would put a token
-// on a record without a declaration.
-func reasonWrites(files []forwarderFile, constants map[string]reasonConstant) ([]reasonConstant, []string) {
-	scan := &reasonWriteScan{constants: constants, seen: make(map[string]bool)}
+// reasonWrites judges every write to a governed reason field and reports the declared
+// reasons that can reach one.
+func reasonWrites(files []forwarderFile, governed map[string]bool, constants map[string]reasonConstant) ([]reasonConstant, map[string]bool, []string) {
+	scan := &reasonScan{
+		constants: constants,
+		governed:  governed,
+		seen:      make(map[string]bool),
+		transfers: make(map[string]bool),
+	}
 	for _, file := range files {
 		ast.Inspect(file.file, func(node ast.Node) bool {
 			switch typed := node.(type) {
@@ -298,117 +398,113 @@ func reasonWrites(files []forwarderFile, constants map[string]reasonConstant) ([
 				scan.literal(file.name, typed)
 			case *ast.AssignStmt:
 				scan.assignment(file.name, typed)
-			case *ast.GenDecl:
-				scan.varDeclaration(file.name, typed)
 			case *ast.CallExpr:
 				scan.conversion(file.name, typed)
 			}
 			return true
 		})
 	}
-	return scan.produced, scan.problems
+	return scan.produced, scan.transfers, scan.problems
 }
 
-// reasonWriteScan accumulates what the record literals and their assignments say.
-type reasonWriteScan struct {
+// reasonScan accumulates what the governed writes say.
+type reasonScan struct {
 	constants map[string]reasonConstant
+	governed  map[string]bool
 	produced  []reasonConstant
+	transfers map[string]bool
 	problems  []string
 	seen      map[string]bool
 }
 
-// literal inspects the reason field of one record literal.
-func (scan *reasonWriteScan) literal(file string, literal *ast.CompositeLit) {
+// literal inspects the reason field of one record literal. A literal naming no type
+// is judged by field name alone: the guard cannot see which record it builds and
+// must not assume that record is harmless.
+func (scan *reasonScan) literal(file string, literal *ast.CompositeLit) {
 	record := exprName(literal.Type)
-	if record == "" {
-		record = "an untyped record literal"
-	}
 	for _, element := range literal.Elts {
 		field, isField := element.(*ast.KeyValueExpr)
-		if !isField || !isReasonField(exprName(field.Key)) {
+		if !isField {
 			continue
 		}
-		scan.reason(file, record, field.Value, record == decisionRecordName)
+		name := exprName(field.Key)
+		governed := scan.governed[record+"."+name] || (record == "" && carriesReason(scan.governed, name))
+		if !governed {
+			continue
+		}
+		site := record + "." + name
+		if record == "" {
+			site = name
+		}
+		scan.write(file, site, field.Value)
 	}
 }
 
-// assignment inspects a reason field set after the record was built; a local variable that happens to be called reason is not a field.
-func (scan *reasonWriteScan) assignment(file string, statement *ast.AssignStmt) {
+// assignment inspects a governed reason field set after the record was built.
+func (scan *reasonScan) assignment(file string, statement *ast.AssignStmt) {
 	for index, target := range statement.Lhs {
-		_, isField := target.(*ast.SelectorExpr)
-		if index >= len(statement.Rhs) || !isField || !isReasonField(exprName(target)) {
+		selector, isSelector := target.(*ast.SelectorExpr)
+		if index >= len(statement.Rhs) || !isSelector {
 			continue
 		}
-		scan.reason(file, "an assignment to "+exprName(target), statement.Rhs[index], false)
-	}
-}
-
-// varDeclaration refuses a token kept in a variable: the vocabulary only sees constants, so a var carries a reason no label can be derived for.
-func (scan *reasonWriteScan) varDeclaration(file string, group *ast.GenDecl) {
-	if group.Tok != token.VAR {
-		return
-	}
-	for _, entry := range group.Specs {
-		spec, isValue := entry.(*ast.ValueSpec)
-		if !isValue || exprName(spec.Type) != reasonTypeName {
+		name := exprName(selector.Sel)
+		if !carriesReason(scan.governed, name) {
 			continue
 		}
-		for _, value := range spec.Values {
-			literal, isLiteral := value.(*ast.BasicLit)
-			if !isLiteral || literal.Kind != token.STRING {
-				continue
-			}
-			scan.problems = append(scan.problems, fmt.Sprintf("%s: declares the variable %s of type %s from a literal (%s); a reason must be a declared constant so the vocabulary can see it",
-				file, spec.Names[0].Name, reasonTypeName, literal.Value))
-		}
+		scan.write(file, exprName(selector.X)+"."+name, statement.Rhs[index])
 	}
 }
 
-// conversion catches a reason built through a type conversion, e.g. EgressReason("x").
-func (scan *reasonWriteScan) conversion(file string, call *ast.CallExpr) {
-	if _, isConverted := reasonConversionLiteral(call); !isConverted {
+// write is the whole rule: a declared reason constant, or an allowlisted transfer.
+// Anything else is a problem, because nothing else proves which token the record
+// would hold.
+func (scan *reasonScan) write(file, site string, value ast.Expr) {
+	if paren, isParen := value.(*ast.ParenExpr); isParen {
+		scan.write(file, site, paren.X)
 		return
 	}
-	scan.problems = append(scan.problems, fmt.Sprintf("%s: builds a reason from a literal instead of a declared reason: a converted string has no declaration to review and no label unless one is added by hand", file))
-}
-
-// reason classifies one expression written into a reason field. mustNameConstant is
-// set where the writing construct is the decision contract itself, whose job is to
-// name which branch decided; a variable or a carried field is left to its own site.
-func (scan *reasonWriteScan) reason(file, site string, value ast.Expr, mustNameConstant bool) {
 	switch typed := value.(type) {
 	case *ast.Ident:
 		constant, declared := scan.constants[typed.Name]
 		if !declared {
-			if mustNameConstant {
-				scan.problems = append(scan.problems, fmt.Sprintf("%s: %s names %s as its reason, which is not a declared reason: the contract must name the constant that decided", file, site, typed.Name))
-			}
+			scan.problemf("%s: %s is written from the identifier %s, which is not a declared reason: the guard cannot resolve what token that local or parameter carries, so an unlabelled value could reach the record", file, site, typed.Name)
 			return
 		}
-		switch {
-		case constant.typ == reasonTypeName:
-			if !scan.seen[constant.name] {
-				scan.seen[constant.name] = true
-				scan.produced = append(scan.produced, constant)
-			}
-		case strings.HasPrefix(constant.name, dropReasonPrefix):
-			// A refusal token. The surface renders it in its own table, and the label
-			// map keeps it renderable should a diagnosis ever carry it as a reason.
-		default:
-			scan.problems = append(scan.problems, fmt.Sprintf("%s: %s writes the declared constant %s (%q) as a reason, but it is neither a decision reason nor a drop reason", file, site, constant.name, constant.token))
+		if constant.typ != reasonTypeName {
+			scan.problemf("%s: %s is written from the constant %s (%q), which is not of type %s", file, site, constant.name, constant.token, reasonTypeName)
+			return
+		}
+		if !scan.seen[constant.name] {
+			scan.seen[constant.name] = true
+			scan.produced = append(scan.produced, constant)
 		}
 	case *ast.SelectorExpr:
-		// Carried across from another record, e.g. decision.reason. The site that
-		// filled that field is scanned on its own.
-	case *ast.BasicLit:
-		if typed.Kind == token.STRING {
-			scan.problems = append(scan.problems, fmt.Sprintf("%s: %s writes the reason as a literal instead of a declared reason (%s): that token has no declaration to review and no label to render", file, site, typed.Value))
+		transfer := exprName(typed.X) + "." + exprName(typed.Sel)
+		if _, allowlisted := decisionReasonTransfers[transfer]; !allowlisted {
+			scan.problemf("%s: %s is written from %s, which is not an allowlisted transfer: the guard cannot prove that selector carries a declared reason", file, site, transfer)
+			return
 		}
+		scan.transfers[transfer] = true
+	case *ast.BasicLit:
+		scan.problemf("%s: %s is written as the literal %s instead of a declared reason: that token has no declaration to review and no label to render", file, site, typed.Value)
 	case *ast.CallExpr:
-		scan.problems = append(scan.problems, fmt.Sprintf("%s: %s builds its reason with a call instead of naming a declared constant: the resulting token cannot be checked against the label vocabulary", file, site))
+		scan.problemf("%s: %s is written from a call, so the guard cannot resolve which token reaches the record", file, site)
 	default:
-		scan.problems = append(scan.problems, fmt.Sprintf("%s: %s writes a reason this guard cannot classify as a declared constant", file, site))
+		scan.problemf("%s: %s is written from an expression this guard cannot resolve as a declared reason or an allowlisted transfer", file, site)
 	}
+}
+
+// conversion catches a reason built through a type conversion, e.g. EgressReason("x").
+func (scan *reasonScan) conversion(file string, call *ast.CallExpr) {
+	if _, isConverted := reasonConversionLiteral(call); !isConverted {
+		return
+	}
+	scan.problemf("%s: builds a reason from a literal instead of a declared reason: a converted string has no declaration to review and no label unless one is added by hand", file)
+}
+
+// problemf records one unresolved write.
+func (scan *reasonScan) problemf(format string, args ...any) {
+	scan.problems = append(scan.problems, fmt.Sprintf(format, args...))
 }
 
 // reasonConversionLiteral reports the string a conversion to EgressReason writes.
@@ -423,9 +519,19 @@ func reasonConversionLiteral(call *ast.CallExpr) (string, bool) {
 	return "", false
 }
 
-// isReasonField reports whether a field name carries a record's reason.
-func isReasonField(name string) bool {
-	return strings.EqualFold(name, "reason") || strings.EqualFold(name, "decisionreason")
+// carriesReason reports whether any governed record declares a field with this name.
+func carriesReason(governed map[string]bool, name string) bool {
+	for key := range governed {
+		if fieldNameOf(key) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// fieldNameOf is the field part of a "Type.field" key.
+func fieldNameOf(key string) string {
+	return key[strings.LastIndex(key, ".")+1:]
 }
 
 // exprName is the identifier an expression names: a type, field key, target or function.
@@ -443,35 +549,27 @@ func exprName(expr ast.Expr) string {
 	return ""
 }
 
-// decisionReasonLabelMap reads the controller's token-to-label mapping.
-func decisionReasonLabelMap(t *testing.T) map[string]string {
+// controllerReasonLabels reads the controller once: the token-to-label map, and every
+// decision-reason label key it resolves, including the two its fallbacks return
+// without a map entry.
+func controllerReasonLabels(t *testing.T) (map[string]string, map[string]bool) {
 	t.Helper()
 
+	source := policyClientDiagControllerSource(t)
 	labels := make(map[string]string)
-	for _, line := range strings.Split(policyClientDiagControllerSource(t), "\n") {
+	for _, line := range strings.Split(source, "\n") {
 		if match := decisionReasonMapEntry.FindStringSubmatch(line); match != nil {
 			labels[match[1]] = match[2]
 		}
 	}
-	if len(labels) == 0 {
-		t.Fatal("found no DECISION_REASON_LABELS entries in the controller; the extraction is wrong")
-	}
-	return labels
-}
-
-// decisionReasonLabelKeys is every decision-reason label key the controller resolves,
-// including the two its fallbacks return without a map entry.
-func decisionReasonLabelKeys(t *testing.T) map[string]bool {
-	t.Helper()
-
 	keys := make(map[string]bool)
-	for _, match := range decisionReasonLabelLiteral.FindAllStringSubmatch(policyClientDiagControllerSource(t), -1) {
+	for _, match := range decisionReasonLabelLiteral.FindAllStringSubmatch(source, -1) {
 		keys[match[1]] = true
 	}
-	if len(keys) == 0 {
-		t.Fatal("found no decision-reason label keys in the controller; the extraction is wrong")
+	if len(labels) == 0 || len(keys) == 0 {
+		t.Fatal("found no DECISION_REASON_LABELS entries in the controller; the extraction is wrong")
 	}
-	return keys
+	return labels, keys
 }
 
 // policyClientDiagControllerSource reads the shipped controller.
