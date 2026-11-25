@@ -118,19 +118,27 @@ func gigahostServerState(ctx context.Context, client gigahost.Client, serverID i
 	}
 	if _, err := client.GetServer(ctx, serverID); err != nil {
 		switch {
-		case errors.Is(err, gigahost.ErrUnauthorized):
+		case gigahostDetailRefused(err):
 			return gigahostServerRefused
 		case errors.Is(err, gigahost.ErrNotFound):
 			return gigahostServerNotReported
 		}
-		var apiErr *gigahost.APIError
-		if errors.As(err, &apiErr) && (apiErr.StatusCode == 400 || apiErr.StatusCode == 405) {
-			// The documented refusal statuses for a server outside a key's scope.
-			return gigahostServerRefused
-		}
 		return gigahostServerUnmeasured
 	}
 	return gigahostServerPresent
+}
+
+// gigahostDetailRefused reports whether a detail read was refused for this key.
+//
+// The provider documents the refusal statuses for a server outside a key's
+// visibility as 400, 401, 403 or 405; a rate limit, a server error or a malformed
+// answer is not a refusal and says nothing about the key's visibility.
+func gigahostDetailRefused(err error) bool {
+	if errors.Is(err, gigahost.ErrUnauthorized) {
+		return true
+	}
+	var apiErr *gigahost.APIError
+	return errors.As(err, &apiErr) && (apiErr.StatusCode == 400 || apiErr.StatusCode == 405)
 }
 
 // ReconcileGigahostServerInventory records, for every Gigahost-provisioned
@@ -385,6 +393,32 @@ func decideGigahostRow(ctx context.Context, row providerBackedServer, answer gig
 	}
 }
 
+// gigahostPassOutcome is what one pass concluded, row by row.
+type gigahostPassOutcome struct {
+	decisions []gigahostRowDecision
+	counts    map[gigahostRowDecision]int
+	// narrowed reports whether anything in the pass showed the inventory answer is
+	// narrower than the account: a server it omitted that the detail read returned,
+	// or a refused detail read.
+	narrowed bool
+}
+
+// decideGigahostRows judges every row against one answer.
+func decideGigahostRows(ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer) gigahostPassOutcome {
+	outcome := gigahostPassOutcome{
+		decisions: make([]gigahostRowDecision, len(rows)),
+		counts:    make(map[gigahostRowDecision]int, len(rows)),
+	}
+	for i, row := range rows {
+		outcome.decisions[i] = decideGigahostRow(ctx, row, answer)
+		outcome.counts[outcome.decisions[i]]++
+		if gigahostRowNarrowsVisibility(outcome.decisions[i]) {
+			outcome.narrowed = true
+		}
+	}
+	return outcome
+}
+
 // applyGigahostInventoryPresence writes the provider's answer onto the rows whose
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
@@ -399,27 +433,35 @@ func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
-	decisions := make([]gigahostRowDecision, len(rows))
-	counts := make(map[gigahostRowDecision]int, len(rows))
-	narrowed := false
-	for i, row := range rows {
-		decisions[i] = decideGigahostRow(ctx, row, answer)
-		counts[decisions[i]]++
-		if gigahostRowNarrowsVisibility(decisions[i]) {
-			narrowed = true
-		}
-	}
+	outcome := decideGigahostRows(ctx, rows, answer)
 
 	// The listing may only conclude absence when nothing in this pass showed it does
 	// not enumerate the account.
-	listingComplete := !narrowed
-	if narrowed && counts[gigahostRowUnlisted] > 0 {
+	listingComplete := !outcome.narrowed
+	withheld := !listingComplete && outcome.counts[gigahostRowUnlisted] > 0
+	if withheld {
 		slog.Info("Provider inventory is narrower than the account; no absence recorded in this pass",
-			"unlisted_rows", counts[gigahostRowUnlisted],
-			"detail_present_rows", counts[gigahostRowDetailPresent],
-			"refused_rows", counts[gigahostRowRefused])
+			"unlisted_rows", outcome.counts[gigahostRowUnlisted],
+			"detail_present_rows", outcome.counts[gigahostRowDetailPresent],
+			"refused_rows", outcome.counts[gigahostRowRefused])
 	}
 
+	failures := h.writeDecidedRows(ctx, rows, outcome.decisions, listingComplete, now)
+	if left := outcome.counts[gigahostRowUnknownAccount] + outcome.counts[gigahostRowOtherAccount] + outcome.counts[gigahostRowUnmeasured]; left > 0 {
+		// Observable without naming an account or a credential: why rows were
+		// left alone, and how many.
+		slog.Info("Provider inventory left server existence state unchanged for rows it cannot speak for",
+			"unknown_account_rows", outcome.counts[gigahostRowUnknownAccount],
+			"other_account_rows", outcome.counts[gigahostRowOtherAccount],
+			"unmeasured_rows", outcome.counts[gigahostRowUnmeasured])
+	}
+	return errors.Join(failures...)
+}
+
+// writeDecidedRows stores the decisions that hold an existence answer.
+func (h *Handlers) writeDecidedRows(
+	ctx context.Context, rows []providerBackedServer, decisions []gigahostRowDecision, listingComplete bool, now time.Time,
+) []error {
 	var failures []error
 	for i, row := range rows {
 		present, measured := decisions[i].presence()
@@ -433,16 +475,7 @@ func (h *Handlers) applyGigahostInventoryPresence(
 			failures = append(failures, err)
 		}
 	}
-
-	if left := counts[gigahostRowUnknownAccount] + counts[gigahostRowOtherAccount] + counts[gigahostRowUnmeasured]; left > 0 {
-		// Observable without naming an account or a credential: why rows were
-		// left alone, and how many.
-		slog.Info("Provider inventory left server existence state unchanged for rows it cannot speak for",
-			"unknown_account_rows", counts[gigahostRowUnknownAccount],
-			"other_account_rows", counts[gigahostRowOtherAccount],
-			"unmeasured_rows", counts[gigahostRowUnmeasured])
-	}
-	return errors.Join(failures...)
+	return failures
 }
 
 // writeProviderAbsence stores one row's observation when it differs from the stored
