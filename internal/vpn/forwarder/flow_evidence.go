@@ -32,29 +32,22 @@ import (
 
 // EgressReason names the branch that selected a flow's route. The values are
 // tokens: the API translates them and a test can name the exact branch.
+//
+// Every value declared here is assigned by the decision contract in
+// routing_decision.go, which is the only producer: a token this build can record
+// is a token a diagnosis can show, so a declared value with no producer would be
+// a label for a branch that does not exist. The correspondence between this
+// block, the controller's label map and the five bundles is checked in both
+// directions by web/policy_client_reason_vocabulary_test.go.
 type EgressReason string
 
 const (
-	// EgressReasonStickyFlow means an existing flow kept the choice it already
-	// had; no new decision was taken for that packet.
-	EgressReasonStickyFlow EgressReason = "sticky_flow"
-	// EgressReasonEvidenceDirect means fresh client-scoped DNS evidence made the
-	// destination DIRECT. The decision path no longer produces it: the address
-	// alone decides. It stays defined because a flow recorded before that
-	// change still carries the token.
-	EgressReasonEvidenceDirect EgressReason = "evidence_direct"
 	// EgressReasonProxyCIDRRule means the published policy snapshot's address
 	// rule put the destination on the proxy.
 	EgressReasonProxyCIDRRule EgressReason = "proxy_cidr_rule"
-	// EgressReasonProxyCachedEvidence means the session's own retained PROXY
-	// decision put the destination on the proxy. Like the evidence_direct token
-	// it is historical only: the decision path no longer produces it.
-	EgressReasonProxyCachedEvidence EgressReason = "proxy_cached_evidence"
 	// EgressReasonNoTrustedEvidence means the destination was uncovered by the
 	// classifier, so the fail-closed default applied.
 	EgressReasonNoTrustedEvidence EgressReason = "no_trusted_evidence"
-	// EgressReasonNonTCPOrUDP means the protocol cannot be NATed directly.
-	EgressReasonNonTCPOrUDP EgressReason = "non_tcp_udp_fallback"
 	// EgressReasonAllocationDirect means the destination is inside the Russian
 	// allocation and no CDN exclusion applied, so the address alone routed it
 	// DIRECT with no DNS evidence (issue #918). The token names allocation

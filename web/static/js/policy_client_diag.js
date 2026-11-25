@@ -35,10 +35,12 @@
     // DECISION_REASON_LABELS maps a recorded decision reason to the one short
     // label the flows table shows. The mapping is data, not a branch: a token this
     // build does not know falls back to one generic label, so a raw token never
-    // reaches a cell. The two refusal conditions are listed as well - this build
-    // records them as a refused packet or a failed dispatch rather than as a
-    // flow's reason, so should a diagnosis ever carry either as one, it still
-    // renders a label instead of the token.
+    // reaches a cell. Every token the packet path can record is listed, and no
+    // token is listed that it cannot record; a test derives both directions from
+    // the producer (web/policy_client_reason_vocabulary_test.go). The two refusal
+    // conditions are listed as well - this build records them as a refused packet
+    // or a failed dispatch rather than as a flow's reason, so should a diagnosis
+    // ever carry either as one, it still renders a label instead of the token.
     var DECISION_REASON_LABELS = {
         allocation_direct: 'policy_client_decision_reason_allocation_direct',
         allocation_cdn_excluded: 'policy_client_decision_reason_allocation_cdn_excluded',
@@ -46,10 +48,6 @@
         prohibited_destination: 'policy_client_decision_reason_prohibited_destination',
         direct_egress_unavailable: 'policy_client_decision_reason_direct_egress_unavailable',
         proxy_cidr_rule: 'policy_client_decision_reason_proxy_cidr_rule',
-        evidence_direct: 'policy_client_decision_reason_evidence_direct',
-        proxy_cached_evidence: 'policy_client_decision_reason_proxy_cached_evidence',
-        sticky_flow: 'policy_client_decision_reason_sticky_flow',
-        non_tcp_udp_fallback: 'policy_client_decision_reason_non_tcp_udp_fallback',
         not_recorded: 'policy_client_decision_reason_not_recorded'
     };
 

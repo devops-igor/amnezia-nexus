@@ -256,14 +256,11 @@ var clientDiagTokenValues = map[string][]string{
 	},
 	"decision": {"direct", "proxy", "unknown"},
 	"protocol": {"tcp", "udp"},
-	"reason": {
-		"sticky_flow", "evidence_direct", "proxy_cidr_rule", "proxy_cached_evidence",
-		"no_trusted_evidence", "not_recorded",
-		// Address classification of issue #918. The first token names allocation
-		// membership, not hosting location; the second names a range that is
-		// inside the allocation but belongs to a multi-region CDN.
-		"allocation_direct", "allocation_cdn_excluded",
-	},
+	// The decision-reason family is deliberately absent: the controller renders
+	// those tokens through its own label map, not through a
+	// policy_client_reason_<token> key, and no bundle carries that family. The
+	// map, the producer's tokens and the bundles are held together by
+	// web/policy_client_reason_vocabulary_test.go.
 	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
 	// What the dispatch path did with the flow's packets. The state is a token
 	// family of its own because it is rendered beside the route: a DIRECT flow

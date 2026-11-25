@@ -381,9 +381,12 @@ func TestRetainedProxyEvidenceCannotProxyAllocationDestination(t *testing.T) {
 	if flow.DecisionReason != EgressReasonAllocationDirect {
 		t.Errorf("decision reason = %q, want %q: the address decided, not the evidence", flow.DecisionReason, EgressReasonAllocationDirect)
 	}
-	if flow.DecisionReason == EgressReasonProxyCachedEvidence || flow.DecisionReason == EgressReasonEvidenceDirect {
-		t.Errorf("decision reason = %q, want an address-based reason", flow.DecisionReason)
-	}
+	// This control used to exclude the two retained-evidence reason tokens as well.
+	// Those tokens no longer exist — a reason this build cannot produce cannot be
+	// declared or labelled — so the equality above is the whole assertion: it
+	// excludes every other reason, including one reintroduced as a raw token
+	// (web/policy_client_reason_vocabulary_test.go refuses an undeclared token
+	// reaching a flow).
 }
 
 // TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect is the other

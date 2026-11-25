@@ -127,7 +127,6 @@ w._ = key => {
   if (key.indexOf('policy_client_decision_') === 0) return 'DECISION:' + key.slice('policy_client_decision_'.length);
   if (key.indexOf('policy_client_protocol_') === 0) return 'PROTO:' + key.slice('policy_client_protocol_'.length);
   if (key.indexOf('policy_client_limit_') === 0) return 'LIMIT:' + key.slice('policy_client_limit_'.length);
-  if (key.indexOf('policy_client_reason_') === 0) return 'REASON:' + key.slice('policy_client_reason_'.length);
   if (key.indexOf('policy_client_return_evidence_') === 0) return 'RETURN_EVIDENCE:' + key.slice('policy_client_return_evidence_'.length);
   if (key.indexOf('policy_client_failure_') === 0) return 'FAILURE:' + key.slice('policy_client_failure_'.length);
   if (key.indexOf('policy_client_dispatch_') === 0) return 'DISPATCH:' + key.slice('policy_client_dispatch_'.length);
@@ -227,7 +226,7 @@ const diagnosis = (session, generation) => ({
                      destination_port: 443, choice: 'DIRECT', route_generation: generation,
                      last_seen: '2026-11-17T09:09:59Z', last_seen_age_seconds: 42,
                      expired: false, close_seen: false,
-                     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'evidence_direct',
+                     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'allocation_direct',
                      policy_generation: 'gen-1',
                      dispatch: {state: 'written_to_wan'}, forward: {packets: 1, bytes: 60, failed: 0},
                      return: {evidence: 'not_observed', packets: 0, bytes: 0}}]},
@@ -296,9 +295,9 @@ assert.deepEqual(rowHeaders('policyClientFlowRows'),
   'the flows table renders the four columns an operator reads');
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
   ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
-   'DECISION_REASON:evidence_direct']);
+   'DECISION_REASON:allocation_direct']);
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
-  '2026-11-17T09:09:58Z · gen-1 · evidence_direct',
+  '2026-11-17T09:09:58Z · gen-1 · allocation_direct',
   'the instant, the generation and the token the label came from are the cell tooltip');
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[1], '',
   'the destination cell states the recorded tuple and no name');
@@ -572,7 +571,7 @@ responder = ((base) => async (url, opts) => {
               first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'}},
     {protocol: 'udp', destination_ip: '9.9.9.9', destination_port: 443, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 14, expired: false, close_seen: false,
-     decision_time: '2026-11-17T09:09:55Z', decision_reason: 'sticky_flow',
+     decision_time: '2026-11-17T09:09:55Z', decision_reason: 'allocation_cdn_excluded',
      policy_generation: 'gen-1', backend_tunnel_id: 77,
      dispatch: {state: 'queued_to_backend'},
      forward: {packets: 5, bytes: 300, failed: 0, backend_writes: 5, backend_write_failed: 0},
@@ -1184,7 +1183,6 @@ func TestPolicyClientDiagFlowDecisionLabels(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 const reasons = ['allocation_direct', 'allocation_cdn_excluded', 'no_trusted_evidence',
   'prohibited_destination', 'direct_egress_unavailable', 'proxy_cidr_rule',
-  'evidence_direct', 'proxy_cached_evidence', 'sticky_flow', 'non_tcp_udp_fallback',
   'not_recorded', 'brand_new_reason'];
 responder = ((base) => async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
@@ -1207,10 +1205,6 @@ const LABELS = {
   policy_client_decision_reason_prohibited_destination: 'Blocked destination',
   policy_client_decision_reason_direct_egress_unavailable: 'Direct unavailable',
   policy_client_decision_reason_proxy_cidr_rule: 'Operator rule',
-  policy_client_decision_reason_evidence_direct: 'DNS evidence',
-  policy_client_decision_reason_proxy_cached_evidence: 'DNS evidence: proxy',
-  policy_client_decision_reason_sticky_flow: 'Kept earlier choice',
-  policy_client_decision_reason_non_tcp_udp_fallback: 'Proxy: protocol fallback',
   policy_client_decision_reason_not_recorded: 'Not recorded',
   policy_client_decision_reason_unknown: 'Other reason'
 };
@@ -1220,7 +1214,7 @@ w._ = key => LABELS[key] || fallback(key);
 selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
-assert.equal(rowCount('policyClientFlowRows'), 12, 'every recorded reason is one row');
+assert.equal(rowCount('policyClientFlowRows'), 8, 'every recorded reason is one row');
 
 const rows = Array.from(w.document.getElementById('policyClientFlowRows').children);
 assert.deepEqual(rows.map(row => row.children[3].textContent), [
@@ -1230,10 +1224,6 @@ assert.deepEqual(rows.map(row => row.children[3].textContent), [
   'Blocked destination',
   'Direct unavailable',
   'Operator rule',
-  'DNS evidence',
-  'DNS evidence: proxy',
-  'Kept earlier choice',
-  'Proxy: protocol fallback',
   'Not recorded',
   'Other reason'
 ], 'each recorded reason renders its own short label');
@@ -1254,9 +1244,9 @@ assert.equal(titles[0], '2026-11-17T09:09:50Z · gen-9 · allocation_direct',
   'the instant, generation and token are the cell tooltip');
 assert.equal(titles[5], '2026-11-17T09:09:55Z · gen-9 · BACKEND 77 · proxy_cidr_rule',
   'a proxy decision keeps its selected backend in the tooltip');
-assert.equal(titles[10], 'gen-9',
+assert.equal(titles[6], 'gen-9',
   'a flow recorded without a reason has no instant or token to describe');
-assert.ok(titles[11].indexOf('brand_new_reason') !== -1,
+assert.ok(titles[7].indexOf('brand_new_reason') !== -1,
   'a token this build does not know stays quotable in the tooltip');
 `)
 }
