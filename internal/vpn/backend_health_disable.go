@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
@@ -186,7 +187,7 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 		// version-pinned) under s.mu, so a target that went bad meanwhile is
 		// rejected instead of receiving traffic.
 		target := targets[i%len(targets)]
-		if mErr := s.MigrateSession(ctx, sess.ID, target.ID); mErr != nil {
+		if mErr := s.migrateHealthSession(ctx, sess.ID, targets, i); mErr != nil {
 			// One failed session must not strand the rest; the peer is left on
 			// the disabled backend and stays visible through the log.
 			log.Printf("[vpn] health-disable failover: session %s (peer %s) NOT migrated off backend %d to %d: %v",
@@ -200,6 +201,24 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 			migrated, len(sessions), source.ID)
 	}
 	return migrated
+}
+
+// migrateHealthSession visits each candidate at most once within the caller's
+// existing budget. Only a confirmed absence refusal selects another destination;
+// other failures keep their existing compensation and retry-debt semantics.
+func (s *Service) migrateHealthSession(ctx context.Context, sessionID string, targets []*models.BackendTunnel, start int) error {
+	var lastErr error
+	for offset := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		target := targets[(start+offset)%len(targets)]
+		lastErr = s.MigrateSession(ctx, sessionID, target.ID)
+		if !errors.Is(lastErr, database.ErrDestinationProviderAbsent) {
+			return lastErr
+		}
+	}
+	return lastErr
 }
 
 // healthDisableTargets returns the still-eligible active tunnels of the same

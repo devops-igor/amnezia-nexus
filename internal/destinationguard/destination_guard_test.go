@@ -40,6 +40,9 @@ import (
 // these is a placer and must reach the destination gate.
 var placementEffects = map[string]bool{
 	"MigrateSession":                  true, // live migration (route + session + counters)
+	"commitSessionMigration":          true, // owner-pinned connected-row publication
+	"migrateHealthSession":            true, // finite health destination attempts
+	"CommitVPNSessionMigration":       true, // inventory-serialized connected-row commit
 	"UpdateVPNSessionBackendTunnel":   true, // durable repoint, no migration service
 	"MigrateVPNSessionBackend":        true, // rollback/persist half of a migration
 	"MigrateVPNSessionToActiveTunnel": true, // predicate-guarded repoint
@@ -54,6 +57,7 @@ var placementEffects = map[string]bool{
 // destinationGateSymbols are the functions that make the decision or consult it on behalf of
 // their callers. Reaching any of them counts as reaching the gate.
 var destinationGateSymbols = map[string]bool{
+	"CommitVPNSessionMigration":         true,
 	"TunnelDestinationAllowed":          true,
 	"EligibleTunnelDestinations":        true,
 	"EligibleTunnelDestinationValues":   true,

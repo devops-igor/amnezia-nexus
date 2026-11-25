@@ -251,12 +251,20 @@ func (d *DB) backendTunnelServerAbsent(ctx context.Context, backendTunnelID int6
 func (d *DB) MigrateVPNSessionBackend(ctx context.Context, sessionID string, backendTunnelID int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+	return d.migrateVPNSessionBackend(ctx, sessionID, backendTunnelID)
+}
+
+func (d *DB) migrateVPNSessionBackend(ctx context.Context, sessionID string, backendTunnelID int64) error {
 	query := "UPDATE vpn_sessions SET backend_tunnel_id = ? WHERE id = ? AND status = 'connected'"
 	res, err := d.sqlDB.ExecContext(ctx, query, backendTunnelID, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to migrate vpn session %s backend tunnel: %w", sessionID, err)
 	}
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check vpn session %s backend migration: %w", sessionID, err)
+	}
+	if rows == 0 {
 		return fmt.Errorf("vpn session %s not found or no longer connected", sessionID)
 	}
 	return nil
