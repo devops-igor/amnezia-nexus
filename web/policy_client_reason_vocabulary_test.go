@@ -190,6 +190,68 @@ func TestEveryDecisionReasonLabelHasAToken(t *testing.T) {
 	}
 }
 
+// TestEveryDeclaredEgressReasonIsProducedWriteForms exercises the same traversal
+// as the package guard. Targets must be judged before pairing their source values;
+// a tuple call is one RHS expression even when it fills several destinations.
+func TestEveryDeclaredEgressReasonIsProducedWriteForms(t *testing.T) {
+	cases := []struct {
+		name, body, problem string
+		writes              int
+	}{
+		{"scalar constant", "decision.reason = EgressReasonKnown", "", 1},
+		{"parallel constants", "decision.choice, decision.reason = 1, EgressReasonKnown", "", 1},
+		{"parenthesized field", "((decision.reason)) = (EgressReasonKnown)", "", 1},
+		{"checked transfer", "decision.reason = stats.reason", "", 0},
+		{"keyed literal", "_ = egressDecision{reason: EgressReasonKnown}", "", 1},
+		{"new storage copy", "_ = &egressDecision{reason: stats.reason}", "", 0},
+		{"unrelated field", "decision.choice, other.choice = pair()", "", 0},
+		{"tuple second result", "decision.choice, decision.reason = pair()", "cannot pair", 0},
+		{"tuple first result", "decision.reason, decision.choice = pair()", "cannot pair", 0},
+		{"tuple both results", "decision.reason, other.reason = pair()", "cannot pair", 0},
+		{"tuple middle result", "decision.choice, decision.reason, other.choice = triple()", "cannot pair", 0},
+		{"comma ok", "decision.reason, ok = reasons[0]", "cannot pair", 0},
+		{"type assertion", "decision.reason, ok = unknown.(EgressReason)", "cannot pair", 0},
+		{"channel receive", "decision.reason, ok = <-reasonsCh", "cannot pair", 0},
+		{"parallel literal", "decision.choice, decision.reason = 1, \"unlabelled\"", "literal", 0},
+		{"compound update", "decision.reason += EgressReasonKnown", "compound assignment", 0},
+		{"parenthesized literal", "(decision.reason) = \"unlabelled\"", "literal", 0},
+		{"indirect target", "*(&decision.reason) = EgressReasonKnown", "cannot resolve assignment target", 0},
+		{"range value", "for _, decision.reason = range reasons {}", "range assignment", 0},
+		{"range key", "for decision.reason = range reasonMap {}", "range assignment", 0},
+		{"increment", "decision.reason++", "increment or decrement", 0},
+		{"decrement", "decision.reason--", "increment or decrement", 0},
+		{"address escape", "_ = &decision.reason", "address escape", 0},
+		{"positional literal", "_ = egressDecision{\"unlabelled\", 0}", "positional literal", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Parsing, not execution: invalid typed mutations still must be refused
+			// by the syntax boundary rather than disappear from the walk.
+			file, err := parser.ParseFile(token.NewFileSet(), "writes.go", "package forwarder; func inspect() { "+tc.body+" }", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			known := reasonConstant{name: "EgressReasonKnown", token: "known", typ: reasonTypeName}
+			produced, transfers, problems := reasonWrites([]forwarderFile{{name: "writes.go", file: file}}, map[string]bool{"egressDecision.reason": true}, map[string]reasonConstant{known.name: known})
+			if tc.problem == "" && len(problems) != 0 {
+				t.Fatalf("resolvable write refused: %v", problems)
+			}
+			if tc.problem != "" && !strings.Contains(strings.Join(problems, "\n"), tc.problem) {
+				t.Fatalf("governed target was not refused with %q: %v", tc.problem, problems)
+			}
+			if tc.name == "tuple both results" && len(problems) != 2 {
+				t.Fatalf("must judge both governed targets, got %v", problems)
+			}
+			if len(produced) != tc.writes {
+				t.Errorf("recordable constants = %v, want %d", produced, tc.writes)
+			}
+			if tc.name == "checked transfer" && !transfers["stats.reason"] {
+				t.Error("resolvable transfer was not observed")
+			}
+		})
+	}
+}
+
 // forwarderReasonVocabulary derives both sides from the forwarding package. It fails
 // rather than return an empty set, because an empty set satisfies every assertion.
 func forwarderReasonVocabulary(t *testing.T) reasonVocabulary {
@@ -398,6 +460,15 @@ func reasonWrites(files []forwarderFile, governed map[string]bool, constants map
 				scan.literal(file.name, typed)
 			case *ast.AssignStmt:
 				scan.assignment(file.name, typed)
+			case *ast.RangeStmt:
+				scan.refuseTargets(file.name, typed.Key, "range assignment")
+				scan.refuseTargets(file.name, typed.Value, "range assignment")
+			case *ast.IncDecStmt:
+				scan.refuseTargets(file.name, typed.X, "increment or decrement")
+			case *ast.UnaryExpr:
+				if typed.Op == token.AND {
+					scan.refuseTargets(file.name, typed.X, "address escape")
+				}
 			case *ast.CallExpr:
 				scan.conversion(file.name, typed)
 			}
@@ -425,6 +496,12 @@ func (scan *reasonScan) literal(file string, literal *ast.CompositeLit) {
 	for _, element := range literal.Elts {
 		field, isField := element.(*ast.KeyValueExpr)
 		if !isField {
+			for governed := range scan.governed {
+				if strings.HasPrefix(governed, record+".") {
+					scan.problemf("%s: %s uses a positional literal whose reason field the guard cannot resolve", file, record)
+					return
+				}
+			}
 			continue
 		}
 		name := exprName(field.Key)
@@ -440,18 +517,54 @@ func (scan *reasonScan) literal(file string, literal *ast.CompositeLit) {
 	}
 }
 
-// assignment inspects a governed reason field set after the record was built.
+// assignment discovers governed targets independently of source arity. Go's
+// multi-valued expressions cannot be paired positionally with the LHS syntax.
+// Only a direct field under plain one-to-one assignment has a resolvable source.
 func (scan *reasonScan) assignment(file string, statement *ast.AssignStmt) {
 	for index, target := range statement.Lhs {
-		selector, isSelector := target.(*ast.SelectorExpr)
-		if index >= len(statement.Rhs) || !isSelector {
-			continue
+		for _, field := range scan.targets(target) {
+			site := exprName(field.X) + "." + field.Sel.Name
+			switch {
+			case ast.Unparen(target) != field:
+				scan.problemf("%s: %s: cannot resolve assignment target containing a governed field", file, site)
+			case statement.Tok != token.ASSIGN:
+				scan.problemf("%s: %s: compound assignment cannot resolve the resulting reason", file, site)
+			case len(statement.Lhs) != len(statement.Rhs):
+				scan.problemf("%s: %s: cannot pair %d assignment targets with %d source expressions; a multi-result write must name a declared reason explicitly", file, site, len(statement.Lhs), len(statement.Rhs))
+			default:
+				scan.write(file, site, statement.Rhs[index])
+			}
 		}
-		name := exprName(selector.Sel)
-		if !carriesReason(scan.governed, name) {
-			continue
+	}
+}
+
+// targets walks the complete destination expression, including parentheses,
+// indirection and indices. A nested governed field is unresolved, never invisible.
+// Matching by field name is deliberately conservative without Go type information.
+func (scan *reasonScan) targets(target ast.Expr) []*ast.SelectorExpr {
+	var fields []*ast.SelectorExpr
+	if target == nil {
+		return fields
+	}
+	ast.Inspect(target, func(node ast.Node) bool {
+		// A literal creates new storage; selectors in its values are reads,
+		// not destinations or escaped addresses of the existing fields.
+		if _, literal := node.(*ast.CompositeLit); literal {
+			return false
 		}
-		scan.write(file, exprName(selector.X)+"."+name, statement.Rhs[index])
+		if field, ok := node.(*ast.SelectorExpr); ok && carriesReason(scan.governed, field.Sel.Name) {
+			fields = append(fields, field)
+		}
+		return true
+	})
+	return fields
+}
+
+// refuseTargets covers implicit assignment by range, arithmetic updates and
+// writable address escape. None supplies a constant/transfer value we can prove.
+func (scan *reasonScan) refuseTargets(file string, target ast.Expr, operation string) {
+	for _, field := range scan.targets(target) {
+		scan.problemf("%s: %s.%s: %s cannot resolve the resulting reason", file, exprName(field.X), field.Sel.Name, operation)
 	}
 }
 
