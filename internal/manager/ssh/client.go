@@ -143,21 +143,19 @@ func DialFromServer(ctx context.Context, server *models.Server, store HostKeySto
 
 // connect establishes a transport only after pool admission.
 func (c *Client) connect(ctx context.Context) error {
+	// The durable observation is read outside the client lock: it reaches the
+	// store, and no store I/O may run under an internal mutex. Refusing here,
+	// before a socket exists, is what keeps a config snapshot taken before the
+	// observation from opening a connection to a removed address.
+	if err := checkProviderPresence(ctx, c.cfg); err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.sshClient != nil && !c.closed {
 		return nil
-	}
-
-	// Refuse before any socket is created: the provider's inventory says this
-	// server no longer exists, so there is no host to authenticate against and
-	// nothing to measure. The durable observation is authoritative here, not only
-	// the config snapshot the connection was built from: a snapshot taken before
-	// the observation was written is exactly how a replacement handshake would
-	// otherwise reach a removed address.
-	if err := checkProviderPresence(ctx, c.cfg); err != nil {
-		return err
 	}
 
 	if c.cfg.Host == "" {
