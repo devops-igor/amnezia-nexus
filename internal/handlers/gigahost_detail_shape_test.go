@@ -82,7 +82,7 @@ func TestRegistrationRecordsOwnerFromTheDocumentedDetailShapes(t *testing.T) {
 				switch {
 				case r.URL.Path == "/account":
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(accountJSON(fixtureAccount, false, "")))
+					_, _ = w.Write([]byte(accountJSON(fixtureAccount, false)))
 				case isDetailPath(r.URL.Path):
 					detailPath = r.URL.Path
 					if tc.status != 0 {
@@ -216,9 +216,7 @@ func TestReconcileGigahostInventory_DetailReadNeverConcludesAbsence(t *testing.T
 	// servers are recorded absent. The detail answers are unchanged between the passes.
 	f.provider.setAccountServers(1)
 	f.provider.answerPerServer(502, http.StatusNotFound)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("control pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 	if !f.row(refused).ProviderAbsent() {
 		t.Fatal("the control pass did not record an absent server, so the refusal above proves nothing")
 	}

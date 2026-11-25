@@ -142,9 +142,7 @@ func TestReconcileGigahostInventory_RestrictedKeyIsNotEvidenceOfAbsence(t *testi
 	// genuinely absent. The detail answers are unchanged between the two passes.
 	f.provider.setAccountServers(1)
 	f.provider.answerPerServer(502, http.StatusNotFound)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("control pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 	if !f.row(filtered).ProviderAbsent() || !f.row(genuinelyGone).ProviderAbsent() {
 		t.Fatal("the control pass did not record the absent servers, so the refusals above prove nothing")
 	}
@@ -167,11 +165,9 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 	// The documented numeric shape, with no text form supplied.
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation refused a documented numeric account identifier: %v", err)
-	}
-	if calls := f.provider.inventoryCallCount(); calls != 1 {
-		t.Fatalf("inventory reads = %d, want 1: the pass stopped before asking", calls)
+	f.confirm(context.Background())
+	if calls := f.provider.inventoryCallCount(); calls != 2 {
+		t.Fatalf("inventory reads = %d, want 2: one per agreeing pass", calls)
 	}
 	if !f.row(gone).ProviderAbsent() {
 		t.Fatal("a genuinely absent server was not recorded absent under a numeric account identifier")
@@ -189,9 +185,7 @@ func TestReconcileGigahostInventory_AcceptsNumericAccountIdentifier(t *testing.T
 	textGone := text.seedServer("Gone", providerProtocols(502))
 	text.provider.set(inventoryJSON(501))
 	text.provider.setAccountServers(1)
-	if err := text.reconcile(context.Background()); err != nil {
-		t.Fatalf("control pass failed: %v", err)
-	}
+	text.confirm(context.Background())
 	if text.row(textListed).ProviderAbsent() || !text.row(textGone).ProviderAbsent() {
 		t.Fatal("the text-shape control recorded a different state than the numeric shape")
 	}

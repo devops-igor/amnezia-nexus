@@ -370,14 +370,6 @@ type AccountInfo struct {
 	QualifiesArrears bool    `json:"qualifies_arrears"`
 	Currency         string  `json:"currency"`
 	Status           string  `json:"status,omitempty"`
-	// Permissions is the documented permissions object when the payload carries one.
-	// It is the only place the provider can state what this credential is allowed to
-	// see: a servers scope with all:true and no ids means the key may enumerate the
-	// whole account. The documented GET /account excerpt carries no permissions
-	// object, and a key cannot read its own record (every API-key endpoint is admin
-	// only), so in practice this is nil for the panel's own credential - which states
-	// nothing and therefore certifies nothing.
-	Permissions *AccountPermissions `json:"permissions,omitempty"`
 }
 
 // HasCredit checks if the account has positive balance, credit, or arrears qualification.

@@ -40,9 +40,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	f.provider.setAccount(fixtureAccount)
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 
 	// Same account: a genuinely absent row is marked, the listed row is not.
 	if !f.row(northGone).ProviderAbsent() {
@@ -65,9 +63,7 @@ func TestReconcileGigahostInventory_ScopesAbsenceToTheAnsweringAccount(t *testin
 	f.provider.setAccount(otherAccount)
 	f.provider.set(inventoryJSON(601))
 	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass after the account swap failed: %v", err)
-	}
+	f.confirm(context.Background())
 	if f.row(northListed).ProviderAbsent() {
 		t.Fatal("swapping the provider account marked the first account's operational server absent")
 	}
@@ -159,9 +155,7 @@ func TestReconcileGigahostInventory_UnattributableAccountChangesNothing(t *testi
 				t.Fatalf("the control pass rewrote an already-correct absence: %q, want %q", got, before)
 			}
 			missing := f.seedServer("Missing", providerProtocols(599))
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("control pass failed: %v", err)
-			}
+			f.confirm(context.Background())
 			if !f.row(missing).ProviderAbsent() {
 				t.Fatal("the control pass did not record an absent server, so the refusals above prove nothing")
 			}
@@ -192,9 +186,7 @@ func TestReconcileGigahostInventory_UnknownAccountPreservesStateBothWays(t *test
 
 	f.provider.set(inventoryJSON(702))
 	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 
 	if f.row(unlisted).ProviderAbsent() {
 		t.Fatal("a row of unknown account was marked absent")

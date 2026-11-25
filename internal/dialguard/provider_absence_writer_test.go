@@ -73,13 +73,14 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 	assertOnlyCallers(t, root, "writeDecidedRows", absenceInventoryFile+":applyGigahostInventoryPresence")
 	assertOnlyCallers(t, root, "applyGigahostInventoryPresence", absenceInventoryFile+":ReconcileGigahostServerInventory")
 
-	// 4. The absence direction is gated before it is written.
+	// 4. The absence direction is gated before it is written, by the confirmation a
+	//    repeated omission produced.
 	body := functionBody(t, root, absenceInventoryFile, "*Handlers", "writeDecidedRows")
 	gate, write := token.NoPos, token.NoPos
 	ast.Inspect(body, func(node ast.Node) bool {
 		switch n := node.(type) {
 		case *ast.IfStmt:
-			if gate == token.NoPos && mentions(n.Cond, "accountWide") && branches(n.Body, token.CONTINUE) {
+			if gate == token.NoPos && (mentions(n.Cond, "confirmed") || (n.Init != nil && mentions(n.Init, "confirmed"))) && branches(n.Body, token.CONTINUE) {
 				gate = n.Pos()
 			}
 		case *ast.CallExpr:
@@ -90,7 +91,7 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		return true
 	})
 	if gate == token.NoPos {
-		t.Fatal("the absence write is no longer gated by the account-wide certification")
+		t.Fatal("the absence write is no longer gated by the repeated-omission confirmation")
 	}
 	if write == token.NoPos {
 		t.Fatal("the pass no longer writes an observation at all")
@@ -99,37 +100,27 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 		t.Fatal("the pass writes the observation before checking the certification")
 	}
 
-	// 5. Certification is computed in exactly one place, from the inventory answer, and
-	//    its authority input is read in exactly one place.
-	assertOnlyCallers(t, root, "gigahostInventoryCertified", absenceInventoryFile+":gigahostInventoryAnswerFor")
-	assertOnlyCallers(t, root, "gigahostCredentialScope", absenceInventoryFile+":gigahostInventoryAnswerFor")
-	assertOnlyCallers(t, root, "EnumeratesWholeAccount", absenceInventoryFile+":gigahostCredentialScope")
+	// 5. The pass-to-pass confirmation is computed in exactly one place, from the two
+	//    counts a pass read, and the account-wide count in one place.
+	assertOnlyCallers(t, root, "confirmRepeatedOmissions", absenceInventoryFile+":applyGigahostInventoryPresence")
+	assertOnlyCallers(t, root, "gigahostAccountServerCount", absenceInventoryFile+":gigahostInventoryAnswerFor")
 
-	// 5b. The credential's scope is checked before the count corroboration: the summary
-	//     read may only confirm an answer whose authority is already established.
-	certify := functionBody(t, root, absenceInventoryFile, "*Handlers", "gigahostInventoryCertified")
-	scope, summary := token.NoPos, token.NoPos
-	ast.Inspect(certify, func(node ast.Node) bool {
-		switch n := node.(type) {
-		case *ast.IfStmt:
-			if scope == token.NoPos && mentions(n.Cond, "scopeStated") && returns(n.Body) {
-				scope = n.Pos()
-			}
-		case *ast.CallExpr:
-			if summary == token.NoPos && mentions(n.Fun, "GetDashboard") {
-				summary = n.Pos()
+	// 6. The certificate must not depend on a field the provider does not document for
+	//    the credential the panel holds: the account payload's permissions object is
+	//    admin-session-only and must not be read here.
+	for _, rel := range []string{absenceInventoryFile,
+		"internal/provider/gigahost/types.go",
+		"internal/provider/gigahost/client.go",
+		"internal/provider/gigahost/account_decode.go"} {
+		raw, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		for _, forbidden := range []string{"EnumeratesWholeAccount", "AccountPermissions", "PermissionScope", `"permissions"`} {
+			if strings.Contains(string(raw), forbidden) {
+				t.Errorf("%s reads %s, which the provider does not document for this credential", rel, forbidden)
 			}
 		}
-		return true
-	})
-	if scope == token.NoPos {
-		t.Fatal("the certificate no longer checks the credential's stated scope")
-	}
-	if summary == token.NoPos {
-		t.Fatal("the certificate no longer corroborates with the account summary")
-	}
-	if scope > summary {
-		t.Fatal("the certificate reads the account summary before the credential's scope")
 	}
 
 	// 6. A detail read may only ask about presence. Nothing in the decision path may
@@ -146,18 +137,6 @@ func TestProviderAbsenceHasOneGatedWriter(t *testing.T) {
 			}
 		}
 	}
-}
-
-// returns reports whether the body exits, which is how a guard refuses.
-func returns(body *ast.BlockStmt) bool {
-	found := false
-	ast.Inspect(body, func(node ast.Node) bool {
-		if _, ok := node.(*ast.ReturnStmt); ok {
-			found = true
-		}
-		return !found
-	})
-	return found
 }
 
 // assertOnlyCallers fails unless symbol is invoked from exactly one function.

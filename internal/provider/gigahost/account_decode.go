@@ -22,9 +22,8 @@ func (a *AccountInfo) UnmarshalJSON(data []byte) error {
 		Credit           float64  `json:"credit"`
 		CreditNOK        float64  `json:"credit_nok"`
 		QualifiesArrears bool     `json:"qualifies_arrears"`
-		Currency         string              `json:"currency"`
-		Status           string              `json:"status"`
-		Permissions      *AccountPermissions `json:"permissions"`
+		Currency         string   `json:"currency"`
+		Status           string   `json:"status"`
 	}{}
 	if err := json.Unmarshal(data, &shadow); err != nil {
 		return err
@@ -39,6 +38,5 @@ func (a *AccountInfo) UnmarshalJSON(data []byte) error {
 	a.QualifiesArrears = shadow.QualifiesArrears
 	a.Currency = shadow.Currency
 	a.Status = shadow.Status
-	a.Permissions = shadow.Permissions
 	return nil
 }

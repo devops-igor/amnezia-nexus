@@ -73,10 +73,6 @@ type inventoryProvider struct {
 	// (the default) means the summary carries no service counts, which certifies
 	// nothing and therefore records no absence.
 	accountServers int
-	// permissions is the documented permissions object served inside /account, which
-	// is where a credential's own scope is stated. Empty means the payload states
-	// nothing about the credential's visibility, which certifies nothing.
-	permissions string
 }
 
 // set serves the given /servers body and clears any previous failure mode.
@@ -142,30 +138,6 @@ func (p *inventoryProvider) setDetailArray(array bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.detailArray = array
-}
-
-// setAccountScopeAccountWide states, in the documented permissions object, that this
-// credential may enumerate every server on the account.
-func (p *inventoryProvider) setAccountScopeAccountWide() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.permissions = `{"servers":{"mode":"r","all":true}}`
-}
-
-// setAccountScopeRestricted states that this credential is limited to specific server
-// ids, which is the shape a filtered key's account payload would carry.
-func (p *inventoryProvider) setAccountScopeRestricted(ids ...int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.permissions = fmt.Sprintf(`{"servers":{"mode":"r","all":false,"ids":%v}}`, ids)
-}
-
-// setAccountScopeUnstated serves an account payload with no permissions object, which
-// is the documented GET /account shape.
-func (p *inventoryProvider) setAccountScopeUnstated() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.permissions = ""
 }
 
 // setAccountServers reports an account-wide server count in the summary, which is
@@ -237,7 +209,7 @@ func (p *inventoryProvider) inventoryCallCount() int {
 func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	account, accountStatus, accountStall := p.account, p.accountStatus, p.accountStall
-	accountServers, permissions := p.accountServers, p.permissions
+	accountServers := p.accountServers
 	accountNumeric, accountBody := p.accountNumeric, p.accountBody
 	if r.URL.Path == "/servers" {
 		p.inventoryCalls++
@@ -270,7 +242,7 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(accountBody))
 			return
 		}
-		_, _ = w.Write([]byte(accountJSON(account, accountNumeric, permissions)))
+		_, _ = w.Write([]byte(accountJSON(account, accountNumeric)))
 		return
 	}
 	if id, ok := perServerPathID(r.URL.Path); ok {
@@ -357,18 +329,11 @@ func perServerJSON(id int64, account string, array bool) string {
 // accountJSON renders the provider's /account answer. An empty id names no
 // account, which the client reports as an account without an identity. With
 // numeric set, cust_id is a JSON number, the shape the provider documents.
-func accountJSON(account string, numeric bool, permissions string) string {
+func accountJSON(account string, numeric bool) string {
 	payload := map[string]any{"meta": map[string]any{"status": 200}, "data": map[string]any{}}
 	data := payload["data"].(map[string]any)
 	data["balance"] = 100.0
 	data["currency"] = "NOK"
-	if permissions != "" {
-		var scope map[string]any
-		if err := json.Unmarshal([]byte(permissions), &scope); err != nil {
-			panic("bad fixture permissions: " + permissions)
-		}
-		data["permissions"] = scope
-	}
 	if account != "" {
 		data["id"] = account
 		if numeric {
@@ -456,16 +421,7 @@ func newInventoryFixture(t *testing.T) *inventoryFixture {
 	if err != nil {
 		t.Fatalf("failed to open the test store: %v", err)
 	}
-	// A normal fixture models an account-wide credential: the account payload states
-	// the documented servers permission with all:true, which is the certificate's
-	// authority input. Tests that model a restricted or unstated credential override
-	// it explicitly.
-	provider := &inventoryProvider{
-		body:           inventoryJSON(),
-		account:        fixtureAccount,
-		accountServers: -1,
-		permissions:    `{"servers":{"mode":"r","all":true}}`,
-	}
+	provider := &inventoryProvider{body: inventoryJSON(), account: fixtureAccount, accountServers: -1}
 	server := httptest.NewServer(http.HandlerFunc(provider.handle))
 
 	f := &inventoryFixture{
@@ -601,6 +557,17 @@ func (f *inventoryFixture) listingBody() []byte {
 	return rec.Body.Bytes()
 }
 
+// confirm runs the reconciliation twice: absence needs two consecutive credible passes,
+// so this is the shortest sequence that can record one.
+func (f *inventoryFixture) confirm(ctx context.Context) {
+	f.t.Helper()
+	for i := 0; i < 2; i++ {
+		if err := f.h.ReconcileGigahostServerInventory(ctx); err != nil {
+			f.t.Fatalf("reconciliation pass %d failed: %v", i+1, err)
+		}
+	}
+}
+
 func (f *inventoryFixture) reconcile(ctx context.Context) error {
 	f.t.Helper()
 	return f.h.ReconcileGigahostServerInventory(ctx)
@@ -615,12 +582,11 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 	})
 
 	// The provider enumerates the account and lists only 501, which is also the
-	// account-wide count: this answer covers the whole account.
+	// account-wide count: this answer covers the whole account, twice in a row, which is
+	// what absence requires.
 	f.provider.set(inventoryJSON(501))
 	f.provider.setAccountServers(1)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 
 	goneRow := f.row(gone)
 	if !goneRow.ProviderAbsent() {
@@ -655,8 +621,8 @@ func TestReconcileGigahostInventory_RecordsAbsenceDurably(t *testing.T) {
 	if got := f.row(gone).ProviderAbsentAt; got != firstObserved {
 		t.Fatalf("a repeated pass rewrote the observation time: %q, want %q", got, firstObserved)
 	}
-	if calls := f.provider.inventoryCallCount(); calls != 2 {
-		t.Fatalf("expected one inventory read per pass, got %d reads over two passes", calls)
+	if calls := f.provider.inventoryCallCount(); calls != 3 {
+		t.Fatalf("expected one inventory read per pass, got %d reads over three passes", calls)
 	}
 
 	// The listing carries the state, so a later consumer can filter on it.
@@ -757,9 +723,7 @@ func TestReconcileGigahostInventory_FailedOrPartialReadsChangeNothing(t *testing
 			// indistinguishable from a pass that never ran.
 			f.provider.set(inventoryJSON(599))
 			f.provider.setAccountServers(1)
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("control pass failed: %v", err)
-			}
+			f.confirm(context.Background())
 			if !f.row(listed).ProviderAbsent() {
 				t.Fatal("the reconciliation never changes state on this fixture, so its 'nothing changed' assertions prove nothing")
 			}
@@ -775,9 +739,7 @@ func TestReconcileGigahostInventory_CorrectsAServerThatReappears(t *testing.T) {
 	// answer: the row it provisioned is absent.
 	f.provider.set(inventoryJSON())
 	f.provider.setAccountServers(0)
-	if err := f.reconcile(context.Background()); err != nil {
-		t.Fatalf("reconciliation pass failed: %v", err)
-	}
+	f.confirm(context.Background())
 	if !f.row(gone).ProviderAbsent() {
 		t.Fatal("a server absent from an enumerated empty account was not recorded absent")
 	}
@@ -889,9 +851,7 @@ func TestReconcileGigahostInventory_UnidentifiableEntryMarksNothingAbsent(t *tes
 			// would also pass if the pass never wrote anything at all.
 			f.provider.set(inventoryJSON(501))
 			f.provider.setAccountServers(1)
-			if err := f.reconcile(context.Background()); err != nil {
-				t.Fatalf("control pass failed: %v", err)
-			}
+			f.confirm(context.Background())
 			if f.row(listed).ProviderAbsent() {
 				t.Fatal("the control pass marked a listed server absent")
 			}

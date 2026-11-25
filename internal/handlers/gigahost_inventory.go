@@ -86,10 +86,12 @@ type gigahostInventoryAnswer struct {
 	listed    map[int64]struct{}
 	accountID string
 	client    gigahost.Client
-	// accountWide reports whether this answer is certified as the account's whole
-	// enumeration, which is the only thing that may conclude absence. It is set by
-	// gigahostInventoryCertified and nowhere else.
-	accountWide bool
+	// accountServers is the account-wide server count this pass read from the summary,
+	// and listingCredible reports whether this pass's own evidence is consistent: the
+	// listing's size equals that count. Only a credible pass contributes evidence, and a
+	// row needs two consecutive credible passes to be recorded absent.
+	accountServers  int
+	listingCredible bool
 }
 
 // gigahostServerReported reports whether the provider answered with this server.
@@ -108,68 +110,80 @@ func gigahostServerReported(ctx context.Context, client gigahost.Client, serverI
 	return err == nil
 }
 
-// gigahostCredentialScope reads the credential's own scope out of the account payload.
+// absenceCandidate is the evidence one pass records so the next one can confirm it.
 //
-// The provider's documented permissions object is the only place it can state what a
-// credential may enumerate; a servers scope with all:true and no ids means the key sees
-// every server on the account. A payload without that object states nothing, and a
-// payload with a restriction states that the key is limited - both certify nothing.
-func gigahostCredentialScope(account *gigahost.AccountInfo) (accountWide, stated bool) {
-	if account == nil {
-		return false, false
-	}
-	return account.EnumeratesWholeAccount()
+// It carries the account the omission belongs to and the two counts that made the pass
+// credible, so a confirmation compares like with like. It is in memory on purpose: the
+// rule is about consecutive reconciliation passes in this process, a restart simply
+// requires two fresh passes, and no stale snapshot is ever trusted.
+type absenceCandidate struct {
+	accountID        string
+	providerServerID int64
+	listedCount      int
+	accountServers   int
+	seenAt           time.Time
 }
 
-// gigahostInventoryCertified certifies that a listing enumerated the whole account.
+// gigahostAccountServerCount reads the account-wide server count the summary reports.
 //
-// Two conditions, in this order, and neither is sufficient alone:
-//
-//  1. Authority, from the credential's own scope: the account payload must state that
-//     this credential may enumerate the whole account (permissions.servers.all true,
-//     no id restriction). No statement, or a restriction, certifies nothing. This is
-//     the certificate's basis, because it is evidence about the credential that
-//     produced the listing rather than about a different moment in time.
-//  2. Corroboration, from the account summary: the listing's size must equal the
-//     account-wide server count (GET /dashboard, documented as available to every
-//     valid token and API key regardless of permissions). This may only confirm an
-//     answer whose authority is already established - two counts taken at different
-//     times can coincide after an unrelated change - and a mismatch always withholds.
-//
-// Nothing here consults a per-server answer: the provider's per-server statuses say
-// nothing about the credential's scope, and modeling them as if they did would
-// replace one wrong conclusion with another.
-func (h *Handlers) gigahostInventoryCertified(
-	ctx context.Context, client gigahost.Client, listed int, credentialAccountWide, scopeStated bool,
-) bool {
-	if !scopeStated {
-		slog.Warn("Provider account payload states no scope for this credential; no absence recorded in this pass")
-		return false
-	}
-	if !credentialAccountWide {
-		slog.Info("Provider account payload restricts this credential's visibility; no absence recorded in this pass")
-		return false
-	}
-
+// GET /dashboard is documented as available "to every valid token and API key,
+// regardless of its permissions", and its services figures count the account's own
+// servers. It is the only documented account-wide count the panel can read with the
+// credential it holds.
+func (h *Handlers) gigahostAccountServerCount(ctx context.Context, client gigahost.Client) (int, bool) {
 	dashboard, err := client.GetDashboard(ctx)
 	switch {
 	case err != nil:
-		slog.Warn("Provider account summary unavailable; no absence recorded in this pass", "err", err)
-		return false
+		slog.Warn("Provider account summary unavailable; absence not recorded in this pass", "err", err)
+		return 0, false
 	case dashboard == nil || !dashboard.ServicesPresent:
-		slog.Warn("Provider account summary carried no service counts; no absence recorded in this pass")
-		return false
+		slog.Warn("Provider account summary carried no service counts; absence not recorded in this pass")
+		return 0, false
 	}
-	accountServers := dashboard.Services.ServerCount()
-	if listed != accountServers {
-		slog.Info("Provider inventory does not corroborate the account summary; no absence recorded in this pass",
-			"listed_servers", listed, "account_servers", accountServers)
-		return false
-	}
-	return true
+	return dashboard.Services.ServerCount(), true
 }
 
-// ReconcileGigahostServerInventory records, for every Gigahost-provisioned
+// confirmRepeatedOmissions turns a repeated omission into a confirmed absence.
+//
+// Absence is concluded only on evidence that repeats: the row must be omitted in two
+// consecutive passes, and each of those passes must be credible on its own - its own
+// listing's size equal to its own account-wide count. Anything else clears the carried
+// evidence: a mismatch, a missing count, an unreadable summary, or a pass in which the
+// row was listed or reported. Two consecutive agreements are what a single coincidental
+// equality cannot produce.
+func (h *Handlers) confirmRepeatedOmissions(accountID string, listedCount, accountServers int, credible bool, candidates []int64) map[int64]struct{} {
+	h.absenceMu.Lock()
+	defer h.absenceMu.Unlock()
+
+	confirmed := make(map[int64]struct{}, len(candidates))
+	next := make(map[int64]absenceCandidate, len(candidates))
+	if credible {
+		for _, id := range candidates {
+			if previous, ok := h.absenceCandidates[id]; ok &&
+				previous.accountID == accountID &&
+				previous.listedCount == listedCount &&
+				previous.accountServers == accountServers {
+				confirmed[id] = struct{}{}
+				continue
+			}
+			next[id] = absenceCandidate{
+				accountID:        accountID,
+				providerServerID: id,
+				listedCount:      listedCount,
+				accountServers:   accountServers,
+				seenAt:           time.Now().UTC(),
+			}
+		}
+	}
+	h.absenceCandidates = next
+	if len(confirmed) == 0 && len(candidates) > 0 && !credible {
+		slog.Info("Provider inventory was not credible in this pass; carried absence evidence cleared",
+			"unlisted_rows", len(candidates), "listed_servers", listedCount, "account_servers", accountServers)
+	}
+	return confirmed
+}
+
+// ReconcileGigahostServerInventory records, for every Gigahost-provisioned// ReconcileGigahostServerInventory records, for every Gigahost-provisioned
 // server row, whether the provider's inventory still lists it.
 //
 // Nothing here is on a request path: the panel's periodic background pass calls
@@ -335,15 +349,18 @@ func (h *Handlers) gigahostInventoryAnswerFor(ctx context.Context) (gigahostInve
 	if err != nil {
 		return gigahostInventoryAnswer{}, err
 	}
-	credentialAccountWide, scopeStated := gigahostCredentialScope(account)
+
+	// Credibility is a property of this pass's own evidence: its listing's size against
+	// the account-wide count read in the same pass. A missing or unreadable summary makes
+	// the pass incredible, which clears the carried evidence rather than concluding
+	// anything from it.
+	accountServers, counted := h.gigahostAccountServerCount(callCtx, client)
 	return gigahostInventoryAnswer{
-		listed:    listed,
-		accountID: accountID,
-		client:    client,
-		// Absence is only ever concluded from a certified-complete answer. The
-		// certificate's basis is this credential's own stated scope, corroborated by
-		// the account summary; nothing here reads a per-server answer.
-		accountWide: h.gigahostInventoryCertified(callCtx, client, len(listed), credentialAccountWide, scopeStated),
+		listed:          listed,
+		accountID:       accountID,
+		client:          client,
+		accountServers:  accountServers,
+		listingCredible: counted && len(listed) == accountServers,
 	}, nil
 }
 
@@ -433,31 +450,46 @@ func decideGigahostRows(ctx context.Context, rows []providerBackedServer, answer
 	return outcome
 }
 
+// unlistedProviderIDs returns the provider server ids of the rows this pass saw omitted,
+// which are the only rows that may become an absence candidate. Presence was already
+// decided per row, so a server a detail read returned is not among them.
+func unlistedProviderIDs(rows []providerBackedServer, decisions []gigahostRowDecision) []int64 {
+	ids := make([]int64, 0, len(rows))
+	for i, row := range rows {
+		if decisions[i] == gigahostRowUnlisted {
+			ids = append(ids, row.providerServerID)
+		}
+	}
+	return ids
+}
+
 // applyGigahostInventoryPresence writes the provider's answer onto the rows whose
 // state it changes. A row already carrying the answer is not rewritten, so the
 // original observation time survives a repeated pass.
 //
-// Absence has exactly one source: a certified-complete inventory answer. A row the
-// account's own enumeration does not list is absent, and the pass writes that only
-// when the answer is certified as the account's whole enumeration (see
-// gigahostInventoryCertified). A detail read is never an absence observation; it
-// can only add presence, which clears a mark immediately.
+// Absence has exactly one source: an omission that repeats across two consecutive
+// credible passes (see confirmRepeatedOmissions). A single pass - however consistent its
+// own counts look - can never record it. A detail read is never an absence observation;
+// it can only add presence, which clears a mark immediately.
 func (h *Handlers) applyGigahostInventoryPresence(
 	ctx context.Context, rows []providerBackedServer, answer gigahostInventoryAnswer,
 ) error {
 	now := time.Now().UTC()
 	outcome := decideGigahostRows(ctx, rows, answer)
 
-	if candidates := outcome.counts[gigahostRowUnlisted]; candidates > 0 && !answer.accountWide {
-		// The listing did not enumerate the account, or nothing proved that it did.
-		// Every candidate keeps the state it had.
-		slog.Info("Provider inventory is not certified as the account's whole answer; no absence recorded in this pass",
-			"unlisted_rows", candidates,
-			"listed_rows", outcome.counts[gigahostRowListed],
-			"detail_returned_rows", outcome.counts[gigahostRowDetailPresent])
+	candidates := unlistedProviderIDs(rows, outcome.decisions)
+	confirmed := h.confirmRepeatedOmissions(answer.accountID, len(answer.listed), answer.accountServers, answer.listingCredible, candidates)
+	if len(candidates) > 0 && len(confirmed) == 0 {
+		// Every candidate keeps the state it had: this pass either was not credible or is
+		// the first of the two that must agree.
+		slog.Info("Provider inventory recorded no absence in this pass",
+			"unlisted_rows", len(candidates),
+			"listing_credible", answer.listingCredible,
+			"listed_servers", len(answer.listed),
+			"account_servers", answer.accountServers)
 	}
 
-	failures := h.writeDecidedRows(ctx, rows, outcome.decisions, answer.accountWide, now)
+	failures := h.writeDecidedRows(ctx, rows, outcome.decisions, confirmed, now)
 	if left := outcome.counts[gigahostRowUnknownAccount] + outcome.counts[gigahostRowOtherAccount]; left > 0 {
 		// Observable without naming an account or a credential: why rows were
 		// left alone, and how many.
@@ -471,10 +503,10 @@ func (h *Handlers) applyGigahostInventoryPresence(
 // writeDecidedRows stores the decisions that hold an existence answer.
 //
 // The only write that can hide a server is the absence write, and it is gated by the
-// certification of the inventory answer: without it, an omitted row keeps whatever
+// confirmation a repeated omission produced: without it, an omitted row keeps whatever
 // state it had.
 func (h *Handlers) writeDecidedRows(
-	ctx context.Context, rows []providerBackedServer, decisions []gigahostRowDecision, accountWide bool, now time.Time,
+	ctx context.Context, rows []providerBackedServer, decisions []gigahostRowDecision, confirmed map[int64]struct{}, now time.Time,
 ) []error {
 	var failures []error
 	for i, row := range rows {
@@ -482,9 +514,11 @@ func (h *Handlers) writeDecidedRows(
 		if !measured {
 			continue
 		}
-		if !present && !accountWide {
-			// Absence may only come from a certified-complete inventory answer.
-			continue
+		if !present {
+			if _, ok := confirmed[row.providerServerID]; !ok {
+				// Absence may only come from an omission confirmed by two agreeing passes.
+				continue
+			}
 		}
 		if err := h.writeProviderAbsence(ctx, row, present, now); err != nil {
 			failures = append(failures, err)
