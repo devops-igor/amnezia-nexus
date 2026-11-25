@@ -40,7 +40,7 @@ const providerAbsenceReadTimeout = 2 * time.Second
 // session because the store was momentarily unreadable would be a larger outage than the
 // narrow window it would close, and the requirement is about CONFIRMED absence. The
 // failure is logged, never silent.
-func (s *Service) providerAbsentServerIDs(ctx context.Context) map[int64]struct{} {
+func (s *Service) providerAbsentServerIDs(ctx context.Context) models.AbsentServerSet {
 	if s == nil || s.db == nil {
 		return nil
 	}
@@ -51,14 +51,7 @@ func (s *Service) providerAbsentServerIDs(ctx context.Context) map[int64]struct{
 		log.Printf("[vpn] warning: cannot read provider-absence marks, selection is unchanged for this request: %v", err)
 		return nil
 	}
-	if len(ids) == 0 {
-		return nil
-	}
-	absent := make(map[int64]struct{}, len(ids))
-	for _, id := range ids {
-		absent[id] = struct{}{}
-	}
-	return absent
+	return models.NewAbsentServerSet(ids)
 }
 
 // withoutProviderAbsent returns the tunnels that may receive NEW work.
@@ -67,19 +60,6 @@ func (s *Service) providerAbsentServerIDs(ctx context.Context) map[int64]struct{
 // confirmed absent is not an assignment or migration destination, independently of its last
 // health sample. Tunnels the provider still lists pass through unchanged, and an empty set
 // (or a failed read) leaves the list exactly as it was.
-func withoutProviderAbsent(tunnels []*models.BackendTunnel, absent map[int64]struct{}) []*models.BackendTunnel {
-	if len(absent) == 0 || len(tunnels) == 0 {
-		return tunnels
-	}
-	kept := make([]*models.BackendTunnel, 0, len(tunnels))
-	for _, tun := range tunnels {
-		if tun == nil {
-			continue
-		}
-		if _, isAbsent := absent[tun.ServerID]; isAbsent {
-			continue
-		}
-		kept = append(kept, tun)
-	}
-	return kept
+func withoutProviderAbsent(tunnels []*models.BackendTunnel, absent models.AbsentServerSet) []*models.BackendTunnel {
+	return models.EligibleTunnelDestinations(tunnels, absent)
 }

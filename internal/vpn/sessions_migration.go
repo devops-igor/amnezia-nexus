@@ -24,11 +24,16 @@ func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
 }
 
 // validateMigrationTarget checks that targetTunnelID exists and is eligible for
-// migration - administratively enabled AND runtime-active (issue #90) -
-// returning its StateVersion. The eligibility preflight must run before any
-// migration mutation so a disabled target is rejected without touching the
+// migration and returns its StateVersion. The eligibility preflight must run before
+// any migration mutation so an ineligible target is rejected without touching the
 // forwarder route, SessionManager state, or the DB session row.
-func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
+//
+// It is the ONE destination gate for every migration caller: the health-disable
+// failover, its retry worker and the scheduled rebalancer all reach it through
+// MigrateSession, so a rule added here is inherited rather than re-implemented. The
+// administrative/runtime conditions (issue #90) and the provider-absence rule are
+// both decided by models.TunnelDestinationAllowed, so they cannot drift apart.
+func (s *Service) validateMigrationTarget(targetTunnelID int64, providerAbsent models.AbsentServerSet) (int64, error) {
 	if s.pool == nil {
 		return 0, nil
 	}
@@ -39,6 +44,13 @@ func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if !targetTun.Enabled || !strings.EqualFold(targetTun.Status, models.TunnelStatusActive) {
 		return 0, fmt.Errorf("target backend tunnel %d is not eligible (enabled=%t status=%s)",
 			targetTunnelID, targetTun.Enabled, targetTun.Status)
+	}
+	if providerAbsent.Contains(targetTun.ServerID) {
+		// The provider's inventory has contradicted this server: moving a working session
+		// onto it would strand the peer, and its "active" status is only the last health
+		// sample. The mark is not converted into a status - nothing is disabled here.
+		return 0, fmt.Errorf("target backend tunnel %d (server %d) is confirmed absent by the provider",
+			targetTunnelID, targetTun.ServerID)
 	}
 	return targetTun.StateVersion, nil
 }
@@ -94,10 +106,14 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 		return errors.New("invalid target tunnel id")
 	}
 
+	// The provider-absence marks are read BEFORE s.mu: this is the destination gate every
+	// migration caller inherits, and no database read may run inside the lock.
+	providerAbsent := s.providerAbsentServerIDs(ctx)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	expectedVersion, err := s.validateMigrationTarget(targetTunnelID)
+	expectedVersion, err := s.validateMigrationTarget(targetTunnelID, providerAbsent)
 	if err != nil {
 		return err
 	}

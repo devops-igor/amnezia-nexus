@@ -47,7 +47,7 @@ func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 //
 // A retired generation is inert — ErrTunnelGenerationRetired and no mutation.
 // An already-removed slot is also inert: there is nothing left to withdraw.
-func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *models.BackendTunnel, providerAbsent map[int64]struct{}) error {
+func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *models.BackendTunnel, providerAbsent models.AbsentServerSet) error {
 	if s.pool == nil {
 		return errors.New("tunnel pool not initialized")
 	}
@@ -82,7 +82,7 @@ func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *m
 // forwarder device, and fails over active sessions (sticky affinities, DB
 // rows, live forwarder routes, pool counters) onto healthy backends so
 // traffic keeps flowing before any further mutation by the caller.
-func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, providerAbsent map[int64]struct{}) error {
+func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, providerAbsent models.AbsentServerSet) error {
 	if s.pool == nil {
 		return errors.New("tunnel pool not initialized")
 	}
@@ -662,7 +662,7 @@ func (s *Service) isServerDeletedLocked(serverID int64) bool {
 func (s *Service) DeleteServer(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
 	if s.deletedServers == nil {
-		s.deletedServers = make(map[int64]struct{})
+		s.deletedServers = make(models.AbsentServerSet)
 	}
 	s.deletedServers[serverID] = struct{}{}
 	if s.deleteBackendErr != nil {
@@ -823,7 +823,7 @@ func (s *Service) isLivePoolTunnel(serverID int64, tunnelID int64) bool {
 	return false
 }
 
-func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64, providerAbsent map[int64]struct{}) error {
+func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64, providerAbsent models.AbsentServerSet) error {
 	if s.db == nil {
 		return nil
 	}

@@ -382,7 +382,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 // A blocked backend without recorded fresh evidence, or whose attached device
 // changed since that evidence was produced, is simply not a candidate: new
 // clients are refused there while established routes keep running.
-func (s *Service) admissibleIngressCandidatesLocked(providerAbsent map[int64]struct{}) []*models.BackendTunnel {
+func (s *Service) admissibleIngressCandidatesLocked(providerAbsent models.AbsentServerSet) []*models.BackendTunnel {
 	// Provider absence disqualifies a destination even when its last health sample is
 	// still active: the provider said the server is gone, and health has not run since.
 	active := withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent)
