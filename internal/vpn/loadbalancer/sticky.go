@@ -16,9 +16,15 @@ import (
 // StickyStore is the DB surface HandleFailover needs. It exists so the
 // failover path can be tested with wrapped/failing DB handles without
 // changing the concrete database.DB type anywhere else.
+//
+// ListProviderAbsentServerIDs is part of this surface on purpose: the failover destination
+// decision must consult the provider-absence marks at the moment it chooses, not from the
+// candidate snapshot its caller built. A store that cannot answer cannot be wired in, so a
+// future caller cannot quietly skip the re-read.
 type StickyStore interface {
 	GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, error)
 	CreateVPNSession(ctx context.Context, s *models.VPNSession) error
+	ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error)
 }
 
 type affinityRecord struct {
@@ -45,6 +51,14 @@ type StickySessionManager struct {
 	// silent - this counter plus the SkippedPeers result field make stranding
 	// observable so callers can retry or alert.
 	skipCounter atomic.Int64
+
+	// candidateHookForTest runs between the candidate snapshot and the destination
+	// re-read, so a test can commit a mark at exactly that boundary.
+	candidateHookForTest func()
+
+	// absentReadErrForTest forces the destination re-read to fail, so the unknown state is
+	// testable without racing a store.
+	absentReadErrForTest error
 }
 
 // NewStickySessionManager creates a new StickySessionManager wrapping a base load balancer.
@@ -465,6 +479,53 @@ func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunn
 	healthy, snap, err := sm.snapshotFailoverTargets(degradedTunnelID, filtered)
 	if err != nil {
 		return nil, err
+	}
+
+	// The candidate list above is a SNAPSHOT taken by the caller before it took its own
+	// service lock. An independent inventory cycle writes absence under the database lock
+	// only, so a mark can commit between that snapshot and the choice below. The decision is
+	// therefore re-made here, immediately before selection, and the available alternative is
+	// simply the next eligible candidate.
+	//
+	// A failed re-read is UNKNOWN, not "nothing is absent": the move is refused rather than
+	// allowed on stale information. That is deliberately different from emptying the fleet -
+	// the peers stay where they are and the outcome is reported as skipped, so an operator
+	// sees why nothing moved.
+	if sm.candidateHookForTest != nil {
+		sm.candidateHookForTest()
+	}
+	healthy, known := sm.revalidateDestinations(ctx, healthy)
+	if !known {
+		result := &FailoverResult{}
+		for _, dp := range sm.snapshotPeers(snap) {
+			sm.skipCounter.Add(1)
+			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
+				PeerPublicKey: dp.peerKey,
+				UserID:        dp.userID,
+				Reason:        "destination eligibility unknown: provider absence could not be re-read",
+			})
+		}
+		sort.SliceStable(result.Skipped, func(i, j int) bool {
+			return result.Skipped[i].PeerPublicKey < result.Skipped[j].PeerPublicKey
+		})
+		return result, nil
+	}
+	if len(healthy) == 0 {
+		// Every candidate is confirmed absent: the peer keeps its current backend rather than
+		// being moved onto a deleted one.
+		result := &FailoverResult{}
+		for _, dp := range sm.snapshotPeers(snap) {
+			sm.skipCounter.Add(1)
+			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
+				PeerPublicKey: dp.peerKey,
+				UserID:        dp.userID,
+				Reason:        "no destination remains after excluding provider-confirmed absent backends",
+			})
+		}
+		sort.SliceStable(result.Skipped, func(i, j int) bool {
+			return result.Skipped[i].PeerPublicKey < result.Skipped[j].PeerPublicKey
+		})
+		return result, nil
 	}
 
 	result := &FailoverResult{}

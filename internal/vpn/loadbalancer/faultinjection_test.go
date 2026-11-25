@@ -44,6 +44,10 @@ func (r *readFailStore) CreateVPNSession(ctx context.Context, s *models.VPNSessi
 	return r.inner.CreateVPNSession(ctx, s)
 }
 
+func (r *readFailStore) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	return r.inner.ListProviderAbsentServerIDs(ctx)
+}
+
 // hangingStore blocks GetActiveVPNSessions until its gate is closed, then
 // delegates - a controllable-latency DB read for scenario 3.
 type hangingStore struct {
@@ -58,6 +62,10 @@ func (h *hangingStore) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSe
 
 func (h *hangingStore) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	return h.inner.CreateVPNSession(ctx, s)
+}
+
+func (h *hangingStore) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	return h.inner.ListProviderAbsentServerIDs(ctx)
 }
 
 // strandingInvariant asserts the scenario-2/5 state invariant for one

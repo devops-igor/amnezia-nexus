@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -173,6 +174,28 @@ func (d *DB) UpdateVPNSessionTraffic(ctx context.Context, sessionID string, rx, 
 	return nil
 }
 
+// providerAbsentDestinationPredicate is the SQL form of "this tunnel's server is not
+// confirmed absent by the provider".
+//
+// The destination decision is made in Go, but the mark is written by an independent inventory
+// cycle under this package's write lock. Between the Go decision and the UPDATE below, a mark
+// can commit, and a write made from a cached candidate list would then place a session on a
+// server the provider has already deleted. Carrying the predicate INTO the statement makes the
+// check and the write one atomic act: either the destination was eligible at commit time or
+// the row is untouched. The same predicate is used by every durable session-move write, so the
+// rule cannot be present in one and missing in another.
+const providerAbsentDestinationPredicate = `NOT EXISTS (
+	SELECT 1 FROM backend_tunnels bt
+	JOIN servers s ON s.id = bt.server_id
+	WHERE bt.id = ? AND s.provider_absent_at IS NOT NULL AND TRIM(s.provider_absent_at) <> ''
+)`
+
+// ErrDestinationProviderAbsent reports a durable session move that was refused because the
+// destination's server is confirmed absent by the provider. It is deliberately distinct from
+// "session not found": one is a destination problem the caller must log and retry elsewhere,
+// the other means there is nothing left to move.
+var ErrDestinationProviderAbsent = errors.New("destination backend belongs to a server the provider no longer lists")
+
 // UpdateVPNSessionBackendTunnel reassigns a connected session to another backend
 // tunnel in place, marking it "draining" (issue #44 R5: rebalancing is DB-only by
 // design — the forwarder's live route is not migrated, so the session must leave
@@ -180,19 +203,44 @@ func (d *DB) UpdateVPNSessionTraffic(ctx context.Context, sessionID string, rx, 
 // clause pins the update to rows still in 'connected' status, so a session that
 // disconnected mid-rebalance is never resurrected; the session ID, connected_at,
 // and traffic counters are all preserved.
+//
+// It also refuses a destination that has become provider-confirmed absent since the caller
+// chose it (see providerAbsentDestinationPredicate), returning ErrDestinationProviderAbsent.
 func (d *DB) UpdateVPNSessionBackendTunnel(ctx context.Context, sessionID string, backendTunnelID int64) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
-	query := "UPDATE vpn_sessions SET backend_tunnel_id = ?, status = 'draining' WHERE id = ? AND status = 'connected'"
-	res, err := d.sqlDB.ExecContext(ctx, query, backendTunnelID, sessionID)
+	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?, status = 'draining'
+		WHERE id = ? AND status = 'connected' AND ` + providerAbsentDestinationPredicate
+	res, err := d.sqlDB.ExecContext(ctx, query, backendTunnelID, sessionID, backendTunnelID)
 	if err != nil {
 		return fmt.Errorf("failed to update vpn session %s backend tunnel: %w", sessionID, err)
 	}
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+	rows, rowsErr := res.RowsAffected()
+	if rowsErr == nil && rows == 0 {
+		// Distinguish the two reasons so the caller reports the true one.
+		if absent, checkErr := d.backendTunnelServerAbsent(ctx, backendTunnelID); checkErr == nil && absent {
+			return fmt.Errorf("%w: backend tunnel %d", ErrDestinationProviderAbsent, backendTunnelID)
+		}
 		return fmt.Errorf("vpn session %s not found or no longer connected", sessionID)
 	}
 	return nil
+}
+
+// backendTunnelServerAbsent reports whether a tunnel's server carries a provider absence mark.
+// It runs under the caller's write lock, so it observes the same snapshot as the write it
+// explains.
+func (d *DB) backendTunnelServerAbsent(ctx context.Context, backendTunnelID int64) (bool, error) {
+	var observed sql.NullString
+	err := d.sqlDB.QueryRowContext(ctx, `SELECT s.provider_absent_at FROM backend_tunnels bt
+		JOIN servers s ON s.id = bt.server_id WHERE bt.id = ?`, backendTunnelID).Scan(&observed)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return observed.Valid && strings.TrimSpace(observed.String) != "", nil
 }
 
 // MigrateVPNSessionBackend updates a session's backend_tunnel_id while keeping status 'connected' (issue #289).
@@ -220,8 +268,9 @@ func (d *DB) MigrateVPNSessionToActiveTunnel(ctx context.Context, sessionID stri
 	query := `UPDATE vpn_sessions SET backend_tunnel_id = ?
 		WHERE id = ? AND backend_tunnel_id = ? AND status = 'connected'
 		AND EXISTS (SELECT 1 FROM backend_tunnels
-			WHERE id = ? AND enabled = 1 AND status = 'active')`
-	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID)
+			WHERE id = ? AND enabled = 1 AND status = 'active')
+		AND ` + providerAbsentDestinationPredicate
+	res, err := d.sqlDB.ExecContext(ctx, query, targetID, sessionID, sourceID, targetID, targetID)
 	if err != nil {
 		return fmt.Errorf("failed to migrate vpn session %s to tunnel %d: %w", sessionID, targetID, err)
 	}
