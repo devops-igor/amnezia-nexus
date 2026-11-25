@@ -6,7 +6,7 @@ package orchestrator
 // the provider's inventory has confirmed deleted. The rebalance is a separate destination
 // source: it enumerates DURABLE tunnels (`GetBackendTunnels`) rather than the pool snapshot,
 // so the filter applied to that snapshot can never see its candidates. This file is what
-// makes the durable source honour the same rule, once, for both of the rebalance's write
+// makes the durable source honor the same rule, once, for both of the rebalance's write
 // paths (the live migrator and the DB-only fallback).
 //
 // Nothing here converts the mark into state: no tunnel is disabled, no probe is fabricated,

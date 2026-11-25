@@ -788,7 +788,7 @@ func parsePartialOrderError(statusCode int, data []byte) *OrderPartialError {
 		} `json:"data"`
 	}
 	// Lossless: these ids are int64 in the returned error, so a fractional or large id must
-	// not be truncated into a neighbouring order.
+	// not be truncated into a neighboring order.
 	var env rawOrderEnvelope
 	if err := decodeJSONUseNumber(data, &env); err != nil {
 		return nil
@@ -798,7 +798,7 @@ func parsePartialOrderError(statusCode int, data []byte) *OrderPartialError {
 	addID := func(v any) {
 		id, err := decodeExactInteger(v)
 		if err != nil {
-			// An unreadable order id names no order; it must not become a neighbouring one.
+			// An unreadable order id names no order; it must not become a neighboring one.
 			return
 		}
 		if id > 0 {
