@@ -189,7 +189,7 @@ func TestPoolMaintenanceNeverClosesInFlightWork(t *testing.T) {
 				inUse = n.Pos()
 			}
 		case *ast.CallExpr:
-			if closed == token.NoPos && mentions(n.Fun, "Close") {
+			if closed == token.NoPos && (mentions(n.Fun, "Close") || mentions(n.Fun, "retire")) {
 				closed = n.Pos()
 			}
 		}
@@ -203,6 +203,43 @@ func TestPoolMaintenanceNeverClosesInFlightWork(t *testing.T) {
 	}
 	if inUse > closed {
 		t.Fatal("maintenance closes a connection before checking whether work is in flight")
+	}
+
+	// Retirement is one private point that keeps the ownership check and the
+	// close together, so no caller can delete an entry it no longer owns.
+	retireBody := functionBody(t, root, sshPoolFile, "*SSHClientPool", "retire")
+	ownership, deleted := token.NoPos, token.NoPos
+	ast.Inspect(retireBody, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.IfStmt:
+			if ownership != token.NoPos || !mentions(n.Cond, "conns") {
+				break
+			}
+			exits := false
+			ast.Inspect(n.Body, func(inner ast.Node) bool {
+				if _, ok := inner.(*ast.ReturnStmt); ok {
+					exits = true
+				}
+				return !exits
+			})
+			if exits {
+				ownership = n.Pos()
+			}
+		case *ast.CallExpr:
+			if deleted == token.NoPos && mentions(n.Fun, "delete") {
+				deleted = n.Pos()
+			}
+		}
+		return true
+	})
+	if deleted == token.NoPos {
+		t.Fatal("retire no longer deletes the retired entry")
+	}
+	if ownership == token.NoPos || ownership > deleted {
+		t.Fatal("retire deletes a pool entry without checking it is still the current one")
+	}
+	if !mentions(retireBody, "Close") {
+		t.Fatal("retire no longer closes the retired connection")
 	}
 }
 
@@ -229,7 +266,7 @@ func checkSSHConstruction(t *testing.T, rel string, file *ast.File, fn *ast.Func
 		switch n := node.(type) {
 		case *ast.SelectorExpr:
 			if file.Name.Name == "ssh" && n.Sel.Name == "conns" {
-				allowed := rel == sshPoolFile && (fn.Name.Name == "cachedClient" || fn.Name.Name == "publishClient" || fn.Name.Name == "Remove" || fn.Name.Name == "RemoveByKey" || fn.Name.Name == "Len" || fn.Name.Name == "Close" || fn.Name.Name == "pingAll" || fn.Name.Name == "sweepIdle")
+				allowed := rel == sshPoolFile && (fn.Name.Name == "cachedClient" || fn.Name.Name == "publishClient" || fn.Name.Name == "retire" || fn.Name.Name == "Remove" || fn.Name.Name == "RemoveByKey" || fn.Name.Name == "Len" || fn.Name.Name == "Close" || fn.Name.Name == "pingAll" || fn.Name.Name == "sweepIdle")
 				if !allowed {
 					t.Errorf("%s:%s reads cached clients outside private pool ownership", rel, fn.Name.Name)
 				}

@@ -180,48 +180,45 @@ func (p *SSHClientPool) cachedClient(ctx context.Context, key string) (*Client, 
 		return nil, nil
 	}
 	alive, err := entry.client.alive(ctx)
-	if err != nil {
-		if !errors.Is(err, errLivenessUnresponsive) {
-			return nil, err // A refused or unmeasured validation parks rather than retires the entry.
-		}
-		// The socket admitted the exchange and never completed it. Drop it so this
-		// checkout makes a fresh attempt instead of being refused, unless work is
-		// still running on it — that is not interrupted, and the next acquisition
-		// replaces it once idle.
-		if entry.client.InUse() {
-			return nil, fmt.Errorf("%w: the unresponsive connection is carrying work in flight", errLivenessUnknown)
-		}
-		p.mu.Lock()
-		if p.closed || p.conns[key] != entry {
-			p.mu.Unlock()
-			return nil, ErrPoolClosed
-		}
-		delete(p.conns, key)
-		p.mu.Unlock()
-		_ = entry.client.Close()
-		return nil, nil // A cache miss: checkout dials a fresh, validated connection.
+	if err != nil && !errors.Is(err, errLivenessUnresponsive) {
+		return nil, err // A refused or unmeasured validation parks rather than retires the entry.
+	}
+	if err != nil || !alive {
+		return p.replaceRejected(key, entry)
 	}
 	p.mu.Lock()
 	if p.closed || p.conns[key] != entry {
 		p.mu.Unlock()
 		return nil, nil
 	}
-	if !alive {
-		// A dead verdict may not cut off a command this connection is carrying,
-		// so a busy entry is parked and this checkout is refused: a later cycle
-		// retires it once idle and the next checkout replaces it then.
-		if entry.client.InUse() {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("%w: the connection is carrying work in flight", errLivenessUnknown)
-		}
-		delete(p.conns, key)
-		p.mu.Unlock()
-		_ = entry.client.Close()
-		return nil, nil
-	}
 	entry.lastActive = time.Now()
 	p.mu.Unlock()
 	return entry.client, nil
+}
+
+// replaceRejected drops a cached connection that must not be handed out again -
+// a dead transport, or a socket that admitted the exchange and never completed
+// it. Work already running on it is never interrupted: that checkout is refused
+// and the next acquisition replaces the connection once it is idle.
+func (p *SSHClientPool) replaceRejected(key string, entry *pooledEntry) (*Client, error) {
+	if entry.client.InUse() {
+		return nil, fmt.Errorf("%w: the connection is carrying work in flight", errLivenessUnknown)
+	}
+	p.retire(key, entry)
+	return nil, nil // A cache miss: checkout dials a fresh, validated connection.
+}
+
+// retire removes entry from the pool when it is still the entry under key and
+// closes it. The caller has established that no operation is running on it.
+func (p *SSHClientPool) retire(key string, entry *pooledEntry) {
+	p.mu.Lock()
+	if p.closed || p.conns[key] != entry {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.conns, key)
+	p.mu.Unlock()
+	_ = entry.client.Close()
 }
 
 func (p *SSHClientPool) publishClient(ctx context.Context, key string, cfg Config, client *Client) (*Client, error) {
@@ -360,12 +357,7 @@ func (p *SSHClientPool) pingAll() {
 		if entry.client.InUse() {
 			continue
 		}
-		p.mu.Lock()
-		if p.conns[entry.key] == entry {
-			delete(p.conns, entry.key)
-		}
-		p.mu.Unlock()
-		_ = entry.client.Close()
+		p.retire(entry.key, entry)
 	}
 }
 
