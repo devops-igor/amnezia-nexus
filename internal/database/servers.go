@@ -82,7 +82,7 @@ func (d *DB) IsServerProviderAbsent(ctx context.Context, id int64) (bool, error)
 // inventory has already contradicted.
 //
 // It is the narrow read a selection path needs: one indexed column, no credential
-// decryption, no row materialisation, and no interpretation. An empty result means
+// decryption, no row materialization, and no interpretation. An empty result means
 // "nothing is confirmed absent", which is also what a caller must assume when the read
 // fails - absence is a positive observation, never a default.
 func (d *DB) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {

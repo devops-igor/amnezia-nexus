@@ -25,7 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
+	"strconv"
 	"strings"
 )
 
@@ -71,34 +71,121 @@ func decodeProviderServerID(val any) (int64, error) {
 	}
 }
 
+// maxProviderServerIDTextLength bounds the text a server id may occupy: int64 needs at
+// most 19 digits, and a decimal or exponent spelling adds a few characters.
+const maxProviderServerIDTextLength = 32
+
+// maxProviderServerIDExponent bounds the exponent an id may carry, so a token such as
+// "1e999999999" is refused instead of being expanded into a huge digit string.
+const maxProviderServerIDExponent = 40
+
 // exactServerID parses the exact decimal text of a server id.
 //
-// big.Rat reads the text itself, so "501.5" cannot become 501 and a 19-digit id cannot be
-// rounded; a value the provider spelled as a whole number in another form ("501.0",
-// "5.01e2") is still the same identity and is accepted.
+// The value is computed from the digits themselves - never through a float - so "501.5"
+// cannot become 501 and a 19-digit id cannot be rounded. A whole number spelled in another
+// form ("501.0", "5.01e2") is the same identity and is accepted; anything else is refused.
 func exactServerID(text string) (int64, error) {
 	if text == "" {
 		return 0, errors.New("server id is empty")
 	}
-	// big.Rat also reads shapes a server id never uses on this API: "a/b" fractions and
-	// hexadecimal spellings. Only a plain decimal may name a server, so anything outside
-	// that alphabet is refused before parsing.
-	for _, r := range text {
-		if (r < '0' || r > '9') && r != '-' && r != '+' && r != '.' && r != 'e' && r != 'E' {
-			return 0, fmt.Errorf("server id %q is not a number", text)
-		}
+	if len(text) > maxProviderServerIDTextLength {
+		return 0, errors.New("server id is too long to be an identifier")
 	}
-	value, ok := new(big.Rat).SetString(text)
-	if !ok {
-		return 0, fmt.Errorf("server id %q is not a number", text)
+	digits, exponent, negative, err := splitServerIDText(text)
+	if err != nil {
+		return 0, err
 	}
-	if !value.IsInt() {
-		return 0, fmt.Errorf("server id %s is not a whole number", value.RatString())
+	scaled, err := scaleServerIDDigits(digits, exponent)
+	if err != nil {
+		return 0, err
 	}
-	if !value.Num().IsInt64() {
+	value, err := strconv.ParseInt(scaled, 10, 64)
+	if err != nil {
 		return 0, fmt.Errorf("server id %s is out of range", text)
 	}
-	return value.Num().Int64(), nil
+	if negative {
+		value = -value
+	}
+	return value, nil
+}
+
+// splitServerIDText separates a decimal spelling into its digits, exponent and sign, and
+// refuses anything that is not that shape.
+func splitServerIDText(text string) (digits string, exponent int, negative bool, err error) {
+	body := text
+	switch body[0] {
+	case '-':
+		negative = true
+		body = body[1:]
+	case '+':
+		body = body[1:]
+	}
+	if body == "" {
+		return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+	}
+
+	if index := strings.IndexAny(body, "eE"); index >= 0 {
+		exponentText := body[index+1:]
+		body = body[:index]
+		if exponentText == "" {
+			return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+		}
+		parsed, convErr := strconv.Atoi(exponentText)
+		if convErr != nil || parsed < -maxProviderServerIDExponent || parsed > maxProviderServerIDExponent {
+			return "", 0, false, fmt.Errorf("server id %s has an unusable exponent", text)
+		}
+		exponent = parsed
+	}
+
+	integerPart, fractionPart := body, ""
+	if dot := strings.IndexByte(body, '.'); dot >= 0 {
+		integerPart, fractionPart = body[:dot], body[dot+1:]
+		if fractionPart == "" {
+			return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+		}
+	}
+	digits = integerPart + fractionPart
+	if digits == "" || !isASCIIDigits(digits) {
+		return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+	}
+	return digits, exponent - len(fractionPart), negative, nil
+}
+
+// scaleServerIDDigits applies a decimal exponent to a digit string, refusing a value whose
+// fractional digits are not zeros: those are exactly the ids that cannot be represented
+// without changing which server they name.
+func scaleServerIDDigits(digits string, exponent int) (string, error) {
+	switch {
+	case exponent < 0:
+		drop := -exponent
+		if drop >= len(digits) {
+			if strings.Trim(digits, "0") != "" {
+				return "", fmt.Errorf("server id %s is not a whole number", digits)
+			}
+			return "0", nil
+		}
+		if strings.Trim(digits[len(digits)-drop:], "0") != "" {
+			return "", fmt.Errorf("server id %s is not a whole number", digits)
+		}
+		digits = digits[:len(digits)-drop]
+	case exponent > 0:
+		digits += strings.Repeat("0", exponent)
+	}
+	trimmed := strings.TrimLeft(digits, "0")
+	if trimmed == "" {
+		return "0", nil
+	}
+	return trimmed, nil
+}
+
+// isASCIIDigits reports whether every byte is a decimal digit.
+func isASCIIDigits(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeFirstServerID reads the first present provider server id among the documented

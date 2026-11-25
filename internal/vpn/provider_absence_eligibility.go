@@ -3,8 +3,8 @@ package vpn
 // Provider absence as an admission and destination authority.
 //
 // A durable absence mark is a statement about the provider's inventory, and the panel
-// already honours it on every path that dials a server: probes, SSH acquisition, channels
-// and commands are refused before dispatch. It was NOT honoured where a *new* session is
+// already honors it on every path that dials a server: probes, SSH acquisition, channels
+// and commands are refused before dispatch. It was NOT honored where a *new* session is
 // placed, so an enabled, still-"active" backend the provider had deleted could keep winning
 // the least-loaded/latency tie and receive fresh client sessions, and it could equally be
 // chosen as a failover or migration destination.
