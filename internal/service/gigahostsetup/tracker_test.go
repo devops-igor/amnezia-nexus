@@ -17,7 +17,6 @@ package gigahostsetup
 // literal sleep is spent.
 
 import (
-	"fmt"
 	"context"
 	"errors"
 	"path/filepath"
@@ -54,9 +53,8 @@ type fakeProvider struct {
 	statusCalls int
 	serverCalls int
 
-	statusFn    func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error)
-	serverFn    func(ctx context.Context) ([]gigahost.ServerInfo, error)
-	getServerFn func(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error)
+	statusFn func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error)
+	serverFn func(ctx context.Context) ([]gigahost.ServerInfo, error)
 }
 
 func (p *fakeProvider) GetDeployStatus(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
@@ -65,15 +63,6 @@ func (p *fakeProvider) GetDeployStatus(ctx context.Context, orderID string) (*gi
 		return p.statusFn(ctx, orderID)
 	}
 	return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusPending, Progress: 10}, nil
-}
-
-// GetServer answers for one server. The tracker fixture defines no per-server
-// answer, so an unexpected call refuses rather than inventing ownership.
-func (p *fakeProvider) GetServer(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error) {
-	if p.getServerFn != nil {
-		return p.getServerFn(ctx, serverID)
-	}
-	return nil, fmt.Errorf("tracker fixture defines no per-server answer for server %d", serverID)
 }
 
 func (p *fakeProvider) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {

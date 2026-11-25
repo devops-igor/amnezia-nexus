@@ -372,38 +372,6 @@ type AccountInfo struct {
 	Status           string  `json:"status,omitempty"`
 }
 
-// UnmarshalJSON accepts the account identifier in either documented shape: the
-// provider sends cust_id as a number on GET /account and as text in other
-// payloads, and both name the same account.
-func (a *AccountInfo) UnmarshalJSON(data []byte) error {
-	shadow := struct {
-		ID               Identity `json:"id"`
-		CustID           Identity `json:"cust_id"`
-		CustName         string   `json:"cust_name"`
-		Email            string   `json:"email"`
-		Balance          float64  `json:"balance"`
-		Credit           float64  `json:"credit"`
-		CreditNOK        float64  `json:"credit_nok"`
-		QualifiesArrears bool     `json:"qualifies_arrears"`
-		Currency         string   `json:"currency"`
-		Status           string   `json:"status"`
-	}{}
-	if err := json.Unmarshal(data, &shadow); err != nil {
-		return err
-	}
-	a.ID = string(shadow.ID)
-	a.CustID = string(shadow.CustID)
-	a.CustName = shadow.CustName
-	a.Email = shadow.Email
-	a.Balance = shadow.Balance
-	a.Credit = shadow.Credit
-	a.CreditNOK = shadow.CreditNOK
-	a.QualifiesArrears = shadow.QualifiesArrears
-	a.Currency = shadow.Currency
-	a.Status = shadow.Status
-	return nil
-}
-
 // HasCredit checks if the account has positive balance, credit, or arrears qualification.
 func (a *AccountInfo) HasCredit() bool {
 	if a == nil {
