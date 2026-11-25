@@ -102,19 +102,22 @@ func TestPoolPresenceLookupPendingIsUnknown(t *testing.T) {
 		gateRead int
 		failRead int
 		inFlight bool
-		wantErr  error
 	}{
-		{name: "idle connection, held past the reply budget", gateRead: 2, wantErr: errLivenessUnknown},
-		{name: "command running, held past the reply budget", gateRead: 2, inFlight: true, wantErr: errLivenessUnknown},
-		{name: "command running, lookup errors", failRead: 2, inFlight: true, wantErr: errPresenceUnavailable},
+		{name: "idle connection, held past the reply budget", gateRead: 2},
+		{name: "command running, held past the reply budget", gateRead: 2, inFlight: true},
+		{name: "command running, lookup errors", failRead: 2, inFlight: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPresenceLookupUnknown(t, tc.gateRead, tc.failRead, tc.inFlight, tc.wantErr)
+			testPresenceLookupUnknown(t, tc.gateRead, tc.failRead, tc.inFlight)
 		})
 	}
 }
 
-func testPresenceLookupUnknown(t *testing.T, gateRead, failRead int, inFlight bool, _ error) {
+// testPresenceLookupUnknown proves maintenance holds the entry when the lookup
+// cannot answer. The identity the pool parked on is asserted where it surfaces
+// (the checkout crossing case and the dead-busy checkout), not here, because
+// maintenance deliberately discards it.
+func testPresenceLookupUnknown(t *testing.T, gateRead, failRead int, inFlight bool) {
 	t.Helper()
 	peer := NewMockSSHServer(t, "root", "pass")
 	defer peer.Close()
