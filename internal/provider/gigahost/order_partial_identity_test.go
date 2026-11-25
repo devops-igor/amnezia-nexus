@@ -45,27 +45,6 @@ func partialOrderClient(t *testing.T, status int, body string) gigahost.Client {
 	return client
 }
 
-// orderServerForPartial calls the real purchase path and returns the partial-purchase error.
-func orderServerForPartial(t *testing.T, client gigahost.Client) *gigahost.OrderPartialError {
-	t.Helper()
-	_, err := client.OrderServer(context.Background(), gigahost.OrderRequest{
-		Quantity:      1,
-		PID:           10,
-		PriceID:       20,
-		OSID:          30,
-		RegionID:      40,
-		BillingPeriod: gigahost.BillingPeriodHourly,
-	})
-	if err == nil {
-		t.Fatal("a 402 answer was accepted as a completed purchase")
-	}
-	var partial *gigahost.OrderPartialError
-	if !errors.As(err, &partial) {
-		t.Fatalf("402 with ids was not classified as a partial purchase: %v", err)
-	}
-	return partial
-}
-
 func TestClient_HTTP402PreservesExactOrderIdentity(t *testing.T) {
 	cases := []struct {
 		name string
