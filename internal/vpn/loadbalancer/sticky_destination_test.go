@@ -28,7 +28,10 @@ func (m *markStore) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSessi
 	return nil, nil
 }
 
-func (m *markStore) CreateVPNSession(ctx context.Context, s *models.VPNSession) error { return nil }
+func (m *markStore) CommitVPNSessionDestination(ctx context.Context, targetID int64, s *models.VPNSession, publish func()) error {
+	publish()
+	return nil
+}
 
 func (m *markStore) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
 	m.asked++

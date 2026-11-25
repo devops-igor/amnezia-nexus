@@ -2,6 +2,7 @@ package loadbalancer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -23,7 +25,7 @@ import (
 // future caller cannot quietly skip the re-read.
 type StickyStore interface {
 	GetActiveVPNSessions(ctx context.Context) ([]models.VPNSession, error)
-	CreateVPNSession(ctx context.Context, s *models.VPNSession) error
+	CommitVPNSessionDestination(ctx context.Context, targetID int64, row *models.VPNSession, publish func()) error
 	ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error)
 }
 
@@ -329,10 +331,10 @@ type stickyPeerTarget struct {
 // degraded backend - a peer that moved on in the meantime keeps its newer
 // assignment.
 //
-// No silent stranding: peers whose backend selection fails are logged,
-// counted, and returned in Result.Skipped; DB persist failures are retried
-// once, then the in-memory migration is marked un-persisted in the result -
-// the reconcilable state stays explicit.
+// No silent stranding: peers whose backend selection or persistence fails
+// are counted and returned in Result.Skipped. A durable write must succeed
+// before the affinity or route is published; provider absence selects another
+// candidate rather than retrying the refused placement.
 type failoverSnapshot struct {
 	degradedUsers []string
 	expiredUsers  []string
@@ -421,44 +423,89 @@ func (sm *StickySessionManager) applyFailoverMoves(degradedTunnelID int64, snap 
 	return migrations
 }
 
-func (sm *StickySessionManager) persistFailoverMoves(ctx context.Context, dbMoves []dbMove, result *FailoverResult) {
-	persistFailures := make(map[string]bool)
+func (sm *StickySessionManager) persistFailoverMoves(ctx context.Context, degradedTunnelID int64, snap failoverSnapshot, moves []peerMove, dbMoves []dbMove, healthy []*models.BackendTunnel, result *FailoverResult, publish func(FailoverMigration)) {
+	rows := make(map[string]*models.VPNSession, len(dbMoves))
+	planned := make(map[string]bool, len(moves))
+	for i := range dbMoves {
+		dm := &dbMoves[i]
+		rows[dm.sess.PeerPublicKey] = &dm.sess
+	}
+	for _, mv := range moves {
+		planned[mv.peerKey] = true
+	}
 	for _, dm := range dbMoves {
-		sess := dm.sess
-		sess.BackendTunnelID = dm.newID
-		if err := sm.persistSession(ctx, &sess); err != nil {
+		if !planned[dm.sess.PeerPublicKey] {
+			moves = append(moves, peerMove{peerKey: dm.sess.PeerPublicKey, userID: dm.sess.UserID, newID: dm.newID})
+		}
+	}
+	// Expiry cleanup has no destination; publish each actual move only inside
+	// its store gate, after the row was accepted.
+	sm.applyFailoverMoves(degradedTunnelID, snap, nil)
+	for _, mv := range moves {
+		if err := sm.commitFailoverMove(ctx, degradedTunnelID, mv, rows[mv.peerKey], healthy, result, publish); err != nil {
 			sm.skipCounter.Add(1)
-			persistFailures[sess.PeerPublicKey] = true
-			log.Printf("[vpn] sticky failover: session %s (peer %s) migrated in memory to backend %d but DB row NOT updated after retry: %v (un-persisted, reconcilable)", sess.ID, sess.PeerPublicKey, dm.newID, err)
 			result.Skipped = append(result.Skipped, FailoverSkippedPeer{
-				PeerPublicKey: sess.PeerPublicKey,
-				UserID:        sess.UserID,
-				Reason:        fmt.Sprintf("DB persist failed after retry: %v", err),
+				PeerPublicKey: mv.peerKey, UserID: mv.userID, Reason: err.Error(),
 			})
 		}
 	}
+}
 
-	// Migration records: one per peer, from the affinity pass; DB-session-only
-	// peers get their record here. A peer whose persist failed still HAS its
-	// in-memory migration, but the DB/memory divergence is reported via
-	// Skipped above (never silently dropped).
-	migratedPeers := make(map[string]bool, len(result.Migrations))
-	for _, m := range result.Migrations {
-		migratedPeers[m.PeerPublicKey] = true
-	}
-	for _, dm := range dbMoves {
-		if persistFailures[dm.sess.PeerPublicKey] || migratedPeers[dm.sess.PeerPublicKey] {
-			continue
+// commitFailoverMove tries each refused destination at most once. Confirmed
+// absence is not a transient write failure: select again without that candidate.
+func (sm *StickySessionManager) commitFailoverMove(ctx context.Context, sourceID int64, mv peerMove, row *models.VPNSession, candidates []*models.BackendTunnel, result *FailoverResult, publish func(FailoverMigration)) error {
+	for {
+		if row != nil {
+			row.BackendTunnelID = mv.newID
 		}
-		result.Migrations = append(result.Migrations, FailoverMigration{
-			PeerPublicKey:      dm.sess.PeerPublicKey,
-			UserID:             dm.sess.UserID,
-			NewBackendTunnelID: dm.newID,
+		err := sm.persistSession(ctx, mv.newID, row, func() {
+			migrations := sm.applyFailoverMoves(sourceID, failoverSnapshot{}, []peerMove{mv})
+			result.Migrations = append(result.Migrations, migrations...)
+			if publish != nil {
+				publish(migrations[0])
+			}
 		})
+		if !errors.Is(err, database.ErrDestinationProviderAbsent) {
+			return err
+		}
+		candidates = excludeFailoverDestination(candidates, mv.newID)
+		if len(candidates) == 0 {
+			return fmt.Errorf("no destination remains after provider absence refusal: %w", err)
+		}
+		target, selectErr := sm.baseBalancer.SelectBackend(ctx, &RoutingRequest{
+			UserID: mv.userID, PeerPublicKey: mv.peerKey, AvailableTunnels: candidates,
+		})
+		if selectErr != nil {
+			return fmt.Errorf("backend selection failed after destination refusal: %w", selectErr)
+		}
+		mv.newID = target.ID
 	}
 }
 
+// excludeFailoverDestination returns a fresh candidate slice so a refusal
+// cannot mutate another peer's plan or retry the same destination indefinitely.
+func excludeFailoverDestination(candidates []*models.BackendTunnel, refusedID int64) []*models.BackendTunnel {
+	remaining := make([]*models.BackendTunnel, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.ID != refusedID {
+			remaining = append(remaining, candidate)
+		}
+	}
+	return remaining
+}
+
 func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel, sourceProto ...string) (*FailoverResult, error) {
+	return sm.handleFailover(ctx, degradedTunnelID, availableTunnels, nil, sourceProto...)
+}
+
+// HandleFailoverAndPublish publishes each accepted route inside the same
+// inventory-serialized gate as its durable assignment and affinity. The callback
+// must be memory-only; persist counters after this method returns.
+func (sm *StickySessionManager) HandleFailoverAndPublish(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel, publish func(FailoverMigration), sourceProto ...string) (*FailoverResult, error) {
+	return sm.handleFailover(ctx, degradedTunnelID, availableTunnels, publish, sourceProto...)
+}
+
+func (sm *StickySessionManager) handleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel, publish func(FailoverMigration), sourceProto ...string) (*FailoverResult, error) {
 	// Issue #713: Do NOT evict pinned client sessions from handshake_blocked backends!
 	// Keep established sessions pinned to the backend as long as the data plane is viable.
 	// Only truly disabled (or non-handshake_blocked degraded) backends trigger failover moves.
@@ -584,14 +631,8 @@ func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunn
 	// without one get a fresh selection here (mutex still not held).
 	dbMoves := sm.planDBSessionMoves(ctx, degradedTunnelID, activeSessions, moves, skippedSeen, healthy, result)
 
-	// --- APPLY: short re-lock, re-check, apply. ---
-	result.Migrations = sm.applyFailoverMoves(degradedTunnelID, snap, moves)
-
-	// --- PERSIST: DB session updates, mutex NOT held. Persist errors are
-	// retried once, then surfaced: the in-memory migration already happened,
-	// so the result must mark the row as un-persisted (reconcilable) rather
-	// than silently dropping the write (issue #85: `_ = CreateVPNSession`). ---
-	sm.persistFailoverMoves(ctx, dbMoves, result)
+	// Persistence and memory publication share the inventory writer's ordering.
+	sm.persistFailoverMoves(ctx, degradedTunnelID, snap, moves, dbMoves, healthy, result, publish)
 
 	// Stable contract: records are returned sorted by peer public key.
 	sort.SliceStable(result.Migrations, func(i, j int) bool {
@@ -667,16 +708,17 @@ func (sm *StickySessionManager) planDBSessionMoves(ctx context.Context, degraded
 
 // persistSession writes the migrated session row, retrying once on failure
 // (issue #85: persist errors surfaced, never silently dropped).
-func (sm *StickySessionManager) persistSession(ctx context.Context, sess *models.VPNSession) error {
+func (sm *StickySessionManager) persistSession(ctx context.Context, targetID int64, sess *models.VPNSession, publish func()) error {
 	if sm.db == nil {
+		publish()
 		return nil
 	}
-	err := sm.db.CreateVPNSession(ctx, sess)
-	if err == nil {
-		return nil
+	commitCtx, cancel := context.WithTimeout(ctx, failoverAbsenceReadTimeout)
+	defer cancel()
+	err := sm.db.CommitVPNSessionDestination(commitCtx, targetID, sess, publish)
+	if err == nil || errors.Is(err, database.ErrDestinationProviderAbsent) {
+		return err
 	}
-	// One retry: transient SQLite write contention during failover is
-	// plausible; a second failure is surfaced to the caller.
-	log.Printf("[vpn] sticky failover: persist of session %s failed, retrying once: %v", sess.ID, err)
-	return sm.db.CreateVPNSession(ctx, sess)
+	log.Printf("[vpn] sticky failover: destination commit failed, retrying once: %v", err)
+	return sm.db.CommitVPNSessionDestination(commitCtx, targetID, sess, publish)
 }

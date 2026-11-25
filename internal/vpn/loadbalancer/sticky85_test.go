@@ -212,7 +212,7 @@ type persistFailingDB struct {
 	calls    int
 }
 
-func (p *persistFailingDB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
+func (p *persistFailingDB) CommitVPNSessionDestination(ctx context.Context, targetID int64, s *models.VPNSession, publish func()) error {
 	p.mu.Lock()
 	p.calls++
 	shouldFail := p.calls <= p.failures
@@ -220,7 +220,7 @@ func (p *persistFailingDB) CreateVPNSession(ctx context.Context, s *models.VPNSe
 	if shouldFail {
 		return errors.New("injected persist failure")
 	}
-	return p.DB.CreateVPNSession(ctx, s)
+	return p.DB.CommitVPNSessionDestination(ctx, targetID, s, publish)
 }
 
 // TestFailoverPersistErrorSurfaced pins issue #85: a DB write failure during

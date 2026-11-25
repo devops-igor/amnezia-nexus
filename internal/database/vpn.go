@@ -90,6 +90,10 @@ func (d *DB) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	return d.createVPNSession(ctx, s)
+}
+
+func (d *DB) createVPNSession(ctx context.Context, s *models.VPNSession) error {
 	if s.ID == "" {
 		uuidBytes := make([]byte, 16)
 		_, _ = rand.Read(uuidBytes)

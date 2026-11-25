@@ -136,7 +136,17 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, prov
 		// Issue #85: HandleFailover returns a result with successful
 		// migrations AND explicitly reported skipped peers — every peer left
 		// on the disabled backend is logged here so stranding is visible.
-		failover, err := s.stickyMgr.HandleFailover(ctx, tunnel.ID, activeTunnels, tunnel.Protocol)
+		var routeErrors []error
+		failover, err := s.stickyMgr.HandleFailoverAndPublish(ctx, tunnel.ID, activeTunnels, func(m loadbalancer.FailoverMigration) {
+			if s.forwarder != nil {
+				if err := s.forwarder.UpdateSessionBackend(m.PeerPublicKey, m.NewBackendTunnelID); err != nil {
+					routeErrors = append(routeErrors, fmt.Errorf("peer %s -> backend %d: %w", m.PeerPublicKey, m.NewBackendTunnelID, err))
+				}
+			}
+		}, tunnel.Protocol)
+		for _, routeErr := range routeErrors {
+			log.Printf("[vpn] failover route redirect: %v", routeErr)
+		}
 		if err != nil {
 			log.Printf("[vpn] failover for backend %d found no healthy target: %v", serverID, err)
 		}
@@ -153,13 +163,8 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, prov
 			migrations = failover.Migrations
 		}
 		for _, m := range migrations {
-			if s.forwarder != nil {
-				if err := s.forwarder.UpdateSessionBackend(m.PeerPublicKey, m.NewBackendTunnelID); err != nil {
-					// ErrSessionNotRegistered = session has no live route
-					// (already disconnected); nothing to redirect then.
-					log.Printf("[vpn] failover route redirect for peer %s -> backend %d: %v", m.PeerPublicKey, m.NewBackendTunnelID, err)
-				}
-			}
+			// Route publication already occurred inside the destination gate.
+			// Counter persistence must stay outside the database write lock.
 			// Move the connection count with the session: the pool counter
 			// tracks currently-connected peers per backend and feeds
 			// least-connections and capacity filtering.
