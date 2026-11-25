@@ -60,7 +60,7 @@ const settingsHarnessHead = `
 const {VirtualConsole} = require('jsdom');
 const vc = new VirtualConsole();
 vc.on('jsdomError', () => {});
-const dom = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + '/settings', virtualConsole: vc});
+const dom = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + CFG.path, virtualConsole: vc});
 const w = dom.window;
 const doc = w.document;
 w.I18N = CFG.dict;
@@ -131,7 +131,7 @@ async function until(fn, label, ms) {
 async function openTab() {
   const vc2 = new VirtualConsole();
   vc2.on('jsdomError', () => {});
-  const d2 = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + '/settings', virtualConsole: vc2});
+  const d2 = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + CFG.path, virtualConsole: vc2});
   const w2 = d2.window;
   w2.I18N = CFG.dict;
   w2._ = k => w2.I18N[k] || k;
@@ -211,6 +211,19 @@ func seedSettingsForPage(t *testing.T, h *Handlers) {
 type settingsHarnessOptions struct {
 	liveNotifications bool
 	storeBeforeRender map[string]any
+	// path is the page a scenario runs against: "" is /settings, and "/routing"
+	// is the page the policy cards moved to (#987). The cards a page renders are
+	// the cards a scenario may drive, so a scenario about a moved card declares
+	// where it lives instead of the harness guessing.
+	path string
+}
+
+// pagePath is the path the scenario renders and the URL its window reports.
+func (o settingsHarnessOptions) pagePath() string {
+	if o.path == "" {
+		return "/settings"
+	}
+	return o.path
 }
 
 // settingsHarnessServerWith exposes the settings and hosting handlers over HTTP as
@@ -254,6 +267,13 @@ func runSettingsScenario(t *testing.T, h *Handlers, scenario string) string {
 	return runSettingsScenarioWith(t, h, settingsHarnessOptions{}, scenario)
 }
 
+// runRoutingScenario is runSettingsScenario against the Routing page: the same
+// harness, the same real modules, on the page the cards it drives now render.
+func runRoutingScenario(t *testing.T, h *Handlers, scenario string) string {
+	t.Helper()
+	return runSettingsScenarioWith(t, h, settingsHarnessOptions{path: "/routing"}, scenario)
+}
+
 // runSettingsScenarioWith is runSettingsScenario with the harness server options.
 func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOptions, scenario string) string {
 	t.Helper()
@@ -264,7 +284,13 @@ func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOpti
 			t.Fatalf("store %s before render: %v", key, err)
 		}
 	}
-	page := renderSettingsPageFor(t, h, models.RoleAdmin)
+	var page string
+	switch opts.pagePath() {
+	case "/routing":
+		page = renderRoutingPageFor(t, h, models.RoleAdmin)
+	default:
+		page = renderSettingsPageFor(t, h, models.RoleAdmin)
+	}
 	srv := settingsHarnessServerWith(t, h, opts)
 
 	enRaw, err := web.TranslationsFS.ReadFile("translations/en.json")
@@ -279,7 +305,9 @@ func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOpti
 	for _, s := range settingsPageScripts(t, page) {
 		scripts = append(scripts, map[string]string{"path": s[0], "source": s[1]})
 	}
-	cfg, err := json.Marshal(map[string]any{"page": page, "base": srv.URL, "dict": dict, "scripts": scripts})
+	cfg, err := json.Marshal(map[string]any{
+		"page": page, "base": srv.URL, "dict": dict, "scripts": scripts, "path": opts.pagePath(),
+	})
 	if err != nil {
 		t.Fatalf("encode harness config: %v", err)
 	}

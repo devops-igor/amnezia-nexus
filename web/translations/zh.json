@@ -200,6 +200,7 @@
   "name": "名称",
   "nav_connections": "连接管理",
   "nav_logout": "登出",
+  "nav_routing": "路由",
   "nav_servers": "服务器",
   "nav_settings": "设置",
   "nav_users": "用户列表",

@@ -200,6 +200,7 @@
   "name": "Name",
   "nav_connections": "Connections",
   "nav_logout": "Logout",
+  "nav_routing": "Routing",
   "nav_servers": "Servers",
   "nav_settings": "Settings",
   "nav_users": "Users",

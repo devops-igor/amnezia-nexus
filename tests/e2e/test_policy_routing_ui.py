@@ -1,8 +1,11 @@
-"""Browser smoke test for the admin policy routing section (#679).
+"""Browser smoke test for the admin policy routing page (#679, #987).
 
-The section is rendered by ``web/templates/settings_policy.html`` and driven by
+The page is rendered by ``web/templates/routing.html`` from
+``web/templates/settings_policy.html`` and driven by
 ``web/static/js/policy_routing.js``; the API is the #678 backend under
-``/api/vpn/policy``. These tests exercise the real page against the real binary
+``/api/vpn/policy``. The surface used to be a Settings section and moved to its own
+page in #987: everything it does is unchanged, so the cases below are the ones that
+ran against the section, pointed at ``/routing``. These tests exercise the real page against the real binary
 started by ``scripts/run_e2e.sh`` — a panel-only deployment with no dataplane —
 so the refusals below are the server's genuine answers, not simulated ones.
 
@@ -57,8 +60,8 @@ EXCEPTIONS = "#policy_proxy_exceptions"
 
 
 def _open_settings(page: Page, base_url: str) -> None:
-    """Open /settings and wait until the controller has finished its first load."""
-    page.goto(f"{base_url}/settings")
+    """Open /routing and wait until the controller has finished its first load."""
+    page.goto(f"{base_url}/routing")
     page.wait_for_load_state("networkidle")
     page.wait_for_selector(CARD, state="visible")
     # The controller writes the enabled flag once it has read the record; the
@@ -289,7 +292,7 @@ def _login_as(page: Page, base_url: str, username: str, password: str) -> None:
 def test_policy_section_and_api_are_admin_only(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """A support operator is refused /settings and the policy API with a 403."""
+    """A support operator is refused /routing and the policy API with a 403."""
     admin_page = authenticated_page
     # Control: the administrator does get the section.
     _open_settings(admin_page, base_url)
@@ -311,11 +314,11 @@ def test_policy_section_and_api_are_admin_only(
     try:
         support_page = context.new_page()
         _login_as(support_page, base_url, username, password)
-        response = support_page.goto(f"{base_url}/settings")
-        assert response is not None, "the settings request produced no response"
+        response = support_page.goto(f"{base_url}/routing")
+        assert response is not None, "the routing request produced no response"
         assert (
             response.status == 403
-        ), f"a support operator must be refused /settings; got {response.status}"
+        ), f"a support operator must be refused /routing; got {response.status}"
         assert (
             support_page.locator(CARD).count() == 0
         ), "the admin-only policy section must not render for a support operator"
@@ -588,7 +591,7 @@ def _open_settings_with_failure(page: Page, base_url: str, lang: str) -> None:
         route.continue_()
 
     page.route(f"**{POLICY_ENDPOINT}", fulfil)
-    page.goto(f"{base_url}/settings?lang={lang}")
+    page.goto(f"{base_url}/routing?lang={lang}")
     page.wait_for_selector(CARD, state="visible")
     page.wait_for_function(
         "() => document.getElementById('policySyncNowBtn') && "

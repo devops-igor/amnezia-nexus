@@ -44,16 +44,16 @@ import (
 	"github.com/devops-igor/amnezia-nexus/web"
 )
 
-// settingsSurfaceControllers are the controllers the settings surface loads.
+// settingsSurfaceControllers are the controllers the Settings page loads. The
+// policy surface is the Routing page since #987, so its controllers are listed
+// apart: the identity of each is pinned on the page that actually loads it, and a
+// controller that moved without its tag is reported on the page that lost it.
 var settingsSurfaceControllers = []string{
 	"/static/js/settings_nav.js",
 	"/static/js/settings_cards.js",
 	"/static/js/settings_save.js",
 	"/static/js/notifications_settings.js",
 	"/static/js/settings.js",
-	"/static/js/policy_routing.js",
-	"/static/js/policy_client_diag_filter.js",
-	"/static/js/policy_client_diag.js",
 	"/static/js/gigahost_catalog_status.js",
 	"/static/js/gigahost_setup.js",
 	"/static/js/gigahost_setup_intents.js",
@@ -62,10 +62,24 @@ var settingsSurfaceControllers = []string{
 	"/static/js/gigahost_placement.js",
 }
 
+// routingSurfaceControllers are the controllers the Routing page loads: the shared
+// save model first, then the four policy modules whose identities are derived from
+// their own bytes.
+var routingSurfaceControllers = []string{
+	"/static/js/settings_cards.js",
+	"/static/js/policy_panels.js",
+	"/static/js/policy_routing.js",
+	"/static/js/policy_client_diag_filter.js",
+	"/static/js/policy_client_diag.js",
+}
+
 // isSettingsSurfaceTemplate reports whether a template belongs to the settings
-// surface: the /settings shell and its policy sub-pages, the save controls, and
-// the card partials under settings/. The rule is the name, so a template added
-// later is scanned without an exemption list to maintain.
+// surface: the /settings and /routing shells, the policy sub-pages the routing page
+// renders, the save controls, and the card partials under settings/. The rule is
+// the name, so a template added later is scanned without an exemption list to
+// maintain. routing.html is here because the policy cards and their four
+// controllers belong to the surface this check exists for, whichever page renders
+// them.
 func isSettingsSurfaceTemplate(p string) bool {
 	base := p
 	if i := strings.LastIndex(base, "/"); i >= 0 {
@@ -73,6 +87,9 @@ func isSettingsSurfaceTemplate(p string) bool {
 	}
 	if !strings.HasSuffix(base, ".html") {
 		return false
+	}
+	if base == "routing.html" {
+		return true
 	}
 	return strings.HasPrefix(base, "settings") || strings.HasPrefix(p, "settings/")
 }
@@ -255,9 +272,9 @@ func TestSettingsTemplatesVersionEveryAsset(t *testing.T) {
 	scan := scanSettingsSurface(t)
 
 	// An empty or partial scan proves nothing, so pin the templates that must be
-	// in it: the shell and the three policy sub-pages that hold the controllers.
+	// in it: both shells and the three policy sub-pages that hold the controllers.
 	for _, required := range []string{
-		"settings.html", "settings_policy.html",
+		"settings.html", "routing.html", "settings_policy.html",
 		"settings_policy_client.html",
 	} {
 		if !slices.Contains(scan.templates, required) {
@@ -268,9 +285,9 @@ func TestSettingsTemplatesVersionEveryAsset(t *testing.T) {
 	for _, ref := range scan.assets {
 		scanned[ref.path] = ref
 	}
-	for _, controller := range settingsSurfaceControllers {
+	for _, controller := range append(append([]string{}, settingsSurfaceControllers...), routingSurfaceControllers...) {
 		if _, ok := scanned[controller]; !ok {
-			t.Errorf("no settings template loads %s; the controller list and the templates have diverged", controller)
+			t.Errorf("no settings or routing template loads %s; the controller list and the templates have diverged", controller)
 		}
 	}
 
@@ -336,50 +353,64 @@ func declaredAssetQueries(t *testing.T) map[string]string {
 	return queries
 }
 
-// TestSettingsPageLoadsEveryControllerUnderItsAssetIdentity proves the page emits
-// the identity its own template declared for every controller, so a controller
+// TestPagesLoadEveryControllerUnderItsAssetIdentity proves each page emits the
+// identity its own template declared for every controller it loads, so a controller
 // whose identity moves cannot stay behind a cached URL. The declared form is read
 // from the shipped templates rather than from a list kept here: a second copy of
 // "which controller uses which form" is the drift this check exists to prevent.
-func TestSettingsPageLoadsEveryControllerUnderItsAssetIdentity(t *testing.T) {
+//
+// The policy controllers moved to /routing (#987) with the surface they drive, so
+// the check runs per page: the list each page must load is the one belonging to it,
+// and a controller that left one page without arriving on the other fails there.
+func TestPagesLoadEveryControllerUnderItsAssetIdentity(t *testing.T) {
 	scan := scanSettingsSurface(t)
 	declared := make(map[string]settingsAssetRef, len(scan.assets))
 	for _, ref := range scan.assets {
 		declared[ref.path] = ref
 	}
 
-	body := renderSettingsPage(t, models.RoleAdmin)
-	links := collectShellLinks(t, body)
+	for _, page := range []struct {
+		name        string
+		body        string
+		controllers []string
+	}{
+		{"/settings", renderSettingsPage(t, models.RoleAdmin), settingsSurfaceControllers},
+		{"/routing", renderRoutingPage(t, models.RoleAdmin), routingSurfaceControllers},
+	} {
+		t.Run(page.name, func(t *testing.T) {
+			links := collectShellLinks(t, page.body)
 
-	effective := make(map[string]string, len(links.scripts))
-	for _, src := range links.scripts {
-		path, _, hasQuery := strings.Cut(src, "?")
-		if hasQuery {
-			effective[path] = src
-		}
-	}
+			effective := make(map[string]string, len(links.scripts))
+			for _, src := range links.scripts {
+				path, _, hasQuery := strings.Cut(src, "?")
+				if hasQuery {
+					effective[path] = src
+				}
+			}
 
-	for _, controller := range settingsSurfaceControllers {
-		ref, ok := declared[controller]
-		if !ok {
-			t.Errorf("no settings template declares %s, so nothing pins its cache identity", controller)
-			continue
-		}
-		want := expectedAssetURL(t, ref)
-		got, ok := effective[controller]
-		if !ok {
-			t.Errorf("%s is served unversioned; a browser that cached the previous build's copy "+
-				"runs it against this markup", controller)
-			continue
-		}
-		if got != want {
-			t.Errorf("%s carries %q, want %q (declared in the template as %s)",
-				controller, got, want, ref.declared)
-		}
-		if strings.Contains(body, `src="`+controller+`"`) {
-			t.Errorf("the page still emits the unversioned %s URL, which is the URL the previous "+
-				"release served and a warm cache still holds", controller)
-		}
+			for _, controller := range page.controllers {
+				ref, ok := declared[controller]
+				if !ok {
+					t.Errorf("no settings or routing template declares %s, so nothing pins its cache identity", controller)
+					continue
+				}
+				want := expectedAssetURL(t, ref)
+				got, ok := effective[controller]
+				if !ok {
+					t.Errorf("%s is served unversioned; a browser that cached the previous build's copy "+
+						"runs it against this markup", controller)
+					continue
+				}
+				if got != want {
+					t.Errorf("%s carries %q, want %q (declared in the template as %s)",
+						controller, got, want, ref.declared)
+				}
+				if strings.Contains(page.body, `src="`+controller+`"`) {
+					t.Errorf("the page still emits the unversioned %s URL, which is the URL the previous "+
+						"release served and a warm cache still holds", controller)
+				}
+			}
+		})
 	}
 }
 
@@ -391,7 +422,10 @@ func TestSettingsPageLoadsEveryControllerUnderItsAssetIdentity(t *testing.T) {
 // bytes this build ships.
 func TestSettingsControllerURLCarriesTheAssetBytes(t *testing.T) {
 	const controller = "/static/js/policy_client_diag.js"
-	body := renderSettingsPage(t, models.RoleAdmin)
+	// The diagnosis controller moved to the Routing page with its card; the identity
+	// requirement is about the bytes a browser caches, so it follows the page that
+	// now requests it.
+	body := renderRoutingPage(t, models.RoleAdmin)
 
 	emitted := ""
 	for _, src := range collectShellLinks(t, body).scripts {

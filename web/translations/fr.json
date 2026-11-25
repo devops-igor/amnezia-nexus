@@ -200,6 +200,7 @@
   "name": "Nom",
   "nav_connections": "Connexions",
   "nav_logout": "Déconnexion",
+  "nav_routing": "Routage",
   "nav_servers": "Serveurs",
   "nav_settings": "Paramètres",
   "nav_users": "Utilisateurs",

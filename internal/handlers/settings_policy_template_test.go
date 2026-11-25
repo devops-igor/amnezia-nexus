@@ -136,7 +136,7 @@ func renderSettingsPage(t *testing.T, role models.UserRole) string {
 }
 
 func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
-	adminBody := renderSettingsPage(t, models.RoleAdmin)
+	adminBody := renderRoutingPage(t, models.RoleAdmin)
 
 	t.Run("AdminSeesSectionAndControls", func(t *testing.T) {
 		for _, id := range policySectionIDs {
@@ -294,7 +294,7 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		if !strings.Contains(adminBody, adminPrefix) {
 			t.Errorf("admin settings page does not load the policy controller (%q missing)", adminPrefix)
 		}
-		supportBody := renderSettingsPage(t, models.RoleSupport)
+		supportBody := renderRoutingPage(t, models.RoleSupport)
 		if strings.Contains(supportBody, `id="policyRoutingCard"`) {
 			t.Error("support operator received the admin-only policy section")
 		}
@@ -652,7 +652,7 @@ func TestPolicySectionRenderingDoesNotLeakIntoOtherPages(t *testing.T) {
 // internal/vpn/forwarder/routing_decision.go, not just with itself. The retired
 // texts are asserted absent from the dictionaries.
 func TestPolicyControlsCarryTheRenamedLabels(t *testing.T) {
-	page := renderSettingsPage(t, models.RoleAdmin)
+	page := renderRoutingPage(t, models.RoleAdmin)
 	for _, want := range []string{
 		"Always PROXY (IPv4)",
 		"Always DIRECT (IPv4)",

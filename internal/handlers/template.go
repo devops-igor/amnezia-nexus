@@ -106,6 +106,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"users.html",
 		"my_connections.html",
 		"settings.html",
+		"routing.html",
 		"leaderboard.html",
 		"user_share.html",
 		"vpn.html",
