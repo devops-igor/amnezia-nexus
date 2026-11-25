@@ -39,7 +39,6 @@ type inventoryProvider struct {
 	body   string
 	status int
 	stall  bool
-	calls  int
 	// account is the identity the provider reports for /account. It decides
 	// which server rows the fixture's inventory read may judge, so a test can
 	// point the panel at a second account by changing it.
@@ -76,12 +75,6 @@ func (p *inventoryProvider) hang() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stall = true
-}
-
-func (p *inventoryProvider) callCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.calls
 }
 
 // setAccount changes the identity the provider reports, which is how a test
@@ -127,7 +120,6 @@ func (p *inventoryProvider) inventoryCallCount() int {
 
 func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
-	p.calls++
 	account, accountStatus, accountStall := p.account, p.accountStatus, p.accountStall
 	if r.URL.Path == "/servers" {
 		p.inventoryCalls++
