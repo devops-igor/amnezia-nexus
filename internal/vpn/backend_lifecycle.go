@@ -144,9 +144,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, prov
 				}
 			}
 		}, tunnel.Protocol)
-		for _, routeErr := range routeErrors {
-			log.Printf("[vpn] failover route redirect: %v", routeErr)
-		}
+		logFailoverRouteErrors(routeErrors)
 		if err != nil {
 			log.Printf("[vpn] failover for backend %d found no healthy target: %v", serverID, err)
 		}
@@ -195,6 +193,14 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64, prov
 	}
 
 	return nil
+}
+
+// logFailoverRouteErrors runs after destination publication has released the
+// inventory writer lock, keeping log I/O outside the memory-only callback.
+func logFailoverRouteErrors(errs []error) {
+	for _, err := range errs {
+		log.Printf("[vpn] failover route redirect: %v", err)
+	}
 }
 
 func (s *Service) resolveNewBackendEndpoint(ctx context.Context, serverID int64, currentEndpoint, newHost string) (string, error) {
