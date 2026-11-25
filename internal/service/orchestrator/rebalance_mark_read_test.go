@@ -29,9 +29,16 @@ func TestRebalanceFallbackRefusesWhenTheMarkReadFails(t *testing.T) {
 		t.Fatal("a healthy destination was refused before the failure was induced")
 	}
 
-	// Break exactly the read this path depends on, then require a refusal.
-	if _, err := f.db.ExecContext(context.Background(), "DROP TABLE servers"); err != nil {
-		t.Fatalf("dropping the mark source: %v", err)
+	// Break exactly the read this path depends on, and nothing else: removing the mark column
+	// leaves the tables, the foreign keys and the tunnel rows intact, so a refusal below can
+	// only be the mark read. (Dropping the table would cascade the tunnels away and the test
+	// would then pass because the TARGET could not be read - a refusal for the wrong reason.)
+	if _, err := f.db.ExecContext(context.Background(), "ALTER TABLE servers DROP COLUMN provider_absent_at"); err != nil {
+		t.Fatalf("removing the mark column: %v", err)
+	}
+	// The destination itself is still perfectly readable.
+	if _, err := f.db.GetBackendTunnel(context.Background(), f.t2); err != nil {
+		t.Fatalf("the target tunnel became unreadable; the failure injection is too broad: %v", err)
 	}
 	if orch.dbTargetEligible(context.Background(), f.t2, nil) {
 		t.Fatal("the destination was treated as eligible on an UNREADABLE mark store; unknown must not be allowed")
