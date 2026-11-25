@@ -150,6 +150,24 @@ func TestUpdateVPNSessionBackendTunnelKeepsRefusalReasonsDistinct(t *testing.T) 
 	}
 }
 
+// An unknown tunnel is not a provider-absent tunnel: the explanation helper must answer "no
+// mark" rather than failing, so a refusal always names the right cause.
+func TestBackendTunnelServerAbsentForUnknownTunnel(t *testing.T) {
+	f := newMoveFixture(t)
+	absent, err := f.db.backendTunnelServerAbsent(context.Background(), 987654321)
+	if err != nil {
+		t.Fatalf("an unknown tunnel produced an error instead of a plain answer: %v", err)
+	}
+	if absent {
+		t.Fatal("an unknown tunnel was reported as provider-absent")
+	}
+	f.markTargetAbsent(t)
+	absent, err = f.db.backendTunnelServerAbsent(context.Background(), f.targetID)
+	if err != nil || !absent {
+		t.Fatalf("a marked tunnel reported absent=%v err=%v", absent, err)
+	}
+}
+
 // The orchestrator's degraded-tunnel path uses this writer, which pins the source and the
 // eligibility of the destination in one statement; the mark predicate is part of that.
 func TestMigrateVPNSessionToActiveTunnelRefusesAbsentDestination(t *testing.T) {
