@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 )
@@ -53,20 +52,9 @@ func decodeProviderServerID(val any) (int64, error) {
 		return exactServerID(v.String())
 	case string:
 		return exactServerID(strings.TrimSpace(v))
-	case int:
-		return int64(v), nil
-	case int64:
-		return v, nil
-	case float64:
-		// Reachable only from a programmatic value: JSON numbers arrive as json.Number.
-		if v != math.Trunc(v) || math.IsInf(v, 0) || math.IsNaN(v) {
-			return 0, fmt.Errorf("server id %v is not a whole number", v)
-		}
-		if v < math.MinInt64 || v > math.MaxInt64 {
-			return 0, fmt.Errorf("server id %v is out of range", v)
-		}
-		return int64(v), nil
 	default:
+		// Includes the plain Go numeric types: every value here comes from decoded JSON,
+		// where a number is a json.Number, so anything else is not an identity.
 		return 0, fmt.Errorf("server id %v is not a number", val)
 	}
 }
@@ -112,43 +100,66 @@ func exactServerID(text string) (int64, error) {
 // splitServerIDText separates a decimal spelling into its digits, exponent and sign, and
 // refuses anything that is not that shape.
 func splitServerIDText(text string) (digits string, exponent int, negative bool, err error) {
-	body := text
-	switch body[0] {
+	body, negative, err := stripServerIDSign(text)
+	if err != nil {
+		return "", 0, false, err
+	}
+	mantissa, exponent, err := splitServerIDExponent(text, body)
+	if err != nil {
+		return "", 0, false, err
+	}
+	digits, fractionLength, err := joinServerIDDigits(text, mantissa)
+	if err != nil {
+		return "", 0, false, err
+	}
+	return digits, exponent - fractionLength, negative, nil
+}
+
+// stripServerIDSign removes an optional sign.
+func stripServerIDSign(text string) (string, bool, error) {
+	switch text[0] {
 	case '-':
-		negative = true
-		body = body[1:]
+		if len(text) == 1 {
+			return "", false, fmt.Errorf("server id %q is not a number", text)
+		}
+		return text[1:], true, nil
 	case '+':
-		body = body[1:]
-	}
-	if body == "" {
-		return "", 0, false, fmt.Errorf("server id %q is not a number", text)
-	}
-
-	if index := strings.IndexAny(body, "eE"); index >= 0 {
-		exponentText := body[index+1:]
-		body = body[:index]
-		if exponentText == "" {
-			return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+		if len(text) == 1 {
+			return "", false, fmt.Errorf("server id %q is not a number", text)
 		}
-		parsed, convErr := strconv.Atoi(exponentText)
-		if convErr != nil || parsed < -maxProviderServerIDExponent || parsed > maxProviderServerIDExponent {
-			return "", 0, false, fmt.Errorf("server id %s has an unusable exponent", text)
-		}
-		exponent = parsed
+		return text[1:], false, nil
 	}
+	return text, false, nil
+}
 
-	integerPart, fractionPart := body, ""
-	if dot := strings.IndexByte(body, '.'); dot >= 0 {
-		integerPart, fractionPart = body[:dot], body[dot+1:]
+// splitServerIDExponent separates a bounded decimal exponent from the mantissa.
+func splitServerIDExponent(text, body string) (string, int, error) {
+	index := strings.IndexAny(body, "eE")
+	if index < 0 {
+		return body, 0, nil
+	}
+	exponent, err := strconv.Atoi(body[index+1:])
+	if err != nil || exponent < -maxProviderServerIDExponent || exponent > maxProviderServerIDExponent {
+		return "", 0, fmt.Errorf("server id %s has an unusable exponent", text)
+	}
+	return body[:index], exponent, nil
+}
+
+// joinServerIDDigits concatenates the integer and fractional digits, reporting how many of
+// them are fractional so the caller can place the decimal point exactly.
+func joinServerIDDigits(text, mantissa string) (string, int, error) {
+	integerPart, fractionPart := mantissa, ""
+	if dot := strings.IndexByte(mantissa, '.'); dot >= 0 {
+		integerPart, fractionPart = mantissa[:dot], mantissa[dot+1:]
 		if fractionPart == "" {
-			return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+			return "", 0, fmt.Errorf("server id %q is not a number", text)
 		}
 	}
-	digits = integerPart + fractionPart
+	digits := integerPart + fractionPart
 	if digits == "" || !isASCIIDigits(digits) {
-		return "", 0, false, fmt.Errorf("server id %q is not a number", text)
+		return "", 0, fmt.Errorf("server id %q is not a number", text)
 	}
-	return digits, exponent - len(fractionPart), negative, nil
+	return digits, len(fractionPart), nil
 }
 
 // scaleServerIDDigits applies a decimal exponent to a digit string, refusing a value whose
