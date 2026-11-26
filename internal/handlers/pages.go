@@ -79,10 +79,35 @@ func (h *Handlers) SettingsPageHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// VPNPageHandler renders the in-process VPN endpoint and load balancing dashboard.
-// All metrics (listener status, backends, config) are fetched client-side from /api/vpn/*.
+// VPNPageHandler renders the VPN overview: the four essential signals and the
+// listener/public-endpoint disclosure. Everything it shows is fetched client-side
+// from /api/vpn/status and /api/vpn/config, so the page itself carries no data.
+//
+// The VPN subject is split across three documents (overview, backends,
+// diagnostics) and each one marks its own sidebar entry current here rather than
+// by prefix, because /vpn is a prefix of the other two.
 func (h *Handlers) VPNPageHandler(w http.ResponseWriter, r *http.Request) {
-	_ = RenderTemplate(w, r, h.db, "vpn.html", nil)
+	_ = RenderTemplate(w, r, h.db, "vpn.html", map[string]any{
+		"active_page": "vpn",
+	})
+}
+
+// VPNBackendsPageHandler renders the VPN backend inventory: the table, its row
+// actions and the add-backend dialog. The inventory, the eligible servers and the
+// enable/disable/delete writes are all /api/vpn/* and /api/servers requests.
+func (h *Handlers) VPNBackendsPageHandler(w http.ResponseWriter, r *http.Request) {
+	_ = RenderTemplate(w, r, h.db, "vpn_backends.html", map[string]any{
+		"active_page": "vpn_backends",
+	})
+}
+
+// VPNDiagnosticsPageHandler renders forwarder health, the Advanced Diagnostics
+// disclosure and the connection (sessions) table. Health and sessions are read
+// from /api/vpn/status and /api/vpn/sessions after load.
+func (h *Handlers) VPNDiagnosticsPageHandler(w http.ResponseWriter, r *http.Request) {
+	_ = RenderTemplate(w, r, h.db, "vpn_diagnostics.html", map[string]any{
+		"active_page": "vpn_diagnostics",
+	})
 }
 
 // RoutingPageHandler renders the policy routing page: the four readouts, the

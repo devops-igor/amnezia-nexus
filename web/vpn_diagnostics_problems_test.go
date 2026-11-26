@@ -9,7 +9,7 @@ func TestVPNSummaryHeaderCountsAndProblemCardOnset(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplStr := fixture.CombinedSource()
 
 	assertions := `
@@ -154,7 +154,7 @@ func TestVPNForwarderCombinedActionableAndGenericConditions(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplStr := fixture.CombinedSource()
 
 	assertions := `
@@ -258,7 +258,7 @@ func TestVPNForwarderProblemCardIdentitiesDOM(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplStr := fixture.CombinedSource()
 
 	assertions := `
@@ -324,7 +324,7 @@ func TestVPNRoutingConsistencyBadgeSeverityAware(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplStr := fixture.CombinedSource()
 
 	assertions := `
@@ -462,7 +462,7 @@ assert.strictEqual(routAlerts.style.color, 'var(--danger)', 'mixed routing alert
 // no traffic counters reports the localized not-measured state rather than a
 // number that would read as measured traffic.
 func TestVPNSessionRowCarriesNoDropCounter(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 
 	assertions := `

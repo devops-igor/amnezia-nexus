@@ -89,7 +89,7 @@ _CHART_BADGE_PATTERNS = {
 def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to /vpn -> interactive time window toggle (15m, 1h, 24h)."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
@@ -136,7 +136,7 @@ def test_vpn_historical_charts_interaction_and_kpis(
 ) -> None:
     """Verify consolidated historical charts, KPI badges, time axes, and hover tooltips."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
@@ -182,7 +182,7 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
 ) -> None:
     """Verify chart availability transition from unavailable to recovered and empty clearing."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     # Open technical details disclosure if collapsed
@@ -233,7 +233,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
 ) -> None:
     """Verify active chart tooltip and hover are preserved across live polling."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     _ensure_diagnostics_open(page)
@@ -270,7 +270,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to /vpn -> Problem Routes details and 'Show all routes' toggle."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     _ensure_diagnostics_open(page)
@@ -297,7 +297,7 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
 def test_vpn_sessions_problems_toggle(authenticated_page: Page, base_url: str) -> None:
     """Verify Connection Troubleshooting problems filter toggle button."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     toggle_btn = page.locator("#vpn-sessions-toggle-problems-btn")
@@ -317,7 +317,7 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     """Verify forwarder routes table mobile containment, horizontal scrolling, and RTL behavior."""
     page = authenticated_page
     page.set_viewport_size({"width": 375, "height": 667})
-    page.goto(f"{base_url}/vpn")
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
     # #955 removed every auto-expand: neither Advanced Diagnostics nor the route
@@ -861,31 +861,29 @@ def test_vpn_metrics_requires_authentication(page: Page, base_url: str) -> None:
 def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     authenticated_page: Page, base_url: str
 ) -> None:
-    """Navigate to /vpn -> assert strictly increasing visual y-order and non-overlapping vertical layout."""
+    """Per-page visual order and exclusivity across the three VPN documents.
+
+    The single VPN page became three documents, so a cross-block y-order check no
+    longer describes any page. Each owner's order is asserted on its own document,
+    and the blocks belonging to the other two are asserted absent.
+    """
     page = authenticated_page
-    page.goto(f"{base_url}/vpn")
+
+    # Diagnostics: health (the answer) before the disclosure, which is before the
+    # sessions table.
+    page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
-    # Locate the 4 sections
-    stats_grid = page.locator(".stats-grid").first
-    backends_card = page.locator("#vpnBackendsTable").locator(
-        "xpath=ancestor::div[contains(@class, 'card')][1]"
-    )
+    diagnostics_card = page.locator("#vpn-diagnostics")
+    forwarder_card = page.locator("#vpn-forwarder-card")
     sessions_card = page.locator("#vpnSessionsTable").locator(
         "xpath=ancestor::div[contains(@class, 'card')][1]"
     )
-    forwarder_card = page.locator("#vpn-forwarder-card")
-
-    # Expected order comes from issue #955 (DESIGN_HANDOVER_R1.md, "Design and template
-    # scope"): VPN Health moves immediately below the page heading, before the overview grid
-    # and the troubleshooting tables.
     sections = [
         ("forwarder-card", forwarder_card),
-        ("stats-grid", stats_grid),
-        ("backends-card", backends_card),
+        ("diagnostics-card", diagnostics_card),
         ("sessions-card", sessions_card),
     ]
-
     boxes = []
     for name, locator in sections:
         expect(locator).to_be_visible()
@@ -900,3 +898,22 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
         assert (
             next_box["y"] >= curr_box["y"] + curr_box["height"] - 1
         ), f"Expected {next_name} y >= {curr_name} bottom"
+
+    # The overview and the inventory are other documents: none of their blocks may
+    # render here, and the overview grid must not be duplicated.
+    expect(page.locator(".stats-grid")).to_have_count(0)
+    expect(page.locator("#vpnBackendsTable")).to_have_count(0)
+
+    # Overview: the four signals, and none of the diagnostics or inventory blocks.
+    page.goto(f"{base_url}/vpn")
+    page.wait_for_load_state("networkidle")
+    expect(page.locator(".stats-grid")).to_have_count(1)
+    expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
+    expect(page.locator("#vpnSessionsTable")).to_have_count(0)
+
+    # Backends: the inventory, and neither the health card nor the sessions table.
+    page.goto(f"{base_url}/vpn/backends")
+    page.wait_for_load_state("networkidle")
+    expect(page.locator("#vpnBackendsTable")).to_be_visible()
+    expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
+    expect(page.locator("#vpnSessionsTable")).to_have_count(0)

@@ -13,44 +13,56 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 	vpnStr := fixture.TemplateHTML
 	backendsStr := fixture.BackendsJS
 	pageStr := fixture.PageJS
+	backendsPageStr := fixture.BackendsPageJS
+	diagnosticsPageStr := fixture.DiagnosticsPageJS
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn_backends.html: %v", err)
+	}
 
-	// 1. Assert vpn.html, backends.js, and page.js modernizations
+	// 1. Assert the VPN documents and modules keep their modernized markup. The
+	// inventory markup is on its own document, so it is asserted there.
 	requiredVPNTokens := []string{
 		"href=\"#icon-shield\"",
-		"href=\"#icon-network\"",
-		"href=\"#icon-server\"",
-		"href=\"#icon-plus\"",
-		"href=\"#icon-pencil\"",
+		"href=\"#icon-users\"",
 		"href=\"#icon-activity\"",
 		"href=\"#icon-x\"",
-		"vpnBackendsTable",
-		"vpnTableContainer",
-		"data-sort-type",
 		"vpn-listener-badge",
 		"vpn-public-endpoint",
-		"/static/js/vpn/page.js",
+		"/static/js/vpn/overview.js",
 	}
 	for _, token := range requiredVPNTokens {
 		if !strings.Contains(vpnStr, token) {
 			t.Errorf("vpn.html missing required modernized token %q", token)
 		}
 	}
+	for _, token := range []string{"href=\"#icon-server\"", "href=\"#icon-plus\"", "vpnBackendsTable", "vpnTableContainer", "data-sort-type", "/static/js/vpn/backends.js"} {
+		if !strings.Contains(string(backendsTemplate), token) {
+			t.Errorf("vpn_backends.html missing required modernized token %q", token)
+		}
+	}
 
 	requiredPageTokens := []string{
 		"API.get",
-		"NexusTable",
 		"NexusTelemetry.poll",
-		"Telemetry.formatBytes",
 	}
 	for _, token := range requiredPageTokens {
 		if !strings.Contains(pageStr, token) {
-			t.Errorf("page.js missing required modernized token %q", token)
+			t.Errorf("overview.js missing required modernized token %q", token)
 		}
+	}
+	for _, token := range []string{"NexusTable", "vpnTableInstance"} {
+		if !strings.Contains(backendsPageStr, token) {
+			t.Errorf("backends_page.js missing required modernized token %q", token)
+		}
+	}
+	if !strings.Contains(diagnosticsPageStr, "Telemetry.formatBytes") {
+		t.Errorf("diagnostics_page.js missing required modernized token %q", "Telemetry.formatBytes")
 	}
 
 	requiredBackendTokens := []string{
@@ -58,7 +70,6 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		"UI.confirm",
 		"UI.toast",
 		"API.post",
-		"API.request",
 		"vpn_delete",
 		"vpn_confirm_delete",
 	}
@@ -68,8 +79,16 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 		}
 	}
 
-	// Ensure raw confirm(), apiCall(), showToast() are eliminated from vpn.html, backends.js, and page.js
-	for name, src := range map[string]string{"vpn.html": vpnStr, "backends.js": backendsStr, "page.js": pageStr} {
+	// Ensure raw confirm(), apiCall(), showToast() are eliminated from every VPN
+	// document and module.
+	for name, src := range map[string]string{
+		"vpn.html":            vpnStr,
+		"vpn_backends.html":   string(backendsTemplate),
+		"backends.js":         backendsStr,
+		"overview.js":         pageStr,
+		"backends_page.js":    backendsPageStr,
+		"diagnostics_page.js": diagnosticsPageStr,
+	} {
 		if strings.Contains(src, "if (!confirm(") || strings.Contains(src, "if(!confirm(") {
 			t.Errorf("%s should not use raw confirm(), must use UI.confirm", name)
 		}
@@ -300,11 +319,19 @@ func TestIssue101VPNModernization(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	vpnStr := fixture.TemplateHTML
 	backendsStr := fixture.BackendsJS
-	pageStr := fixture.PageJS
+	backendsPageStr := fixture.BackendsPageJS
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn_backends.html: %v", err)
+	}
+	diagnosticsTemplate, err := fs.ReadFile(templatesFS, "vpn_diagnostics.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn_diagnostics.html: %v", err)
 	}
 
 	staticFS, err := GetStaticSubFS()
@@ -321,15 +348,23 @@ func TestIssue101VPNModernization(t *testing.T) {
 	// replaced the old four-card block: #vpn-active-tunnels no longer exists (a route
 	// mismatch replaces it, and only when one is reported), while the cumulative Rx/Tx
 	// totals moved into Advanced Diagnostics.
-	requiredDOMIDs := []string{
+	// Each id is asserted on the document that renders it. The overview keeps the
+	// listener/endpoint surface, the inventory its table and add dialog, and
+	// diagnostics the cumulative totals.
+	overviewIDs := []string{
 		"vpn-listener-badge",
 		"vpn-listen-port",
 		"vpn-subnet",
 		"vpn-public-endpoint",
 		"vpn-edit-endpoint-btn",
 		"vpn-sessions",
-		"vpn-rx",
-		"vpn-tx",
+		"editEndpointModal",
+		"editEndpointForm",
+		"vpnPublicEndpointInput",
+		"vpnEndpointModalError",
+		"vpnEditEndpointSubmitBtn",
+	}
+	backendsIDs := []string{
 		"vpnTableContainer",
 		"vpnBackendsTable",
 		"vpn-backends-tbody",
@@ -352,15 +387,21 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"vpnNoServersNotice",
 		"vpnModalError",
 		"vpnAddBackendSubmitBtn",
-		"editEndpointModal",
-		"editEndpointForm",
-		"vpnPublicEndpointInput",
-		"vpnEndpointModalError",
-		"vpnEditEndpointSubmitBtn",
 	}
-	for _, id := range requiredDOMIDs {
+	diagnosticsIDs := []string{"vpn-rx", "vpn-tx", "vpn-cumulative-totals"}
+	for _, id := range overviewIDs {
 		if !strings.Contains(vpnStr, `id="`+id+`"`) {
 			t.Errorf("vpn.html missing required DOM element id=%q", id)
+		}
+	}
+	for _, id := range backendsIDs {
+		if !strings.Contains(string(backendsTemplate), `id="`+id+`"`) {
+			t.Errorf("vpn_backends.html missing required DOM element id=%q", id)
+		}
+	}
+	for _, id := range diagnosticsIDs {
+		if !strings.Contains(string(diagnosticsTemplate), `id="`+id+`"`) {
+			t.Errorf("vpn_diagnostics.html missing required DOM element id=%q", id)
 		}
 	}
 
@@ -390,7 +431,8 @@ func TestIssue101VPNModernization(t *testing.T) {
 		}
 	}
 
-	// 4. Assert NexusTable options include statusFilters and statusAttribute
+	// 4. Assert NexusTable options include statusFilters and statusAttribute. The
+	// table engine is created by the inventory controller.
 	requiredTableOptions := []string{
 		"statusFilters: ['all', 'active', 'degraded', 'disabled']",
 		"statusAttribute: 'data-status'",
@@ -398,8 +440,8 @@ func TestIssue101VPNModernization(t *testing.T) {
 		"emptyMessage",
 	}
 	for _, opt := range requiredTableOptions {
-		if !strings.Contains(pageStr, opt) {
-			t.Errorf("page.js missing NexusTable option %q", opt)
+		if !strings.Contains(backendsPageStr, opt) {
+			t.Errorf("backends_page.js missing NexusTable option %q", opt)
 		}
 	}
 
@@ -696,17 +738,17 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 		}
 	}
 
-	// Assert page.js JS fallback uses simplified strings
-	pageData, err := fs.ReadFile(staticFS, "js/vpn/page.js")
+	// Assert the overview controller's JS fallback uses simplified strings
+	pageData, err := fs.ReadFile(staticFS, "js/vpn/overview.js")
 	if err != nil {
-		t.Fatalf("failed to read js/vpn/page.js: %v", err)
+		t.Fatalf("failed to read js/vpn/overview.js: %v", err)
 	}
 	pageStr := string(pageData)
 	if !strings.Contains(pageStr, `'Auto: %s'`) {
-		t.Errorf("page.js missing 'Auto: %%s' fallback")
+		t.Errorf("overview.js missing 'Auto: %%s' fallback")
 	}
 	if !strings.Contains(pageStr, `'Auto-detect'`) {
-		t.Errorf("page.js missing 'Auto-detect' fallback")
+		t.Errorf("overview.js missing 'Auto-detect' fallback")
 	}
 
 	// 3. VPN Backends table width 100%
@@ -716,11 +758,15 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
 		t.Errorf("style.css missing .table-container table with width: 100%%, min-width: 100%%, and border-collapse: collapse")
 	}
-	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
-		t.Errorf("vpn.html missing #vpnTableContainer")
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	if err != nil {
+		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
-	if !strings.Contains(vpnStr, `class="table interactive-table" id="vpnBackendsTable"`) {
-		t.Errorf("vpn.html missing table.interactive-table#vpnBackendsTable")
+	if !strings.Contains(string(backendsTemplate), `id="vpnTableContainer"`) {
+		t.Errorf("vpn_backends.html missing #vpnTableContainer")
+	}
+	if !strings.Contains(string(backendsTemplate), `class="table interactive-table" id="vpnBackendsTable"`) {
+		t.Errorf("vpn_backends.html missing table.interactive-table#vpnBackendsTable")
 	}
 }
 
@@ -747,22 +793,23 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Errorf("style.css missing .table-container table with width: 100%% and min-width: 100%%")
 	}
 
-	// 2. Assert vpn.html contains table#vpnBackendsTable with 100% width and min-width
-	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
+	// 2. Assert the inventory document contains table#vpnBackendsTable with 100%
+	// width and min-width. The table is on its own document now.
+	vpnData, err := fs.ReadFile(templatesFS, "vpn_backends.html")
 	if err != nil {
-		t.Fatalf("failed to read vpn.html: %v", err)
+		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
 	vpnStr := string(vpnData)
 	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable">`) {
-		t.Errorf("vpn.html missing table#vpnBackendsTable with the interactive-table contract")
+		t.Errorf("vpn_backends.html missing table#vpnBackendsTable with the interactive-table contract")
 	}
 	// Full width is carried by .interactive-table in the stylesheet rather than an
 	// inline style, which #955 removed along with the rest of the large inline styling.
 	if strings.Contains(vpnStr, `style="width: 100%; min-width: 100%;"`) {
-		t.Errorf("vpn.html must not carry inline full-width table styling")
+		t.Errorf("vpn_backends.html must not carry inline full-width table styling")
 	}
 	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
-		t.Errorf("vpn.html missing #vpnTableContainer")
+		t.Errorf("vpn_backends.html missing #vpnTableContainer")
 	}
 
 	// 3. Assert stylesheet cache identity across all shell and auth templates:

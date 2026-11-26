@@ -16,13 +16,44 @@ import (
 	"golang.org/x/net/html"
 )
 
+// vpnScriptsByPage is the synchronous chain each VPN document loads, in
+// evaluation order. The single VPN page became three documents, so the asset
+// list is no longer one list: an assertion about "the VPN page's scripts" has to
+// name the page, or it would assert against a superset no document ships.
+var vpnScriptsByPage = map[string][]string{
+	"vpn": {
+		"/static/js/vpn/anchor_handoff.js",
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/overview.js",
+	},
+	"vpn_backends": {
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/backends.js",
+		"/static/js/vpn/backends_page.js",
+	},
+	"vpn_diagnostics": {
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/health_problems.js",
+		"/static/js/vpn/health_summary.js",
+		"/static/js/vpn/charts.js",
+		"/static/js/vpn/sessions.js",
+		"/static/js/vpn/diagnostics_page.js",
+	},
+}
+
+// canonicalVPNScripts is every VPN module this delivery ships, for checks that
+// must cover all of them (static serving) rather than one document's chain.
 var canonicalVPNScripts = []string{
+	"/static/js/vpn/anchor_handoff.js",
 	"/static/js/vpn/backends.js",
+	"/static/js/vpn/backends_page.js",
+	"/static/js/vpn/charts.js",
+	"/static/js/vpn/common.js",
+	"/static/js/vpn/diagnostics_page.js",
 	"/static/js/vpn/health_problems.js",
 	"/static/js/vpn/health_summary.js",
-	"/static/js/vpn/charts.js",
+	"/static/js/vpn/overview.js",
 	"/static/js/vpn/sessions.js",
-	"/static/js/vpn/page.js",
 }
 
 var coreScripts = []string{
@@ -57,21 +88,29 @@ const vpnTestAppVersion = "9.9.9-test"
 
 func renderBaseAndVPNTemplate(t *testing.T) string {
 	t.Helper()
+	return renderVPNPage(t, "vpn")
+}
+
+// renderVPNPage renders the shell with one VPN document. The document is the
+// page whose scripts block and body the assertion is about, so the page name is
+// explicit rather than implied.
+func renderVPNPage(t *testing.T, page string) string {
+	t.Helper()
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	tmpl, err := template.New("base.html").Funcs(getVPNFuncMap()).ParseFS(templatesFS, "base.html", "vpn.html")
+	tmpl, err := template.New("base.html").Funcs(getVPNFuncMap()).ParseFS(templatesFS, "base.html", page+".html")
 	if err != nil {
-		t.Fatalf("failed to parse base.html and vpn.html: %v", err)
+		t.Fatalf("failed to parse base.html and %s.html: %v", page, err)
 	}
 
 	data := map[string]any{
 		"title":             "VPN Test",
 		"lang":              "en",
-		"active_page":       "vpn",
+		"active_page":       page,
 		"csrf_token":        "csrf-test-token",
 		"translations_json": "{}",
 		"app_version":       vpnTestAppVersion,
@@ -92,20 +131,25 @@ func renderBaseAndVPNTemplate(t *testing.T) string {
 
 func renderVPNScriptsBlock(t *testing.T) string {
 	t.Helper()
+	return renderVPNPageScriptsBlock(t, "vpn")
+}
+
+func renderVPNPageScriptsBlock(t *testing.T, page string) string {
+	t.Helper()
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
 
-	tmpl, err := template.New("vpn.html").Funcs(getVPNFuncMap()).ParseFS(templatesFS, "vpn.html")
+	tmpl, err := template.New(page+".html").Funcs(getVPNFuncMap()).ParseFS(templatesFS, page+".html")
 	if err != nil {
-		t.Fatalf("failed to parse vpn.html: %v", err)
+		t.Fatalf("failed to parse %s.html: %v", page, err)
 	}
 
 	var buf bytes.Buffer
 	if err := tmpl.ExecuteTemplate(&buf, "scripts", nil); err != nil {
-		t.Fatalf("failed to execute scripts block in vpn.html: %v", err)
+		t.Fatalf("failed to execute scripts block in %s.html: %v", page, err)
 	}
 	return buf.String()
 }
@@ -219,17 +263,22 @@ func validateScriptElement(s *html.Node, expectedSrc string) error {
 // validateVPNScriptsBlock enforces that the scripts block has strictly the 6 canonical
 // classic blocking scripts with empty bodies and zero extra scripts.
 func validateVPNScriptsBlock(scriptsHTML string) error {
+	return validateVPNScriptsBlockFor("vpn", scriptsHTML)
+}
+
+func validateVPNScriptsBlockFor(page, scriptsHTML string) error {
+	expected := vpnScriptsByPage[page]
 	doc, err := html.Parse(strings.NewReader(scriptsHTML))
 	if err != nil {
 		return fmt.Errorf("failed to parse scripts block: %w", err)
 	}
 	scripts := collectScriptNodes(doc)
-	if len(scripts) != len(canonicalVPNScripts) {
+	if len(scripts) != len(expected) {
 		return fmt.Errorf("expected strictly %d <script> elements in scripts block, got %d",
-			len(canonicalVPNScripts), len(scripts))
+			len(expected), len(scripts))
 	}
 	for i, s := range scripts {
-		if err := validateScriptElement(s, canonicalVPNScripts[i]); err != nil {
+		if err := validateScriptElement(s, expected[i]); err != nil {
 			return fmt.Errorf("script index %d in scripts block: %w", i, err)
 		}
 	}
@@ -240,6 +289,11 @@ func validateVPNScriptsBlock(scriptsHTML string) error {
 // zero content-area scripts, strict pre-bootstrap core sequence, zero unexpected inline scripts,
 // and strict precedence of base bootstrap over VPN scripts.
 func validateRenderedVPNPage(renderedHTML string) error {
+	return validateRenderedVPNPageFor("vpn", renderedHTML)
+}
+
+func validateRenderedVPNPageFor(page, renderedHTML string) error {
+	expected := vpnScriptsByPage[page]
 	doc, err := html.Parse(strings.NewReader(renderedHTML))
 	if err != nil {
 		return fmt.Errorf("failed to parse rendered HTML: %w", err)
@@ -323,7 +377,7 @@ func validateRenderedVPNPage(renderedHTML string) error {
 	// 6. Ensure NO VPN companion scripts exist at or before bootstrapIdx
 	for i := 0; i <= bootstrapIdx; i++ {
 		src, _ := getAttr(allScripts[i], "src")
-		for _, vpnScript := range canonicalVPNScripts {
+		for _, vpnScript := range expected {
 			if src == vpnScript {
 				return fmt.Errorf("VPN script %q placed at or before base bootstrap (index %d vs %d)",
 					src, i, bootstrapIdx)
@@ -333,13 +387,13 @@ func validateRenderedVPNPage(renderedHTML string) error {
 
 	// 7. Scripts after base bootstrap must be strictly the 6 canonical VPN scripts, with zero extra
 	scriptsAfterBootstrap := allScripts[bootstrapIdx+1:]
-	if len(scriptsAfterBootstrap) != len(canonicalVPNScripts) {
+	if len(scriptsAfterBootstrap) != len(expected) {
 		return fmt.Errorf("expected strictly %d <script> elements after base bootstrap, found %d",
-			len(canonicalVPNScripts), len(scriptsAfterBootstrap))
+			len(expected), len(scriptsAfterBootstrap))
 	}
 
 	for i, s := range scriptsAfterBootstrap {
-		if err := validateScriptElement(s, canonicalVPNScripts[i]); err != nil {
+		if err := validateScriptElement(s, expected[i]); err != nil {
 			return fmt.Errorf("script index %d after bootstrap: %w", i, err)
 		}
 	}
@@ -387,15 +441,15 @@ func withExtraAttribute(attr, extra string) string {
 }
 
 func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
-	rendered := renderBaseAndVPNTemplate(t)
-	scriptsBlock := renderVPNScriptsBlock(t)
+	rendered := renderVPNPage(t, "vpn_backends")
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_backends")
 
 	target := emittedSrcAttr(t, rendered, "/static/js/vpn/backends.js")
 	mutated := strings.Replace(rendered, target, withExtraAttribute(target, "async"), 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply async mutation")
 	}
-	err := validateRenderedVPNPage(mutated)
+	err := validateRenderedVPNPageFor("vpn_backends", mutated)
 	if err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject async mutant, but it passed")
 	}
@@ -408,7 +462,7 @@ func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply async mutation to scripts block")
 	}
-	if err := validateVPNScriptsBlock(mutatedBlock); err == nil || !strings.Contains(err.Error(), "async") {
+	if err := validateVPNScriptsBlockFor("vpn_backends", mutatedBlock); err == nil || !strings.Contains(err.Error(), "async") {
 		t.Fatalf("expected validateVPNScriptsBlock to reject async mutant, got: %v", err)
 	}
 }
@@ -423,7 +477,7 @@ func TestRenderedVPNTemplateRejectInlineScriptMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
 	scriptsBlock := renderVPNScriptsBlock(t)
 
-	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/page.js")
+	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/overview.js")
 	mutated := strings.Replace(rendered, pageTag, pageTag+`<script>window.unexpectedInline = true</script>`, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply inline script mutation")
@@ -432,7 +486,7 @@ func TestRenderedVPNTemplateRejectInlineScriptMutant(t *testing.T) {
 		t.Fatal("expected validateRenderedVPNPage to reject inline script mutant, but it passed")
 	}
 
-	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/page.js")
+	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/overview.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blockTag, blockTag+`<script>window.unexpectedInline = true</script>`, 1)
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply inline script mutation to scripts block")
@@ -446,7 +500,7 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
 	scriptsBlock := renderVPNScriptsBlock(t)
 
-	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/page.js")
+	pageTag := emittedScriptTag(t, rendered, "/static/js/vpn/overview.js")
 	mutated := strings.Replace(rendered, pageTag, pageTag+`<script src="/static/js/vpn/extra.js"></script>`, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply extra script mutation")
@@ -455,7 +509,7 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 		t.Fatal("expected validateRenderedVPNPage to reject extra script mutant, but it passed")
 	}
 
-	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/page.js")
+	blockTag := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/overview.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blockTag, blockTag+`<script src="/static/js/vpn/extra.js"></script>`, 1)
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply extra script mutation to scripts block")
@@ -466,39 +520,40 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 }
 
 func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
-	rendered := renderBaseAndVPNTemplate(t)
+	rendered := renderVPNPage(t, "vpn_backends")
 
-	// Swap backends.js and health_problems.js, keeping each element's own
-	// identity query with it: the order is what this rejects, not the URLs.
+	// Swap backends.js and backends_page.js on the inventory document, keeping
+	// each element's own identity query with it: the order is what this rejects,
+	// not the URLs. backends_page.js must follow the controller it drives.
 	b1 := emittedScriptTag(t, rendered, "/static/js/vpn/backends.js")
-	b2 := emittedScriptTag(t, rendered, "/static/js/vpn/health_problems.js")
+	b2 := emittedScriptTag(t, rendered, "/static/js/vpn/backends_page.js")
 	mutated := strings.Replace(rendered, b1, "__PLACEHOLDER__", 1)
 	mutated = strings.Replace(mutated, b2, b1, 1)
 	mutated = strings.Replace(mutated, "__PLACEHOLDER__", b2, 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply order mutation")
 	}
-	if err := validateRenderedVPNPage(mutated); err == nil {
+	if err := validateRenderedVPNPageFor("vpn_backends", mutated); err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject order mutant, but it passed")
 	}
 
-	scriptsBlock := renderVPNScriptsBlock(t)
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_backends")
 	blk1 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends.js")
-	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/health_problems.js")
+	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends_page.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blk1, "__PLACEHOLDER__", 1)
 	mutatedBlock = strings.Replace(mutatedBlock, blk2, blk1, 1)
 	mutatedBlock = strings.Replace(mutatedBlock, "__PLACEHOLDER__", blk2, 1)
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply order mutation to scripts block")
 	}
-	if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
+	if err := validateVPNScriptsBlockFor("vpn_backends", mutatedBlock); err == nil {
 		t.Fatal("expected validateVPNScriptsBlock to reject order mutant, but it passed")
 	}
 }
 
 func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
-	rendered := renderBaseAndVPNTemplate(t)
-	scriptsBlock := renderVPNScriptsBlock(t)
+	rendered := renderVPNPage(t, "vpn_diagnostics")
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_diagnostics")
 
 	typeMutants := []struct {
 		name      string
@@ -522,7 +577,7 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 			if mutatedPage == rendered {
 				t.Fatalf("failed to apply %s mutation to rendered page", tc.name)
 			}
-			if err := validateRenderedVPNPage(mutatedPage); err == nil {
+			if err := validateRenderedVPNPageFor("vpn_diagnostics", mutatedPage); err == nil {
 				t.Fatalf("expected validateRenderedVPNPage to reject %s mutant, but it passed", tc.name)
 			}
 
@@ -532,7 +587,7 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 			if mutatedBlock == scriptsBlock {
 				t.Fatalf("failed to apply %s mutation to scripts block", tc.name)
 			}
-			if err := validateVPNScriptsBlock(mutatedBlock); err == nil {
+			if err := validateVPNScriptsBlockFor("vpn_diagnostics", mutatedBlock); err == nil {
 				t.Fatalf("expected validateVPNScriptsBlock to reject %s mutant, but it passed", tc.name)
 			}
 		})
@@ -543,7 +598,7 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 	rendered := renderBaseAndVPNTemplate(t)
 
 	t.Run("VPNPrecedingBootstrapRejected", func(t *testing.T) {
-		mutated := strings.Replace(rendered, `<head>`, `<head><script src="/static/js/vpn/page.js"></script>`, 1)
+		mutated := strings.Replace(rendered, `<head>`, `<head><script src="/static/js/vpn/overview.js"></script>`, 1)
 		if mutated == rendered {
 			t.Fatal("failed to apply VPN preceding bootstrap mutation")
 		}

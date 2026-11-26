@@ -185,7 +185,7 @@ console.log('VPN955_07_LAT_MAX_OK');
 	t.Run("RestoredUnderDiagnosticsNotEmptySummaryTiles", func(t *testing.T) {
 		// The restoration must live in the accepted diagnostics sections; the eight
 		// summary tiles stay retired, and the four new rows are inside them.
-		r := NewVPNTestFixture(t)
+		r := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		templateHTML := r.TemplateHTML
 		if strings.Contains(templateHTML, `id="vpn-kpi-`) {
 			t.Error("the eight summary tiles must stay retired")
