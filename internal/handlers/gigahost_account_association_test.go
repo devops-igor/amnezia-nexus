@@ -22,7 +22,7 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -219,12 +219,15 @@ func TestAssociationLeavesUnattributableRowsUnknown(t *testing.T) {
 				t.Fatalf("preview reasons = %+v, want one %q", preview.Reasons, tc.wantCode)
 			}
 
-			// Even the confirmed action must not associate a row the provider
-			// speaks against or says nothing about.
-			result := f.associationActionCall(true)
-			if result.Associated != 0 || result.Unattributed != 1 {
-				t.Fatalf("the confirmed action associated %d rows (%d unattributed), want 0 and 1",
-					result.Associated, result.Unattributed)
+			// A pass with nothing to write offers no confirmation at all, so the
+			// administrator cannot confirm a screen that promised nothing - and a
+			// request that tries anyway writes nothing.
+			if preview.PreviewID != "" {
+				t.Fatalf("a preview with nothing to associate offered a confirmation (%q)", preview.PreviewID)
+			}
+			refusal := f.associationActionRaw(`{"preview_id":"","include_unlisted":true}`)
+			if refusal.Code != http.StatusConflict {
+				t.Fatalf("a confirmation without a preview answered %d, want 409: %s", refusal.Code, refusal.Body.String())
 			}
 			if got := f.row(row); got.ProviderAccountKnown() {
 				t.Fatalf("an unattributable row was associated with %q", got.ProviderAccountID)
@@ -252,10 +255,15 @@ func TestAssociationNeverRewritesARecordedAccount(t *testing.T) {
 	if preview.Candidates != 0 || preview.AlreadyBound != 1 {
 		t.Fatalf("preview = %+v, want no candidate and one already-bound row", preview)
 	}
+	if preview.PreviewID != "" {
+		t.Fatalf("a preview with nothing to write offered a confirmation (%q)", preview.PreviewID)
+	}
 
-	result := f.associationActionCall(true)
-	if result.Associated != 0 || result.AlreadyBound != 1 {
-		t.Fatalf("the action associated %d rows (%d already bound), want 0 and 1", result.Associated, result.AlreadyBound)
+	// A row that already records an account is never a candidate, so there is no
+	// consent to give and the action refuses rather than opening a write path for it.
+	rec := f.associationActionRaw(`{"preview_id":"","include_unlisted":true}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("the action answered %d for a preview with nothing to write, want 409: %s", rec.Code, rec.Body.String())
 	}
 	if got := f.row(row); got.ProviderAccountID != otherAccount {
 		t.Fatalf("the recorded account was rewritten to %q, want %q", got.ProviderAccountID, otherAccount)
@@ -277,23 +285,26 @@ func TestAssociationIsIdempotent(t *testing.T) {
 	f.provider.set(inventoryJSON(641))
 	f.provider.answerPerServer(641, http.StatusOK)
 
-	first := f.associationActionCall(true)
+	preview := f.associationPreviewCall()
+	first := f.associationActionCallWithPreview(preview.PreviewID, false)
 	if first.Associated != 1 {
 		t.Fatalf("the first run associated %d rows, want 1", first.Associated)
 	}
-	second := f.associationActionCall(true)
+	// A second confirmation of the same preview is the repeated click this action
+	// must absorb: it reports what remains, and writes nothing further.
+	second := f.associationActionCallWithPreview(preview.PreviewID, false)
 	if second.Associated != 0 || second.AlreadyBound != 1 || second.Unattributed != 0 {
 		t.Fatalf("the second run = %+v, want 0 associated, 1 already bound, 0 unattributed", second)
 	}
 	if got := f.row(live); got.ProviderAccountID != fixtureAccount {
 		t.Fatalf("the repeated run changed the recorded account to %q", got.ProviderAccountID)
 	}
-	preview := f.associationPreviewCall()
-	if preview.Candidates != 0 || preview.Attributable != 0 || preview.Unlisted != 0 {
-		t.Fatalf("the preview after the association = %+v, want nothing left to associate", preview)
+	after := f.associationPreviewCall()
+	if after.Candidates != 0 || after.Attributable != 0 || after.Unlisted != 0 {
+		t.Fatalf("the preview after the association = %+v, want nothing left to associate", after)
 	}
-	if preview.AlreadyBound != 1 {
-		t.Fatalf("the preview after the association reports %d already-bound rows, want 1", preview.AlreadyBound)
+	if after.AlreadyBound != 1 {
+		t.Fatalf("the preview after the association reports %d already-bound rows, want 1", after.AlreadyBound)
 	}
 }
 
@@ -316,9 +327,14 @@ func TestAssociationRefusesWhenTheProviderCannotAnswer(t *testing.T) {
 			row := f.seedLegacyServer("Legacy", 651)
 			f.provider.set(inventoryJSON(651))
 			f.provider.answerPerServer(651, http.StatusOK)
+
+			// The administrator reviews a real preview, and only then does the
+			// provider stop answering. The confirmation must refuse rather than
+			// associate from a partial read.
+			preview := f.associationPreviewCall()
 			tc.prepare(f.provider)
 
-			rec := f.associationRequest(http.MethodPost, `{"include_unlisted":true}`, models.RoleAdmin)
+			rec := f.associationActionRaw(fmt.Sprintf(`{"preview_id":%q,"include_unlisted":false}`, preview.PreviewID))
 			if rec.Code != http.StatusServiceUnavailable {
 				t.Fatalf("the action answered %d, want 503; body=%s", rec.Code, rec.Body.String())
 			}
@@ -329,10 +345,12 @@ func TestAssociationRefusesWhenTheProviderCannotAnswer(t *testing.T) {
 	}
 }
 
-// TestAssociationTreatsAnEmptyOrUnreadableBodyAsNoConfirmation proves the default
-// is the narrow one: a client that sends nothing associates only the rows the
-// provider named, and a malformed body is refused rather than read as consent.
-func TestAssociationTreatsAnEmptyOrUnreadableBodyAsNoConfirmation(t *testing.T) {
+// TestAssociationTreatsAnUnnamedPreviewOrUnreadableBodyAsNoConsent proves the
+// consent is only ever what the administrator answered for a named preview: a body
+// that names no preview is refused, a body inside a named preview that does not ask
+// for the unlisted rows associates only the rows the provider named, and a malformed
+// body is refused rather than read as consent.
+func TestAssociationTreatsAnUnnamedPreviewOrUnreadableBodyAsNoConsent(t *testing.T) {
 	f := newInventoryFixture(t)
 	live := f.seedLegacyServer("Legacy-live", 671)
 	gone := f.seedLegacyServer("Legacy-deleted", 672)
@@ -340,25 +358,31 @@ func TestAssociationTreatsAnEmptyOrUnreadableBodyAsNoConfirmation(t *testing.T) 
 	f.provider.answerPerServer(671, http.StatusOK)
 	f.provider.answerPerServer(672, http.StatusNotFound)
 
+	// No preview id: the counts the administrator saw belong to no account the panel
+	// can verify, so the request is refused before anything is read or written.
 	rec := f.associationRequest(http.MethodPost, "", models.RoleAdmin)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("the action with no body answered %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("the action with no body answered %d, want 409: %s", rec.Code, rec.Body.String())
 	}
-	var result associationResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-		t.Fatalf("failed to decode the outcome: %v (%s)", err, rec.Body.String())
-	}
-	if result.Associated != 1 || result.Unlisted != 0 {
-		t.Fatalf("the action with no body associated %d rows (%d unlisted), want 1 and 0", result.Associated, result.Unlisted)
-	}
-	if got := f.row(gone); got.ProviderAccountKnown() {
-		t.Fatal("a body with no confirmation associated a row the account no longer lists")
-	}
-	if got := f.row(live); !got.ProviderAccountKnown() {
-		t.Fatal("a body with no confirmation did not associate the row the provider names")
+	if got := f.row(live); got.ProviderAccountKnown() {
+		t.Fatal("a confirmation that named no preview associated the row the provider names")
 	}
 
-	malformed := f.associationRequest(http.MethodPost, `{"include_unlisted":"yes"}`, models.RoleAdmin)
+	// Inside a named preview, sending no include_unlisted is the narrow answer: the
+	// provider-named row is associated, the unlisted one is not.
+	preview := f.associationPreviewCall()
+	result := f.associationActionCallWithPreview(preview.PreviewID, false)
+	if result.Associated != 1 || result.Unlisted != 0 {
+		t.Fatalf("the action associated %d rows (%d unlisted), want 1 and 0", result.Associated, result.Unlisted)
+	}
+	if got := f.row(gone); got.ProviderAccountKnown() {
+		t.Fatal("a confirmation that did not include the unlisted rows associated one")
+	}
+	if got := f.row(live); !got.ProviderAccountKnown() {
+		t.Fatal("the confirmation did not associate the row the provider names")
+	}
+
+	malformed := f.associationRequest(http.MethodPost, `{"preview_id":"x","include_unlisted":"yes"}`, models.RoleAdmin)
 	if malformed.Code != http.StatusBadRequest {
 		t.Fatalf("a malformed confirmation answered %d, want 400", malformed.Code)
 	}

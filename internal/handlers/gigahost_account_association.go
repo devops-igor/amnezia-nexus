@@ -128,6 +128,10 @@ type gigahostAccountBinding struct {
 // written. The preview endpoint returns it and the action endpoint applies it, so
 // what the administrator is shown and what the action does cannot drift.
 type gigahostAccountPlan struct {
+	// account is the identifier the provider said it answered as. The confirmation
+	// is bound to it: a plan built under a different account must never apply a
+	// consent given for this one.
+	account string
 	// candidates are the provider-provisioned rows that record no account.
 	candidates int
 	// alreadyBound are the provider-provisioned rows that already record one.
@@ -305,6 +309,7 @@ func (h *Handlers) planGigahostAccountAssociation(ctx context.Context, r *http.R
 	if err != nil {
 		return plan, err
 	}
+	plan.account = answerAccount
 	plan.attributed, plan.unlisted, plan.undecided = gigahostAssociationBindings(callCtx, client, rows, listed, answerAccount)
 	return plan, nil
 }
@@ -338,8 +343,13 @@ func reasonPayload(reasons map[gigahostAssociationReason]int) []map[string]any {
 
 // previewPayload is what the administrator is shown before confirming. Every count
 // is the count the action will apply, because both come from the same plan.
-func (p gigahostAccountPlan) previewPayload() map[string]any {
+//
+// previewID is the token the confirmation must present. It stands for the account
+// that answered and the unlisted rows below, so a confirmation cannot be carried to
+// a different account or to a preview that never showed those rows.
+func (p gigahostAccountPlan) previewPayload(previewID string) map[string]any {
 	return map[string]any{
+		"preview_id":    previewID,
 		"candidates":    p.candidates,
 		"already_bound": p.alreadyBound,
 		"attributable":  len(p.attributed),
@@ -363,16 +373,28 @@ func (h *Handlers) GigahostAccountAssociationPreviewHandler(w http.ResponseWrite
 		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable", err.Error())
 		return
 	}
-	h.JSON(w, http.StatusOK, plan.previewPayload())
+	previewID, err := h.recordGigahostAssociationPreview(plan)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "gigahost_association_unavailable",
+			"the preview could not be recorded, so nothing may be confirmed from it")
+		return
+	}
+	h.JSON(w, http.StatusOK, plan.previewPayload(previewID))
 }
 
 // gigahostAssociationConfirmation is the administrator's answer to the preview.
+//
+// PreviewID names the preview this answer was given for. It is required: the counts
+// the administrator saw belong to one account and one set of unlisted rows, and a
+// confirmation that does not name them could be applied to whichever account the
+// configured key happens to belong to by the time it arrives.
 //
 // IncludeUnlisted is the authorisation for the rows the provider says it does not
 // have. It is a named field rather than an inference from the request, so a client
 // that does not send it can never associate one of those rows by accident.
 type gigahostAssociationConfirmation struct {
-	IncludeUnlisted bool `json:"include_unlisted"`
+	PreviewID       string `json:"preview_id"`
+	IncludeUnlisted bool   `json:"include_unlisted"`
 }
 
 // gigahostAssociationApplication is what one application of the plan wrote.
@@ -436,16 +458,60 @@ func (h *Handlers) GigahostAccountAssociationHandler(w http.ResponseWriter, r *h
 	}
 
 	ctx := r.Context()
+
+	// The consent must name the preview it was given for, before anything is read
+	// from the provider: a request without one has no account and no unlisted scope
+	// to be bound to.
+	if strings.TrimSpace(confirmation.PreviewID) == "" {
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_required",
+			"check again before associating: the confirmation must name the preview it was given for, and nothing was changed")
+		return
+	}
+	consent, ok := h.gigahostAssociationPreviewRecordFor(confirmation.PreviewID)
+	if !ok {
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
+			"that check is no longer available; check again and confirm from the fresh counts, and nothing was changed")
+		return
+	}
+
 	plan, err := h.planGigahostAccountAssociation(ctx, r)
 	if err != nil {
 		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable", err.Error())
 		return
 	}
 
-	bindings := plan.attributed
-	if confirmation.IncludeUnlisted {
-		bindings = append(append([]gigahostAccountBinding{}, plan.attributed...), plan.unlisted...)
+	// The account that answers now must be the account the administrator previewed.
+	// Otherwise the consent shown for one account would be applied to another: the
+	// remainder of the request would be a write the administrator never approved.
+	//
+	// An empty plan account means the pass had no candidate rows to ask the provider
+	// about, so this request can only be a no-op (a repeated confirmation, or an
+	// account whose every row already records itself). There is no account behind it
+	// to mismatch, and there is nothing it could write.
+	if plan.account != "" && plan.account != consent.account {
+		h.forgetGigahostAssociationPreview(confirmation.PreviewID)
+		h.JSONError(w, http.StatusConflict, "gigahost_association_account_changed",
+			"the configured account changed since that check; check again and confirm under the account you reviewed, and nothing was changed")
+		return
 	}
+
+	var unlisted []gigahostAccountBinding
+	if confirmation.IncludeUnlisted {
+		if len(consent.unlisted) == 0 {
+			h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
+				"that check did not offer any servers the account no longer lists; check again before confirming, and nothing was changed")
+			return
+		}
+		// Only the rows the administrator was actually shown are covered by that
+		// consent. A row that became unlisted after the preview is not.
+		for _, binding := range plan.unlisted {
+			if _, previewed := consent.unlisted[binding.serverID]; previewed {
+				unlisted = append(unlisted, binding)
+			}
+		}
+	}
+
+	bindings := append(append([]gigahostAccountBinding{}, plan.attributed...), unlisted...)
 
 	reasons := make(map[gigahostAssociationReason]int, len(plan.undecided))
 	for reason, count := range plan.undecided {

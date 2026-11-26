@@ -24,6 +24,7 @@ type associationReasonCount struct {
 
 // associationPreview mirrors the preview response.
 type associationPreview struct {
+	PreviewID    string                   `json:"preview_id"`
 	Candidates   int                      `json:"candidates"`
 	AlreadyBound int                      `json:"already_bound"`
 	Attributable int                      `json:"attributable"`
@@ -108,10 +109,24 @@ func (f *inventoryFixture) associationPreviewCall() associationPreview {
 	return preview
 }
 
-// associationActionCall runs the action and decodes its outcome.
+// associationActionRaw posts a confirmation body and returns the recorder, so a
+// refusal can be asserted on its status and code rather than through a decoded
+// success.
+func (f *inventoryFixture) associationActionRaw(body string) *httptest.ResponseRecorder {
+	return f.associationRequest(http.MethodPost, body, models.RoleAdmin)
+}
+
+// associationActionCall runs the action the way the page does: it takes a preview and
+// then confirms that preview's own id.
 func (f *inventoryFixture) associationActionCall(includeUnlisted bool) associationResult {
-	body := fmt.Sprintf(`{"include_unlisted":%t}`, includeUnlisted)
-	rec := f.associationRequest(http.MethodPost, body, models.RoleAdmin)
+	preview := f.associationPreviewCall()
+	return f.associationActionCallWithPreview(preview.PreviewID, includeUnlisted)
+}
+
+// associationActionCallWithPreview confirms one named preview and decodes the outcome.
+func (f *inventoryFixture) associationActionCallWithPreview(previewID string, includeUnlisted bool) associationResult {
+	body := fmt.Sprintf(`{"preview_id":%q,"include_unlisted":%t}`, previewID, includeUnlisted)
+	rec := f.associationActionRaw(body)
 	if rec.Code != http.StatusOK {
 		f.t.Fatalf("association action returned %d: %s", rec.Code, rec.Body.String())
 	}

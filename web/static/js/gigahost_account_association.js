@@ -87,21 +87,36 @@ function gigahostAssociationPreviewText(preview, includeUnlisted) {
     return parts.join(' ');
 }
 
-/* gigahostAssociationOutcomeText reports what the action did. A run that associated
- * nothing says so rather than looking empty: the action is idempotent, so "nothing
- * further" is a successful outcome and must be readable as one. */
+/* gigahostAssociationOutcomeText reports what the action did.
+ *
+ * A run that associated nothing has two very different meanings, and telling them
+ * apart is the whole point of this function:
+ *
+ *   - nothing was written and rows remain (a write failed, or the provider could not
+ *     answer for them). Reconciliation still skips those rows, so reporting the
+ *     success copy here would tell the administrator the work is done when it is not;
+ *   - nothing was written and nothing remains. That is a genuine all-clear: every row
+ *     already records its account, which is what a repeated confirmation sees. */
 function gigahostAssociationOutcomeText(result) {
     if (!result) return _('gigahost_association_done_none');
     const associated = Number(result.associated) || 0;
+    const unattributed = Number(result.unattributed) || 0;
     if (associated === 0) {
-        return _('gigahost_association_done_none');
+        if (unattributed === 0) {
+            // Nothing left to do: the idempotent repeat, or an account whose every
+            // row already records itself.
+            return _('gigahost_association_done_none');
+        }
+        return gigahostAssociationFormat(_('gigahost_association_preview_unattributed'), [
+            unattributed,
+            gigahostAssociationReasonText(result.reasons)
+        ]);
     }
     const parts = [gigahostAssociationFormat(_('gigahost_association_done'), [associated])];
     const unlisted = Number(result.unlisted) || 0;
     if (unlisted > 0) {
         parts.push(gigahostAssociationFormat(_('gigahost_association_done_unlisted'), [unlisted]));
     }
-    const unattributed = Number(result.unattributed) || 0;
     if (unattributed > 0) {
         parts.push(gigahostAssociationFormat(_('gigahost_association_preview_unattributed'), [
             unattributed,
@@ -111,11 +126,18 @@ function gigahostAssociationOutcomeText(result) {
     return parts.join(' ');
 }
 
-/* gigahostAssociationRequest is the body the confirmation posts. It is derived from
- * the administrator's own choice, never from a default: an absent field and false
- * mean the same thing to the panel, and false is what an untouched control says. */
-function gigahostAssociationRequest(includeUnlisted) {
-    return {include_unlisted: includeUnlisted === true};
+/* gigahostAssociationRequest is the body the confirmation posts.
+ *
+ * It carries the preview it was given for, so the panel can refuse a consent that
+ * belongs to a different account or to a screen the administrator has since left.
+ * The unlisted field is derived from the administrator's own choice, never from a
+ * default: an absent field and false mean the same thing to the panel, and false is
+ * what an untouched control says. */
+function gigahostAssociationRequest(previewID, includeUnlisted) {
+    return {
+        preview_id: previewID === undefined || previewID === null ? '' : String(previewID),
+        include_unlisted: includeUnlisted === true
+    };
 }
 
 /* gigahostAssociationState holds the last preview and the in-flight guard. Each
@@ -142,8 +164,14 @@ function gigahostAssociationShow(element, visible) {
 }
 
 /* renderGigahostAssociationPreview shows the panel's counts and offers the
- * confirmation only when there is something to do. */
-function renderGigahostAssociationPreview(state, preview) {
+ * confirmation only when there is something to do.
+ *
+ * fresh marks a preview the panel just produced. Every fresh preview clears the
+ * unlisted consent, because that consent was given for the previous counts: keeping
+ * it checked would silently re-authorise the absent-marking consequence for a screen
+ * the administrator has not answered yet. A re-render caused by the checkbox itself
+ * is not fresh and preserves the administrator's current choice. */
+function renderGigahostAssociationPreview(state, preview, fresh) {
     state.preview = preview || null;
     const choice = document.getElementById('gigahostAssociationUnlistedChoice');
     const checkbox = document.getElementById('gigahostAssociationIncludeUnlisted');
@@ -151,17 +179,20 @@ function renderGigahostAssociationPreview(state, preview) {
     const confirm = document.getElementById('btnGigahostAssociationConfirm');
 
     const unlisted = preview ? (Number(preview.unlisted) || 0) : 0;
+    if (checkbox && (fresh || unlisted === 0)) checkbox.checked = false;
     // The choice only exists when the account has stopped listing something: an
     // offered control that can do nothing would be a decision the administrator
     // cannot make meaningfully.
-    if (unlisted === 0 && checkbox) checkbox.checked = false;
     gigahostAssociationShow(choice, unlisted > 0);
 
+    const previewID = preview && preview.preview_id ? String(preview.preview_id) : '';
     if (outcome) {
         outcome.textContent = gigahostAssociationPreviewText(preview, checkbox && checkbox.checked);
         gigahostAssociationShow(outcome, true);
     }
-    gigahostAssociationShow(confirm, gigahostAssociationWanted(preview, checkbox && checkbox.checked) > 0);
+    // A confirmation without the preview it answers has nothing to bind: the panel
+    // would have to apply it to whichever account answers next.
+    gigahostAssociationShow(confirm, previewID !== '' && gigahostAssociationWanted(preview, checkbox && checkbox.checked) > 0);
 }
 
 function renderGigahostAssociationOutcome(result) {
@@ -189,7 +220,7 @@ async function runGigahostAssociationPreview(state) {
     gigahostAssociationBusy(state);
     try {
         const preview = await API.get('/api/admin/hosting/gigahost/account-association', {silent: true});
-        renderGigahostAssociationPreview(state, preview);
+        renderGigahostAssociationPreview(state, preview, true);
     } catch (err) {
         const outcome = document.getElementById('gigahostAssociationOutcome');
         if (outcome) {
@@ -208,16 +239,25 @@ async function runGigahostAssociationPreview(state) {
 async function runGigahostAssociation(state) {
     if (state.inFlight) return;
     const checkbox = document.getElementById('gigahostAssociationIncludeUnlisted');
+    // Without a preview there is no account and no unlisted scope to bind the
+    // confirmation to, so there is nothing this action could legitimately do.
+    const previewID = state.preview && state.preview.preview_id ? String(state.preview.preview_id) : '';
+    if (previewID === '') return;
     state.inFlight = true;
     gigahostAssociationBusy(state);
     try {
         const result = await API.post(
             '/api/admin/hosting/gigahost/account-association',
-            gigahostAssociationRequest(checkbox && checkbox.checked),
+            gigahostAssociationRequest(previewID, checkbox && checkbox.checked),
             {silent: true}
         );
         renderGigahostAssociationOutcome(result);
+        // The one-time action has run: the choice it covered is spent, so the switch
+        // is hidden AND cleared. Leaving it checked would carry that consent into a
+        // later preview for a different set of rows.
+        if (checkbox) checkbox.checked = false;
         gigahostAssociationShow(document.getElementById('gigahostAssociationUnlistedChoice'), false);
+        state.preview = null;
     } catch (err) {
         const outcome = document.getElementById('gigahostAssociationOutcome');
         if (outcome) {
@@ -261,7 +301,7 @@ function initGigahostAssociation() {
         // does, and re-reading the provider to learn the same numbers would make the
         // two disagree whenever the account changes in between.
         checkbox.addEventListener('change', () => {
-            renderGigahostAssociationPreview(state, state.preview);
+            renderGigahostAssociationPreview(state, state.preview, false);
         });
     }
     return state;

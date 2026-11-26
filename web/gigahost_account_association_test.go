@@ -168,7 +168,7 @@ w.API = {
     calls.push({method:'GET', url});
     if (holdNext) { const release = holdNext; holdNext = null; await release; }
     if (failNext) { const e = new Error(failNext); failNext = null; throw e; }
-    return {candidates: 3, attributable: 1, unlisted: 1, unattributed: 1,
+    return {preview_id: 'preview-1', candidates: 3, attributable: 1, unlisted: 1, unattributed: 1,
             already_bound: 4, reasons: [{reason:'provider_refused', count:1}]};
   },
   post: async (url, body) => {
@@ -195,10 +195,10 @@ const click = id => w.document.getElementById(id).click();
   assert.equal(w.gigahostAssociationWanted({attributable: 2, unlisted: 1}, false), 2);
   assert.equal(w.gigahostAssociationWanted({attributable: 2, unlisted: 1}, true), 3);
   assert.equal(w.gigahostAssociationWanted(null, true), 0);
-  assert.deepEqual(w.gigahostAssociationRequest(true), {include_unlisted: true});
-  assert.deepEqual(w.gigahostAssociationRequest(false), {include_unlisted: false});
-  assert.deepEqual(w.gigahostAssociationRequest('yes'), {include_unlisted: false});
-  assert.deepEqual(w.gigahostAssociationRequest(), {include_unlisted: false});
+  assert.deepEqual(w.gigahostAssociationRequest('preview-1', true), {preview_id:'preview-1', include_unlisted: true});
+  assert.deepEqual(w.gigahostAssociationRequest('preview-1', false), {preview_id:'preview-1', include_unlisted: false});
+  assert.deepEqual(w.gigahostAssociationRequest('preview-1', 'yes'), {preview_id:'preview-1', include_unlisted: false});
+  assert.deepEqual(w.gigahostAssociationRequest(), {preview_id:'', include_unlisted: false});
   assert.equal(
     w.gigahostAssociationPreviewText({candidates:0, attributable:0, unlisted:0, unattributed:0}, false),
     'nothing-to-associate');
@@ -213,6 +213,20 @@ const click = id => w.document.getElementById(id).click();
     '2 of 3 can be associated 1 unattributed: refused');
   assert.equal(w.gigahostAssociationOutcomeText({associated:0}), 'nothing-further');
   assert.equal(w.gigahostAssociationOutcomeText(null), 'nothing-further');
+  assert.equal(w.gigahostAssociationOutcomeText({associated:0, unattributed:0, reasons:[]}), 'nothing-further');
+  // A zero-write result that still has rows to reconcile must not read as completion.
+  assert.equal(
+    w.gigahostAssociationOutcomeText({associated:0, unattributed:2,
+      reasons:[{reason:'write_failed', count:2}]}),
+    '2 unattributed: not-recorded');
+  assert.equal(
+    w.gigahostAssociationOutcomeText({associated:0, unattributed:1,
+      reasons:[{reason:'provider_unanswered', count:1}]}),
+    '1 unattributed: did-not-answer');
+  assert.notEqual(
+    w.gigahostAssociationOutcomeText({associated:0, unattributed:1,
+      reasons:[{reason:'provider_unanswered', count:1}]}),
+    'nothing-further');
   assert.equal(w.gigahostAssociationOutcomeText({associated:2, unlisted:1}), '2 associated 1 will be marked deleted next');
   assert.equal(
     w.gigahostAssociationOutcomeText({associated:2, unlisted:0, unattributed:1,
@@ -247,10 +261,31 @@ const click = id => w.document.getElementById(id).click();
   await flush();
   assert.equal(byMethod('POST').length, 1);
   assert.equal(byMethod('POST')[0].url, '/api/admin/hosting/gigahost/account-association');
-  assert.deepEqual(byMethod('POST')[0].body, {include_unlisted: true});
+  assert.deepEqual(byMethod('POST')[0].body, {preview_id: 'preview-1', include_unlisted: true});
   assert.equal(text('gigahostAssociationOutcome'), '2 associated 1 will be marked deleted next 1 unattributed: unnamed');
   assert.ok(hidden('btnGigahostAssociationConfirm'), 'the confirmation is still offered after the action ran');
   assert.ok(hidden('gigahostAssociationUnlistedChoice'), 'the choice is still offered after the action ran');
+  assert.strictEqual(checkbox.checked, false, 'the spent unlisted consent is left checked');
+
+  // 5b. A fresh preview never inherits the previous opt-in: that consent was given
+  //     for counts the new screen has replaced, and carrying it forward would
+  //     re-authorise the absent-marking consequence without a fresh answer.
+  click('btnGigahostAssociationPreview');
+  await flush();
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new w.Event('change'));
+  assert.strictEqual(checkbox.checked, true, 'the operator opt-in did not stick to its own preview');
+  click('btnGigahostAssociationPreview');
+  await flush();
+  assert.strictEqual(checkbox.checked, false, 'a fresh preview kept the previous opt-in');
+  assert.ok(!hidden('gigahostAssociationUnlistedChoice'), 'the fresh preview hid the choice it should offer');
+  const postsBeforeSecondConfirm = byMethod('POST').length;
+  click('btnGigahostAssociationConfirm');
+  await flush();
+  assert.equal(byMethod('POST').length, postsBeforeSecondConfirm + 1, 'the fresh preview offered no confirmation');
+  assert.deepEqual(byMethod('POST').slice(-1)[0].body,
+    {preview_id: 'preview-1', include_unlisted: false},
+    'a fresh preview posted the previous opt-in');
 
   // 6. Two requests must not overlap. The guard is asserted through the controller
   //    entry point itself, because the button also carries a disabled state that
@@ -293,7 +328,7 @@ const click = id => w.document.getElementById(id).click();
   click('btnGigahostAssociationConfirm');
   await flush();
   assert.equal(text('gigahostAssociationOutcome'), 'failed: write refused');
-  assert.deepEqual(byMethod('POST').slice(-1)[0].body, {include_unlisted: false});
+  assert.deepEqual(byMethod('POST').slice(-1)[0].body, {preview_id: 'preview-1', include_unlisted: false});
 
   // 9. An empty plan offers nothing to confirm and says so.
   w.API.get = async url => {
