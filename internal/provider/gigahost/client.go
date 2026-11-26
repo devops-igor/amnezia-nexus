@@ -28,6 +28,14 @@ type Client interface {
 	OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error)
 	GetServers(ctx context.Context) ([]ServerInfo, error)
+	// GetServer reads one server. It is the authoritative per-server answer: the
+	// provider refuses a server outside the key's visibility with an authorization
+	// error, so "not found" here proves absence while a refusal proves nothing.
+	GetServer(ctx context.Context, serverID int64) (*ServerInfo, error)
+	// GetDashboard reads the account summary, whose service counts are account-wide
+	// even for a permission-limited key. It is the only key-reachable statement about
+	// how many servers the account has.
+	GetDashboard(ctx context.Context) (*Dashboard, error)
 }
 
 // Config provides configuration settings for creating a Gigahost client.
@@ -104,25 +112,59 @@ func NewClient(cfg Config) (Client, error) {
 // GetAccount queries account credit and balance via GET /account.
 func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodGet, "/account", nil, &rawData)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/account", nil, &rawData); err != nil {
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
+	return decodeAccount(rawData)
+}
 
+// decodeAccount reads an account payload in the shapes the provider documents: the
+// nested document (which is the only shape that carries eligibility), an
+// {account|data} envelope, and a flat object.
+func decodeAccount(rawData []byte) (*AccountInfo, error) {
+	if account, ok := accountFromDocument(rawData); ok {
+		return account, nil
+	}
+	if account := accountFromEnvelope(rawData); account != nil {
+		return account, nil
+	}
+
+	// The account was not in a shape this client could decode. If the body carries
+	// an identifier it cannot read, say so: "the identifier is unreadable" and "the
+	// account has no identifier" must not look the same to a caller, because one is
+	// a protocol problem and the other disables the identity-dependent paths.
+	if err := rejectUnreadableIdentity(rawData); err != nil {
+		return nil, err
+	}
+
+	var flat AccountInfo
+	if err := json.Unmarshal(rawData, &flat); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal account response: %w", err)
+	}
+	return flat.withIdentityFallback(), nil
+}
+
+// accountFromDocument reads the documented {"meta":…,"data":{…}} account document,
+// which is the shape that carries eligibility. It reports false when the body is
+// not that shape or names no account.
+func accountFromDocument(rawData []byte) (*AccountInfo, bool) {
 	type docAccount struct {
 		Meta struct {
 			Status int `json:"status"`
 		} `json:"meta"`
 		Data struct {
-			CustID      string  `json:"cust_id"`
-			CustName    string  `json:"cust_name"`
-			CustEmail   string  `json:"cust_email"`
-			ID          string  `json:"id"`
-			Email       string  `json:"email"`
-			Balance     float64 `json:"balance"`
-			Credit      float64 `json:"credit"`
-			Currency    string  `json:"currency"`
-			Status      string  `json:"status"`
+			// Identity fields tolerate the documented numeric shape and the text
+			// shape, so a numeric cust_id still takes this rich decode (which maps
+			// eligibility) instead of falling through to the flat fallbacks.
+			CustID      Identity `json:"cust_id"`
+			CustName    string   `json:"cust_name"`
+			CustEmail   string   `json:"cust_email"`
+			ID          Identity `json:"id"`
+			Email       string   `json:"email"`
+			Balance     float64  `json:"balance"`
+			Credit      float64  `json:"credit"`
+			Currency    string   `json:"currency"`
+			Status      string   `json:"status"`
 			Eligibility struct {
 				QualifiesArrears bool    `json:"qualifies_arrears"`
 				CreditNOK        float64 `json:"credit_nok"`
@@ -130,46 +172,81 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 		} `json:"data"`
 	}
 	var doc docAccount
-	if err := json.Unmarshal(rawData, &doc); err == nil && (doc.Data.CustID != "" || doc.Data.ID != "" || doc.Data.CustName != "" || doc.Data.Eligibility.QualifiesArrears) {
-		acc := &AccountInfo{
-			ID:               doc.Data.ID,
-			CustID:           doc.Data.CustID,
-			CustName:         doc.Data.CustName,
-			Email:            doc.Data.CustEmail,
-			Balance:          doc.Data.Balance,
-			Credit:           doc.Data.Credit,
-			CreditNOK:        doc.Data.Eligibility.CreditNOK,
-			QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
-			Currency:         doc.Data.Currency,
-			Status:           doc.Data.Status,
-		}
-		if acc.ID == "" {
-			acc.ID = doc.Data.CustID
-		}
-		if acc.Email == "" {
-			acc.Email = doc.Data.Email
-		}
-		return acc, nil
+	if err := json.Unmarshal(rawData, &doc); err != nil {
+		return nil, false
 	}
+	custID, accountID := doc.Data.CustID.String(), doc.Data.ID.String()
+	if custID == "" && accountID == "" && doc.Data.CustName == "" && !doc.Data.Eligibility.QualifiesArrears {
+		return nil, false
+	}
+	account := &AccountInfo{
+		ID:               accountID,
+		CustID:           custID,
+		CustName:         doc.Data.CustName,
+		Email:            doc.Data.CustEmail,
+		Balance:          doc.Data.Balance,
+		Credit:           doc.Data.Credit,
+		CreditNOK:        doc.Data.Eligibility.CreditNOK,
+		QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
+		Currency:         doc.Data.Currency,
+		Status:           doc.Data.Status,
+	}
+	if account.Email == "" {
+		account.Email = doc.Data.Email
+	}
+	return account.withIdentityFallback(), true
+}
 
-	var wrapped struct {
+// accountFromEnvelope reads an account nested under "account" or "data".
+func accountFromEnvelope(rawData []byte) *AccountInfo {
+	var envelope struct {
 		Account *AccountInfo `json:"account"`
 		Data    *AccountInfo `json:"data"`
 	}
-	if wrapErr := json.Unmarshal(rawData, &wrapped); wrapErr == nil {
-		if wrapped.Account != nil {
-			return wrapped.Account, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, nil
-		}
+	if err := json.Unmarshal(rawData, &envelope); err != nil {
+		return nil
 	}
+	if envelope.Account != nil {
+		return envelope.Account.withIdentityFallback()
+	}
+	return envelope.Data.withIdentityFallback()
+}
 
-	var acc AccountInfo
-	if err := json.Unmarshal(rawData, &acc); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal account response: %w", err)
+// withIdentityFallback gives a decoded account whose only identifier is cust_id the
+// same value in ID, so a caller reading either field sees the account. It returns
+// the receiver so decode paths can return it directly.
+func (a *AccountInfo) withIdentityFallback() *AccountInfo {
+	if a == nil {
+		return nil
 	}
-	return &acc, nil
+	if strings.TrimSpace(a.ID) == "" {
+		a.ID = a.CustID
+	}
+	return a
+}
+
+// rejectUnreadableIdentity reports a body that names an account identifier this
+// client cannot read.
+func rejectUnreadableIdentity(rawData []byte) error {
+	var probe struct {
+		Data struct {
+			CustID json.RawMessage `json:"cust_id"`
+			ID     json.RawMessage `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rawData, &probe); err != nil {
+		return nil
+	}
+	for _, raw := range [][]byte{probe.Data.CustID, probe.Data.ID} {
+		if len(raw) == 0 {
+			continue
+		}
+		if _, ok := parseIdentity(raw); !ok {
+			return fmt.Errorf("gigahost /account returned an account identifier this client cannot read: %s",
+				strings.TrimSpace(string(raw)))
+		}
+	}
+	return nil
 }
 
 // orderBody is the documented POST /deploy/servers request body. Field order is
@@ -427,6 +504,35 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 }
 
 // GetServers queries active servers via GET /servers with pagination aggregation.
+// GetServer reads one server by its provider server id.
+//
+// The documented endpoint is GET /servers/{id} and answers with the same server
+// object the list carries, including the account it belongs to. A 404 comes back
+// as ErrNotFound (the resource is gone); an authorization refusal comes back as
+// ErrUnauthorized or an APIError with 403, which says the key cannot see the
+// server — that is not evidence it is gone, and callers must treat the two
+// outcomes differently.
+// GetServer reads one server by its provider server id.
+//
+// The answer is used only when it names the server that was asked for. The
+// documented shapes are accepted strictly (see decodeServerDetail); anything else
+// is refused, so a malformed or unrelated answer can never be read as "this server
+// exists", and a refusal keeps its own identity for the caller to classify.
+func (c *client) GetServer(ctx context.Context, serverID int64) (*ServerInfo, error) {
+	if serverID <= 0 {
+		return nil, fmt.Errorf("invalid server id %d", serverID)
+	}
+	var rawData []byte
+	if err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/servers/%d", serverID), nil, &rawData); err != nil {
+		return nil, fmt.Errorf("failed to read server %d: %w", serverID, err)
+	}
+	server, err := decodeServerDetail(rawData, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("server %d: %w", serverID, err)
+	}
+	return server, nil
+}
+
 func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	var rawData []byte
 	if err := c.doRequest(ctx, http.MethodGet, "/servers?page=1", nil, &rawData); err != nil {
@@ -681,14 +787,20 @@ func parsePartialOrderError(statusCode int, data []byte) *OrderPartialError {
 			} `json:"orders"`
 		} `json:"data"`
 	}
+	// Lossless: these ids are int64 in the returned error, so a fractional or large id must
+	// not be truncated into a neighboring order.
 	var env rawOrderEnvelope
-	if err := json.Unmarshal(data, &env); err != nil {
+	if err := decodeJSONUseNumber(data, &env); err != nil {
 		return nil
 	}
 
 	var parsedIDs []int64
 	addID := func(v any) {
-		id := parseInt64Field(v)
+		id, err := decodeExactInteger(v)
+		if err != nil {
+			// An unreadable order id names no order; it must not become a neighboring one.
+			return
+		}
 		if id > 0 {
 			for _, existing := range parsedIDs {
 				if existing == id {

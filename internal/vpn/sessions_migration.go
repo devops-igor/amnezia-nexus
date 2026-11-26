@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 )
@@ -24,11 +24,14 @@ func (s *Service) SetPreCommitMigrationHookForTest(fn func()) {
 }
 
 // validateMigrationTarget checks that targetTunnelID exists and is eligible for
-// migration - administratively enabled AND runtime-active (issue #90) -
-// returning its StateVersion. The eligibility preflight must run before any
-// migration mutation so a disabled target is rejected without touching the
+// migration and returns its StateVersion. The eligibility preflight must run before
+// any migration mutation so an ineligible target is rejected without touching the
 // forwarder route, SessionManager state, or the DB session row.
-func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
+//
+// The optimistic preflight is shared by health failover, its retry worker and
+// rebalancing. Final acceptance is serialized with inventory in the connected-row
+// commit; this read alone cannot authorize publication.
+func (s *Service) validateMigrationTarget(targetTunnelID int64, providerAbsent models.AbsentServerSet) (int64, error) {
 	if s.pool == nil {
 		return 0, nil
 	}
@@ -39,6 +42,13 @@ func (s *Service) validateMigrationTarget(targetTunnelID int64) (int64, error) {
 	if !targetTun.Enabled || !strings.EqualFold(targetTun.Status, models.TunnelStatusActive) {
 		return 0, fmt.Errorf("target backend tunnel %d is not eligible (enabled=%t status=%s)",
 			targetTunnelID, targetTun.Enabled, targetTun.Status)
+	}
+	if providerAbsent.Contains(targetTun.ServerID) {
+		// The provider's inventory has contradicted this server: moving a working session
+		// onto it would strand the peer, and its "active" status is only the last health
+		// sample. The mark is not converted into a status - nothing is disabled here.
+		return 0, fmt.Errorf("%w: target backend tunnel %d (server %d) is confirmed absent by the provider",
+			database.ErrDestinationProviderAbsent, targetTunnelID, targetTun.ServerID)
 	}
 	return targetTun.StateVersion, nil
 }
@@ -94,10 +104,14 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 		return errors.New("invalid target tunnel id")
 	}
 
+	// Optimistic filtering stays outside the topology lock. Final connected-row
+	// acceptance rechecks inventory under its writer lock before any publication.
+	providerAbsent := s.providerAbsentServerIDs(ctx)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	expectedVersion, err := s.validateMigrationTarget(targetTunnelID)
+	expectedVersion, err := s.validateMigrationTarget(targetTunnelID, providerAbsent)
 	if err != nil {
 		return err
 	}
@@ -113,11 +127,6 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	peerKey := sess.PeerPublicKey
 	oldTunnelID := sess.BackendTunnelID
-	oldStatus := sess.Status
-	if oldStatus == "" {
-		oldStatus = "connected"
-	}
-
 	if oldTunnelID == targetTunnelID {
 		return nil
 	}
@@ -140,49 +149,14 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 		}
 	}
 
-	// Step 1: Live Forwarder Route Migration
-	var forwarderMigrated bool
-	if s.forwarder != nil {
-		if err := s.forwarder.UpdateSessionBackend(peerKey, targetTunnelID); err != nil {
-			if !errors.Is(err, forwarder.ErrSessionNotRegistered) {
-				return fmt.Errorf("failed to update live forwarder route for session %s: %w", sessionID, err)
-			}
-		} else {
-			forwarderMigrated = true
-		}
-	}
-
-	// Step 2: In-Memory Session Update
-	if _, _, _, err := s.sessionMgr.UpdateSessionBackend(sessionID, targetTunnelID, "connected"); err != nil {
-		rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, false, false)
-		return errors.Join(fmt.Errorf("failed to update in-memory session %s: %w", sessionID, err), rbErr)
-	}
-
-	// Step 3: Database Persistence
-	if s.db != nil {
-		if err := s.db.MigrateVPNSessionBackend(ctx, sessionID, targetTunnelID); err != nil {
-			rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, false)
-			return errors.Join(fmt.Errorf("failed to persist vpn session %s backend migration: %w", sessionID, err), rbErr)
-		}
-	}
-
-	// Step 4.5: Pre-commit hook for testing check-to-commit races
+	// The test seam may mutate pool state or cancel the request; run it before
+	// pinning the owners, then validate the captured target generation at commit.
 	if s.preCommitMigrationHookForTest != nil {
 		s.preCommitMigrationHookForTest()
 	}
-
-	// Step 5: Transfer Connection Counters
-	if s.pool != nil {
-		if err := s.pool.TransferConnectionsIfActive(oldTunnelID, targetTunnelID, expectedVersion); err != nil {
-			rbErr := s.rollbackMigration(ctx, sessionID, peerKey, oldTunnelID, oldStatus, forwarderMigrated, true, true)
-			return errors.Join(fmt.Errorf("failed to commit connection transfer to target tunnel %d: %w", targetTunnelID, err), rbErr)
-		}
+	if err := s.commitSessionMigration(ctx, sess, targetTunnelID, expectedVersion); err != nil {
+		return err
 	}
-
-	if s.stickyMgr != nil {
-		s.stickyMgr.AssignPeerAffinity(peerKey, targetTunnelID)
-	}
-	s.sessionMgr.BumpLifecycleVersion()
 
 	log.Printf("[vpn] migrated session %s (peer %s) from backend %d to backend %d (connected)",
 		sessionID, peerKey, oldTunnelID, targetTunnelID)

@@ -44,6 +44,26 @@ func (o *Orchestrator) CheckServerReachability(ctx context.Context) (map[int64]m
 
 	for _, srv := range servers {
 		server := srv
+		if server.ProviderAbsent() {
+			// The provider's inventory says this server no longer exists, so there
+			// is nothing to dial: no handshake, no TCP attempt, against an address
+			// the provider has already told the panel is not its server.
+			//
+			// The last observation is carried over unchanged rather than dropped.
+			// Dropping it would turn a refused probe into a status change - every
+			// row is re-read from this map - and status is the panel's own
+			// reachability vocabulary, which this fact does not restate. Consumers
+			// that ask "does this server still exist" read the provider state, not
+			// this result.
+			if previous, ok := o.cachedReachability(server.ID); ok {
+				mu.Lock()
+				results[server.ID] = previous
+				mu.Unlock()
+			}
+			slog.Debug("Skipping reachability probe for a server absent from the provider inventory",
+				"server_id", server.ID)
+			continue
+		}
 		g.Go(func() (err error) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -75,6 +95,44 @@ func (o *Orchestrator) CheckServerReachability(ctx context.Context) (map[int64]m
 	o.mu.Unlock()
 
 	return results, nil
+}
+
+// cachedReachability returns the last recorded reachability result for a server,
+// so a pass that refuses to probe it can leave that observation in place.
+func (o *Orchestrator) cachedReachability(serverID int64) (map[string]any, bool) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	entry, ok := o.reachabilityCache[serverID]
+	return entry, ok
+}
+
+// providerAbsentServerIDs returns the servers the provider's inventory has
+// confirmed absent.
+//
+// Every background job that dials a server asks this first, because the panel
+// keeps provider-removed rows and tunnels deliberately: keeping the row is a
+// presentation decision, while continuing to open connections to an address the
+// provider has already told the panel is not its server is network work the panel
+// has durable evidence against. It is one read per pass rather than one per row.
+//
+// A read failure is returned rather than swallowed: a caller that cannot tell
+// which servers are absent must not guess, and both current callers already treat
+// a database read failure as a pass-level error.
+func (o *Orchestrator) providerAbsentServerIDs(ctx context.Context) (map[int64]struct{}, error) {
+	if o.db == nil {
+		return nil, errors.New("database is not configured")
+	}
+	servers, err := o.db.GetAllServers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read servers for the provider-absence guard: %w", err)
+	}
+	absent := make(map[int64]struct{})
+	for _, s := range servers {
+		if s.ProviderAbsent() {
+			absent[s.ID] = struct{}{}
+		}
+	}
+	return absent, nil
 }
 
 func (o *Orchestrator) probeSingleServer(ctx context.Context, server *models.Server) map[string]any {

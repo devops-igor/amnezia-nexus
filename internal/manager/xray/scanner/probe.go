@@ -33,6 +33,7 @@ type ProbeResult struct {
 	CertValid bool          `json:"cert_valid"`
 	Issuer    string        `json:"issuer,omitempty"`
 	Error     string        `json:"error,omitempty"`
+	cause     error
 }
 
 // ProbeTLSH2 performs a TLS 1.3 handshake with curve inspection asserting X25519 key exchange
@@ -81,6 +82,7 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 		return ProbeResult{
 			Domain: domain,
 			Error:  fmt.Sprintf("tcp dial failed: %v", err),
+			cause:  err,
 		}
 	}
 	defer func() {

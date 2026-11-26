@@ -313,6 +313,12 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Post("/orders/{order_id}/setup", h.GigahostDeployHandler)
 			r.Get("/deploy/{order_id}", h.GigahostDeployStatusHandler)
 			r.Get("/orders/{order_id}/status", h.GigahostDeployStatusHandler)
+			// One-time association of the server rows registered before the panel
+			// recorded which hosting account owns them. The GET previews what the
+			// action would associate and writes nothing; the POST applies exactly
+			// that plan for the rows the administrator confirmed.
+			r.Get("/account-association", h.GigahostAccountAssociationPreviewHandler)
+			r.Post("/account-association", h.GigahostAccountAssociationHandler)
 			// Durable setup approval, revocation and status. These record the
 			// administrator's intent and expose the background tracker's progress;
 			// the resume and host-confirmation routes are the two actions a pause

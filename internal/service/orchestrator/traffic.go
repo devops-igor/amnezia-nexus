@@ -61,6 +61,15 @@ func (o *Orchestrator) SyncTraffic(ctx context.Context) error {
 
 	for _, srv := range servers {
 		server := srv
+		if server.ProviderAbsent() {
+			// No SSH session is opened to a server the provider's inventory no
+			// longer lists: the traffic read is a dial like any other. Its
+			// connections keep their last recorded counters, which is the honest
+			// state for a host the panel cannot measure.
+			slog.Debug("Skipping traffic sync for a server absent from the provider inventory",
+				"server_id", server.ID)
+			continue
+		}
 		serverConns, hasConns := connsByServer[server.ID]
 		if !hasConns || len(server.Protocols) == 0 {
 			continue

@@ -667,9 +667,10 @@ func TestServerPageControllerURLMovesWithTheBytes(t *testing.T) {
 	const other = "/static/css/vpn.css"
 
 	// The page inherits the shell's links, so the root has to hold every asset
-	// base.html asks for through the identity. Only the controller's URL is
-	// followed here.
-	root := deliveredStaticCopy(t, controller, other, "/static/css/settings.css", "/static/js/tables.js")
+	// base.html and server.html ask for through the identity. Only the
+	// controller's URL is followed here.
+	root := deliveredStaticCopy(t, controller, other, "/static/css/settings.css",
+		"/static/js/tables.js", "/static/js/server_telemetry.js")
 	before := renderServerShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, controller)
 	if beforeURL == "" {

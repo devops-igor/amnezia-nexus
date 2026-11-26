@@ -58,6 +58,7 @@ var DeliveredAssets = []string{
 	"/static/js/policy_panels.js",
 	"/static/js/policy_routing.js",
 	"/static/js/server_actions.js",
+	"/static/js/server_telemetry.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",
 	"/static/js/vpn/backends.js",

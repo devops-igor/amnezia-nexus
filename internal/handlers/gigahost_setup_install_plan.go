@@ -184,7 +184,15 @@ func (h *Handlers) registerServerForInstall(
 	if orderErr != nil {
 		return nil, fmt.Errorf("failed to load order %s: %w", req.OrderID, orderErr)
 	}
-	server, err := h.registerDeployServer(ctx, req, order, 0, req.ProviderServerID, req.AssignedIP, fingerprint)
+	// The association comes from the provider's own answer for this server, never
+	// from whichever account the panel is configured with now: a durable job can
+	// outlive a key switch, and the server still belongs to the account that
+	// provisioned it.
+	accountID := ""
+	if client, clientErr := h.getGigahostClient(ctx, nil); clientErr == nil {
+		accountID = h.gigahostServerAccount(ctx, client, req.ProviderServerID)
+	}
+	server, err := h.registerDeployServer(ctx, req, order, 0, req.ProviderServerID, req.AssignedIP, fingerprint, accountID)
 	if err != nil {
 		return nil, err
 	}

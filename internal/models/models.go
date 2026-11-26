@@ -163,6 +163,15 @@ const (
 	ReachabilityUnknown ReachabilityStatus = "unknown"
 )
 
+// ProviderAbsentStatus is the response status a measurement endpoint reports when
+// it refuses to measure a server the provider's inventory no longer lists.
+//
+// It is deliberately not a ReachabilityStatus: nothing was measured, so it must
+// not be read as a health sample of either direction. Consumers that ask "is this
+// server healthy" keep the previous observation; consumers that ask "does this
+// server still exist" read this or the server's provider_absent field.
+const ProviderAbsentStatus = "provider_absent"
+
 // LoadBalancingAlgorithm defines VPN routing algorithm.
 type LoadBalancingAlgorithm string
 
@@ -185,11 +194,49 @@ type Server struct {
 	CreatedAt  time.Time          `json:"created_at" db:"created_at"`
 	Status     ReachabilityStatus `json:"status,omitempty"`
 	ServerInfo map[string]any     `json:"server_info,omitempty"`
+	// ProviderAbsentAt records when the provider's own server inventory last
+	// confirmed that this provider-provisioned server no longer exists, as an
+	// RFC3339 UTC timestamp. Empty means no such observation: either the provider
+	// still lists the server, or no successful inventory read has judged it. It is
+	// an observation about the provider's view, never a deletion: the row, its
+	// address, its credentials and its sessions are untouched.
+	ProviderAbsentAt string `json:"-" db:"provider_absent_at"`
+	// ProviderAbsentAccountID records which provider account the listing that produced
+	// this observation was read from. It is written and cleared together with the
+	// observation, so a later key change is visible rather than silent: a mark carrying
+	// a different account than the configured key is a mark made by another credential.
+	ProviderAbsentAccountID string `json:"-" db:"provider_absent_account_id"`
+	// ProviderAccountID is the provider-issued identifier of the account this
+	// row was provisioned under, recorded when the deployment registered it. It is
+	// an opaque account id, never the API key, a secret or a request header, so
+	// holding it cannot replay a credential. Empty means the association is
+	// unknown: the row predates the association or the provider could not name the
+	// account. An unknown association never matches an inventory read, so such a
+	// row is never marked absent.
+	ProviderAccountID string `json:"-" db:"provider_account_id"`
 }
 
 // Reachable returns true if the server status is not offline.
 func (s Server) Reachable() bool {
 	return s.Status != ReachabilityOffline
+}
+
+// ProviderAbsent reports whether the provider's inventory has confirmed that
+// this server no longer exists.
+//
+// It is deliberately separate from Status: reachability says whether the panel
+// could talk to the host, this says whether the host is the provider's to list.
+// A server can be absent from the inventory and still carry an old reachability
+// observation, so consumers that filter on existence must ask this, not Status.
+func (s Server) ProviderAbsent() bool {
+	return strings.TrimSpace(s.ProviderAbsentAt) != ""
+}
+
+// ProviderAccountKnown reports whether the row records the provider account it
+// was provisioned under. Absence may only be recorded for a row whose account is
+// known, because an inventory read is evidence about the account that answered.
+func (s Server) ProviderAccountKnown() bool {
+	return strings.TrimSpace(s.ProviderAccountID) != ""
 }
 
 // User represents an authenticated dashboard user or VPN client subscriber.

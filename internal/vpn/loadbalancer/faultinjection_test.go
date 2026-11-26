@@ -40,8 +40,12 @@ func (r *readFailStore) GetActiveVPNSessions(ctx context.Context) ([]models.VPNS
 	return nil, r.readErr
 }
 
-func (r *readFailStore) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
-	return r.inner.CreateVPNSession(ctx, s)
+func (r *readFailStore) CommitVPNSessionDestination(ctx context.Context, targetID int64, s *models.VPNSession, publish func()) error {
+	return r.inner.CommitVPNSessionDestination(ctx, targetID, s, publish)
+}
+
+func (r *readFailStore) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	return r.inner.ListProviderAbsentServerIDs(ctx)
 }
 
 // hangingStore blocks GetActiveVPNSessions until its gate is closed, then
@@ -56,8 +60,12 @@ func (h *hangingStore) GetActiveVPNSessions(ctx context.Context) ([]models.VPNSe
 	return h.inner.GetActiveVPNSessions(ctx)
 }
 
-func (h *hangingStore) CreateVPNSession(ctx context.Context, s *models.VPNSession) error {
-	return h.inner.CreateVPNSession(ctx, s)
+func (h *hangingStore) CommitVPNSessionDestination(ctx context.Context, targetID int64, s *models.VPNSession, publish func()) error {
+	return h.inner.CommitVPNSessionDestination(ctx, targetID, s, publish)
+}
+
+func (h *hangingStore) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	return h.inner.ListProviderAbsentServerIDs(ctx)
 }
 
 // strandingInvariant asserts the scenario-2/5 state invariant for one

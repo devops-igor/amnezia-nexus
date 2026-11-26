@@ -3,7 +3,6 @@ package tunnel
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -632,25 +631,6 @@ func (hp *HealthProber) SetTimeoutForTest(timeout time.Duration) {
 	hp.mu.Unlock()
 }
 
-// probeEndpoint dispatches the probe according to the backend tunnel's protocol.
-func (hp *HealthProber) probeEndpoint(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
-	if tunnel == nil {
-		return 0, errors.New("tunnel is nil")
-	}
-
-	proto := models.NormalizeTunnelProtocol(tunnel.Protocol)
-	switch proto {
-	case models.ProtocolAWG:
-		return hp.probeAWG(ctx, tunnel)
-	case models.ProtocolVLESS:
-		return hp.probeVLESS(ctx, tunnel)
-	case models.ProtocolNaive:
-		return hp.probeNaive(ctx, tunnel)
-	default:
-		return 0, fmt.Errorf("unsupported protocol: %s", tunnel.Protocol)
-	}
-}
-
 // checkTunnelAvailable rejects a stale probe if its pool entry was deleted or
 // replaced, as well as tunnels that were disabled while the probe was running.
 func (hp *HealthProber) checkTunnelAvailable(tunnel *models.BackendTunnel) error {
@@ -716,6 +696,12 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	probeTarget.Endpoint = snapshot.Endpoint
 
 	latencyMS, err := hp.probeEndpoint(ctx, &probeTarget)
+	if errors.Is(err, ErrProviderAbsent) {
+		// Not a measurement: the server is no longer the provider's, so no failure
+		// is recorded, no status is written and no failover is triggered. The prior
+		// status and the tunnel row stay exactly as they are.
+		return 0, ErrProviderAbsent
+	}
 	if err != nil {
 		if stateErr := hp.checkTunnelAvailable(&probeTarget); stateErr != nil {
 			return 0, stateErr

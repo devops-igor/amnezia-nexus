@@ -41,7 +41,7 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 
 	// 1. Assert server.html requests its controller through the content-derived identity, and telemetry, before the inline <script> block.
 	const scriptTagPrefix = `<script src="{{ asset_url "/static/js/server_actions.js" }}"`
-	const telemetryScriptTagPrefix = `<script src="/static/js/server_telemetry.js`
+	const telemetryScriptTagPrefix = `<script src="{{ asset_url "/static/js/server_telemetry.js" }}"`
 	scriptIdx := strings.Index(serverHTML, scriptTagPrefix)
 	if scriptIdx == -1 {
 		t.Fatalf("server.html missing required script tag: %q", scriptTagPrefix)
@@ -105,7 +105,7 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	sb.WriteString("const expectedFunctions = " + string(expectedFunctionsJSON) + ";\n")
 	sb.WriteString(`
 const scriptTagPrefix = '{{ asset_url "/static/js/server_actions.js" }}';
-const telemetryScriptTagPrefix = '<script src="/static/js/server_telemetry.js';
+const telemetryScriptTagPrefix = '<script src="{{ asset_url "/static/js/server_telemetry.js" }}"';
 assert(serverHtmlRaw.includes(scriptTagPrefix), 'serverHtmlRaw must request server_actions.js through asset_url');
 assert(serverHtmlRaw.includes(telemetryScriptTagPrefix), 'serverHtmlRaw must contain server_telemetry.js script tag');
 
@@ -133,7 +133,7 @@ rendered = rendered.replace(/\{\{\s*asset_url\s+"([^"]+)"\s*\}\}/g, (m, p) => p 
 
 assert(!rendered.includes('{{'), 'all template directives must be resolved');
 assert(rendered.includes('<script src="/static/js/server_actions.js?v=asset-bytes"'), 'the resolved controller tag must remain intact before script replacement');
-assert(rendered.includes(telemetryScriptTagPrefix), 'telemetryScriptTagPrefix must remain intact before script replacement');
+assert(rendered.includes('<script src="/static/js/server_telemetry.js?v=asset-bytes"'), 'the resolved telemetry tag must remain intact before script replacement');
 
 // Replace script tags with inlined server_actions.js and server_telemetry.js
 rendered = rendered.replace(/<script src="\/static\/js\/server_actions\.js[^"]*"><\/script>/, '<script>\n' + serverActionsJs + '\n</script>');

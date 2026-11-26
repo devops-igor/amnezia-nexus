@@ -262,3 +262,156 @@ func TestServersEdgeCases(t *testing.T) {
 		t.Errorf("expected error in UpdateServerProtocols with unmarshalable protocol")
 	}
 }
+
+// The provider-absence observation is a durable column, and clearing it must
+// really clear it: a server the provider lists again carries no observation, which
+// is a different fact from "absent since the beginning of time".
+func TestServersProviderAbsenceRoundTrip(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	id, err := db.CreateServer(ctx, &models.Server{Name: "Provider server", Host: "198.51.100.9"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	created, err := db.GetServer(ctx, id)
+	if err != nil || created == nil {
+		t.Fatalf("GetServer(%d) failed: %v", id, err)
+	}
+	if created.ProviderAbsent() {
+		t.Fatalf("a newly registered server was already marked provider-absent: %q", created.ProviderAbsentAt)
+	}
+
+	observed := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
+	if err := db.SetServerProviderAbsence(ctx, id, observed, "acct-north"); err != nil {
+		t.Fatalf("SetServerProviderAbsence failed: %v", err)
+	}
+	marked, err := db.GetServer(ctx, id)
+	if err != nil || marked == nil {
+		t.Fatalf("GetServer(%d) after recording absence failed: %v", id, err)
+	}
+	if !marked.ProviderAbsent() {
+		t.Fatal("the recorded absence did not reach the row")
+	}
+	if got, want := marked.ProviderAbsentAt, observed.Format(time.RFC3339); got != want {
+		t.Fatalf("recorded observation = %q, want %q", got, want)
+	}
+	// The account the listing was read from is stored with the observation, so a later
+	// key change is visible rather than silent.
+	if got := marked.ProviderAbsentAccountID; got != "acct-north" {
+		t.Fatalf("recorded observing account = %q, want acct-north", got)
+	}
+
+	all, err := db.GetAllServers(ctx)
+	if err != nil || len(all) != 1 {
+		t.Fatalf("GetAllServers = %d rows, err=%v", len(all), err)
+	}
+	if !all[0].ProviderAbsent() || all[0].ProviderAbsentAccountID != "acct-north" {
+		t.Fatal("GetAllServers did not read the recorded absence and its account")
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
+		t.Fatalf("clearing the absence failed: %v", err)
+	}
+	cleared, err := db.GetServer(ctx, id)
+	if err != nil || cleared == nil {
+		t.Fatalf("GetServer(%d) after clearing failed: %v", id, err)
+	}
+	if cleared.ProviderAbsent() {
+		t.Fatalf("a cleared observation still reads as absent: %q", cleared.ProviderAbsentAt)
+	}
+	if cleared.ProviderAbsentAccountID != "" {
+		t.Fatalf("clearing left the observing account behind: %q", cleared.ProviderAbsentAccountID)
+	}
+	// The rest of the row is untouched by both writes.
+	if cleared.Name != "Provider server" || cleared.Host != "198.51.100.9" {
+		t.Fatalf("recording provider absence changed the server row: %+v", cleared)
+	}
+}
+
+// The narrow list a selection path reads: only marked servers, and nothing at all when no
+// mark exists. An empty result is the "nothing confirmed absent" answer a caller needs.
+func TestServersListProviderAbsentServerIDs(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	ids := make([]int64, 0, 3)
+	for _, name := range []string{"Present A", "Absent B", "Absent C"} {
+		id, err := db.CreateServer(ctx, &models.Server{Name: name, Host: "198.51.100.9"})
+		if err != nil {
+			t.Fatalf("CreateServer(%s) failed: %v", name, err)
+		}
+		ids = append(ids, id)
+	}
+
+	listed, err := db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing with no marks failed: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("an unmarked store listed %v; absence is a positive observation", listed)
+	}
+
+	observed := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
+	for _, id := range ids[1:] {
+		if err := db.SetServerProviderAbsence(ctx, id, observed, "acct-north"); err != nil {
+			t.Fatalf("marking server %d failed: %v", id, err)
+		}
+	}
+	listed, err = db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing marks failed: %v", err)
+	}
+	if len(listed) != 2 || listed[0] != ids[1] || listed[1] != ids[2] {
+		t.Fatalf("listed %v, want %v (ordered, marks only)", listed, ids[1:])
+	}
+
+	// Clearing one mark removes exactly that server from the list.
+	if err := db.SetServerProviderAbsence(ctx, ids[1], time.Time{}, ""); err != nil {
+		t.Fatalf("clearing server %d failed: %v", ids[1], err)
+	}
+	listed, err = db.ListProviderAbsentServerIDs(ctx)
+	if err != nil {
+		t.Fatalf("listing after a clear failed: %v", err)
+	}
+	if len(listed) != 1 || listed[0] != ids[2] {
+		t.Fatalf("after clearing one mark, listed %v, want [%d]", listed, ids[2])
+	}
+}
+
+// The narrow provider-absence read the background prober and the deploy path use.
+// A missing row must not read as "provider-confirmed absent": nothing is known
+// about it, and a caller must not turn that into a refusal.
+func TestServersIsProviderAbsent(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	id, err := db.CreateServer(ctx, &models.Server{Name: "Provider server", Host: "198.51.100.44"})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || absent {
+		t.Fatalf("IsServerProviderAbsent(%d) = (%v, %v), want (false, nil)", id, absent, err)
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Now().UTC(), ""); err != nil {
+		t.Fatalf("SetServerProviderAbsence failed: %v", err)
+	}
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || !absent {
+		t.Fatalf("IsServerProviderAbsent(%d) after recording = (%v, %v), want (true, nil)", id, absent, err)
+	}
+
+	if err := db.SetServerProviderAbsence(ctx, id, time.Time{}, ""); err != nil {
+		t.Fatalf("clearing the absence failed: %v", err)
+	}
+	if absent, err := db.IsServerProviderAbsent(ctx, id); err != nil || absent {
+		t.Fatalf("IsServerProviderAbsent(%d) after clearing = (%v, %v), want (false, nil)", id, absent, err)
+	}
+
+	missing, err := db.IsServerProviderAbsent(ctx, 424242)
+	if err != nil || missing {
+		t.Fatalf("IsServerProviderAbsent on a missing row = (%v, %v), want (false, nil)", missing, err)
+	}
+}

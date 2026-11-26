@@ -449,11 +449,15 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 		Data rawOrder `json:"data"`
 	}
 	var raw rawOrder
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := decodeJSONUseNumber(data, &raw); err != nil {
 		return err
 	}
+	// The envelope pass carries the SAME identity fields as the flat pass, so it must decode
+	// the same way: json.Unmarshal into an `any` field yields float64, and the strict identity
+	// decoder refuses that dynamic type even for a small integer, which turned an accepted
+	// purchase into an uncertain one. decodeJSONUseNumber keeps every number exact here too.
 	var env envelope
-	if err := json.Unmarshal(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || (env.Data.Success != nil && *env.Data.Success)) {
+	if err := decodeJSONUseNumber(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || (env.Data.Success != nil && *env.Data.Success)) {
 		raw = env.Data
 	}
 
@@ -469,7 +473,11 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	} else if raw.OrderID != nil {
 		o.OrderID = parseStringField(raw.OrderID)
 	}
-	o.ServerID = parseInt64Field(raw.ServerID)
+	serverID, err := decodeProviderServerID(raw.ServerID)
+	if err != nil {
+		return fmt.Errorf("order response does not name a usable server: %w", err)
+	}
+	o.ServerID = serverID
 
 	if raw.Success != nil && !*raw.Success {
 		return errors.New("provider reported order failure (success=false)")
@@ -531,7 +539,7 @@ func (d *DeployStatusResponse) UnmarshalJSON(data []byte) error {
 	}
 
 	var env envelope
-	if err := json.Unmarshal(data, &env); err == nil && (env.Data != nil || env.Status != nil) {
+	if err := decodeJSONUseNumber(data, &env); err == nil && (env.Data != nil || env.Status != nil) {
 		var src *rawStatus
 		if env.Data != nil {
 			src = env.Data
@@ -545,13 +553,11 @@ func (d *DeployStatusResponse) UnmarshalJSON(data []byte) error {
 			d.Error = s.Error
 			d.UpdatedAt = s.UpdatedAt
 			d.OrderID = parseStringField(s.OrderID)
-			if s.SrvID != nil {
-				d.ServerID = parseInt64Field(s.SrvID)
-			} else if s.ServerID != nil {
-				d.ServerID = parseInt64Field(s.ServerID)
-			} else if s.ID != nil {
-				d.ServerID = parseInt64Field(s.ID)
+			serverID, err := decodeFirstServerID(s.SrvID, s.ServerID, s.ID)
+			if err != nil {
+				return fmt.Errorf("deployment status does not name a usable server: %w", err)
 			}
+			d.ServerID = serverID
 			ip := s.IP
 			if ip == "" {
 				ip = s.AssignedIP
@@ -575,12 +581,16 @@ func (d *DeployStatusResponse) UnmarshalJSON(data []byte) error {
 		d.Error = src.Error
 		d.UpdatedAt = src.UpdatedAt
 		d.OrderID = parseStringField(src.OrderID)
-		d.ServerID = parseInt64Field(src.ServerID)
+		serverID, err := decodeProviderServerID(src.ServerID)
+		if err != nil {
+			return fmt.Errorf("deployment status does not name a usable server: %w", err)
+		}
+		d.ServerID = serverID
 		return nil
 	}
 
 	var raw rawStatus
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := decodeJSONUseNumber(data, &raw); err != nil {
 		return err
 	}
 
@@ -591,13 +601,11 @@ func (d *DeployStatusResponse) UnmarshalJSON(data []byte) error {
 		d.Error = s.Error
 		d.UpdatedAt = s.UpdatedAt
 		d.OrderID = parseStringField(s.OrderID)
-		if s.SrvID != nil {
-			d.ServerID = parseInt64Field(s.SrvID)
-		} else if s.ServerID != nil {
-			d.ServerID = parseInt64Field(s.ServerID)
-		} else if s.ID != nil {
-			d.ServerID = parseInt64Field(s.ID)
+		serverID, err := decodeFirstServerID(s.SrvID, s.ServerID, s.ID)
+		if err != nil {
+			return fmt.Errorf("deployment status does not name a usable server: %w", err)
 		}
+		d.ServerID = serverID
 		ip := s.IP
 		if ip == "" {
 			ip = s.AssignedIP
@@ -622,7 +630,11 @@ func (d *DeployStatusResponse) UnmarshalJSON(data []byte) error {
 	d.Error = raw.Error
 	d.UpdatedAt = raw.UpdatedAt
 	d.OrderID = parseStringField(raw.OrderID)
-	d.ServerID = parseInt64Field(raw.ServerID)
+	serverID, err := decodeProviderServerID(raw.ServerID)
+	if err != nil {
+		return fmt.Errorf("deployment status does not name a usable server: %w", err)
+	}
+	d.ServerID = serverID
 	return nil
 }
 
@@ -728,18 +740,22 @@ func (m PaginationMeta) Validate(page, expectedPages int, hasExpectedTotal bool,
 
 // ServerInfo represents an existing server instance.
 type ServerInfo struct {
-	ID         int64  `json:"id"`
-	OrderID    string `json:"order_id,omitempty"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	IPv4       string `json:"ipv4,omitempty"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	RegionID   int    `json:"region_id,omitempty"`
-	PID        int    `json:"pid,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	SrvType    string `json:"srv_type,omitempty"`
-	SrvVPSType string `json:"srv_vps_type,omitempty"`
-	BwIsHourly *bool  `json:"bw_is_hourly,omitempty"`
+	ID int64 `json:"id"`
+	// CustID is the account the provider says this server belongs to. It is the
+	// authoritative ownership answer for a single server, in the same identifier
+	// shape the account read uses.
+	CustID     Identity `json:"cust_id,omitempty"`
+	OrderID    string   `json:"order_id,omitempty"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"`
+	IPv4       string   `json:"ipv4,omitempty"`
+	IPAddress  string   `json:"ip_address,omitempty"`
+	RegionID   int      `json:"region_id,omitempty"`
+	PID        int      `json:"pid,omitempty"`
+	CreatedAt  string   `json:"created_at,omitempty"`
+	SrvType    string   `json:"srv_type,omitempty"`
+	SrvVPSType string   `json:"srv_vps_type,omitempty"`
+	BwIsHourly *bool    `json:"bw_is_hourly,omitempty"`
 }
 
 // IsHourlyVPS checks if a server is relevant to hourly VPS budget calculations.
@@ -773,6 +789,7 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 	type rawServer struct {
 		ID         any      `json:"id"`
 		SrvID      any      `json:"srv_id"`
+		CustID     Identity `json:"cust_id"`
 		OrderID    any      `json:"order_id"`
 		Name       string   `json:"name"`
 		SrvName    string   `json:"srv_name"`
@@ -791,10 +808,11 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 		BwIsHourly any      `json:"bw_is_hourly"`
 	}
 	var raw rawServer
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := decodeJSONUseNumber(data, &raw); err != nil {
 		return err
 	}
 
+	s.CustID = raw.CustID
 	s.SrvType = raw.SrvType
 	s.SrvVPSType = raw.SrvVPSType
 	if raw.BwIsHourly != nil {
@@ -843,11 +861,11 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 
 	s.CreatedAt = raw.CreatedAt
 
-	if raw.SrvID != nil {
-		s.ID = parseInt64Field(raw.SrvID)
-	} else {
-		s.ID = parseInt64Field(raw.ID)
+	id, err := decodeFirstServerID(raw.SrvID, raw.ID)
+	if err != nil {
+		return fmt.Errorf("inventory entry does not name a usable server: %w", err)
 	}
+	s.ID = id
 
 	if raw.Order.OrderID != nil {
 		s.OrderID = parseStringField(raw.Order.OrderID)
@@ -866,113 +884,4 @@ func (s *ServerInfo) GetIP() string {
 		return s.IPv4
 	}
 	return s.IPAddress
-}
-
-func parseStringField(val any) string {
-	if val == nil {
-		return ""
-	}
-	switch v := val.(type) {
-	case string:
-		return v
-	case float64:
-		return strconv.FormatInt(int64(v), 10)
-	case int64:
-		return strconv.FormatInt(v, 10)
-	case int:
-		return strconv.Itoa(v)
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
-
-func parseInt64Field(val any) int64 {
-	if val == nil {
-		return 0
-	}
-	switch v := val.(type) {
-	case float64:
-		return int64(v)
-	case int64:
-		return v
-	case int:
-		return int64(v)
-	case string:
-		n, _ := strconv.ParseInt(v, 10, 64)
-		return n
-	default:
-		return 0
-	}
-}
-
-func parseIntFieldStrict(val any) (int, bool) {
-	if val == nil {
-		return 0, false
-	}
-	switch v := val.(type) {
-	case int:
-		return v, true
-	case int64:
-		return int(v), true
-	case float64:
-		if v != float64(int64(v)) {
-			return 0, false
-		}
-		return int(v), true
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return 0, false
-		}
-		n, err := strconv.ParseInt(trimmed, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return int(n), true
-	default:
-		return 0, false
-	}
-}
-
-func parseBoolFieldStrict(val any) (bool, bool) {
-	if val == nil {
-		return false, false
-	}
-	switch v := val.(type) {
-	case bool:
-		return v, true
-	case int:
-		if v == 1 {
-			return true, true
-		} else if v == 0 {
-			return false, true
-		}
-		return false, false
-	case int64:
-		if v == 1 {
-			return true, true
-		} else if v == 0 {
-			return false, true
-		}
-		return false, false
-	case float64:
-		if v == 1 {
-			return true, true
-		} else if v == 0 {
-			return false, true
-		}
-		return false, false
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return false, false
-		}
-		b, err := strconv.ParseBool(trimmed)
-		if err != nil {
-			return false, false
-		}
-		return b, true
-	default:
-		return false, false
-	}
 }

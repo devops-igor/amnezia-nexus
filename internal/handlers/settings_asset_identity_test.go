@@ -60,6 +60,7 @@ var settingsSurfaceControllers = []string{
 	"/static/js/gigahost_order_status_model.js",
 	"/static/js/gigahost_order_status.js",
 	"/static/js/gigahost_placement.js",
+	"/static/js/gigahost_account_association.js",
 }
 
 // routingSurfaceControllers are the controllers the Routing page loads: the shared

@@ -599,7 +599,7 @@
 {{ define "scripts" }}
 <!-- Server Actions & Telemetry Scripts -->
 <script src="{{ asset_url "/static/js/server_actions.js" }}"></script>
-<script src="/static/js/server_telemetry.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/server_telemetry.js" }}"></script>
 <script>
     // Server Page Telemetry Bootstrap
     const SERVER_ID = {{ .server_id }};

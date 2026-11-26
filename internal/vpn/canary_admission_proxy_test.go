@@ -139,7 +139,7 @@ func (e *proxyAdmissionEnv) sweepOuterFailing(t *testing.T) *models.BackendTunne
 func (e *proxyAdmissionEnv) isCandidate(t *testing.T) bool {
 	t.Helper()
 	e.svc.mu.Lock()
-	candidates := e.svc.admissibleIngressCandidatesLocked()
+	candidates := e.svc.admissibleIngressCandidatesLocked(nil)
 	e.svc.mu.Unlock()
 	for _, c := range candidates {
 		if c != nil && c.ID == e.tun.ID {

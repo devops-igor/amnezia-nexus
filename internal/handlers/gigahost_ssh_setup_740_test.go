@@ -257,7 +257,7 @@ func TestSetupWithManagedCredential_RealHandshakeAndStrictHostIdentity(t *testin
 
 	// A stored identity that no longer matches is also refused rather than
 	// silently re-bound.
-	registered, err := h.registerDeployServer(t.Context(), req, nil, 0, 9001, host, challenge.Fingerprint)
+	registered, err := h.registerDeployServer(t.Context(), req, nil, 0, 9001, host, challenge.Fingerprint, "")
 	if err != nil {
 		t.Fatalf("registerDeployServer: %v", err)
 	}

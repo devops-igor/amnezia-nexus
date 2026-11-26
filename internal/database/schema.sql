@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS servers (
     ssh_pass TEXT,
     ssh_key TEXT,
     protocols TEXT,
-    created_at TEXT
+    created_at TEXT,
+    provider_absent_at TEXT NOT NULL DEFAULT ''
 );
 
 -- 2. Users Table
@@ -245,3 +246,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON 
 CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_server_proto ON peer_lifecycle(server_id, protocol);
 CREATE INDEX IF NOT EXISTS idx_peer_lifecycle_status ON peer_lifecycle(status);
 
+-- The effective provider-configuration version. Every write of the gigahost
+-- settings bumps it in the same transaction as the setting itself, so an
+-- association consent taken under one key can never be honored under another.
+CREATE TABLE IF NOT EXISTS gigahost_config_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO gigahost_config_epoch (id, epoch) VALUES (1, 0);
+
+-- The one provider account association authority each administrator may hold.
+-- A preview replaces the previous row in a single statement, and every binding
+-- write requires this row (token, version, configuration identity and expiry) to
+-- still match, inside the same statement that writes the server row.
+CREATE TABLE IF NOT EXISTS gigahost_association_authority (
+    admin TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    account TEXT NOT NULL,
+    config_epoch INTEGER NOT NULL,
+    config_generation INTEGER NOT NULL,
+    config_scope TEXT NOT NULL,
+    unlisted TEXT NOT NULL DEFAULT '[]',
+    expires_at INTEGER NOT NULL
+);
