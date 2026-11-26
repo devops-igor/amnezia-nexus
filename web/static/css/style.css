@@ -8,6 +8,10 @@
 /* ===== CSS Variables / Tokens ===== */
 :root {
     /* Color palette — refined dark canvas & modern violet/indigo accents */
+    /* Height of the shell's fixed top bar. A fragment landing scrolls its target to
+       the top of the viewport, so anything that lands under this bar would be hidden
+       behind it; the landing targets use this as their scroll margin. */
+    --shell-chrome-height: 88px;
     --bg-primary: #090a0f;
     --bg-surface: #0d0e15;
     --bg-secondary: #12131c;
@@ -2653,6 +2657,22 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
 
 .hidden {
     display: none !important;
+}
+
+/* ===== Fragment landing geometry =====
+   A fragment landing scrolls its target to the top of the viewport, where the shell's
+   fixed header would cover it. The landing targets carry the shell's own chrome height
+   as a scroll margin, so the focused element is visible below the bar on a phone as
+   well as on a desktop. */
+.vpn-region-target,
+.vpn-diag-entry,
+.vpn-page-title,
+.vpn-card-head,
+#vpn-advanced-entry,
+#vpn-troubleshooting-title,
+#vpn-traffic-performance-title,
+#vpn-diagnostics-title {
+    scroll-margin-top: var(--shell-chrome-height, 88px);
 }
 
 /* ===== VPN Link ===== */
