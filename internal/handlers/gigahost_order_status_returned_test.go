@@ -173,6 +173,177 @@ func TestProviderDeletedResponseSuppressesActionsAndIsCorrectedByInventory(t *te
 	}
 }
 
+// returnedOrderProviderModes are the inventories this regression moves the provider
+// through, in the order the sequences below run.
+const (
+	returnedOrderDeletion   = "deletion"
+	returnedOrderLive       = "live"
+	returnedOrderOutage     = "outage"
+	returnedOrderOtherOrder = "other-order"
+	returnedOrderTerminal   = "terminal"
+)
+
+// TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer is F995-02's
+// durable half.
+//
+// The correction above proves one read: a deletion was recorded, an affirmative listing
+// repaired it, and that response rendered correctly. It cannot see whether the repair was
+// *persisted* or whether it survives the next read, and those are the two failures reported
+// afterwards. A row repaired with the provider's `active` spelling was never written at all,
+// so the ledger kept `deleted` and the next outage rendered the deletion again. A row
+// repaired with `ready` held until the next identical inventory read, which changed no row
+// and therefore asked the order detail again: that detail still answered `deleted`, and the
+// stale ending was committed a second time.
+//
+// Each phase below therefore reloads the ledger row from the database and renders the same
+// order's row, so "the return held" is asserted against durable state and against what the
+// operator is shown - not against the response that produced it.
+func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *testing.T) {
+	// Both spellings the provider uses for a live server. `active` is the one the inventory
+	// decoder passes through and the view renders as ready, and it was the spelling the
+	// ledger refused to store.
+	for _, liveSpelling := range []string{gigahost.StatusReady, "active"} {
+		t.Run(liveSpelling, func(t *testing.T) {
+			h, _, _ := setupTestHandlers(t)
+			const orderID = "ord_995_durable"
+			const providerServerID = int64(6198)
+			const address = "198.51.100.198"
+			seedUnonboardedOrder(t, h, orderID, address)
+
+			mode := returnedOrderDeletion
+			detailReads := 0
+			// One provider for the whole sequence, so every phase is the same provider
+			// answering differently rather than a different provider each time.
+			h.SetGigahostClient(&mockGigahostClient{
+				getServersFn: func(context.Context) ([]gigahost.ServerInfo, error) {
+					switch mode {
+					case returnedOrderOutage:
+						return nil, fmt.Errorf("controlled inventory read failure")
+					case returnedOrderLive:
+						return []gigahost.ServerInfo{{
+							ID: providerServerID, OrderID: orderID, IPv4: address, Status: liveSpelling,
+						}}, nil
+					case returnedOrderTerminal:
+						return []gigahost.ServerInfo{{
+							ID: providerServerID, OrderID: orderID, IPv4: address, Status: deletedProviderStatus,
+						}}, nil
+					case returnedOrderOtherOrder:
+						// A different deployment at the same address: the listing names
+						// neither this order nor this order's provider server id, so it
+						// answers nothing about whether this deployment exists.
+						return []gigahost.ServerInfo{{
+							ID: providerServerID + 1, OrderID: "ord_995_neighbour", IPv4: address, Status: "active",
+						}}, nil
+					default:
+						return nil, nil
+					}
+				},
+				getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
+					detailReads++
+					// The detail keeps answering the same ending for the whole sequence,
+					// which is what a stale terminal record looks like. A fixture that made
+					// it helpful here would not exercise the rule at all.
+					return &gigahost.DeployStatusResponse{
+						OrderID: orderID, Status: deletedProviderStatus,
+						ServerID: providerServerID, AssignedIP: address,
+					}, nil
+				},
+			})
+
+			snapshot := func(label string) (string, deletedDeploymentRender, int) {
+				t.Helper()
+				read := gigahostOrderStatusRead(t, h, orderID)
+				read.Details = map[string]string{orderID: read.Detail}
+				order, _, _, _, err := h.getDeployOrderByID(context.Background(), orderID)
+				if err != nil || order == nil {
+					t.Fatalf("%s: reload the ledger row: %v", label, err)
+				}
+				return order.Status, renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, orderID)), detailReads
+			}
+
+			// Phase 1 - the provider's literal deletion, while the panel does not yet know
+			// which provider server this order is.
+			status, row, _ := snapshot("literal deletion")
+			if status != deletedProviderStatus {
+				t.Fatalf("the literal deletion must reach the ledger, got %q", status)
+			}
+			if row.Stage != "deleted" || len(row.Actions) != 0 {
+				t.Fatalf("a deleted deployment must render deleted with no action, got %+v", row)
+			}
+
+			// Phase 2 - the same server is listed again. The ledger has to record it: the
+			// view reading it correctly is not the same fact as the panel remembering it.
+			mode = returnedOrderLive
+			status, row, _ = snapshot("live return (" + liveSpelling + ")")
+			if status != liveSpelling {
+				t.Fatalf("an affirmative live listing must be persisted, got ledger status %q, want %q",
+					status, liveSpelling)
+			}
+			if row.Stage == "deleted" {
+				t.Fatalf("a deployment the provider lists again still renders deleted: %+v", row)
+			}
+			if !slices.Contains(row.Actions, "deploy_setup_btn") {
+				t.Fatalf("a returned deployment must get its ordinary actions back, got %v", row.Actions)
+			}
+
+			// Phase 3 - an identical inventory read with an unchanged detail answer. This is
+			// the read that used to re-delete the row, because the inventory changed nothing
+			// and the detail was therefore asked again.
+			beforeDetail := detailReads
+			status, row, afterDetail := snapshot("identical inventory read")
+			if afterDetail == beforeDetail {
+				t.Fatalf("the fixture must still ask the order detail, otherwise this phase " +
+					"does not exercise the stale answer it exists for")
+			}
+			if status != liveSpelling {
+				t.Fatalf("an unchanged terminal detail answer re-deleted the row: ledger status %q, want %q",
+					status, liveSpelling)
+			}
+			if row.Stage == "deleted" {
+				t.Fatalf("an unchanged terminal detail answer re-deleted the rendered row: %+v", row)
+			}
+
+			// Phase 4 - the inventory read fails. An inventory the panel could not read is not
+			// evidence that the server is gone, so the same stale detail answer must not bring
+			// the deletion back.
+			mode = returnedOrderOutage
+			status, row, _ = snapshot("inventory outage")
+			if status != liveSpelling {
+				t.Fatalf("an inventory outage exposed the deletion again: ledger status %q, want %q",
+					status, liveSpelling)
+			}
+			if row.Stage == "deleted" {
+				t.Fatalf("an inventory outage re-deleted the rendered row: %+v", row)
+			}
+
+			// Phase 5 - the inventory answers with a different deployment at the same
+			// address. It names neither this order nor its provider server id, so it says
+			// nothing about this deployment and must change nothing.
+			mode = returnedOrderOtherOrder
+			status, row, _ = snapshot("non-matching inventory")
+			if status != liveSpelling {
+				t.Fatalf("a non-matching inventory changed the ledger row: status %q, want %q",
+					status, liveSpelling)
+			}
+			if row.Stage == "deleted" {
+				t.Fatalf("a non-matching inventory re-deleted the rendered row: %+v", row)
+			}
+
+			// Phase 6 - the ending is still reachable. When the provider's own inventory names
+			// this order's server with a terminal status, that answer is recorded, so the rule
+			// above suppresses a stale detail answer rather than making an ending unreachable.
+			mode = returnedOrderTerminal
+			status, row, _ = snapshot("provider's terminal listing")
+			if status != deletedProviderStatus {
+				t.Fatalf("the provider's own terminal status for this server must still be recorded, got %q", status)
+			}
+			if row.Stage != "deleted" || len(row.Actions) != 0 {
+				t.Fatalf("a deployment the provider reports as deleted must render deleted with no action, got %+v", row)
+			}
+		})
+	}
+}
+
 // TestGenuineCancellationSurvivesAnInventoryThatDoesNotListIt is the negative control
 // for the correction above: a row the provider terminated is not repaired by an
 // inventory read that simply does not mention it. Only an affirmative live listing

@@ -256,6 +256,43 @@ func isDeletedStatus(status string) bool {
 	return s == "deleted" || s == "terminated"
 }
 
+// gigahostDetailDeletionUnconfirmed reports whether a provider detail answer that the
+// deployment is gone must not be applied to this row.
+//
+// The order detail and the server inventory answer different questions: the detail says how
+// the order ended, the inventory says whether the server exists. A detail record can keep
+// naming a deletion the inventory has already contradicted, and the contradiction is durable
+// in the bad direction: once a recorded deletion is corrected by an affirmative listing the
+// next identical inventory read changes no row, so the handler asks the detail again and a
+// stale terminal answer there would delete the row a second time while the provider still
+// lists the same server. The next inventory outage then exposes that ending again, and the
+// row loses the ordinary actions for a deployment that exists.
+//
+// So a deletion from the detail settles an order only while the panel cannot ask the
+// inventory about that order's server: the inventory read has to have succeeded, it may not
+// name the order live, and the panel may not yet hold the provider server id registration
+// journals. Once that identity is recorded the inventory owns the existence fact - it names
+// the server live, names it with the provider's own terminal status, or leaves the per-server
+// absence to the inventory pass that records it on the server row - and an ending the detail
+// alone reports is the stale half of a contradiction, or a listing that did not include this
+// order: a scope-limited key and a real deletion look identical from here, which is why an
+// omitted order is not treated as absence.
+//
+// A cancellation is deliberately not covered: it is the order's own outcome rather than a
+// claim about the server, which is why a live listing does not contradict it.
+func gigahostDetailDeletionUnconfirmed(inventoryKnown bool, live []gigahost.ServerInfo, order *GigahostOrderRecord, detailStatus string) bool {
+	if !isDeletedStatus(detailStatus) {
+		return false
+	}
+	if !inventoryKnown {
+		return true
+	}
+	if gigahostProviderServerLive(live, order.OrderID) {
+		return true
+	}
+	return order.ServerID > 0
+}
+
 // repairDeletedOrderFromInventory applies this response's inventory to a terminal row
 // whose recorded ending is a deletion.
 //
@@ -291,11 +328,21 @@ func (h *Handlers) repairDeletedOrderFromInventory(
 	return observation, true
 }
 
+// refreshOrderFromServers applies this response's inventory to one order's ledger row:
+// the provider's status for the order's server, and the server identity and address the
+// inventory names. It reports whether the row changed.
+//
+// An inventory status replaces the recorded one unless the row is still making progress -
+// a server the provider lists as running does not prove that an install the panel is
+// tracking has finished. Every other spelling the provider sends is written, including
+// `active`: the provider names a live server `ready` or `active`, and refusing one of the
+// two left the ledger holding an ending the provider had already contradicted, which the
+// next inventory outage then exposed again.
 func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order *GigahostOrderRecord) bool {
 	for _, s := range servers {
 		if s.OrderID != "" && s.OrderID == order.OrderID {
 			updated := false
-			if s.Status != "" && s.Status != order.Status && !strings.EqualFold(s.Status, "active") {
+			if s.Status != "" && s.Status != order.Status {
 				if isTerminalStatus(s.Status) || !isPendingOrInFlight(order.Status) {
 					order.Status = s.Status
 					updated = true
@@ -334,6 +381,18 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 	if deployErr == nil {
 		updated := false
 		if statusResp != nil && statusResp.Status != "" && statusResp.Status != order.Status {
+			if gigahostDetailDeletionUnconfirmed(inventoryKnown, live, order, statusResp.Status) {
+				// The ending is not recorded. Report the affirmative inventory answer
+				// when this response has one; otherwise the read answered nothing about
+				// the deployment's existence and the row keeps what it recorded.
+				if status, ok := gigahostProviderServerStatus(live, order.OrderID); ok {
+					return updated, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
+				}
+				return updated, GigahostProviderObservation{
+					Outcome: gigahostObservationUnavailable,
+					Error:   "provider detail reports the deployment deleted while the inventory does not confirm the server is gone",
+				}
+			}
 			order.Status = statusResp.Status
 			updated = true
 		}
