@@ -21,7 +21,12 @@
 // ledger row, which is only the panel's copy of the last answer.
 const gigahostOrderStatusReadySpellings = ['ready', 'active'];
 const gigahostOrderStatusFailedSpellings = ['failed', 'error'];
-const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled', 'deleted'];
+const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled'];
+// gigahostOrderStatusDeletedSpellings is the provider's word for a deployment it no
+// longer has. It is a stage of its own rather than a cancellation, because the fact the
+// operator needs is that the server is gone: a cancelled order was stopped while its
+// VPS could still be running, and a deleted one has no VPS at all.
+const gigahostOrderStatusDeletedSpellings = ['deleted'];
 // gigahostOrderStatusRequestedSpellings are the provider and ledger spellings for an
 // order that exists but whose deployment has not started yet. `requested` is a stage in
 // the progression below, so a queued order is not drawn as one already deploying: both
@@ -32,6 +37,10 @@ const gigahostOrderStatusRequestedSpellings = ['pending', 'waiting', 'pending_pa
 // gigahostOrderStatusStages are the provider stages an order passes through, in order.
 // VPN setup and backend health are separate axes, never drawn as stages.
 const gigahostOrderStatusStages = ['requested', 'deploying', 'ready'];
+
+// gigahostOrderStatusTerminalStages name the stages that end the progression: their
+// chain is the request plus the ending, because none of them can claim it ever deployed.
+const gigahostOrderStatusTerminalStages = ['failed', 'cancelled', 'deleted', 'unknown'];
 
 // gigahostOrderStatusSetupStates maps a saved setup-intent state to the setup axis. A
 // state outside this table is reported as unknown rather than guessed into a group:
@@ -100,6 +109,7 @@ function gigahostOrderStatusProviderStage(status) {
     const s = String(status || '').trim().toLowerCase();
     if (gigahostOrderStatusReadySpellings.indexOf(s) !== -1) return 'ready';
     if (gigahostOrderStatusFailedSpellings.indexOf(s) !== -1) return 'failed';
+    if (gigahostOrderStatusDeletedSpellings.indexOf(s) !== -1) return 'deleted';
     if (gigahostOrderStatusCancelledSpellings.indexOf(s) !== -1) return 'cancelled';
     if (gigahostOrderStatusRequestedSpellings.indexOf(s) !== -1) return 'requested';
     if (s === 'unknown' || s === '') return 'unknown';
@@ -119,7 +129,7 @@ function gigahostOrderStatusIsPlaceholderID(orderId) {
  * done, current or pending. Steps the current state contradicts are not returned:
  * a failed, cancelled or unknown order does not claim it ever deployed. */
 function gigahostOrderStatusStageChain(stage) {
-    if (stage === 'failed' || stage === 'cancelled' || stage === 'unknown') {
+    if (gigahostOrderStatusTerminalStages.indexOf(stage) !== -1) {
         return [
             {stage: 'requested', state: 'done'},
             {stage: stage, state: 'current'}
@@ -212,7 +222,10 @@ function gigahostOrderStatusHealthState(health) {
  * unreadable setup or health axis yields no advice rather than a guess. */
 function gigahostOrderStatusNextAction(model) {
     if (model.stage === 'unknown') return 'gigahost_status_next_action_check_provider';
-    if (model.stage === 'cancelled') return 'gigahost_status_next_action_none';
+    // A deployment the provider no longer has is over: there is no server to check, to
+    // set up or to retry, and every action the view could name would contact a host the
+    // panel has evidence is not the provider's.
+    if (model.stage === 'cancelled' || model.stage === 'deleted') return 'gigahost_status_next_action_none';
     if (model.stage === 'requested' || model.stage === 'deploying') return 'gigahost_status_next_action_wait';
     if (model.stage === 'failed' || model.setup === 'failed') return 'gigahost_status_next_action_retry';
     return gigahostOrderStatusSettledNextAction(model);
@@ -269,11 +282,25 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     const journal = gigahostOrderStatusJournalEvidence(detail);
     const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal);
 
+    // providerAbsent is the panel's durable record that the provider's own server
+    // inventory no longer lists the server this order registered. It is read from the
+    // order's deploy read, never inferred here: this view decides nothing about
+    // existence, it renders the one observation the panel already made.
+    //
+    // It decides the stage on its own, and outranks both the provider's order spelling
+    // and the ledger copy. These are different questions - whether the order was stopped
+    // versus whether the VPS exists - and the operator asked the second one. A provider
+    // that still reports the order as ready while its server inventory no longer lists
+    // the server is exactly the state this exists to present as DELETED.
+    const providerAbsent = record.provider_absent === true;
     const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusProviderStage(claimed.status || record.status);
-    const stage = gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage;
+    const stage = providerAbsent
+        ? 'deleted'
+        : (gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage);
     const assignedIP = gigahostOrderStatusText(detail.assigned_ip, record.assigned_ip);
     return {
         orderId: orderId,
+        providerAbsent: providerAbsent,
         providerStatus: claimed.unknown ? '' : gigahostOrderStatusText(claimed.status, record.status),
         providerSource: claimed.source,
         // The provider was actually read in this response. This is the only thing that
@@ -367,6 +394,7 @@ function gigahostOrderStatusModel(order, context) {
         orderId: provider.orderId,
         stage: provider.stage,
         chain: gigahostOrderStatusStageChain(provider.stage),
+        providerAbsent: provider.providerAbsent,
         providerStatus: provider.providerStatus,
         providerSource: provider.providerSource,
         providerConfirmed: provider.providerConfirmedRead,

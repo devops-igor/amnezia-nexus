@@ -113,6 +113,11 @@ type GigahostDeployStatus struct {
 	Error            string    `json:"error,omitempty"`
 	Message          string    `json:"message,omitempty"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	// ProviderAbsent reports that the provider's own server inventory has confirmed
+	// the server this order registered no longer exists. It is the panel's recorded
+	// observation, read from the row - this response performs no provider read to
+	// decide it, and an order that registered no panel server reports false.
+	ProviderAbsent bool `json:"provider_absent,omitempty"`
 }
 
 // SetSSHDialerForTest injects an SSH dialer hook for unit and integration testing.
@@ -816,7 +821,27 @@ func (h *Handlers) GetGigahostDeployStatus(ctx context.Context, orderID string) 
 		AssignedIP:       order.AssignedIP,
 		Error:            lastError,
 		UpdatedAt:        order.UpdatedAt,
+		ProviderAbsent:   h.deploymentProviderAbsent(ctx, nexusServerID),
 	}, nil
+}
+
+// deploymentProviderAbsent reports whether the provider's own inventory has confirmed
+// that the panel server this order registered no longer exists.
+//
+// The answer is the row's recorded observation, read through the one accessor that
+// already owns that question; this function decides nothing about absence. An order that
+// registered no panel server reports false, and so does a lookup that failed: absence is
+// a positive observation, and an unanswered read is not one. The safe direction is also
+// the ordinary one - a row that cannot be shown to be absent keeps its normal treatment.
+func (h *Handlers) deploymentProviderAbsent(ctx context.Context, nexusServerID int64) bool {
+	if nexusServerID <= 0 || h.db == nil {
+		return false
+	}
+	absent, err := h.db.IsServerProviderAbsent(ctx, nexusServerID)
+	if err != nil {
+		return false
+	}
+	return absent
 }
 
 // GigahostDeployHandler handles POST /api/admin/hosting/gigahost/deploy.

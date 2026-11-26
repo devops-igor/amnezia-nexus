@@ -164,6 +164,10 @@ const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
     stage: cell ? cell.getAttribute('data-stage') : null,
     panel: flat(container.querySelector('.gigahost-order-status-details')),
     container: flat(container),
+    // The row's identity and the actions it offers are part of what the view claims, so
+    // a test can assert that a state changed the row without losing either.
+    identity: flat(container.querySelector('.gigahost-order-identity')),
+    actions: Array.from(container.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => flat(b)),
     stale: container.getAttribute('data-stale'),
     staleNotice: !!container.querySelector('#recentOrdersStale'),
     lastSuccessAt: w.gigahostOrderStatusRefreshState().lastSuccessAt

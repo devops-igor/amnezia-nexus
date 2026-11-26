@@ -52,7 +52,9 @@ let gigahostOrderStatusOverlapDetected = 0;
 /* gigahostOrderStatusBadgeClass maps a stage to the existing badge vocabulary. */
 function gigahostOrderStatusBadgeClass(stage) {
     if (stage === 'ready') return 'badge-success';
-    if (stage === 'failed' || stage === 'cancelled') return 'badge-danger';
+    // A deleted deployment is as unusable as a failed or cancelled one, so it wears the
+    // same danger badge rather than a treatment of its own.
+    if (stage === 'failed' || stage === 'cancelled' || stage === 'deleted') return 'badge-danger';
     if (stage === 'deploying') return 'badge-info';
     return 'badge-secondary';
 }
@@ -161,11 +163,22 @@ function gigahostOrderStatusFailureDetail(panel, model) {
 }
 
 /* gigahostOrderStatusAddressDetail shows the address when there is one, and says
- * what it does and does not prove while the provider is still provisioning: an
- * address on an unready server is not a usable VPN endpoint. */
+ * what it does and does not prove: an address on an unready server is not a usable VPN
+ * endpoint, and an address on a deleted server may already belong to somebody else. */
 function gigahostOrderStatusAddressDetail(panel, model) {
     if (!model.assignedIP) return;
     gigahostOrderStatusDetail(panel, 'gigahost_status_address', model.assignedIP);
+    // A deleted deployment keeps its last recorded address as a fact about the past. The
+    // provisioning explanation would be false for it - the provider is not deploying
+    // anything - and the honest warning is that the address is no longer reserved for
+    // this panel, which is exactly why nothing here may dial it.
+    if (model.stage === 'deleted') {
+        const stale = document.createElement('div');
+        stale.style.color = 'var(--text-secondary)';
+        stale.textContent = _('gigahost_status_ip_deleted');
+        panel.appendChild(stale);
+        return;
+    }
     // An address proves nothing about readiness when the provider state is unknown, so
     // the explanation is due in that case too, not only while actively deploying.
     if (!model.addressWhileProvisioning && !model.providerUnknown) return;
@@ -183,8 +196,8 @@ function gigahostOrderStatusAddressDetail(panel, model) {
  * every browser, and it is assertable without a browser that synthesizes a click
  * for a key event. preventDefault stops a browser from delivering the activation
  * a second time as a click, so one press opens the panel once. */
-function gigahostOrderStatusCell(order, context) {
-    const model = gigahostOrderStatusModel(order, context);
+function gigahostOrderStatusCell(order, context, classification) {
+    const model = classification || gigahostOrderStatusModel(order, context);
     gigahostOrderStatusDetailsCounter += 1;
     const safeId = model.orderId.replace(/[^A-Za-z0-9_-]/g, '-');
     const detailsID = 'gigahost-order-status-' + gigahostOrderStatusDetailsCounter + '-' + (safeId || 'row');
@@ -629,7 +642,20 @@ function gigahostOrderStatusRow(order, context) {
 
     const right = document.createElement('div');
     right.className = 'gigahost-order-state';
-    right.appendChild(gigahostOrderStatusCell(order, context));
+    // One classification decides both what the row says and what it offers, so the
+    // status cell and the action area can never disagree about the same order.
+    const classification = gigahostOrderStatusModel(order, context);
+    right.appendChild(gigahostOrderStatusCell(order, context, classification));
+
+    // A deployment the provider's inventory has confirmed gone gets no action. Every
+    // action here - retry, immediate setup, a saved approval - ends in a connection to
+    // the deployment's address, and the panel already holds durable evidence that
+    // address is no longer the provider's server.
+    if (classification.providerAbsent) {
+        row.appendChild(left);
+        row.appendChild(right);
+        return row;
+    }
 
     if (order.status === 'failed') {
         const btnRetry = document.createElement('button');
@@ -673,6 +699,11 @@ function mergeGigahostOrderDetail(order, deploy) {
         if (deploy.step) merged.step = deploy.step;
         if (deploy.error) merged.last_error = deploy.error;
         if (deploy.server_id) merged.nexus_server_id = deploy.server_id;
+        // The deploy read is the one place this view is told that the provider's own
+        // server inventory no longer lists the server this order registered. Only a
+        // true value is carried: an order the panel has no such record for keeps the
+        // ordinary treatment rather than reading a missing field as agreement.
+        if (deploy.provider_absent === true) merged.provider_absent = true;
         if (deploy.status === 'failed') merged.status = 'failed';
         else if (deploy.status === 'ready' && deploy.server_id > 0) merged.nexus_onboarded = true;
     }

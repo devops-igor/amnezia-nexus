@@ -18,14 +18,41 @@ func (h *Handlers) IndexPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	servers, _ := h.db.GetAllServers(ctx)
+	allServers, _ := h.db.GetAllServers(ctx)
+
+	// The deployments section is decided against the whole server read, before the
+	// grid is narrowed: a deployment whose server the provider no longer lists has a
+	// server row of its own, and deciding the deployments from the narrowed list would
+	// put that deployment back on the page as one that has no server yet - the exact
+	// row the grid is hiding.
+	deployments := h.gigahostDeploymentsForServersPage(ctx, allServers)
 
 	// Deployments this panel has ordered but not set up have no servers row, so the
 	// grid alone cannot show them; they are named here and rendered beside it.
 	_ = RenderTemplate(w, r, h.db, "index.html", map[string]any{
-		"servers":     servers,
-		"deployments": h.gigahostDeploymentsForServersPage(ctx, servers),
+		"servers":     serversListedOnServersPage(allServers),
+		"deployments": deployments,
 	})
+}
+
+// serversListedOnServersPage is the one decision about which server rows the Servers
+// section lists.
+//
+// A row the provider's own inventory has confirmed absent is left out. The row itself
+// is kept - it is the panel's record, and Recent Deployments still names the order - but
+// it is not a server the panel can reach, so offering it as a card would offer actions
+// the rest of the panel refuses. Every other row is passed through unchanged and in its
+// original order, whether the panel provisioned it or an operator added it: the section
+// has one grid and no provider-based grouping.
+func serversListedOnServersPage(servers []models.Server) []models.Server {
+	listed := make([]models.Server, 0, len(servers))
+	for i := range servers {
+		if servers[i].ProviderAbsent() {
+			continue
+		}
+		listed = append(listed, servers[i])
+	}
+	return listed
 }
 
 // UsersPageHandler renders the multi-user management interface.

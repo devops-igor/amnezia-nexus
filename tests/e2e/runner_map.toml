@@ -19,6 +19,7 @@ paths = [
   "tests/e2e/test_hint_contrast.py",
   "tests/e2e/test_server_page_width.py",
   "tests/e2e/test_settings.py",
+  "tests/e2e/test_gigahost_deleted_deployment.py",
   "tests/e2e/test_settings_confirmations.py",
   "tests/e2e/test_settings_navigation.py",
   "tests/e2e/test_notifications.py",
