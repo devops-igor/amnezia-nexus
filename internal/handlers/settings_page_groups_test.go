@@ -354,9 +354,12 @@ func TestSettingsPageCardHeadingsSitBelowTheGroupHeading(t *testing.T) {
 				want := 0
 				if role == models.RoleAdmin {
 					want = map[string]int{
-						"settings-subheading":       0,
+						"settings-subheading": 0,
+						// The hosting card carries two named sub-areas inside it: the
+						// deploy area and the one-time account association of servers
+						// registered before the panel recorded their account.
 						"settings-list-title":       3,
-						"settings-subsection-title": 1,
+						"settings-subsection-title": 2,
 					}[class]
 				}
 				if count != want {
