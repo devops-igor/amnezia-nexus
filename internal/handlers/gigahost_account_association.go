@@ -185,6 +185,90 @@ func gigahostAssociationReasonFor(outcome gigahostDetailOutcome) gigahostAssocia
 	}
 }
 
+// gigahostAssociationCandidates splits the server rows into the ones the provider
+// can judge and the ones that already record their account.
+func gigahostAssociationCandidates(servers []models.Server) ([]providerBackedServer, int) {
+	var rows []providerBackedServer
+	alreadyBound := 0
+	for _, s := range servers {
+		providerServerID, ok := providerBackedServerID(s.Protocols)
+		if !ok {
+			continue
+		}
+		account := strings.TrimSpace(s.ProviderAccountID)
+		if account != "" {
+			alreadyBound++
+			continue
+		}
+		rows = append(rows, providerBackedServer{
+			serverID:         s.ID,
+			providerServerID: providerServerID,
+			accountID:        account,
+			absentAt:         s.ProviderAbsentAt,
+		})
+	}
+	return rows, alreadyBound
+}
+
+// gigahostAssociationAnswer reads the two answers the association is decided from:
+// the identity of the account that answered, and the servers that account lists.
+//
+// Both are required together. An answer that cannot be attributed to an account
+// proves nothing about any row, and a listing that could not be read cannot say which
+// rows the account holds, so either failure refuses the pass rather than associating
+// from a partial read.
+func gigahostAssociationAnswer(ctx context.Context, client gigahost.Client) (map[int64]struct{}, string, error) {
+	account, err := client.GetAccount(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("gigahost account identity unavailable; no server row changed: %w", err)
+	}
+	answerAccount := gigahostAccountIdentity(account)
+	if answerAccount == "" {
+		return nil, "", errors.New(
+			"gigahost GET /account answered without a usable account identifier; no server row changed")
+	}
+	inventory, err := client.GetServers(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("gigahost inventory read failed; no server row changed: %w", err)
+	}
+	listed, err := gigahostIdentifiedServerIDs(inventory)
+	if err != nil {
+		return nil, "", err
+	}
+	return listed, answerAccount, nil
+}
+
+// gigahostAssociationBindings classifies every candidate row against one answer.
+//
+// The per-server read is made only for a row the listing does not contain: the
+// listing already answered for the rest, and a second answer could only contradict
+// the enumeration this pass is decided from.
+func gigahostAssociationBindings(
+	ctx context.Context,
+	client gigahost.Client,
+	rows []providerBackedServer,
+	listed map[int64]struct{},
+	answerAccount string,
+) (attributed, unlisted []gigahostAccountBinding, undecided map[gigahostAssociationReason]int) {
+	undecided = make(map[gigahostAssociationReason]int)
+	for _, row := range rows {
+		outcome, namedAccount := gigahostDetailUnanswered, ""
+		if _, isListed := listed[row.providerServerID]; !isListed {
+			outcome, namedAccount = gigahostDetailOutcomeFor(client.GetServer(ctx, row.providerServerID))
+		}
+		binding := decideGigahostAssociation(row, listed, answerAccount, outcome, namedAccount)
+		switch {
+		case binding.unlisted:
+			unlisted = append(unlisted, binding)
+		case binding.accountID != "":
+			attributed = append(attributed, binding)
+		default:
+			undecided[gigahostAssociationReasonFor(outcome)]++
+		}
+	}
+	return attributed, unlisted, undecided
+}
+
 // planGigahostAccountAssociation reads the provider and decides, per row, which
 // account to record. It writes nothing.
 //
@@ -201,27 +285,9 @@ func (h *Handlers) planGigahostAccountAssociation(ctx context.Context, r *http.R
 	if err != nil {
 		return plan, fmt.Errorf("failed to read servers for the provider account association: %w", err)
 	}
-
-	var rows []providerBackedServer
-	for _, s := range servers {
-		providerServerID, ok := providerBackedServerID(s.Protocols)
-		if !ok {
-			continue
-		}
-		row := providerBackedServer{
-			serverID:         s.ID,
-			providerServerID: providerServerID,
-			accountID:        strings.TrimSpace(s.ProviderAccountID),
-			absentAt:         s.ProviderAbsentAt,
-		}
-		if row.accountID != "" {
-			plan.alreadyBound++
-			continue
-		}
-		rows = append(rows, row)
-	}
-	plan.candidates = len(rows)
-	if plan.candidates == 0 {
+	rows, alreadyBound := gigahostAssociationCandidates(servers)
+	plan.candidates, plan.alreadyBound = len(rows), alreadyBound
+	if len(rows) == 0 {
 		// Every provider-provisioned row already records its account, so there is
 		// nothing to ask the provider and nothing to associate.
 		return plan, nil
@@ -235,42 +301,11 @@ func (h *Handlers) planGigahostAccountAssociation(ctx context.Context, r *http.R
 	callCtx, cancel := context.WithTimeout(ctx, gigahostAssociationTimeout)
 	defer cancel()
 
-	account, err := client.GetAccount(callCtx)
-	if err != nil {
-		return plan, fmt.Errorf("gigahost account identity unavailable; no server row changed: %w", err)
-	}
-	answerAccount := gigahostAccountIdentity(account)
-	if answerAccount == "" {
-		return plan, errors.New(
-			"gigahost GET /account answered without a usable account identifier; no server row changed")
-	}
-
-	inventory, err := client.GetServers(callCtx)
-	if err != nil {
-		return plan, fmt.Errorf("gigahost inventory read failed; no server row changed: %w", err)
-	}
-	listed, err := gigahostIdentifiedServerIDs(inventory)
+	listed, answerAccount, err := gigahostAssociationAnswer(callCtx, client)
 	if err != nil {
 		return plan, err
 	}
-
-	for _, row := range rows {
-		outcome, namedAccount := gigahostDetailUnanswered, ""
-		if _, isListed := listed[row.providerServerID]; !isListed {
-			// The listing already answers for a listed row, and its answer is the
-			// authoritative one; asking a second time could only contradict it.
-			outcome, namedAccount = gigahostDetailOutcomeFor(client.GetServer(callCtx, row.providerServerID))
-		}
-		binding := decideGigahostAssociation(row, listed, answerAccount, outcome, namedAccount)
-		switch {
-		case binding.unlisted:
-			plan.unlisted = append(plan.unlisted, binding)
-		case binding.accountID != "":
-			plan.attributed = append(plan.attributed, binding)
-		default:
-			plan.undecided[gigahostAssociationReasonFor(outcome)]++
-		}
-	}
+	plan.attributed, plan.unlisted, plan.undecided = gigahostAssociationBindings(callCtx, client, rows, listed, answerAccount)
 	return plan, nil
 }
 
@@ -340,6 +375,44 @@ type gigahostAssociationConfirmation struct {
 	IncludeUnlisted bool `json:"include_unlisted"`
 }
 
+// gigahostAssociationApplication is what one application of the plan wrote.
+type gigahostAssociationApplication struct {
+	associated     int
+	unlisted       int
+	boundElsewhere int
+	reasons        map[gigahostAssociationReason]int
+}
+
+// applyGigahostAssociation writes every binding, one conditional row update each.
+//
+// One row's failure does not stop the rest: the association is per-row and
+// idempotent, and the count reports what happened. A row another writer bound first
+// is counted as already bound rather than as a change of this run, which is what
+// makes a repeated run report "nothing further associated".
+func (h *Handlers) applyGigahostAssociation(
+	ctx context.Context, bindings []gigahostAccountBinding, reasons map[gigahostAssociationReason]int,
+) gigahostAssociationApplication {
+	application := gigahostAssociationApplication{reasons: reasons}
+	for _, binding := range bindings {
+		written, err := h.db.BindServerProviderAccount(ctx, binding.serverID, binding.accountID)
+		if err != nil {
+			slog.Warn("Provider account association could not record a server",
+				"server_id", binding.serverID, "error", err)
+			application.reasons[gigahostAssociationWriteFailed]++
+			continue
+		}
+		if !written {
+			application.boundElsewhere++
+			continue
+		}
+		application.associated++
+		if binding.unlisted {
+			application.unlisted++
+		}
+	}
+	return application
+}
+
 // GigahostAccountAssociationHandler applies the plan the preview showed.
 //
 // It writes one column and only onto rows that record no account. It sets no
@@ -379,49 +452,26 @@ func (h *Handlers) GigahostAccountAssociationHandler(w http.ResponseWriter, r *h
 		reasons[reason] = count
 	}
 
-	associated, unlisted, boundElsewhere, failed := 0, 0, 0, 0
-	for _, binding := range bindings {
-		written, err := h.db.BindServerProviderAccount(ctx, binding.serverID, binding.accountID)
-		if err != nil {
-			// One row's failure does not stop the rest: the association is
-			// per-row and idempotent, and the count reports what happened.
-			slog.Warn("Provider account association could not record a server",
-				"server_id", binding.serverID, "error", err)
-			reasons[gigahostAssociationWriteFailed]++
-			failed++
-			continue
-		}
-		if !written {
-			// The row recorded an account between the plan and this write, or
-			// another run of this action bound it first. Either way this run did
-			// not change it.
-			boundElsewhere++
-			continue
-		}
-		associated++
-		if binding.unlisted {
-			unlisted++
-		}
-	}
+	applied := h.applyGigahostAssociation(ctx, bindings, reasons)
 
 	unattributed := 0
-	for _, count := range reasons {
+	for _, count := range applied.reasons {
 		unattributed += count
 	}
 
 	slog.Info("Provider account association recorded",
-		"associated", associated,
-		"unlisted", unlisted,
-		"already_bound", plan.alreadyBound+boundElsewhere,
+		"associated", applied.associated,
+		"unlisted", applied.unlisted,
+		"already_bound", plan.alreadyBound+applied.boundElsewhere,
 		"unattributed", unattributed,
-		"write_failures", failed)
+		"write_failures", applied.reasons[gigahostAssociationWriteFailed])
 
 	h.JSON(w, http.StatusOK, map[string]any{
-		"associated":    associated,
-		"unlisted":      unlisted,
-		"already_bound": plan.alreadyBound + boundElsewhere,
+		"associated":    applied.associated,
+		"unlisted":      applied.unlisted,
+		"already_bound": plan.alreadyBound + applied.boundElsewhere,
 		"unattributed":  unattributed,
-		"reasons":       reasonPayload(reasons),
+		"reasons":       reasonPayload(applied.reasons),
 	})
 }
 
