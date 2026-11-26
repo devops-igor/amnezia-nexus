@@ -246,7 +246,11 @@ func (h *Handlers) planGigahostAccountAssociation(ctx context.Context, r *http.R
 		if err != nil {
 			return plan, gigahostAssociationConfig{}, nil
 		}
-		return plan, gigahostAssociationConfigOf(resolution), nil
+		epoch, err := h.db.GigahostConfigEpoch(ctx)
+		if err != nil {
+			return plan, gigahostAssociationConfig{}, nil
+		}
+		return plan, gigahostAssociationConfigOf(resolution, epoch), nil
 	}
 
 	resolution, err := h.resolveGigahostClient(ctx, r)
@@ -264,5 +268,9 @@ func (h *Handlers) planGigahostAccountAssociation(ctx context.Context, r *http.R
 	}
 	plan.account = answerAccount
 	plan.attributed, plan.unlisted, plan.undecided = gigahostAssociationBindings(callCtx, client, rows, listed, answerAccount)
-	return plan, gigahostAssociationConfigOf(resolution), nil
+	epoch, err := h.db.GigahostConfigEpoch(ctx)
+	if err != nil {
+		return plan, gigahostAssociationConfig{}, fmt.Errorf("the provider configuration version could not be read: %w", err)
+	}
+	return plan, gigahostAssociationConfigOf(resolution, epoch), nil
 }

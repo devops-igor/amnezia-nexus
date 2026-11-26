@@ -79,12 +79,10 @@ type Handlers struct {
 	notificationSvc *notifications.Service
 	gigahostClient  gigahost.Client
 	gigahostMu      sync.RWMutex
-	// associationAuthorities holds the single consent each administrator may hold,
-	// keyed by administrator: the account and configuration that answered, and the
-	// rows the preview showed as unlisted. The map is per-process, so a restart
-	// simply makes every outstanding consent stale, which is the safe direction.
-	associationMu          sync.Mutex
-	associationAuthorities map[string]gigahostAssociationAuthority
+	// associationBindingHook, when set by a test, runs after one binding commits. It
+	// exists so an interleaving (a newer preview, or a provider key saved mid-batch)
+	// can be placed deterministically between two rows of the same batch.
+	associationBindingHook func(serverID int64)
 	// purchaseMu serializes the duplicate-purchase check with the durable intent
 	// row that makes its decision visible, so two concurrent order attempts cannot
 	// both pass the check. It is deliberately released before the provider call:

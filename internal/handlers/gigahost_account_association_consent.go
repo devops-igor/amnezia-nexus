@@ -1,119 +1,81 @@
 package handlers
 
-// The consent a preview issues, and the record a confirmation is checked against.
+// The consent a preview issues, on top of the durable authority the database holds.
 //
-// There is ONE authority per administrator: issuing a preview retires whatever the
-// same administrator held before. Two Settings tabs therefore cannot both hold a
-// confirmable screen; the older one is refused when it is presented, rather than
-// being applied to a batch the administrator has since replaced.
+// There is ONE authority per administrator, and it lives in the database rather than
+// in this process: issuing a preview replaces the previous row in a single statement,
+// so two Settings tabs cannot both hold a confirmable screen. The authority records
+// the account that answered, the rows the preview showed as unlisted, the provider
+// configuration version that produced it, and an expiry.
 //
-// The record is also bound to the effective provider configuration that produced it
-// (client generation and credential scope). A confirmation that predates a change of
-// that configuration is refused, so a write-once association cannot be recorded
-// against an account the administrator is no longer configured with.
-//
-// The store is per-process: a restart makes every outstanding consent stale, which is
-// the safe direction, and an expired consent is refused rather than re-interpreted.
+// Nothing here decides whether a binding may be written. That decision is made by the
+// statement that writes the row, which requires this authority to still be current -
+// see BindServerProviderAccountUnderAuthority.
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 )
 
 // gigahostAssociationPreviewTTL is how long a preview's consent stays usable. It must
-// not outlive a plausible reading of that screen; an expired preview is refused rather
-// than re-interpreted.
+// not outlive a plausible reading of that screen; an expired authority is refused
+// rather than re-interpreted.
 const gigahostAssociationPreviewTTL = 15 * time.Minute
-
-// gigahostAssociationRetiredLimit bounds the tombstones kept per administrator. They
-// exist only so a superseded token is answered with an explicit refusal instead of
-// being indistinguishable from an invented one; a token older than this bound is
-// refused as unknown, which is the same outcome for the caller.
-const gigahostAssociationRetiredLimit = 8
 
 // gigahostAssociationConfig identifies the effective provider configuration a plan
 // was produced from.
 //
-// generation advances whenever the provider client is replaced, and scope is the
-// one-way digest of the credential that answered. Both are needed: a settings change
-// that swaps the key builds a new client without replacing the injected one, so the
-// scope moves while the generation may not, and a replacement of the injected client
-// moves the generation while the credential stays empty.
+// epoch is the durable version of the gigahost settings, moved in the same transaction
+// as a settings write; generation advances when the provider client is replaced; scope
+// is the one-way digest of the credential that answered. All three are required, since
+// an injected client and a stored key move different parts of this identity.
 type gigahostAssociationConfig struct {
+	epoch      int64
 	generation uint64
 	scope      string
 }
 
 // gigahostAssociationConfigOf names the configuration one resolution acts under.
-func gigahostAssociationConfigOf(resolution gigahostClientResolution) gigahostAssociationConfig {
+func gigahostAssociationConfigOf(resolution gigahostClientResolution, epoch int64) gigahostAssociationConfig {
 	return gigahostAssociationConfig{
+		epoch:      epoch,
 		generation: resolution.generation,
 		scope:      catalogScopeKey(resolution.credential),
 	}
-}
-
-// gigahostAssociationPreviewRecord is what one preview promised: the account that
-// answered, the configuration it was asked under, and the rows it showed as unlisted.
-type gigahostAssociationPreviewRecord struct {
-	account  string
-	config   gigahostAssociationConfig
-	unlisted map[int64]struct{}
-	expires  time.Time
-}
-
-// gigahostAssociationAuthority is the single consent one administrator may hold.
-type gigahostAssociationAuthority struct {
-	// token is the consent currently offered; empty means the last preview offered
-	// nothing to confirm.
-	token string
-	// record is what that token stands for.
-	record gigahostAssociationPreviewRecord
-	// retired holds the tokens this administrator has superseded, newest last.
-	retired []string
 }
 
 // gigahostAssociationConsentStatus is how a presented token was answered.
 type gigahostAssociationConsentStatus int
 
 const (
-	// gigahostAssociationConsentCurrent: this administrator's live consent.
+	// gigahostAssociationConsentCurrent: this administrator's live authority.
 	gigahostAssociationConsentCurrent gigahostAssociationConsentStatus = iota
-	// gigahostAssociationConsentSuperseded: a consent a newer preview retired.
+	// gigahostAssociationConsentSuperseded: an authority a newer preview replaced.
 	gigahostAssociationConsentSuperseded
-	// gigahostAssociationConsentUnknown: nothing this administrator ever held, or an
-	// expired one.
+	// gigahostAssociationConsentUnknown: nothing this administrator holds, or an
+	// expired authority.
 	gigahostAssociationConsentUnknown
 )
 
 // issueGigahostAssociationPreview mints the token a confirmation must present, and
 // makes it the administrator's only authority.
 //
-// Every earlier consent for the same administrator is retired here, whether or not the
-// new plan has anything to write: the screen the administrator is looking at now is the
-// only one their next answer can be about.
+// Every earlier authority for the same administrator is replaced by the same
+// statement, whether or not the new plan has anything to write: the screen the
+// administrator is looking at now is the only one their next answer can be about.
 func (h *Handlers) issueGigahostAssociationPreview(
-	admin string, plan gigahostAccountPlan, config gigahostAssociationConfig,
+	ctx context.Context, admin string, plan gigahostAccountPlan, config gigahostAssociationConfig,
 ) (string, error) {
-	now := time.Now()
-	h.associationMu.Lock()
-	defer h.associationMu.Unlock()
-	if h.associationAuthorities == nil {
-		h.associationAuthorities = make(map[string]gigahostAssociationAuthority)
-	}
-	previous := h.associationAuthorities[admin]
-	retired := append([]string{}, previous.retired...)
-	if previous.token != "" {
-		retired = append(retired, previous.token)
-	}
-	if len(retired) > gigahostAssociationRetiredLimit {
-		retired = retired[len(retired)-gigahostAssociationRetiredLimit:]
-	}
-
 	if plan.account == "" || len(plan.attributed)+len(plan.unlisted) == 0 {
-		// Nothing to write: the new screen withdraws the previous consent and offers
+		// Nothing to write: the new screen withdraws the previous authority and offers
 		// no replacement, so an earlier token can no longer be presented.
-		h.associationAuthorities[admin] = gigahostAssociationAuthority{retired: retired}
+		if _, err := h.db.ClearGigahostAssociationAuthority(ctx, admin); err != nil {
+			return "", err
+		}
 		return "", nil
 	}
 
@@ -122,83 +84,61 @@ func (h *Handlers) issueGigahostAssociationPreview(
 		return "", err
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	unlisted := make(map[int64]struct{}, len(plan.unlisted))
+	unlisted := make([]int64, 0, len(plan.unlisted))
 	for _, binding := range plan.unlisted {
-		unlisted[binding.serverID] = struct{}{}
+		unlisted = append(unlisted, binding.serverID)
 	}
-	h.associationAuthorities[admin] = gigahostAssociationAuthority{
-		token: token,
-		record: gigahostAssociationPreviewRecord{
-			account:  plan.account,
-			config:   config,
-			unlisted: unlisted,
-			expires:  now.Add(gigahostAssociationPreviewTTL),
-		},
-		retired: retired,
+	authority := database.GigahostAssociationAuthority{
+		Admin:            admin,
+		Token:            token,
+		Account:          plan.account,
+		ConfigEpoch:      config.epoch,
+		ConfigGeneration: config.generation,
+		ConfigScope:      config.scope,
+		Unlisted:         unlisted,
+		ExpiresAt:        time.Now().Add(gigahostAssociationPreviewTTL),
+	}
+	if err := h.db.StoreGigahostAssociationAuthority(ctx, authority); err != nil {
+		return "", err
 	}
 	return token, nil
 }
 
 // gigahostAssociationConsent answers what a presented token stands for.
 //
-// Only the administrator's current token is a consent. A token this administrator has
-// superseded is REFUSED (never silently accepted and never applied to the current
-// plan), and anything else is unknown.
+// Only the administrator's current, unexpired authority is a consent. A token the
+// administrator has superseded is REFUSED, and anything else is unknown.
 func (h *Handlers) gigahostAssociationConsent(
-	admin, token string,
-) (gigahostAssociationPreviewRecord, gigahostAssociationConsentStatus) {
-	h.associationMu.Lock()
-	defer h.associationMu.Unlock()
-	authority, ok := h.associationAuthorities[admin]
-	if !ok {
-		return gigahostAssociationPreviewRecord{}, gigahostAssociationConsentUnknown
+	ctx context.Context, admin, token string,
+) (database.GigahostAssociationAuthority, gigahostAssociationConsentStatus, error) {
+	authority, found, err := h.db.LoadGigahostAssociationAuthority(ctx, admin, token, time.Now())
+	if err != nil {
+		return database.GigahostAssociationAuthority{}, gigahostAssociationConsentUnknown, err
 	}
-	if token != "" && token == authority.token {
-		if time.Now().After(authority.record.expires) {
-			h.forgetLocked(admin, authority)
-			return gigahostAssociationPreviewRecord{}, gigahostAssociationConsentUnknown
-		}
-		return authority.record, gigahostAssociationConsentCurrent
+	if found {
+		return authority, gigahostAssociationConsentCurrent, nil
 	}
-	for _, retired := range authority.retired {
-		if retired == token {
-			return gigahostAssociationPreviewRecord{}, gigahostAssociationConsentSuperseded
-		}
+	current, held, err := h.db.GigahostAssociationAuthorityToken(ctx, admin)
+	if err != nil {
+		return database.GigahostAssociationAuthority{}, gigahostAssociationConsentUnknown, err
 	}
-	return gigahostAssociationPreviewRecord{}, gigahostAssociationConsentUnknown
+	if held && current != "" && current != token {
+		return database.GigahostAssociationAuthority{}, gigahostAssociationConsentSuperseded, nil
+	}
+	return database.GigahostAssociationAuthority{}, gigahostAssociationConsentUnknown, nil
 }
 
-// gigahostAssociationHoldsAuthority reports whether this token is still the
-// administrator's live consent. The commit path asks again immediately before it
-// writes, so a preview that arrived while the confirmation was deciding cannot be
-// overtaken by the older answer.
-func (h *Handlers) gigahostAssociationHoldsAuthority(admin, token string) bool {
-	h.associationMu.Lock()
-	defer h.associationMu.Unlock()
-	authority, ok := h.associationAuthorities[admin]
-	return ok && token != "" && token == authority.token && !time.Now().After(authority.record.expires)
+// gigahostAssociationHoldsAuthority reports whether this authority, as presented, is
+// still current under the configuration in force. It explains a refused binding; it
+// never authorizes one.
+func (h *Handlers) gigahostAssociationHoldsAuthority(
+	ctx context.Context, authority database.GigahostAssociationAuthority,
+) (bool, error) {
+	return h.db.CurrentGigahostAssociationAuthority(ctx, authority, h.catalogCache().currentGeneration(), time.Now())
 }
 
-// forgetGigahostAssociationPreview withdraws a consent that can no longer be honored,
-// keeping its token as a tombstone so a replay is refused explicitly.
-func (h *Handlers) forgetGigahostAssociationPreview(admin, token string) {
-	h.associationMu.Lock()
-	defer h.associationMu.Unlock()
-	authority, ok := h.associationAuthorities[admin]
-	if !ok {
-		return
-	}
-	h.forgetLocked(admin, authority)
-}
-
-// forgetLocked withdraws the administrator's authority. The caller holds associationMu.
-func (h *Handlers) forgetLocked(admin string, authority gigahostAssociationAuthority) {
-	retired := append([]string{}, authority.retired...)
-	if authority.token != "" {
-		retired = append(retired, authority.token)
-	}
-	if len(retired) > gigahostAssociationRetiredLimit {
-		retired = retired[len(retired)-gigahostAssociationRetiredLimit:]
-	}
-	h.associationAuthorities[admin] = gigahostAssociationAuthority{retired: retired}
+// forgetGigahostAssociationPreview withdraws a consent that can no longer be honored.
+func (h *Handlers) forgetGigahostAssociationPreview(ctx context.Context, admin string) error {
+	_, err := h.db.ClearGigahostAssociationAuthority(ctx, admin)
+	return err
 }

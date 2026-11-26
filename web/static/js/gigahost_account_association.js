@@ -39,7 +39,9 @@ const gigahostAssociationReasonKeys = {
     write_failed: 'gigahost_association_reason_write_failed',
     // A row the account no longer lists, left alone because this confirmation did
     // not authorise its deletion. It still records no account.
-    unlisted_not_confirmed: 'gigahost_association_reason_unlisted_not_confirmed'
+    unlisted_not_confirmed: 'gigahost_association_reason_unlisted_not_confirmed',
+    // The authorization stopped being current before this row was written.
+    authority_changed: 'gigahost_association_reason_authority_changed'
 };
 
 function gigahostAssociationReasonText(reasons) {

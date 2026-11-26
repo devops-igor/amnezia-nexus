@@ -171,46 +171,173 @@ func TestAssociationNewerPreviewRetiresTheOlderOne(t *testing.T) {
 	}
 }
 
-// TestAssociationCommitIsFencedByTheEffectiveConfiguration is the second ordering: a
-// confirmation is paused inside the provider detail read, the administrator replaces
-// the key, and the reply then resumes. The fence is established inside the commit path
-// against live state, so the older answer cannot bind the row under the account it was
-// previewed with.
+// TestAssociationCommitIsFencedByTheEffectiveConfiguration is the round-24 paused
+// ordering, both forms: the confirmation pauses inside the provider detail read, and
+// the effective configuration or the authority changes before its reply resumes. No
+// binding may land from the authority the reply was based on.
 func TestAssociationCommitIsFencedByTheEffectiveConfiguration(t *testing.T) {
-	f := newInventoryFixture(t)
-	row := f.seedLegacyServer("Legacy", 703)
+	t.Run("ClientReplacedDuringThePausedRead", func(t *testing.T) {
+		f := newInventoryFixture(t)
+		row := f.seedLegacyServer("Legacy", 703)
 
-	f.provider.set(inventoryJSON())
-	f.provider.answerPerServer(703, http.StatusNotFound)
-	preview := f.associationPreviewCall()
-	if preview.Unlisted != 1 || preview.PreviewID == "" {
-		t.Fatalf("preview = %+v, want one unlisted row and a consent", preview)
-	}
-
-	// While the confirmation is inside the detail read, the effective configuration is
-	// replaced - the same thing a settings save of a new key does.
-	replaced := false
-	f.provider.onDetail = func() {
-		if replaced {
-			return
+		f.provider.set(inventoryJSON())
+		f.provider.answerPerServer(703, http.StatusNotFound)
+		preview := f.associationPreviewCall()
+		if preview.Unlisted != 1 || preview.PreviewID == "" {
+			t.Fatalf("preview = %+v, want one unlisted row and a consent", preview)
 		}
-		replaced = true
-		f.h.SetGigahostClient(f.h.gigahostClient)
+
+		replaced := false
+		f.provider.onDetail = func() {
+			if replaced {
+				return
+			}
+			replaced = true
+			f.h.SetGigahostClient(f.h.gigahostClient)
+		}
+
+		rec := f.associationActionRaw(`{"preview_id":"` + preview.PreviewID + `","include_unlisted":true}`)
+		if !replaced {
+			t.Fatal("the confirmation never reached the provider detail read, so the fence was not exercised")
+		}
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("the confirmation across a configuration change answered %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "gigahost_association_authority_lost") {
+			t.Fatalf("the refusal is not the authority fence: %s", rec.Body.String())
+		}
+		if got := f.row(row); got.ProviderAccountKnown() {
+			t.Fatalf("the fenced confirmation associated the row with %q", got.ProviderAccountID)
+		}
+	})
+
+	t.Run("NewPreviewTakenDuringThePausedRead", func(t *testing.T) {
+		f := newInventoryFixture(t)
+		row := f.seedLegacyServer("Legacy", 706)
+
+		f.provider.set(inventoryJSON())
+		f.provider.answerPerServer(706, http.StatusNotFound)
+		older := f.associationPreviewCall()
+		if older.PreviewID == "" {
+			t.Fatal("the first preview offered no consent")
+		}
+
+		var newer associationPreview
+		taken := false
+		f.provider.onDetail = func() {
+			if taken {
+				return
+			}
+			taken = true
+			newer = f.associationPreviewCall()
+		}
+
+		rec := f.associationActionRaw(`{"preview_id":"` + older.PreviewID + `","include_unlisted":true}`)
+		if !taken {
+			t.Fatal("the confirmation never reached the provider detail read, so the newer preview did not interleave")
+		}
+		if newer.PreviewID == "" || newer.PreviewID == older.PreviewID {
+			t.Fatalf("the interleaved preview did not replace the consent: %+v", newer)
+		}
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("the superseded confirmation answered %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+		if got := f.row(row); got.ProviderAccountKnown() {
+			t.Fatalf("the superseded confirmation associated the row with %q", got.ProviderAccountID)
+		}
+	})
+}
+
+// TestAssociationMidBatchInvalidationStopsLaterBindings is the interleaving that the
+// single pre-batch check could not catch: the authority is valid when the batch starts,
+// and is invalidated before one of the batch's later rows commits. The invalidation is
+// placed deterministically between two rows of the same batch; each row's write decides
+// its own authority currency, so nothing lands from the invalidated authority.
+func TestAssociationMidBatchInvalidationStopsLaterBindings(t *testing.T) {
+	seedBatch := func(t *testing.T) (*inventoryFixture, []int64) {
+		t.Helper()
+		f := newInventoryFixture(t)
+		rows := []int64{
+			f.seedLegacyServer("Legacy-a", 801),
+			f.seedLegacyServer("Legacy-b", 802),
+			f.seedLegacyServer("Legacy-c", 803),
+		}
+		f.provider.set(inventoryJSON(801, 802, 803))
+		for _, id := range []int64{801, 802, 803} {
+			f.provider.answerPerServer(id, http.StatusOK)
+		}
+		return f, rows
 	}
 
-	rec := f.associationActionRaw(`{"preview_id":"` + preview.PreviewID + `","include_unlisted":true}`)
-	if !replaced {
-		t.Fatal("the confirmation never reached the provider detail read, so the fence was not exercised")
-	}
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("the confirmation across a configuration change answered %d, want 409: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "gigahost_association_configuration_changed") {
-		t.Fatalf("the refusal is not the configuration fence: %s", rec.Body.String())
-	}
-	if got := f.row(row); got.ProviderAccountKnown() {
-		t.Fatalf("the fenced confirmation associated the row with %q", got.ProviderAccountID)
-	}
+	t.Run("ProviderKeySavedAfterTheFirstBinding", func(t *testing.T) {
+		f, rows := seedBatch(t)
+		preview := f.associationPreviewCall()
+		if preview.Attributable != 3 || preview.PreviewID == "" {
+			t.Fatalf("preview = %+v, want three attributable rows and a consent", preview)
+		}
+
+		saved := false
+		f.h.associationBindingHook = func(int64) {
+			if saved {
+				return
+			}
+			saved = true
+			// The administrator saves a key for another account while the batch runs.
+			if err := f.db.SetSetting(context.Background(), "gigahost", map[string]any{"api_key": "another-account-key"}); err != nil {
+				t.Fatalf("failed to save the provider key mid-batch: %v", err)
+			}
+		}
+
+		result := f.associationActionCallWithPreview(preview.PreviewID, false)
+		if !saved {
+			t.Fatal("the batch never reached its second row, so the interleaving was not exercised")
+		}
+		if result.Associated != 1 {
+			t.Fatalf("the batch associated %d rows after the key changed, want exactly the first", result.Associated)
+		}
+		if result.Unattributed != 2 || !hasReason(result.Reasons, string(gigahostAssociationAuthorityChanged)) {
+			t.Fatalf("the batch = %+v, want the two remaining rows reported with the authority reason", result)
+		}
+		for _, id := range rows[1:] {
+			if got := f.row(id); got.ProviderAccountKnown() {
+				t.Fatalf("row %d was bound from an authority the key save had invalidated (%q)", id, got.ProviderAccountID)
+			}
+		}
+		if got := f.row(rows[0]); got.ProviderAccountID != fixtureAccount {
+			t.Fatalf("the first row's legitimate binding was lost: %q", got.ProviderAccountID)
+		}
+	})
+
+	t.Run("NewerPreviewTakenAfterTheFirstBinding", func(t *testing.T) {
+		f, rows := seedBatch(t)
+
+		older := f.associationPreviewCall()
+		var newer associationPreview
+		taken := false
+		f.h.associationBindingHook = func(int64) {
+			if taken {
+				return
+			}
+			taken = true
+			newer = f.associationPreviewCall()
+		}
+
+		result := f.associationActionCallWithPreview(older.PreviewID, false)
+		if !taken || newer.PreviewID == "" || newer.PreviewID == older.PreviewID {
+			t.Fatalf("the interleaved preview did not replace the consent: %+v", newer)
+		}
+		if result.Associated != 1 {
+			t.Fatalf("the batch associated %d rows after the newer preview, want exactly the first", result.Associated)
+		}
+		if result.Unattributed != 2 || !hasReason(result.Reasons, string(gigahostAssociationAuthorityChanged)) {
+			t.Fatalf("the batch = %+v, want the two remaining rows reported with the authority reason", result)
+		}
+		for _, id := range rows[1:] {
+			if got := f.row(id); got.ProviderAccountKnown() {
+				t.Fatalf("row %d was bound from an authority a newer preview had replaced (%q)", id, got.ProviderAccountID)
+			}
+		}
+	})
 }
 
 // TestAssociationRepeatWithoutConsentKeepsTheUnlistedRowCounted is the reporting half:

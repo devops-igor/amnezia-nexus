@@ -46,6 +46,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -73,6 +74,10 @@ const (
 	gigahostAssociationUnnamed gigahostAssociationReason = "provider_unnamed"
 	// gigahostAssociationWriteFailed: the row's association could not be stored.
 	gigahostAssociationWriteFailed gigahostAssociationReason = "write_failed"
+	// gigahostAssociationAuthorityChanged: the confirmation's authority stopped being
+	// current before this row could be written (a newer preview, or a provider key
+	// saved mid-batch). The row still records no account.
+	gigahostAssociationAuthorityChanged gigahostAssociationReason = "authority_changed"
 	// gigahostAssociationNotConfirmed: the row is one the account no longer lists,
 	// and the administrator did not authorize that consequence for this preview. It
 	// still records no account, so reconciliation still skips it.
@@ -138,7 +143,7 @@ func (h *Handlers) GigahostAccountAssociationPreviewHandler(w http.ResponseWrite
 		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable", err.Error())
 		return
 	}
-	previewID, err := h.issueGigahostAssociationPreview(h.gigahostAssociationAdminID(r), plan, config)
+	previewID, err := h.issueGigahostAssociationPreview(r.Context(), h.gigahostAssociationAdminID(r), plan, config)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "gigahost_association_unavailable",
 			"the preview could not be recorded, so nothing may be confirmed from it")
@@ -178,7 +183,10 @@ type gigahostAssociationApplication struct {
 	associated     int
 	unlisted       int
 	boundElsewhere int
-	reasons        map[gigahostAssociationReason]int
+	// refused counts the rows the batch did not write because the authority stopped
+	// being current. They are reported as still needing an answer.
+	refused int
+	reasons map[gigahostAssociationReason]int
 }
 
 // gigahostAssociationRefusal says why the commit path wrote nothing.
@@ -215,9 +223,7 @@ const (
 // makes a repeated run report "nothing further associated".
 func (h *Handlers) applyGigahostAssociation(
 	ctx context.Context,
-	r *http.Request,
-	admin, token string,
-	expected gigahostAssociationConfig,
+	authority database.GigahostAssociationAuthority,
 	bindings []gigahostAccountBinding,
 	reasons map[gigahostAssociationReason]int,
 ) (gigahostAssociationApplication, gigahostAssociationRefusal) {
@@ -228,32 +234,43 @@ func (h *Handlers) applyGigahostAssociation(
 		// key to answer "nothing further" would turn a true all-clear into an error.
 		return application, gigahostAssociationCommitted
 	}
-	if !h.gigahostAssociationHoldsAuthority(admin, token) {
-		return application, gigahostAssociationLostAuthority
-	}
-	live, err := h.resolveGigahostClient(ctx, r)
-	if err != nil {
-		return application, gigahostAssociationCommitUnavailable
-	}
-	if gigahostAssociationConfigOf(live) != expected {
-		return application, gigahostAssociationConfigMoved
-	}
-	for _, binding := range bindings {
-		written, err := h.db.BindServerProviderAccount(ctx, binding.serverID, binding.accountID)
+	for index, binding := range bindings {
+		written, err := h.db.BindServerProviderAccountUnderAuthority(ctx, binding.serverID, binding.accountID, authority, h.catalogCache().currentGeneration(), time.Now())
 		if err != nil {
 			slog.Warn("Provider account association could not record a server",
 				"server_id", binding.serverID, "error", err)
 			application.reasons[gigahostAssociationWriteFailed]++
 			continue
 		}
-		if !written {
+		if written {
+			application.associated++
+			if binding.unlisted {
+				application.unlisted++
+			}
+			if h.associationBindingHook != nil {
+				h.associationBindingHook(binding.serverID)
+			}
+			continue
+		}
+
+		// The row was not written. Either someone else bound it first, or this
+		// authority is no longer current - a newer preview, or a provider key saved
+		// after the batch began. The statement decided both questions together; this
+		// read only chooses which answer to report.
+		current, err := h.gigahostAssociationHoldsAuthority(ctx, authority)
+		if err != nil {
+			return application, gigahostAssociationCommitUnavailable
+		}
+		if current {
 			application.boundElsewhere++
 			continue
 		}
-		application.associated++
-		if binding.unlisted {
-			application.unlisted++
-		}
+		// Every row left in the batch is unbindable under this authority, and nothing
+		// may land from it. Count them as still needing an answer and stop.
+		remaining := len(bindings) - index
+		application.reasons[gigahostAssociationAuthorityChanged] += remaining
+		application.refused = remaining
+		return application, gigahostAssociationLostAuthority
 	}
 	return application, gigahostAssociationCommitted
 }
@@ -268,120 +285,24 @@ func (h *Handlers) GigahostAccountAssociationHandler(w http.ResponseWriter, r *h
 	if !h.gigahostAssociationAdmin(w, r) {
 		return
 	}
-
-	confirmation := gigahostAssociationConfirmation{}
-	if r.Body != nil {
-		// An absent or empty body means "no confirmation", which is what a client
-		// that only wants the provider-named rows sends. Anything unreadable is
-		// refused, so a malformed confirmation can never be read as consent.
-		if err := h.DecodeJSON(r, &confirmation); err != nil && !errors.Is(err, io.EOF) {
-			h.JSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
-			return
-		}
+	confirmation, ok := h.decodeGigahostAssociationConfirmation(w, r)
+	if !ok {
+		return
 	}
-
 	ctx := r.Context()
 	admin := h.gigahostAssociationAdminID(r)
 
-	// The consent must name the preview it was given for, before anything is read
-	// from the provider: a request without one has no account and no unlisted scope
-	// to be bound to.
-	if strings.TrimSpace(confirmation.PreviewID) == "" {
-		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_required",
-			"check again before associating: the confirmation must name the preview it was given for, and nothing was changed")
+	consent, ok := h.authorizeGigahostAssociationConfirmation(w, ctx, admin, confirmation.PreviewID)
+	if !ok {
 		return
 	}
-	consent, status := h.gigahostAssociationConsent(admin, confirmation.PreviewID)
-	switch status {
-	case gigahostAssociationConsentSuperseded:
-		// A newer check replaced the screen this answer came from. It is refused
-		// outright: the batch the administrator is looking at now is a different one.
-		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_superseded",
-			"a newer check has replaced that one; confirm from the check you are looking at, and nothing was changed")
-		return
-	case gigahostAssociationConsentCurrent:
-	default:
-		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
-			"that check is no longer available; check again and confirm from the fresh counts, and nothing was changed")
+	batch, ok := h.planGigahostAssociationBatch(w, r, consent, confirmation.IncludeUnlisted)
+	if !ok {
 		return
 	}
 
-	plan, config, err := h.planGigahostAccountAssociation(ctx, r)
-	if err != nil {
-		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable", err.Error())
-		return
-	}
-
-	// The account that answers now must be the account the administrator previewed.
-	// Otherwise the consent shown for one account would be applied to another: the
-	// remainder of the request would be a write the administrator never approved.
-	//
-	// An empty plan account means the pass had no candidate rows to ask the provider
-	// about, so this request can only be a no-op (a repeated confirmation, or an
-	// account whose every row already records itself). There is no account behind it
-	// to mismatch, and there is nothing it could write.
-	if plan.account != "" && plan.account != consent.account {
-		h.forgetGigahostAssociationPreview(admin, confirmation.PreviewID)
-		h.JSONError(w, http.StatusConflict, "gigahost_association_account_changed",
-			"the configured account changed since that check; check again and confirm under the account you reviewed, and nothing was changed")
-		return
-	}
-
-	// Every row that still needs an answer is counted, including the ones this
-	// confirmation excludes: a row left unknown is still skipped by reconciliation,
-	// so a result that wrote nothing must not look like an all-clear.
-	var unlisted []gigahostAccountBinding
-	excluded := 0
-	for _, binding := range plan.unlisted {
-		_, previewed := consent.unlisted[binding.serverID]
-		if confirmation.IncludeUnlisted && previewed {
-			unlisted = append(unlisted, binding)
-			continue
-		}
-		excluded++
-	}
-	if confirmation.IncludeUnlisted && len(consent.unlisted) == 0 {
-		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
-			"that check did not offer any servers the account no longer lists; check again before confirming, and nothing was changed")
-		return
-	}
-
-	bindings := append(append([]gigahostAccountBinding{}, plan.attributed...), unlisted...)
-
-	// The configuration that produced the preview must still be the one in effect.
-	// The commit path re-establishes this against live state; refusing here keeps the
-	// request from doing any further work for a screen that is already obsolete.
-	// Only a request with something to write is fenced: a no-op repeat has nothing to
-	// record and must still be able to report that.
-	if len(bindings) > 0 && config != consent.config {
-		h.forgetGigahostAssociationPreview(admin, confirmation.PreviewID)
-		h.JSONError(w, http.StatusConflict, "gigahost_association_configuration_changed",
-			"the provider configuration changed since that check; check again under the current key, and nothing was changed")
-		return
-	}
-
-	reasons := make(map[gigahostAssociationReason]int, len(plan.undecided)+1)
-	for reason, count := range plan.undecided {
-		reasons[reason] = count
-	}
-	if excluded > 0 {
-		reasons[gigahostAssociationNotConfirmed] += excluded
-	}
-
-	applied, refusal := h.applyGigahostAssociation(ctx, r, admin, confirmation.PreviewID, consent.config, bindings, reasons)
-	switch refusal {
-	case gigahostAssociationLostAuthority:
-		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_superseded",
-			"a newer check replaced that one while it was being confirmed; confirm from the check you are looking at, and nothing was changed")
-		return
-	case gigahostAssociationConfigMoved:
-		h.forgetGigahostAssociationPreview(admin, confirmation.PreviewID)
-		h.JSONError(w, http.StatusConflict, "gigahost_association_configuration_changed",
-			"the provider configuration changed while that confirmation was being applied; check again under the current key, and nothing was changed")
-		return
-	case gigahostAssociationCommitUnavailable:
-		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable",
-			"the provider configuration could not be re-read, so nothing was changed")
+	applied, refusal := h.applyGigahostAssociation(ctx, consent, batch.bindings, batch.reasons)
+	if !h.reportGigahostAssociationOutcome(w, ctx, admin, refusal, applied) {
 		return
 	}
 
@@ -393,17 +314,179 @@ func (h *Handlers) GigahostAccountAssociationHandler(w http.ResponseWriter, r *h
 	slog.Info("Provider account association recorded",
 		"associated", applied.associated,
 		"unlisted", applied.unlisted,
-		"already_bound", plan.alreadyBound+applied.boundElsewhere,
+		"already_bound", batch.alreadyBound+applied.boundElsewhere,
 		"unattributed", unattributed,
+		"refused", applied.refused,
 		"write_failures", applied.reasons[gigahostAssociationWriteFailed])
 
 	h.JSON(w, http.StatusOK, map[string]any{
 		"associated":    applied.associated,
 		"unlisted":      applied.unlisted,
-		"already_bound": plan.alreadyBound + applied.boundElsewhere,
+		"already_bound": batch.alreadyBound + applied.boundElsewhere,
 		"unattributed":  unattributed,
 		"reasons":       reasonPayload(applied.reasons),
 	})
+}
+
+// decodeGigahostAssociationConfirmation reads the administrator's answer. An absent or
+// empty body is a body with no preview, which the caller refuses; an unreadable one is
+// refused too, so a malformed confirmation can never be read as consent.
+func (h *Handlers) decodeGigahostAssociationConfirmation(w http.ResponseWriter, r *http.Request) (gigahostAssociationConfirmation, bool) {
+	confirmation := gigahostAssociationConfirmation{}
+	if r.Body != nil {
+		if err := h.DecodeJSON(r, &confirmation); err != nil && !errors.Is(err, io.EOF) {
+			h.JSONError(w, http.StatusBadRequest, "invalid_body", err.Error())
+			return gigahostAssociationConfirmation{}, false
+		}
+	}
+	return confirmation, true
+}
+
+// authorizeGigahostAssociationConfirmation answers the request when the named preview
+// is not this administrator's live authority. It writes the refusal itself.
+func (h *Handlers) authorizeGigahostAssociationConfirmation(
+	w http.ResponseWriter, ctx context.Context, admin, previewID string,
+) (database.GigahostAssociationAuthority, bool) {
+	if strings.TrimSpace(previewID) == "" {
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_required",
+			"check again before associating: the confirmation must name the preview it was given for, and nothing was changed")
+		return database.GigahostAssociationAuthority{}, false
+	}
+	consent, status, err := h.gigahostAssociationConsent(ctx, admin, previewID)
+	if err != nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable",
+			"the authorization for that check could not be read, so nothing was changed")
+		return database.GigahostAssociationAuthority{}, false
+	}
+	switch status {
+	case gigahostAssociationConsentSuperseded:
+		// A newer check replaced the screen this answer came from. It is refused
+		// outright: the batch the administrator is looking at now is a different one.
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_superseded",
+			"a newer check has replaced that one; confirm from the check you are looking at, and nothing was changed")
+		return database.GigahostAssociationAuthority{}, false
+	case gigahostAssociationConsentCurrent:
+		return consent, true
+	default:
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
+			"that check is no longer available; check again and confirm from the fresh counts, and nothing was changed")
+		return database.GigahostAssociationAuthority{}, false
+	}
+}
+
+// gigahostAssociationBatch is what one confirmation would write, and what it would
+// leave needing an answer.
+type gigahostAssociationBatch struct {
+	bindings     []gigahostAccountBinding
+	reasons      map[gigahostAssociationReason]int
+	alreadyBound int
+}
+
+// planGigahostAssociationBatch re-reads the provider and returns the rows this
+// confirmation covers, refusing the request when the account or the configuration is no
+// longer the one the preview was produced under.
+func (h *Handlers) planGigahostAssociationBatch(
+	w http.ResponseWriter, r *http.Request,
+	consent database.GigahostAssociationAuthority, includeUnlisted bool,
+) (gigahostAssociationBatch, bool) {
+	ctx := r.Context()
+	plan, config, err := h.planGigahostAccountAssociation(ctx, r)
+	if err != nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable", err.Error())
+		return gigahostAssociationBatch{}, false
+	}
+
+	// The account that answers now must be the account the administrator previewed.
+	// An empty plan account means the pass had no candidate rows to ask the provider
+	// about, so this request can only be a no-op and cannot mismatch anything.
+	if plan.account != "" && plan.account != consent.Account {
+		_ = h.forgetGigahostAssociationPreview(ctx, h.gigahostAssociationAdminID(r))
+		h.JSONError(w, http.StatusConflict, "gigahost_association_account_changed",
+			"the configured account changed since that check; check again and confirm under the account you reviewed, and nothing was changed")
+		return gigahostAssociationBatch{}, false
+	}
+
+	previewed := make(map[int64]struct{}, len(consent.Unlisted))
+	for _, id := range consent.Unlisted {
+		previewed[id] = struct{}{}
+	}
+	if includeUnlisted && len(previewed) == 0 {
+		h.JSONError(w, http.StatusConflict, "gigahost_association_preview_stale",
+			"that check did not offer any servers the account no longer lists; check again before confirming, and nothing was changed")
+		return gigahostAssociationBatch{}, false
+	}
+
+	batch := gigahostAssociationBatch{
+		reasons:      make(map[gigahostAssociationReason]int, len(plan.undecided)+1),
+		alreadyBound: plan.alreadyBound,
+	}
+	for reason, count := range plan.undecided {
+		batch.reasons[reason] = count
+	}
+
+	// Every row that still needs an answer is counted, including the ones this
+	// confirmation excludes: a row left unknown is still skipped by reconciliation, so
+	// a result that wrote nothing must not look like an all-clear.
+	excluded := 0
+	batch.bindings = append(batch.bindings, plan.attributed...)
+	for _, binding := range plan.unlisted {
+		if _, wasPreviewed := previewed[binding.serverID]; includeUnlisted && wasPreviewed {
+			batch.bindings = append(batch.bindings, binding)
+			continue
+		}
+		excluded++
+	}
+	if excluded > 0 {
+		batch.reasons[gigahostAssociationNotConfirmed] += excluded
+	}
+
+	// The configuration that produced the preview must still be the one in effect.
+	// This is a cheap refusal for a screen that is already obsolete; the binding
+	// statement itself carries the same requirement, so a change that lands after this
+	// point still cannot authorize a write.
+	expected := gigahostAssociationConfig{
+		epoch:      consent.ConfigEpoch,
+		generation: consent.ConfigGeneration,
+		scope:      consent.ConfigScope,
+	}
+	if len(batch.bindings) > 0 && config != expected {
+		_ = h.forgetGigahostAssociationPreview(ctx, h.gigahostAssociationAdminID(r))
+		h.JSONError(w, http.StatusConflict, "gigahost_association_configuration_changed",
+			"the provider configuration changed since that check; check again under the current key, and nothing was changed")
+		return gigahostAssociationBatch{}, false
+	}
+	return batch, true
+}
+
+// reportGigahostAssociationOutcome answers the request when the batch could not be
+// applied as a whole. It reports true when the caller should send the outcome.
+func (h *Handlers) reportGigahostAssociationOutcome(
+	w http.ResponseWriter, ctx context.Context, admin string,
+	refusal gigahostAssociationRefusal, applied gigahostAssociationApplication,
+) bool {
+	switch refusal {
+	case gigahostAssociationLostAuthority:
+		if applied.associated == 0 {
+			h.JSONError(w, http.StatusConflict, "gigahost_association_authority_lost",
+				"the authorization for that check stopped being current before any row was written; check again, and nothing was changed")
+			return false
+		}
+		// Some rows were written under an authority that was still current when they
+		// committed; the rest are reported as still needing an answer rather than
+		// silently dropped.
+		return true
+	case gigahostAssociationConfigMoved:
+		_ = h.forgetGigahostAssociationPreview(ctx, admin)
+		h.JSONError(w, http.StatusConflict, "gigahost_association_configuration_changed",
+			"the provider configuration changed while that confirmation was being applied; check again under the current key, and nothing was changed")
+		return false
+	case gigahostAssociationCommitUnavailable:
+		h.JSONError(w, http.StatusServiceUnavailable, "gigahost_association_unavailable",
+			"the authorization could not be revalidated while that confirmation was being applied, so nothing was changed")
+		return false
+	default:
+		return true
+	}
 }
 
 // gigahostAssociationAdmin answers the request itself when the caller is not an
