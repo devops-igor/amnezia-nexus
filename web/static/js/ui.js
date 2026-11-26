@@ -173,9 +173,26 @@
                 document.body.style.overflow = '';
             }
 
-            if (previousActiveElement && typeof previousActiveElement.focus === 'function') {
+            // The opener a modal saves is often replaced by the refresh the modal's
+            // own action triggers (an empty-state button, a row control). Restoring
+            // focus to a disconnected node does nothing and drops focus to the body,
+            // so the owner is asked for an equivalent target first.
+            let restoreTo = previousActiveElement;
+            const detached = restoreTo && typeof document.contains === 'function' && !document.contains(restoreTo);
+            if (!restoreTo || detached) {
+                if (typeof window !== 'undefined' && typeof window.vpnModalFocusFallback === 'function') {
+                    try {
+                        restoreTo = window.vpnModalFocusFallback(modalId);
+                    } catch (_) {
+                        restoreTo = null;
+                    }
+                } else {
+                    restoreTo = null;
+                }
+            }
+            if (restoreTo && typeof restoreTo.focus === 'function') {
                 try {
-                    previousActiveElement.focus();
+                    restoreTo.focus();
                 } catch (_) {}
             }
 

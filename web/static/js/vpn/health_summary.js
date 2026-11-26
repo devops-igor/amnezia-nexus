@@ -1,7 +1,9 @@
-// VPN Health orchestration: the compact health panel, the four essential signals,
-// the Advanced Diagnostics disclosure and the per-route pressure table.
-// Extracted from web/templates/vpn.html per #496 (Epic #475 Phase 3), and reduced
-// to a problem-first surface for #955.
+// VPN diagnostics health: the compact health panel, the Advanced Diagnostics
+// disclosure and the per-route pressure table. Extracted from vpn.html per #496
+// (Epic #475 Phase 3) and reduced to a problem-first surface for #955.
+//
+// The overview's four signals and the formatters shared with it live in
+// common.js and overview.js. This module is loaded only on the diagnostics page.
 
 // vpnDiagnosticsOpen records whether the operator opened Advanced Diagnostics.
 // It is owned by user intent alone: polling, a new problem or a severity
@@ -9,15 +11,9 @@
 // exactly the behaviour #955 removes.
 let vpnDiagnosticsOpen = false;
 
-// vpnAssignText writes text only when it actually changes. The health summary is
-// a polite atomic live region, so re-assigning identical text on every 5s poll
-// would re-announce an unchanged status to a screen reader.
-function vpnAssignText(el, text) {
-    if (!el) return;
-    const next = String(text === null || typeof text === 'undefined' ? '' : text);
-    if (el.textContent === next) return;
-    el.textContent = next;
-}
+// vpnLastStatus is the last successful status payload. Declared here because the
+// health renderer owns it on this page.
+let vpnLastStatus = null;
 
 function vpnFormatHealthTime(val) {
     if (!val) return '';
@@ -34,59 +30,6 @@ function vpnFormatHealthTime(val) {
         return String(val);
     } catch (_) {
         return String(val);
-    }
-}
-
-// vpnSignalMeasured reports whether a numeric value is an actual measurement.
-// `undefined`/`null`/NaN/Infinity and an absent availability flag are NOT a
-// sample, and rendering them as 0 would assert a measurement nobody took.
-function vpnSignalMeasured(value) {
-    return typeof value === 'number' && Number.isFinite(value);
-}
-
-// vpnFormatHealthBps renders a byte-per-second rate with its unit, or returns
-// null when the payload carries no trustworthy rate.
-function vpnFormatHealthBps(bps) {
-    if (!vpnSignalMeasured(bps)) return null;
-    const b = bps;
-    // Bits per second, matching the diagnostics panel wording so the overview and
-    // the panel never describe the same number in different units.
-    if (b >= 1e9) return (b / 1e9).toFixed(2) + ' Gbps';
-    if (b >= 1e6) return (b / 1e6).toFixed(2) + ' Mbps';
-    if (b >= 1e3) return (b / 1e3).toFixed(2) + ' Kbps';
-    return b.toFixed(0) + ' bps';
-}
-
-// vpnFormatHealthPps renders an aggregate packet rate. A value that is not a
-// measurement returns null so the caller renders the not-measured state instead
-// of a number nobody sampled.
-function vpnFormatHealthPps(pps) {
-    if (!vpnSignalMeasured(pps)) return null;
-    if (pps >= 1e6) return (pps / 1e6).toFixed(2) + ' Mpps';
-    if (pps >= 1e3) return (pps / 1e3).toFixed(2) + ' Kpps';
-    return pps.toFixed(1) + ' pps';
-}
-
-// vpnFormatHealthDuration renders an ACCUMULATED duration, keeping the remainder
-// of each unit so a since-reset counter is not silently floored: 90s is "1m 30s",
-// not "1m". Distinct from vpnFormatHealthWindow, which renders a sample horizon.
-function vpnFormatHealthDuration(sec) {
-    const s = Math.max(0, Math.floor(Number(sec) || 0));
-    if (s < 60) return s + 's';
-    if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
-    return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
-}
-
-// vpnSetDiagnosticText is the single writer of a diagnostic row's value AND its
-// measured/unmeasured state. Writing both together is what stops a row from
-// showing a number while still carrying the not-measured marker, or the reverse.
-function vpnSetDiagnosticText(el, measured, text) {
-    if (!el) return;
-    el.textContent = text;
-    if (measured) {
-        el.classList.remove('vpn-not-measured');
-    } else {
-        el.classList.add('vpn-not-measured');
     }
 }
 
@@ -143,149 +86,6 @@ function vpnRenderStallsTotal(latency) {
     const ok = vpnSignalMeasured(latency.stalls);
     vpnSetDiagnosticText(document.getElementById('vpn-diag-write-stalls-total'), ok,
         ok ? String(latency.stalls) : _('vpn_diag_not_measured'));
-}
-
-// vpnSetSignalValue writes a measured value plus its unit, or the not-measured
-// text. A measured zero renders as a number with its unit; an unmeasured value
-// never becomes "0".
-function vpnSetSignalValue(id, value, unit) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = '';
-    // A null/undefined value is an ABSENT measurement, never a numeric zero.
-    if (value === null || typeof value === 'undefined') {
-        el.classList.add('vpn-not-measured');
-        el.textContent = _('vpn_diag_not_measured');
-        return;
-    }
-    el.classList.remove('vpn-not-measured');
-    const valueSpan = document.createElement('span');
-    valueSpan.className = 'font-mono';
-    valueSpan.textContent = String(value);
-    el.appendChild(valueSpan);
-    if (unit) {
-        const unitSpan = document.createElement('span');
-        unitSpan.className = 'vpn-signal-unit';
-        unitSpan.textContent = unit;
-        const separator = document.createTextNode(' ');
-        el.appendChild(separator);
-        el.appendChild(unitSpan);
-    }
-}
-
-function vpnSetSignalSub(id, text, isProblem) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    vpnAssignText(el, text || '');
-    if (isProblem) {
-        el.classList.add('vpn-signal-mismatch');
-    } else {
-        el.classList.remove('vpn-signal-mismatch');
-    }
-}
-
-// vpnRenderSignals renders the four essential signals. Configured peers,
-// synchronized peers and live sessions are separate facts: only the reported
-// active-session count feeds the Sessions signal, and a route mismatch appears
-// only when routing_consistency actually reports one.
-function vpnRenderSignals(status) {
-    const s = (status && typeof status === 'object') ? status : null;
-
-    // Backends: disabled inventory is never counted as failed, and when
-    // eligibility is unknown the enabled denominator is not invented.
-    const be = (s && s.backends) || {};
-    if (vpnSignalMeasured(be.healthy_count) && be.eligibility_known === true && vpnSignalMeasured(be.enabled_count)) {
-        vpnSetSignalValue('vpn-signal-backends-value', be.healthy_count, '/ ' + be.enabled_count);
-        vpnSetSignalSub('vpn-signal-backends-sub', _('vpn_signal_backends_enabled'), false);
-    } else if (vpnSignalMeasured(be.healthy_count) && vpnSignalMeasured(be.total_count)) {
-        vpnSetSignalValue('vpn-signal-backends-value', be.healthy_count, '/ ' + be.total_count);
-        vpnSetSignalSub('vpn-signal-backends-sub', _('vpn_signal_backends_total'), false);
-    } else {
-        vpnSetSignalValue('vpn-signal-backends-value', null);
-        vpnSetSignalSub('vpn-signal-backends-sub', _('vpn_diag_not_measured'), false);
-    }
-
-    // Sessions: the LIVE count only. connected_sessions is the reported live
-    // session count; routing_consistency.active_sessions_count is the routing
-    // view's count and is used only as a fallback when the live field is absent.
-    // Configured peers and synchronized peers are never substituted here.
-    const rcCounts = (s && s.routing_consistency) || {};
-    const sessions = (s && vpnSignalMeasured(s.connected_sessions)) ? s.connected_sessions
-        : (vpnSignalMeasured(rcCounts.active_sessions_count) ? rcCounts.active_sessions_count : null);
-    const sessionsEl = document.getElementById('vpn-sessions');
-    if (sessionsEl) {
-        vpnAssignText(sessionsEl, sessions === null ? _('vpn_diag_not_measured') : String(sessions));
-        if (sessions === null) {
-            sessionsEl.classList.add('vpn-not-measured');
-        } else {
-            sessionsEl.classList.remove('vpn-not-measured');
-        }
-    }
-    // A route mismatch is shown only when the payload reports one, never inferred
-    // from count equality.
-    const rc = (s && s.routing_consistency) || {};
-    const withoutRoute = Array.isArray(rc.sessions_without_route) ? rc.sessions_without_route.length : 0;
-    const mismatchEl = document.getElementById('vpn-session-mismatch');
-    if (mismatchEl) {
-        if (withoutRoute > 0) {
-            mismatchEl.hidden = false;
-            mismatchEl.textContent = vpnDiagText('vpn_signal_sessions_mismatch', {count:withoutRoute});
-        } else {
-            mismatchEl.hidden = true;
-            mismatchEl.textContent = '';
-        }
-    }
-
-    // Throughput: current rate, only when the rate payload says it is available.
-    const rates = (s && s.rates) || {};
-    const throughputTotalBps = (Number(rates.rx_bps) || 0) + (Number(rates.tx_bps) || 0);
-    const throughputValue = (rates.available === true) ? vpnFormatHealthBps(throughputTotalBps) : null;
-    const throughputEl = document.getElementById('vpn-signal-throughput-value');
-    if (throughputEl) {
-        throughputEl.textContent = '';
-        if (throughputValue === null) {
-            throughputEl.classList.add('vpn-not-measured');
-            throughputEl.textContent = _('vpn_diag_not_measured');
-        } else {
-            throughputEl.classList.remove('vpn-not-measured');
-            const parts = throughputValue.split(' ');
-            const num = document.createElement('span');
-            num.className = 'font-mono';
-            num.textContent = parts[0];
-            const unit = document.createElement('span');
-            unit.className = 'vpn-signal-unit';
-            unit.textContent = parts.slice(1).join(' ');
-            throughputEl.appendChild(num);
-            throughputEl.appendChild(document.createTextNode(' '));
-            throughputEl.appendChild(unit);
-        }
-    }
-    // The value cell already reads "Not measured" when the rate payload has no
-    // sample, so the supporting line only states the horizon when there IS one.
-    // A second "no samples" sentence would restate the same state in different
-    // words, which is why #955 does not carry a separate key for it.
-    vpnSetSignalSub('vpn-signal-throughput-sub',
-        throughputValue === null ? '' : _('vpn_signal_throughput_horizon'), false);
-
-    // Dataplane drops: the CURRENT rate and the since-reset total are separate
-    // facts with separate labels and units. Scoped to the dataplane, not
-    // end-to-end packet loss.
-    const dc = (s && s.drop_categories) || {};
-    const dropRate = (dc.rates_available === true && vpnSignalMeasured(dc.total_drop_rate_pps)) ? dc.total_drop_rate_pps : null;
-    const dropTotal = vpnSignalMeasured(dc.total_drops) ? dc.total_drops : null;
-    vpnSetSignalValue('vpn-signal-drops-value', dropRate === null ? null : dropRate.toFixed(2), dropRate === null ? '' : _('vpn_unit_dps'));
-    // The supporting line always states the dataplane scope, so the number cannot
-    // be read as end-to-end packet loss, and always separates the cumulative
-    // since-reset count from the current rate.
-    const dropSubParts = [];
-    if (dropTotal !== null) {
-        dropSubParts.push(vpnDiagText('vpn_signal_drops_since_reset', {count:dropTotal}));
-    }
-    // The value cell already reads "Not measured" when no rate sample exists, so
-    // this line does not restate it: it keeps the independently available
-    // since-reset total and the dataplane scope.
-    dropSubParts.push(_('vpn_dataplane_drops_scope'));
-    vpnSetSignalSub('vpn-signal-drops-sub', dropSubParts.join(' \u00b7 '), false);
 }
 
 // vpnSetDiagnosticsOpen is the ONLY writer of #vpn-diagnostics visibility. It is
@@ -632,7 +432,6 @@ function vpnRenderForwarderHealth(status) {
         vpnRenderHealthStatus(null, 0);
         vpnRenderActiveProblemsCards(null, {});
         vpnResetTechDiagnosticCards();
-        vpnRenderSignals(null);
         vpnRenderRestoredAggregates(null);
         vpnRenderRoutePressure(null, []);
 
@@ -676,6 +475,10 @@ function vpnRenderForwarderHealth(status) {
             if (typeof renderSessions === 'function') {
                 renderSessions(window.vpnLastSessions.sessions);
             }
+        } else if (typeof vpnRenderSessionsUnavailable === 'function') {
+            // A refused read with no earlier snapshot has nothing to render and must
+            // not leave the table on Loading: state the refusal instead.
+            vpnRenderSessionsUnavailable();
         }
 
         return isAvailable;
@@ -720,7 +523,7 @@ function vpnRenderForwarderHealth(status) {
         routeHasPressure: routeHasPressure
     });
     vpnRenderHealthStatus(status, typeof problemCount === 'number' ? problemCount : 0);
-    vpnRenderSignals(status);
+
     vpnRenderRestoredAggregates(status);
 
     // Delegate the technical detail panels and the historical charts. They live
@@ -749,6 +552,10 @@ function vpnRenderForwarderHealth(status) {
         if (typeof renderSessions === 'function') {
             renderSessions(window.vpnLastSessions.sessions);
         }
+    } else if (typeof vpnRenderSessionsUnavailable === 'function') {
+        // A refused read with no earlier snapshot has nothing to render and must not
+        // leave the table on Loading: state the refusal instead.
+        vpnRenderSessionsUnavailable();
     }
 
     return isAvailable;
@@ -756,14 +563,9 @@ function vpnRenderForwarderHealth(status) {
 
 if (typeof window !== 'undefined') {
     window.vpnRenderForwarderHealth = vpnRenderForwarderHealth;
-    window.vpnRenderSignals = vpnRenderSignals;
     window.vpnSetDiagnosticsOpen = vpnSetDiagnosticsOpen;
     window.vpnToggleDiagnostics = vpnToggleDiagnostics;
     window.vpnCloseDiagnostics = vpnCloseDiagnostics;
-    window.vpnFormatHealthBps = vpnFormatHealthBps;
-    window.vpnFormatHealthPps = vpnFormatHealthPps;
-    window.vpnFormatHealthDuration = vpnFormatHealthDuration;
-    window.vpnSetDiagnosticText = vpnSetDiagnosticText;
     window.vpnRenderRestoredAggregates = vpnRenderRestoredAggregates;
     window.vpnRenderPacketRate = vpnRenderPacketRate;
     window.vpnRenderMaxWriteMs = vpnRenderMaxWriteMs;

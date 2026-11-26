@@ -30,13 +30,6 @@ function vpnFormatPeerKey(key) {
     return key.slice(0, 8) + '...' + key.slice(-4);
 }
 
-function vpnDiagText(key, values) {
-    const parameters = values || {};
-    return _(key).replace(/\{([a-z0-9_]+)\}/g, function(match, name) {
-        return Object.prototype.hasOwnProperty.call(parameters, name) ? String(parameters[name]) : match;
-    });
-}
-
 function vpnLossReasonLabels() {
     return {
         backend_device_unattributed: 'vpn_diag_loss_backend_device_unattributed',
@@ -844,7 +837,6 @@ if (typeof window !== 'undefined') {
     window.vpnLastActiveProblemCount = vpnLastActiveProblemCount;
     window.vpnFormatTime = vpnFormatTime;
     window.vpnFormatPeerKey = vpnFormatPeerKey;
-    window.vpnDiagText = vpnDiagText;
     window.vpnLossReasonLabels = vpnLossReasonLabels;
     window.parseConditionMessage = parseConditionMessage;
     window.deriveStableConditionCode = deriveStableConditionCode;

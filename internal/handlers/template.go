@@ -110,6 +110,8 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"leaderboard.html",
 		"user_share.html",
 		"vpn.html",
+		"vpn_backends.html",
+		"vpn_diagnostics.html",
 	}
 
 	// layoutPartials are template files that only define a section included by a layout

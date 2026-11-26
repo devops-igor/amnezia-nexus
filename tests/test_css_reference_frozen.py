@@ -146,10 +146,24 @@ def test_legacy_view_sets_aside_the_surface_without_losing_a_legacy_selector() -
         css_surface.individual_selectors(view["vpn"])
     )
     assert css_surface.SETTINGS_UTILITY_SELECTORS <= removed_vpn
-    # Sheets that define no new-surface class are compared byte for byte, so
-    # their rules are not merely present but unmodified.
-    assert all(view[name] == sheets[name] for name in view if name != "vpn")
-    assert "vpn" in view and view["vpn"] != sheets["vpn"]
+    # A sheet is rewritten if and only if it holds a selector using a new-surface
+    # class: every other sheet is compared byte for byte, so its rules are not
+    # merely present but unmodified. The expectation is derived from the sheets
+    # rather than from a list of names, so a sheet that gains a new-surface class
+    # is set aside visibly, and a legacy-only sheet cannot drift into being set
+    # aside without a rule being removed and reported above.
+    rewritten = {
+        name
+        for name, css in sheets.items()
+        if name != "settings"
+        and any(
+            set(css_surface._CLASS_RE.findall(selector)) & css_surface.SURFACE_CLASSES
+            for selector in css_surface.individual_selectors(css)
+        )
+    }
+    assert rewritten == {"vpn", "layout"}, f"sheets set aside: {sorted(rewritten)}"
+    for name in view:
+        assert (view[name] != sheets[name]) is (name in rewritten), name
 
 
 def test_a_selector_shared_with_a_new_class_keeps_its_legacy_half() -> None:

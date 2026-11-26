@@ -10,9 +10,9 @@ import (
 )
 
 func TestVPNHistoryChartLatencyAvailability(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
-	script := fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + `
+	script := fixture.TranslationsJS("en") + "\n" + fixture.CommonJS + "\n" + fixture.HealthProblemsJS + `
 const assert = require('assert');
 const chart = {innerHTML:''};
 const document = {getElementById:id => id === 'vpn-chart-latency' ? chart : null};
@@ -42,7 +42,7 @@ assert(chart.innerHTML.includes('No data'), 'missing observation count is unavai
 }
 
 func TestVPNCompleteRouteTooltipContract(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
 
 	// Marshal the production schema: a newly populated field cannot silently
@@ -62,7 +62,7 @@ func TestVPNCompleteRouteTooltipContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
+	script := "const route = " + string(encoded) + ";\n" + vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.CommonJS + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,problem_routes:[route]});
 const renderedRouteCells = document.getElementById('vpn-fwd-routes-tbody').children[0].children;
 assert.strictEqual(renderedRouteCells[0].style.whiteSpace, 'nowrap', 'peer cell must have white-space: nowrap');
@@ -132,7 +132,7 @@ assert(unknown.includes('Last traffic age (s): Unavailable'));
 }
 
 func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
 	data := fixture.TemplateHTML
 	for _, id := range []string{"throughput", "queue", "drops", "latency", "reasons", "backends"} {
@@ -140,7 +140,7 @@ func TestVPNCompleteHistoryAllWindowRenderers(t *testing.T) {
 			t.Fatalf("missing history chart %s", id)
 		}
 	}
-	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS + `
+	script := vpnDOMMock(t, data) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.CommonJS + "\n" + fixture.HealthProblemsJS + "\n" + fixture.ChartsJS + `
 const originalSparkline = vpnGenerateSparklineSVG;
 const seen=[];
 vpnGenerateSparklineSVG = (values,...args) => {seen.push(values);return originalSparkline(values,...args);};
@@ -223,7 +223,7 @@ assert(document.getElementById('vpn-history-fleet-note').textContent.includes('5
 // empty is what makes this regression meaningful. Starting from empty
 // containers would prove nothing.
 func TestVPNUnavailableForwarderClearsStaleHistoryState(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
 
 	for _, id := range []string{
@@ -276,7 +276,6 @@ vpnRenderForwarderHealth({forwarder_available:true,forwarder_queue_capacity:100,
 // have nothing to resurrect and the cache-clearing guard would go untested.
 assert(vpnLastStatus&&vpnLastStatus.historical_series,'available poll must cache its series');
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent,_('vpn_forwarder_healthy'),'available poll must render Healthy');
-assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(),'1.00 Mbps','available poll must render the current throughput rate');
 for (const id of SVG_CHARTS) {
  assert(document.getElementById(id).innerHTML.includes('<svg'),'seed must render SVG in '+id);
 }
@@ -313,11 +312,6 @@ for (const id of SVG_CHARTS.concat(SERIES_CHARTS).concat(['vpn-diag-be-traffic',
  assert(!el.innerHTML.includes('<path'),'unavailable state must not invent curves in '+id);
  assert(!el.innerHTML.includes('<circle'),'unavailable state must not invent points in '+id);
 }
-// #955 replaced the eight KPI tiles with four overview signals.
-const ALL_SIGNALS = [
- 'vpn-signal-backends-value', 'vpn-sessions',
- 'vpn-signal-throughput-value', 'vpn-signal-drops-value'
-];
 const DETAIL_PANEL_IDS = [
  'vpn-diag-throughput', 'vpn-diag-ewma5m', 'vpn-diag-ewma1h',
  'vpn-diag-queue-occ', 'vpn-diag-queue-peak',
@@ -335,9 +329,6 @@ function assertAllSurfacesCleared(context) {
  assert.strictEqual(problemList.textContent, '', context + ': problem list text');
  assert.strictEqual(problemList.hidden, true, context + ': problem list hidden');
 
- for (const id of ALL_SIGNALS) {
-  assert.strictEqual(document.getElementById(id).textContent, _('vpn_diag_not_measured'), context + ': signal ' + id);
- }
  for (const id of DETAIL_PANEL_IDS) {
   const expected = id === 'vpn-diag-lat-percentiles' ? _('vpn_diag_not_measured') : '-';
   assert.strictEqual(document.getElementById(id).textContent, expected, context + ': detail elem ' + id);
@@ -408,7 +399,6 @@ const freshAvailableStatus = {
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert(vpnLastStatus && vpnLastStatus.historical_series, 'fresh poll must cache status');
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'fresh poll restores Healthy');
-assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(), '2.00 Mbps', 'fresh poll restores throughput');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'fresh poll restores backend rows');
 for (const id of SVG_CHARTS) assert(document.getElementById(id).innerHTML.includes('<svg'), 'fresh poll restores SVG in ' + id);
 for (const id of SERIES_CHARTS) assert(document.getElementById(id).children.length > 0, 'fresh poll restores series in ' + id);
@@ -430,7 +420,6 @@ assertAllSurfacesCleared('after null window 15m');
 // Recovery from null status when live poll succeeds
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'recovery after null poll');
-assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent.replace(/\s+/g,' ').trim(), '2.00 Mbps', 'recovery throughput after null poll');
 assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.length, 1, 'recovery backend rows after null poll');
 
 `
@@ -444,7 +433,7 @@ assert.strictEqual(document.getElementById('vpn-diag-be-traffic').children.lengt
 }
 
 func TestVPNPanelRateAvailability(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
 	assertions := `
 // 1. Both rate flags false: detail panels must show explicit unavailable text, NOT measured zero.
@@ -455,13 +444,10 @@ vpnRenderForwarderHealth({
 	drop_categories: { rates_available: false, client_drop_rate_pps: 0, client_total_drops: 12, return_drop_rate_pps: 0, return_total_drops: 34, total_drop_rate_pps: 0, total_drops: 46 }
 });
 
-assert.strictEqual(document.getElementById('vpn-signal-throughput-value').textContent, 'Not measured', 'unmeasured throughput is text, not a numeric zero');
 assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, 'Traffic unavailable', 'detail throughput must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-ewma5m').textContent, 'Traffic unavailable', 'detail ewma5m must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-ewma1h').textContent, 'Traffic unavailable', 'detail ewma1h must be unavailable');
 
-assert.strictEqual(document.getElementById('vpn-signal-drops-value').textContent, 'Not measured', 'unmeasured drop rate is text, not a numeric zero');
-assert(document.getElementById('vpn-signal-drops-sub').textContent.includes('46 drops since reset'), 'the cumulative total is still reported');
 assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, 'Loss rate unavailable (12 cumulative)', 'detail client drops must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, 'Loss rate unavailable (34 cumulative)', 'detail return drops must be unavailable');
 assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, 'Loss rate unavailable (46 cumulative)', 'detail total drops must be unavailable');
@@ -480,8 +466,6 @@ assert.strictEqual(document.getElementById('vpn-diag-throughput').textContent, '
 assert.strictEqual(document.getElementById('vpn-diag-drops-client').textContent, '0.00 pps (5 cumulative)', 'available zero client loss must show measured rate');
 assert.strictEqual(document.getElementById('vpn-diag-drops-return').textContent, '0.00 pps (2 cumulative)', 'available zero return loss must show measured rate');
 assert.strictEqual(document.getElementById('vpn-diag-drops-total').textContent, '0.00 pps (7 cumulative)', 'available zero total loss must show measured rate');
-assert.strictEqual(document.getElementById('vpn-signal-drops-value').textContent.replace(/\s+/g,' ').trim(), '0.00 drops/s', 'a sampled zero rate stays numeric');
-assert(document.getElementById('vpn-signal-drops-sub').textContent.includes('7 drops since reset'));
 
 // 3. Independent flags: Traffic available (legitimate idle zero), Loss unavailable.
 vpnRenderForwarderHealth({
@@ -541,7 +525,7 @@ assert.strictEqual(document.getElementById('vpn-diag-drops-client').style.color,
 }
 
 func TestVPNHorizonWindowToggles(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
 
@@ -650,7 +634,7 @@ assert.deepStrictEqual(seen[0], [31000], 'restoring 15m restores its own series'
 }
 
 func TestVPNHistoricalChartsHoverPreservedAcrossRerender(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{

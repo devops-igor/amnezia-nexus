@@ -23,7 +23,7 @@ const UI = { escapeHtml: escapeHtml };
 }
 
 func TestVPNConnectionTroubleshootingTableAndCorrelation(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
 
@@ -486,7 +486,6 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 	for _, expectedRussianHeader := range []string{
 		"Пользователь и устройство",
 		"Текущий трафик",
-		"Сбросы dataplane",
 		"Диагностика подключений",
 		"Только с проблемами",
 	} {
@@ -497,7 +496,7 @@ assert(drilldown1.textContent.includes('Телеметрия маршрута ф
 }
 
 func TestVPNReconnectSessionIDMismatchShowsUnroutable(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 
 	assertions := `
@@ -580,7 +579,7 @@ assert(probRow.children[4].textContent.includes('Unroutable'), 'session in Probl
 }
 
 func TestVPNNexusTableLifecycleDrilldownAndConfigDedup(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
 	sessionsJS := fixture.SessionsJS
@@ -748,7 +747,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS, fixture.PageJS)
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.CommonJS, fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.PageJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {

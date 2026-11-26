@@ -34,8 +34,9 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 }
 
 // DeliveredAssets are the /static paths this branch replaced in place: the two
-// policy readout modules, the server page's tab controller, the six VPN modules,
-// the stylesheet every shell links and the table engine the VPN page's reveal
+// policy readout modules, the server page's tab controller, the VPN page modules
+// (the split produced four new ones and retired the single page controller), the
+// stylesheet every shell links and the table engine the VPN page's reveal
 // depends on. The release
 // version did not move with them, so ?v=<release> is exactly the URL their
 // predecessor served and a returning browser keeps the old bytes. Each one
@@ -53,6 +54,7 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 // VPN-only guard. A delivery that changes another shipped asset adds it here and
 // the checks that consume this list cover it without further edits.
 var DeliveredAssets = []string{
+	"/static/css/layout.css",
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
 	"/static/js/policy_panels.js",
@@ -61,12 +63,17 @@ var DeliveredAssets = []string{
 	"/static/js/server_telemetry.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",
+	"/static/js/ui.js",
+	"/static/js/vpn/anchor_handoff.js",
 	"/static/js/vpn/backends.js",
+	"/static/js/vpn/backends_page.js",
+	"/static/js/vpn/charts.js",
+	"/static/js/vpn/common.js",
+	"/static/js/vpn/diagnostics_page.js",
 	"/static/js/vpn/health_problems.js",
 	"/static/js/vpn/health_summary.js",
-	"/static/js/vpn/charts.js",
+	"/static/js/vpn/overview.js",
 	"/static/js/vpn/sessions.js",
-	"/static/js/vpn/page.js",
 }
 
 // AssetURL returns the URL a template emits for one asset of this build: the
