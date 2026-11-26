@@ -80,7 +80,7 @@ async function vpnLoadBackends() {
     let backendData;
     try {
         backendData = await API.get('/api/vpn/backends');
-    } catch (_) {
+    } catch (err) {
         vpnRenderBackendsError(_('error'));
         return null;
     }

@@ -103,9 +103,13 @@ VPN_SURFACE_CLASSES = frozenset({
 # controls a page renders, which the reference predates. `nav-tab` is here for the
 # same reason: the server page declares it in a template style block, so the
 # frozen reference has never known it, and the page-content scale names it.
+# `nav-group` is the sidebar's labelled group: the reference predates it, and the
+# rule that lays the group out lives in the shell's own layout sheet, so it is a
+# page-shell class rather than one of the VPN page's own.
 PORTAL_SURFACE_CLASSES = frozenset({
     "portal-page",
     "nav-tab",
+    "nav-group",
 })
 
 # Every class newly introduced beyond the frozen reference, whichever sheet holds
