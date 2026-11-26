@@ -31,7 +31,7 @@ func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
  w.UI.toast = () => {};
  let rows = [{id: 77, server_id: 2, enabled: true, status: 'active'}];
  let posts = 0, reads = 0, reject = false;
- w.API = { get: async () => { reads++; return {backends: rows}; }, post: async () => { posts++; if (reject) throw Error('refused'); rows = []; } };
+ w.API = { get: async () => { reads++; return {backends: rows}; }, post: async url => { posts++; if (reject) throw Error('refused'); rows = url.endsWith('/disable') ? [{id: 77, server_id: 2, enabled: false, status: 'active'}] : []; } };
  for (const action of ['delete', 'disable']) {
    rows = [{id: 77, server_id: 2, enabled: true, status: 'active'}];
    await w.vpnLoadBackends();
@@ -48,7 +48,10 @@ func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
    assert.strictEqual(reads, before + 1, 'success really refreshed the owner');
    assert.strictEqual(opener.isConnected, false, 'refresh replaced the activated row');
    assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'success keeps terminal owner focus');
+   if (action === 'disable') assert(d.querySelector('[data-backend-action="enable"]'), 'Disable refresh renders the now-disabled backend');
  }
+ rows = [];
+ await w.vpnLoadBackends();
  const cta = d.querySelector('#vpn-backends-tbody [data-action="vpn-open-add-backend"]');
  cta.focus();
  w.openModal('addBackendModal');
