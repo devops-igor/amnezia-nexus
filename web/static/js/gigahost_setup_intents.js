@@ -18,6 +18,15 @@
  * The key is the order id, so acting on one order never blocks another. */
 const setupIntentsInFlight = new Set();
 
+/* SETUP_INTENTS_MOVING_REFRESH_MS is the pace at which a job the panel is still
+ * provisioning is followed. SETUP_INTENTS_PRESENCE_REFRESH_MS is the pace at which a
+ * job whose row still offers a contact action is re-observed: the mark that the
+ * provider no longer lists its server is written by the panel's own inventory pass,
+ * which runs on a schedule of its own, so this waits for an observation that has had
+ * time to arrive instead of re-reading a settled list every few seconds. */
+const SETUP_INTENTS_MOVING_REFRESH_MS = 4000;
+const SETUP_INTENTS_PRESENCE_REFRESH_MS = 30000;
+
 /* withSetupIntentAction runs one action for one order under that guard.
  *
  * It returns false when an action for the same order was already in flight, so a
@@ -326,14 +335,53 @@ function setupIntentActions(i) {
 
 /* scheduleSetupIntentsPolling refreshes while any job is still moving, so the
  * view follows provisioning and installation without the browser that started
- * it. A settled list is not polled. */
+ * it. A settled list is not polled.
+ *
+ * A job that still offers an action ending in a connection to its server is
+ * polled too, at the pace of a durable observation rather than of provisioning:
+ * the panel records that the provider's inventory no longer lists that server
+ * from another surface, on its own schedule, so a list that stopped reading
+ * after the first render kept offering Resume for a server already known to be
+ * gone until the operator reloaded the page. One timer owns that refresh, it is
+ * armed only while such a row is still shown, and it stops as soon as none is
+ * left, so a list with nothing actionable left is not polled at all. */
 function scheduleSetupIntentsPolling(intents) {
+    if (window.setupIntentsPollTimer) return;
     const moving = intents.some(i => i.state === 'pending' || i.state === 'installing');
-    if (!moving || window.setupIntentsPollTimer) return;
+    const contactable = intents.some(setupIntentsContactable);
+    if (!moving && !contactable) return;
+    bindSetupIntentsLifecycle();
+    const delay = moving ? SETUP_INTENTS_MOVING_REFRESH_MS : SETUP_INTENTS_PRESENCE_REFRESH_MS;
     window.setupIntentsPollTimer = setTimeout(() => {
         window.setupIntentsPollTimer = null;
         loadSetupIntents();
-    }, 4000);
+    }, delay);
+}
+
+/* setupIntentsContactable reports whether a saved job offers an action that ends
+ * in a connection to the server it registered, which is the state a fresh
+ * observation can change. Revocation is deliberately not one of them: it is a
+ * local decision about the panel's own approval and contacts nothing. */
+function setupIntentsContactable(i) {
+    if (!i || setupIntentProviderAbsent(i)) return false;
+    if (i.state === 'install_paused' || i.state === 'awaiting_credentials') return true;
+    return i.state === 'awaiting_host_confirmation' && !!setupIntentDisplayedIdentity(i);
+}
+
+/* stopSetupIntentsPolling clears the view's refresh, so a settled list stops
+ * asking and a closed page leaves no timer behind. */
+function stopSetupIntentsPolling() {
+    if (!window.setupIntentsPollTimer) return;
+    clearTimeout(window.setupIntentsPollTimer);
+    window.setupIntentsPollTimer = null;
+}
+
+/* bindSetupIntentsLifecycle stops the refresh when the page goes away. It is
+ * bound once, by the load that arms the first timer. */
+function bindSetupIntentsLifecycle() {
+    if (window.setupIntentsLifecycleBound || typeof window === 'undefined' || !window.addEventListener) return;
+    window.addEventListener('pagehide', stopSetupIntentsPolling);
+    window.setupIntentsLifecycleBound = true;
 }
 
 /* cancelSetupIntent revokes an approval. The confirmation is explicit because
