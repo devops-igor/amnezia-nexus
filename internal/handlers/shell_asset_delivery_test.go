@@ -67,6 +67,26 @@ var untouchedBareShellAssets = []string{
 	"/static/js/users.js",
 }
 
+// preExistingContentIdentifiedShellAssets are /static scripts a shipped shell
+// already requests under their own content address although this delivery did
+// not change them: their identity was adopted by a delivery that is already on
+// main. They are named because the enumeration cannot tell "registered by this
+// delivery" from "registered by an earlier one" — the URL it reads is the same
+// digest form either way, and history is not available to a test.
+//
+// The entry exists so the reverse rule below stays strict rather than being
+// turned off: every other undeclared asset a shell asks for under its own
+// digest is still reported, which is the state a withdrawn registration leaves
+// behind. It is not a permission to serve these paths bare or at the release
+// version; only the reverse rule consults it. Each entry must be observed under
+// its digest in a real render, and an asset that joins web.DeliveredAssets has
+// to be removed here, because the two lists give opposite answers.
+var preExistingContentIdentifiedShellAssets = []string{
+	// The routing page's diagnosis controller: asset_url was adopted for it by
+	// the delivery that moved the policy surface onto that page.
+	"/static/js/policy_client_diag.js",
+}
+
 // shellRenderContexts are the sessions every shell is rendered with. A block
 // gated on a role could hold the only reference to an asset, so rendering only
 // one context would leave that reference unchecked.
@@ -82,18 +102,28 @@ var shellRenderContexts = []struct {
 	}},
 }
 
+// shippedAssetDigestOf returns the digest of the bytes this build embeds for
+// path, or the error that prevented reading them.
+func shippedAssetDigestOf(path string) (string, error) {
+	body, err := web.StaticFS.ReadFile(strings.TrimPrefix(path, "/"))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // shippedAssetDigest is the query a URL for path must carry: the SHA-256 of the
 // bytes this build embeds for it, in hex. It is computed here from the shipped
 // bytes rather than read back from the helper, so a helper that returned a
 // constant could not satisfy it.
 func shippedAssetDigest(t *testing.T, path string) string {
 	t.Helper()
-	body, err := web.StaticFS.ReadFile(strings.TrimPrefix(path, "/"))
+	digest, err := shippedAssetDigestOf(path)
 	if err != nil {
 		t.Fatalf("read the delivered asset %s: %v", path, err)
 	}
-	sum := sha256.Sum256(body)
-	return hex.EncodeToString(sum[:])
+	return digest
 }
 
 // renderEveryShippedShell renders every shell the production template engine
@@ -138,11 +168,26 @@ func renderEveryShippedShell(t *testing.T) map[string]map[string]string {
 	return rendered
 }
 
+// contentAddressed reports whether url requests path under the digest of the
+// bytes this build ships for it — the one identity form only asset_url emits. A
+// path this build does not embed cannot be content-addressed, so the comparison
+// is simply false rather than an error: an asset_url argument naming nothing is
+// a different defect.
+func contentAddressed(url, path string) bool {
+	digest, err := shippedAssetDigestOf(path)
+	if err != nil {
+		return false
+	}
+	return url == path+"?v="+digest
+}
+
 // shellAssetFindings reports every script or stylesheet reference in one rendered
 // shell that breaks the delivery contract: a changed asset requested at anything
-// other than the digest of its bytes, or a bare reference to an asset no one has
-// declared untouched. The enumeration and its control both judge a render with
-// this one rule, so the control proves the rule rather than a second copy of it.
+// other than the digest of its bytes, a reference to an undeclared asset that is
+// requested at that asset's own digest, or a bare reference to an asset no one
+// has declared untouched. The enumeration and its control both judge a render
+// with this one rule, so the control proves the rule rather than a second copy of
+// it.
 func shellAssetFindings(t *testing.T, shell, markup string) []string {
 	t.Helper()
 	links := collectShellLinks(t, markup)
@@ -160,7 +205,23 @@ func shellAssetFindings(t *testing.T, shell, markup string) []string {
 			continue
 		}
 		if hasQuery {
-			// An unchanged asset keeps whatever identity it already carries.
+			// An unchanged asset keeps whatever identity it already carries —
+			// except the one identity only asset_url emits. A reference whose
+			// query is the digest of that asset's own bytes says the asset's
+			// bytes moved with a delivery, so the asset belongs in
+			// web.DeliveredAssets; if it is not there, the registration was
+			// withdrawn (or never made) while the shell still asks for it under
+			// its content address, and every other check in this file reads the
+			// list rather than the URL and would accept it silently. The paths
+			// whose identity an earlier delivery registered are the one thing
+			// this build cannot attribute, so they are named instead.
+			if contentAddressed(url, path) && !slices.Contains(preExistingContentIdentifiedShellAssets, path) {
+				findings = append(findings, shell+": "+path+" is requested under the digest of its "+
+					"own bytes, but web.DeliveredAssets does not name it; a shell asks for that "+
+					"form only for an asset this delivery changed, so either the asset belongs "+
+					"in web.DeliveredAssets and must be enumerated, or the reference has to go "+
+					"back to its predecessor form")
+			}
 			continue
 		}
 		if slices.Contains(untouchedBareShellAssets, path) {
@@ -180,14 +241,26 @@ func quoteURL(url string) string {
 }
 
 // requireDisjointAssetLists stops one asset from being both changed and
-// untouched. The two lists answer different questions; an entry in both would be
-// exempted by whichever branch the findings rule happened to read first.
+// untouched, or from carrying two different answers about its identity. The three
+// lists answer different questions; an entry in more than one would be exempted
+// by whichever branch the findings rule happened to read first.
 func requireDisjointAssetLists(t *testing.T) {
 	t.Helper()
 	for _, path := range untouchedBareShellAssets {
 		if slices.Contains(web.DeliveredAssets, path) {
 			t.Fatalf("%s is listed both as untouched and as changed by this delivery; one of the two "+
 				"lists is wrong and the enumeration would answer from whichever it reads first", path)
+		}
+	}
+	for _, path := range preExistingContentIdentifiedShellAssets {
+		if slices.Contains(web.DeliveredAssets, path) {
+			t.Fatalf("%s is listed both as changed by this delivery and as carrying an earlier "+
+				"delivery's content identity; one of the two lists is wrong, and the reverse rule "+
+				"would read whichever it consults first", path)
+		}
+		if slices.Contains(untouchedBareShellAssets, path) {
+			t.Fatalf("%s is listed both as untouched-and-bare and as content-identified by an "+
+				"earlier delivery; the two entries contradict each other", path)
 		}
 	}
 }
@@ -199,6 +272,9 @@ type shellAssetEvidence struct {
 	referenced map[string][]string
 	// observedBare is the set of /static paths some shell requests with no query.
 	observedBare map[string]bool
+	// observedContentAddressed is the set of /static paths some shell requests
+	// under the digest of their own bytes.
+	observedContentAddressed map[string]bool
 	// checked counts the asset references examined.
 	checked int
 }
@@ -208,7 +284,11 @@ type shellAssetEvidence struct {
 // that breaks the delivery rule through the one rule function.
 func collectShellAssetEvidence(t *testing.T, rendered map[string]map[string]string) shellAssetEvidence {
 	t.Helper()
-	ev := shellAssetEvidence{referenced: map[string][]string{}, observedBare: map[string]bool{}}
+	ev := shellAssetEvidence{
+		referenced:               map[string][]string{},
+		observedBare:             map[string]bool{},
+		observedContentAddressed: map[string]bool{},
+	}
 	for shell, contexts := range rendered {
 		if len(contexts) != len(shellRenderContexts) {
 			t.Fatalf("%s was rendered %d time(s), want %d", shell, len(contexts), len(shellRenderContexts))
@@ -220,6 +300,8 @@ func collectShellAssetEvidence(t *testing.T, rendered map[string]map[string]stri
 				path, _, hasQuery := strings.Cut(url, "?")
 				if !hasQuery {
 					ev.observedBare[path] = true
+				} else if contentAddressed(url, path) {
+					ev.observedContentAddressed[path] = true
 				}
 				if slices.Contains(web.DeliveredAssets, path) && !slices.Contains(ev.referenced[path], shell) {
 					ev.referenced[path] = append(ev.referenced[path], shell)
@@ -376,6 +458,17 @@ func TestEveryShippedShellRequestsDeliveredAssetsUnderTheirBytes(t *testing.T) {
 		if !ev.observedBare[path] {
 			t.Errorf("%s is declared untouched but no rendered shell requests it without a cache "+
 				"identity; the entry grants a standing exemption to a reference that no longer exists", path)
+		}
+	}
+
+	// The pre-existing identity list names paths whose digest form this delivery
+	// cannot take credit for. An entry no shell requests under its digest any more
+	// would exempt nothing and would outlive the reference it was reviewed for.
+	for _, path := range preExistingContentIdentifiedShellAssets {
+		if !ev.observedContentAddressed[path] {
+			t.Errorf("%s is declared as carrying an earlier delivery's content identity, but no "+
+				"rendered shell requests it under the digest of its bytes; the entry no longer "+
+				"describes a shipped reference", path)
 		}
 	}
 
@@ -560,6 +653,74 @@ func TestShellAssetEnumerationRejectsABareOrReleaseVersionedDeliveredAsset(t *te
 		if !strings.Contains(strings.Join(findings, "\n"), changed) {
 			t.Fatalf("the finding for the %s form does not name %s: %v", name, changed, findings)
 		}
+	}
+}
+
+// TestShellAssetEnumerationRejectsAnUndeclaredAssetAtItsOwnDigest is the control
+// for the reverse direction of the rule, and it works on a real render: it moves
+// one asset this delivery did not change onto its own content address, which is
+// the reference state a withdrawn registration leaves behind. Every other check in
+// this file reads web.DeliveredAssets rather than the URL, so without this control
+// the reverse rule could be green because it never looks at a reference whose
+// asset the list has lost.
+//
+// The negative half matters as much: the same reference at the release version is
+// still accepted, so the rule rejects the content address of an undeclared asset
+// rather than every query, and an unchanged asset keeps the identity it carries.
+func TestShellAssetEnumerationRejectsAnUndeclaredAssetAtItsOwnDigest(t *testing.T) {
+	const undeclared = "/static/js/ui.js"
+
+	rendered := renderEveryShippedShell(t)["base.html"]["admin"]
+	if rendered == "" {
+		t.Fatal("base.html was not rendered, so this control has nothing to mutate")
+	}
+	if slices.Contains(web.DeliveredAssets, undeclared) {
+		t.Fatalf("%s is listed as changed by this delivery, so it cannot stand in for an "+
+			"undeclared asset", undeclared)
+	}
+	bare := urlForAsset(t, rendered, undeclared)
+	if bare != undeclared {
+		t.Fatalf("base.html requests %s at %q, so it is not the bare reference this control "+
+			"rewrites", undeclared, bare)
+	}
+
+	// Positive control: the unmutated render is accepted, so a rejection below is
+	// attributable to the mutation rather than to the rule failing always.
+	if findings := shellAssetFindings(t, "base.html", rendered); len(findings) != 0 {
+		t.Fatalf("the shipped render is reported as broken, so the control below would prove "+
+			"nothing: %v", findings)
+	}
+
+	digestRef := `src="` + undeclared + "?v=" + shippedAssetDigest(t, undeclared) + `"`
+	mutated := strings.Replace(rendered, `src="`+bare+`"`, digestRef, 1)
+	if mutated == rendered {
+		t.Fatalf("could not move %s onto its own content address; the control would pass without "+
+			"exercising the rule", undeclared)
+	}
+	findings := shellAssetFindings(t, "base.html", mutated)
+	if len(findings) == 0 {
+		t.Fatalf("an undeclared asset requested under the digest of its own bytes was accepted; " +
+			"withdrawing a registration from web.DeliveredAssets would go unnoticed")
+	}
+	if !strings.Contains(strings.Join(findings, "\n"), undeclared) {
+		t.Fatalf("the finding does not name %s: %v", undeclared, findings)
+	}
+
+	// Negative control: the identity an unchanged asset legitimately keeps is not
+	// what the reverse rule rejects.
+	releaseRef := `src="` + undeclared + "?v=" + config.AppVersion + `"`
+	if releaseRef == digestRef {
+		t.Fatalf("%s at the release version is also its digest form, so this negative control "+
+			"cannot tell the two rules apart", undeclared)
+	}
+	atRelease := strings.Replace(rendered, `src="`+bare+`"`, releaseRef, 1)
+	if atRelease == rendered {
+		t.Fatal("could not rewrite the reference to the release version; the control would prove " +
+			"nothing")
+	}
+	if findings := shellAssetFindings(t, "base.html", atRelease); len(findings) != 0 {
+		t.Fatalf("an unchanged asset at the release version was reported, so the reverse rule "+
+			"rejects every query rather than the content address of an undeclared asset: %v", findings)
 	}
 }
 
