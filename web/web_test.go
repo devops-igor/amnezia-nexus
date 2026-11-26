@@ -107,7 +107,6 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 	baseStr := string(baseData)
 	requiredIntegrations := []string{
 		"src=\"/static/js/api.js",
-		"src=\"/static/js/ui.js\"",
 		"id=\"nexusConfirmModal\"",
 		"id=\"nexusConfirmTitle\"",
 		"id=\"nexusConfirmBody\"",
@@ -118,6 +117,23 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 		if !strings.Contains(baseStr, item) {
 			t.Errorf("base.html missing required component integration %q", item)
 		}
+	}
+
+	// The shell must load UI under the identity of its delivered bytes, not
+	// the retired bare URL. Check the real render rather than template syntax.
+	rendered := renderFileWith(t, "base.html", getVPNFuncMap())
+	wantUI := "/static/js/ui.js?v=" + deliveredAssetDigest(t, "/static/js/ui.js")
+	uiReferences := 0
+	for _, src := range scriptSrcs(t, rendered) {
+		if path, _, _ := strings.Cut(src, "?"); path == "/static/js/ui.js" {
+			uiReferences++
+			if src != wantUI {
+				t.Errorf("base.html loads UI at %q, want %q", src, wantUI)
+			}
+		}
+	}
+	if uiReferences != 1 {
+		t.Errorf("base.html loads UI %d times, want exactly once", uiReferences)
 	}
 }
 

@@ -137,6 +137,11 @@ async function vpnLoadBackends() {
     const staleBanner = document.getElementById('vpnBackendsStaleBanner');
     if (staleBanner) staleBanner.remove();
 
+    const focused = document.activeElement;
+    const tbodyBefore = document.getElementById('vpn-backends-tbody');
+    const replacingFocus = tbodyBefore && tbodyBefore.contains(focused);
+    const focusFallback = replacingFocus && focused.closest('[data-action="vpn-open-add-backend"]')
+        ? 'vpn-add-backend-btn' : 'vpn-backends-title';
     if (!backends.length) {
         vpnRenderBackendsEmpty();
     } else {
@@ -148,6 +153,8 @@ async function vpnLoadBackends() {
         vpnEnsureBackendsTable();
         if (vpnTableInstance) vpnTableInstance.refresh();
     }
+
+    if (replacingFocus) vpnFocusIfFocusable(document.getElementById(focusFallback));
 
     if (!vpnBackendsAnchorApplied) {
         vpnBackendsAnchorApplied = true;
@@ -257,12 +264,15 @@ function vpnApplyBackendsLanding() {
     if (!id) return null;
     const el = document.getElementById(id);
     if (!el) return null;
-    vpnScrollToTarget(el);
-    if (!vpnFocusIfFocusable(el)) {
-        const heading = vpnNearestHeading(el, 'vpn-backends-title');
-        vpnFocusIfFocusable(heading);
-    }
-    return id;
+    // Dialog contents are never a landing target while the dialog is inactive.
+    // Resolve by ownership so every named child, including conditional controls,
+    // converges with legacy links on the permanent opener without opening it.
+    const modal = document.getElementById('addBackendModal');
+    const target = modal && modal.contains(el) ? document.getElementById('vpn-add-backend-btn') : el;
+    const focusTarget = vpnIsFocusable(target) ? target : vpnNearestHeading(target, 'vpn-backends-title');
+    vpnScrollToTarget(focusTarget);
+    vpnFocusIfFocusable(focusTarget);
+    return target.id;
 }
 
 // ---- Delegation ----

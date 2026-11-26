@@ -253,13 +253,12 @@ console.log('VPN955_02_STATE_OK');
 const assert = require('assert');
 const d = w.document;
 
-// Render a real session row through the shipped renderer; it carries the tabindex
-// the focus path depends on.
+// Seed the real cache: health and Inspect both render the table from this payload.
+w.vpnLastSessions = { sessions: [{ session_id: 'S-100', username: 'alice', status: 'active' }] };
+w.renderSessions(w.vpnLastSessions.sessions);
 const tbody = d.getElementById('vpn-sessions-tbody');
-tbody.textContent = '';
-const tr = w.vpnRenderSessionRow({ session_id: 'S-100', username: 'alice', status: 'active' });
-tbody.appendChild(tr);
-const cell = tr.querySelector('[data-action="vpn-toggle-session"]');
+let tr = w.vpnFindSessionRow('S-100');
+let cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert(cell, 'the rendered session row carries its action cell');
 assert.strictEqual(cell.getAttribute('tabindex'), '-1', 'the action cell is programmatically focusable');
 
@@ -280,7 +279,10 @@ const list = d.getElementById('vpn-fwd-problem-list');
 const action = list.children[0].children[1];
 action.click();
 
-// 1. Focus actually landed on the affected session's action cell.
+// 1. Reacquire the live row after the health renderer and Inspect replaced rows.
+tr = w.vpnFindSessionRow('S-100');
+assert(tr && tr.isConnected, 'the cached session has a current rendered row');
+cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert.strictEqual(d.activeElement, cell, 'Inspect moves focus to the affected session cell');
 assert.strictEqual(d.activeElement.getAttribute('data-session-id'), 'S-100', 'and to the reported session');
 
@@ -293,6 +295,8 @@ assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect mu
 // 3. A SECOND Inspect reveals rather than closes. Toggling would remove the detail
 // the operator is trying to read.
 action.click();
+tr = w.vpnFindSessionRow('S-100');
+cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert(tr.classList.contains('row-expanded'), 'a second Inspect keeps the drill-down open');
 assert(tbody.querySelector('.vpn-session-drilldown-row[data-parent-session-id="S-100"]'),
     'a second Inspect keeps the drill-down row present');
@@ -337,8 +341,10 @@ assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'diagnostic
 assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'rendering alone must not move focus');
 
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
-assert.strictEqual(w.vpnConsumeBackendHandoff(), '7', 'the handoff carries the backend tunnel id');
-assert.deepStrictEqual(w.__navDestinations, ['/vpn/backends#vpn-backends-title'], 'and goes to the inventory heading');
+assert.strictEqual(w.__navDestinations.length, 1, 'Inspect navigates exactly once');
+assert.match(w.__navDestinations[0], /^\/vpn\/backends#vpn-inspect-[A-Za-z0-9_-]+$/, 'the URL carries only the opaque arrival nonce');
+w.history.replaceState(null, '', w.__navDestinations[0]);
+assert.strictEqual(w.vpnConsumeBackendHandoff(), '7', 'the matching arrival carries the backend tunnel id');
 assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus stays on the diagnostics entry');
 assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect must NOT open diagnostics');
 console.log('VPN955_02_BACKEND_FOCUS_OK');
@@ -554,6 +560,20 @@ vpnRenderForwarderHealth({
 assert(el('vpn-diag-lat-percentiles').textContent.includes('0.0'), 'a sampled zero percentile is a measurement');
 console.log('VPN955_04_ZERO_OK');
 `, "VPN955_04_ZERO_OK")
+	})
+
+	t.Run("SmallPercentileRoundsToZeroButStaysMeasured", func(t *testing.T) {
+		runVPNHealthAcceptance(t, "en", `
+const el = id => document.getElementById(id);
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forward_latency: { p95_health_ms: 0.04, p95_health_samples: 5, p95_health_window_sec: 60 }
+});
+const text = el('vpn-diag-lat-percentiles').textContent;
+assert(text !== 'Not measured', 'a valid sample is measured even when it rounds to 0.0');
+assert(text.includes('0.0'), 'it renders the rounded numeric value: ' + text);
+console.log('VPN955_04_SMALL_OK');
+`, "VPN955_04_SMALL_OK")
 	})
 
 	t.Run("TwoLatencySeriesWithDifferentCoverage", func(t *testing.T) {
@@ -929,7 +949,10 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 	}
 	subjects := []subject{
 		{"vpn template", "templates/vpn.html", 600},
-		{"vpn stylesheet", "static/css/vpn.css", 1000},
+		// This stylesheet has an approved per-PR SG1 exception for the fragment
+		// landing rule. Pin that exact physical size: the exception allows no
+		// further growth; architecture_health checks the PR-level justification.
+		{"vpn stylesheet", "static/css/vpn.css", 1016},
 		{"health summary module", "static/js/vpn/health_summary.js", 1000},
 		{"health problems module", "static/js/vpn/health_problems.js", 1000},
 	}
@@ -942,7 +965,7 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 				if readErr != nil {
 					t.Fatalf("read %s: %v", s.path, readErr)
 				}
-				if lines := strings.Count(string(body), "\n") + 1; lines > s.maxLines {
+				if lines := strings.Count(strings.TrimSuffix(string(body), "\n"), "\n") + 1; lines > s.maxLines {
 					t.Errorf("%s is %d lines, over the %d ceiling", s.name, lines, s.maxLines)
 				}
 				continue
@@ -955,7 +978,7 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", s.path, err)
 		}
-		if lines := strings.Count(string(body), "\n") + 1; lines > s.maxLines {
+		if lines := strings.Count(strings.TrimSuffix(string(body), "\n"), "\n") + 1; lines > s.maxLines {
 			t.Errorf("%s is %d lines, over the %d ceiling", s.name, lines, s.maxLines)
 		}
 	}

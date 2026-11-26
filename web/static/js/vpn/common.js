@@ -176,16 +176,20 @@ function vpnNearestHeading(el, fallbackId) {
 }
 
 // The cross-document Inspect handoff: one opaque tunnel id, in a one-shot slot
-// that only the backends page reads, so Back returns to diagnostics and an
-// ordinary reload or bookmark cannot replay a previous Inspect.
+// that only the backends page reads. The URL carries a random navigation identity,
+// not the entity payload; a destination that never activates cannot leave an intent
+// that an unrelated later bookmark consumes.
 var VPN_BACKEND_HANDOFF_KEY = 'vpn.backend-inspect.tunnel';
 
 function vpnStoreBackendHandoff(tunnelId) {
     try {
         if (typeof window === 'undefined' || !window.sessionStorage) return false;
         if (tunnelId === null || typeof tunnelId === 'undefined' || String(tunnelId) === '') return false;
-        window.sessionStorage.setItem(VPN_BACKEND_HANDOFF_KEY, String(tunnelId));
-        return true;
+        const nonce = Array.from(window.crypto.getRandomValues(new Uint8Array(16)), function (byte) {
+            return byte.toString(16).padStart(2, '0');
+        }).join('');
+        window.sessionStorage.setItem(VPN_BACKEND_HANDOFF_KEY, JSON.stringify({ nonce: nonce, tunnelId: String(tunnelId) }));
+        return nonce;
     } catch (_) {
         return false;
     }
@@ -195,9 +199,17 @@ function vpnConsumeBackendHandoff() {
     try {
         if (typeof window === 'undefined' || !window.sessionStorage) return null;
         const stored = window.sessionStorage.getItem(VPN_BACKEND_HANDOFF_KEY);
-        if (stored === null) return null;
         window.sessionStorage.removeItem(VPN_BACKEND_HANDOFF_KEY);
-        return stored === '' ? null : stored;
+        const hash = window.location.hash;
+        const match = /^#vpn-inspect-([a-f0-9]{32})$/.exec(hash);
+        if (match) {
+            // Remove the navigation identity even on a refused/expired arrival. A
+            // reload or saved bookmark must not become another Inspect request.
+            window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search + '#vpn-backends-title');
+        }
+        if (!stored || !match) return null;
+        const request = JSON.parse(stored);
+        return request.nonce === match[1] && typeof request.tunnelId === 'string' ? request.tunnelId : null;
     } catch (_) {
         return null;
     }

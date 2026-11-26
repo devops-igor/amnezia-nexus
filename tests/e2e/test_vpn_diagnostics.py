@@ -87,7 +87,7 @@ _CHART_BADGE_PATTERNS = {
 
 @pytest.mark.e2e
 def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> interactive time window toggle (15m, 1h, 24h)."""
+    """Navigate to Diagnostics -> interactive time window toggle (15m, 1h, 24h)."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
@@ -268,7 +268,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
 
 @pytest.mark.e2e
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
-    """Navigate to /vpn -> Problem Routes details and 'Show all routes' toggle."""
+    """Navigate to Diagnostics -> Problem Routes details and 'Show all routes' toggle."""
     page = authenticated_page
     page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
@@ -874,6 +874,12 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     page.goto(f"{base_url}/vpn/diagnostics")
     page.wait_for_load_state("networkidle")
 
+    # Health and sessions remain visible while Advanced Diagnostics starts closed.
+    expect(page.locator("#vpn-forwarder-card")).to_be_visible()
+    expect(page.locator("#vpnSessionsTable")).to_be_visible()
+    expect(page.locator("#vpn-diagnostics")).to_be_hidden()
+    _ensure_diagnostics_open(page)
+
     diagnostics_card = page.locator("#vpn-diagnostics")
     forwarder_card = page.locator("#vpn-forwarder-card")
     sessions_card = page.locator("#vpnSessionsTable").locator(
@@ -903,6 +909,7 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     # render here, and the overview grid must not be duplicated.
     expect(page.locator(".stats-grid")).to_have_count(0)
     expect(page.locator("#vpnBackendsTable")).to_have_count(0)
+    expect(page.locator("#vpn-configuration")).to_have_count(0)
 
     # Overview: the four signals, and none of the diagnostics or inventory blocks.
     page.goto(f"{base_url}/vpn")
@@ -910,6 +917,17 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     expect(page.locator(".stats-grid")).to_have_count(1)
     expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
     expect(page.locator("#vpnSessionsTable")).to_have_count(0)
+    expect(page.locator("#vpn-diagnostics")).to_have_count(0)
+    expect(page.locator("#vpnBackendsTable")).to_have_count(0)
+    overview = page.locator(".stats-grid.vpn-overview")
+    configuration = page.locator("#vpn-configuration")
+    expect(overview).to_be_visible()
+    expect(configuration).to_be_visible()
+    overview_box = overview.bounding_box()
+    configuration_box = configuration.bounding_box()
+    assert overview_box is not None and configuration_box is not None
+    assert overview_box["y"] < configuration_box["y"]
+    assert configuration_box["y"] >= overview_box["y"] + overview_box["height"] - 1
 
     # Backends: the inventory, and neither the health card nor the sessions table.
     page.goto(f"{base_url}/vpn/backends")
@@ -917,3 +935,6 @@ def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     expect(page.locator("#vpnBackendsTable")).to_be_visible()
     expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
     expect(page.locator("#vpnSessionsTable")).to_have_count(0)
+    expect(page.locator(".stats-grid")).to_have_count(0)
+    expect(page.locator("#vpn-diagnostics")).to_have_count(0)
+    expect(page.locator("#vpn-configuration")).to_have_count(0)

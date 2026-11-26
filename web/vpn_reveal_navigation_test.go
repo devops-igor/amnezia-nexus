@@ -2,6 +2,7 @@ package web
 
 import (
 	"io/fs"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -92,6 +93,10 @@ function backendRow(tunnelId) {
     return Array.from(d.getElementById('vpn-backends-tbody').children)
         .find(function (r) { return r && r.getAttribute && r.getAttribute('data-tunnel-id') === tunnelId; }) || null;
 }
+function storeBackendArrival(tunnelId) {
+    const nonce = w.vpnStoreBackendHandoff(tunnelId);
+    w.history.replaceState(null, '', '/vpn/backends#vpn-inspect-' + nonce);
+}
 w.vpnCachedServers = [{ id: 1, name: 'Alpha Gateway' }, { id: 3, name: 'Gamma' }, { id: 7, name: 'Delta' }, { id: 12, name: 'Beta Relay' }];
 const btbody = d.getElementById('vpn-backends-tbody');
 btbody.textContent = '';
@@ -161,7 +166,7 @@ assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'focus starts away 
 assert.strictEqual(w.vpnApplyBackendsLanding(), null, 'an ordinary visit lands on nothing');
 assert.strictEqual(target.style.display, 'none', 'and the paginated row stays hidden');
 
-w.vpnStoreBackendHandoff('52');
+storeBackendArrival('52');
 assert.strictEqual(w.vpnApplyBackendsLanding(), 'inspect', 'the handoff names a row to reveal');
 
 // OUTCOME: the row is painted, focus is on it, and the table shows its page.
@@ -190,7 +195,7 @@ assert.strictEqual(isVisible(cell), false, 'and its name cell is not painted');
 assert.strictEqual(w.vpnTableInstance.searchQuery, 'nothing-matches-this', 'and that search term is what hides it');
 
 d.getElementById('vpn-backends-title').focus();
-w.vpnStoreBackendHandoff('60');
+storeBackendArrival('60');
 w.vpnApplyBackendsLanding();
 
 assert.strictEqual(isVisible(cell), true, 'the handoff revealed the search-hidden backend row');
@@ -218,7 +223,7 @@ assert.strictEqual(isVisible(cell), false, 'and its name cell is not painted');
 assert.strictEqual(w.vpnTableInstance.currentStatusFilter, 'degraded', 'and that chip is what hides it');
 
 d.getElementById('vpn-backends-title').focus();
-w.vpnStoreBackendHandoff('60');
+storeBackendArrival('60');
 w.vpnApplyBackendsLanding();
 
 assert.strictEqual(isVisible(cell), true, 'the handoff revealed the status-hidden backend row');
@@ -252,7 +257,7 @@ assert(degradedChip.classList.contains('active'), 'the degraded chip is active b
 assert(!allChip.classList.contains('active'), 'and All is not');
 assert.strictEqual(backendRow('60').style.display, 'none', 'the row is hidden');
 
-w.vpnStoreBackendHandoff('60');
+storeBackendArrival('60');
 w.vpnApplyBackendsLanding();
 
 // OUTCOME: the row is painted and the toolbar shows the filter the table now uses.
@@ -272,7 +277,7 @@ console.log('VPN955_R9_CHIP_SYNC_OK');
 (() => {
 const assert = require('assert');
 `+vpnRevealBackendsTableJS+`
-w.vpnStoreBackendHandoff('999');
+storeBackendArrival('999');
 assert.strictEqual(w.vpnApplyBackendsLanding(), 'inspect-missing', 'the handoff reports the missing row');
 const region = d.getElementById('vpn-backends-announcement');
 assert(region && region.getAttribute('role') === 'status', 'the inventory heading owns a live region');
@@ -489,12 +494,12 @@ const targetB = backendRow('52');
 assert(targetA && targetB, 'both targets are listed');
 assert.strictEqual(targetB.style.display, 'none', 'PRE-CONDITION: the page-2 target is hidden');
 
-w.vpnStoreBackendHandoff('52');
+storeBackendArrival('52');
 w.vpnApplyBackendsLanding();
 assert.strictEqual(d.activeElement, targetB.querySelector('td[data-backend-name]'), 'the handoff focuses the named backend');
 assert.strictEqual(d.activeElement.getAttribute('data-backend-name'), '12', 'which is server 12, its own server id');
 
-w.vpnStoreBackendHandoff('43');
+storeBackendArrival('43');
 w.vpnApplyBackendsLanding();
 assert.strictEqual(d.activeElement, targetA.querySelector('td[data-backend-name]'), 'the second handoff focuses the other backend');
 assert.strictEqual(d.activeElement.getAttribute('data-backend-name'), '3', 'and it is backend 43 (server 3), not its neighbour');
@@ -541,42 +546,151 @@ func TestVPN955R9RevealGoesThroughTheTableController(t *testing.T) {
 	}
 }
 
-// TestVPN955R9RevealRegressionsFailWithoutTheFix is the oracle check: the same
-// hiding-and-focusing assertions run against a variant of the controller that
-// reproduces the OLD behaviour (focus the row without asking the table to reveal it)
-// and must fail. A regression that stays green under that variant is not testing the
-// fix.
+// Each surviving pre-split variant runs on its shipped owner document, first as a
+// positive control, then with only that owner's reveal call reverted. A nonzero
+// exit is insufficient: only the named behavioral assertion may kill the mutant.
 func TestVPN955R9RevealRegressionsFailWithoutTheFix(t *testing.T) {
-	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
-	if fixture.NodePath == "" {
-		t.Fatal("Inspect reveal tests require Node.js (see CONTRIBUTING.md)")
-	}
-	reverted := *fixture
-	reverted.PageJS = strings.Replace(fixture.PageJS,
-		"const tr = vpnRevealBackendRow(row);",
-		"const tr = row;", 1)
-	if reverted.PageJS == fixture.PageJS {
-		t.Fatal("the reverted controller is byte-identical to the delivered one, so the variant proves nothing")
-	}
-
-	script := reverted.BuildJSDOMHarness(JSDOMHarnessOptions{IncludeNexusTable: true, ExtraJS: `
-const assert = require('assert');
-` + vpnRevealBackendsTableJS + `
+	for _, tc := range []struct {
+		name, page, from, to, fixture, setup, outcome, assertion string
+	}{
+		{
+			name: "BackendHiddenByPagination", page: "vpn_backends",
+			from: "const tr = vpnRevealBackendRow(row);", to: "const tr = row;",
+			fixture: vpnRevealBackendsTableJS,
+			setup: `
 const target = backendRow('52');
 const cell = target.querySelector('td[data-backend-name]');
-assert.strictEqual(target.style.display, 'none', 'PRE-CONDITION: the target is hidden by pagination');
-assert.strictEqual(isVisible(cell), false, 'and its cell is not painted');
-w.vpnStoreBackendHandoff('52');
+assert.strictEqual(target.style.display, 'none', 'PRE-CONDITION: pagination hides the backend');
+assert.strictEqual(isVisible(cell), false, 'PRE-CONDITION: its cell is not painted');
+assert.strictEqual(w.vpnTableInstance.currentPage, 1, 'PRE-CONDITION: the table shows page 1');
+storeBackendArrival('52');
 w.vpnApplyBackendsLanding();
-assert.strictEqual(isVisible(cell), true, 'the row is revealed');
-assert.strictEqual(d.activeElement, cell, 'focus landed on the revealed backend cell');
-console.log('VPN955_R9_VARIANT_UNEXPECTEDLY_PASSED');
-`})
-	out, err := execNodeScript(fixture.NodePath, script)
-	if err == nil {
-		t.Fatalf("the reverted controller must fail these assertions, but the run passed:\n%s", out)
-	}
-	if strings.Contains(string(out), "VPN955_R9_VARIANT_UNEXPECTEDLY_PASSED") {
-		t.Fatalf("the reverted controller reached the success marker, so the regression does not test the fix:\n%s", out)
+`,
+			outcome: `
+assert.strictEqual(isVisible(cell), true, expectedAssertion);
+assert.strictEqual(w.vpnTableInstance.currentPage, 2, 'the table shows the target page');
+assert.strictEqual(d.activeElement, cell, 'focus lands on the revealed backend');
+`,
+			assertion: "REVEAL: backend pagination must reveal its row",
+		},
+		{
+			name: "BackendHiddenBySearch", page: "vpn_backends",
+			from: "const tr = vpnRevealBackendRow(row);", to: "const tr = row;",
+			fixture: vpnRevealBackendsTableJS,
+			setup: `
+const target = backendRow('60');
+const cell = target.querySelector('td[data-backend-name]');
+w.vpnTableInstance.search('nothing-matches-this');
+assert.strictEqual(target.style.display, 'none', 'PRE-CONDITION: search hides the backend');
+assert.strictEqual(isVisible(cell), false, 'PRE-CONDITION: its cell is not painted');
+assert.strictEqual(w.vpnTableInstance.searchQuery, 'nothing-matches-this', 'PRE-CONDITION: search is active');
+storeBackendArrival('60');
+w.vpnApplyBackendsLanding();
+`,
+			outcome: `
+assert.strictEqual(isVisible(cell), true, expectedAssertion);
+assert.strictEqual(w.vpnTableInstance.searchQuery, '', 'the conflicting search is cleared');
+assert.strictEqual(d.activeElement, cell, 'focus lands on the revealed backend');
+`,
+			assertion: "REVEAL: backend search must reveal its row",
+		},
+		{
+			name: "SessionHiddenByPagination", page: "vpn_diagnostics",
+			from: "const tr = vpnRevealSessionRow(wanted);", to: "const tr = vpnFindSessionRow(wanted);",
+			fixture: vpnSessionRevealPreconditionsJS,
+			setup: `
+const routes = [], sessions = [];
+for (let i = 1; i <= 12; i++) {
+    routes.push({ session_id: 'S-' + i, traffic: {}, queue_full_drops_recent: 0, write_errors_recent: 0, write_stalls_recent: 0 });
+    sessions.push({ session_id: 'S-' + i, username: 'user' + i, status: 'connected', server_name: 'Alpha' });
+}
+w.vpnLastSessions = { sessions: sessions };
+w.renderSessions(sessions);
+w.vpnRenderForwarderHealth({ forwarder_available: true, all_routes: routes,
+    health_assessment: { status: 'CRITICAL', actionable_problems: [
+        { severity: 'CRITICAL', message: 'No route', session_id: 'S-12', category: 'routing' }
+    ] }
+});
+assert.strictEqual(sessionRow('S-12').style.display, 'none', 'PRE-CONDITION: pagination hides the session after health renders');
+assert.strictEqual(isVisible(sessionRow('S-12')), false, 'PRE-CONDITION: the session is not painted');
+assert.strictEqual(w.vpnSessionsTableInstance.currentPage, 1, 'PRE-CONDITION: the table shows page 1');
+inspectProblem();
+const revealed = sessionRow('S-12');
+assert(revealed, 'the target session exists');
+const cell = revealed.querySelector('[data-action="vpn-toggle-session"]');
+`,
+			outcome: `
+assert.strictEqual(isVisible(cell), true, expectedAssertion);
+assert.strictEqual(w.vpnSessionsTableInstance.currentPage, 2, 'the table shows the target page');
+assert.strictEqual(d.activeElement, cell, 'focus lands on the revealed session');
+`,
+			assertion: "REVEAL: session pagination must reveal its row",
+		},
+		{
+			name: "SessionExcludedByProblemsOnly", page: "vpn_diagnostics",
+			from: "const tr = vpnRevealSessionRow(wanted);", to: "const tr = vpnFindSessionRow(wanted);",
+			fixture: vpnSessionRevealPreconditionsJS + vpnRevealSessionsFixtureJS,
+			setup: `
+queuePressureProblem();
+w.vpnToggleSessionsProblemFilter();
+assert.strictEqual(w.vpnSessionsFilterOnlyProblems, true, 'PRE-CONDITION: problems-only is active');
+assert.strictEqual(!!sessionRow('S-quiet'), false, 'PRE-CONDITION: problems-only excludes the target');
+assert(sessionRow('S-pressure'), 'PRE-CONDITION: the pressured neighbour remains');
+assert(w.vpnFindSessionById('S-quiet'), 'PRE-CONDITION: the excluded session exists in the cache');
+inspectProblem();
+`,
+			outcome: `
+assert.strictEqual(!!sessionRow('S-quiet'), true, expectedAssertion);
+const revealed = sessionRow('S-quiet');
+const cell = revealed.querySelector('[data-action="vpn-toggle-session"]');
+assert.strictEqual(isVisible(cell), true, 'the revealed session is painted');
+assert.strictEqual(d.activeElement, cell, 'focus lands on the revealed session');
+assert(revealed.classList.contains('row-expanded'), 'the session drilldown is open');
+assert.strictEqual(w.vpnSessionsFilterOnlyProblems, false, 'the filter stays cleared');
+assert(!d.getElementById('vpn-fwd-headline-summary').textContent.includes('no longer in the current list'),
+    'a cached session is not reported missing');
+`,
+			assertion: "REVEAL: problems-only must render its excluded session",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := NewVPNTestFixtureForPage(t, tc.page)
+			nodePath := fixture.RequireJSDOM()
+			if strings.Count(fixture.PageJS, tc.from) != 1 {
+				t.Fatalf("expected exactly one reveal call to mutate: %q", tc.from)
+			}
+			extra := "(() => {\nconst assert = require('assert');\nconst expectedAssertion = " + strconv.Quote(tc.assertion) + ";\n" +
+				"try {\n" + tc.fixture + tc.setup +
+				"console.log('VPN_REVEAL_ACTION_COMPLETE');\n" + tc.outcome +
+				"console.log('VPN_REVEAL_POSITIVE_OK');\n" + `
+} catch (e) {
+    if (e.name === 'AssertionError' && e.code === 'ERR_ASSERTION' &&
+        e.operator === 'strictEqual' && e.actual === false && e.expected === true &&
+        e.message.startsWith(expectedAssertion)) {
+        console.error('VPN_REVEAL_EXPECTED_ASSERTION:' + expectedAssertion);
+    }
+    throw e;
+}
+})();
+`
+			// The exact same setup and outcome must pass without the mutation.
+			positive := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{IncludeNexusTable: true, ExtraJS: extra})
+			out, err := execNodeScript(nodePath, positive)
+			if err != nil || !strings.Contains(string(out), "VPN_REVEAL_POSITIVE_OK") {
+				t.Fatalf("unmutated positive control failed: %v\n%s", err, out)
+			}
+			t.Logf("positive control exit=0\n%s", out)
+			reverted := *fixture
+			reverted.PageJS = strings.Replace(fixture.PageJS, tc.from, tc.to, 1)
+			mutant := reverted.BuildJSDOMHarness(JSDOMHarnessOptions{IncludeNexusTable: true, ExtraJS: extra})
+			out, err = execNodeScript(nodePath, mutant)
+			if err == nil || !strings.Contains(string(out), "VPN_REVEAL_ACTION_COMPLETE") ||
+				!strings.Contains(string(out), "VPN_REVEAL_EXPECTED_ASSERTION:"+tc.assertion) ||
+				!strings.Contains(string(out), "AssertionError [ERR_ASSERTION]") ||
+				strings.Contains(string(out), "VPN_REVEAL_POSITIVE_OK") {
+				t.Fatalf("mutant did not fail at its intended behavioral assertion: %v\n%s", err, out)
+			}
+			t.Logf("mutant expected RED (%v), specific assertion verified\n%s", err, out)
+		})
 	}
 }

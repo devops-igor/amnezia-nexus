@@ -183,12 +183,10 @@ function vpnNavigateToBackends(targetId) {
 // backend-category problem with no id goes straight to the inventory heading with
 // no handoff and no missing-entity statement.
 function vpnFocusBackendIssue(row) {
-    if (row && row.backendId) {
-        // If the slot is unavailable the destination is still reached; only the
-        // row-level focus is lost.
-        vpnStoreBackendHandoff(row.backendId);
-    }
-    vpnNavigateToBackends('vpn-backends-title');
+    const nonce = row && row.backendId ? vpnStoreBackendHandoff(row.backendId) : null;
+    // The URL carries only a random arrival identity, never an entity id. If
+    // storage is unavailable the heading remains a usable destination.
+    vpnNavigateToBackends(nonce ? 'vpn-inspect-' + nonce : 'vpn-backends-title');
 }
 
 // vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
@@ -308,7 +306,7 @@ function vpnApplyDiagnosticsAnchor() {
     if (!vpnIsFocusable(el)) {
         focusTarget = vpnNearestHeading(el, fallbackId);
     }
-    vpnScrollToTarget(el);
+    vpnScrollToTarget(focusTarget);
     vpnFocusIfFocusable(focusTarget);
     return id;
 }

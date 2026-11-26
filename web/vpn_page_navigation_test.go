@@ -134,7 +134,8 @@ func TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation(t *testing.T) {
     const rowCount = () => Array.from(tbody.children).filter(tr => !tr.classList.contains('table-empty-state')).length;
 
     // 1. The arrival that carries an Inspect request, whose first read fails.
-    w.sessionStorage.setItem('vpn.backend-inspect.tunnel', 't-2');
+    const nonce = w.vpnStoreBackendHandoff('t-2');
+    w.history.replaceState(null, '', '/vpn/backends#vpn-inspect-' + nonce);
     let mode = 'reject';
     w.API = {
         get: async () => { if (mode === 'reject') throw new Error('first read refused'); return { backends: backends }; },
@@ -160,6 +161,7 @@ func TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation(t *testing.T) {
 
     // 3. An ordinary later visit is a fresh document: nothing page-local survives, and
     //    storage holds nothing to replay.
+    w.history.replaceState(null, '', '/vpn/backends');
     w.eval('vpnPendingInspectTunnelId = null');
     w.eval('vpnBackendsAnchorApplied = false');
     w.document.activeElement.blur();

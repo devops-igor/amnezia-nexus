@@ -28,7 +28,10 @@ const navigationBindingPrelude = `
 assert.strictEqual(typeof w.vpnFocusIssueTarget, 'function',
     'the JSDOM window must bind vpnFocusIssueTarget from the diagnostics controller');
 w.__navDestinations = [];
-w.vpnNavigateToBackends = function (targetId) { w.__navDestinations.push('/vpn/backends#' + targetId); };
+w.vpnNavigateToBackends = function (targetId) {
+    w.__navDestinations.push('/vpn/backends#' + targetId);
+    if (targetId.startsWith('vpn-inspect-')) w.history.replaceState(null, '', '/vpn/backends#' + targetId);
+};
 function lastDestination() {
     return w.__navDestinations.length ? w.__navDestinations[w.__navDestinations.length - 1] : null;
 }
@@ -88,7 +91,7 @@ const summaryBefore = summary ? summary.textContent : '';
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
 
 assert.strictEqual(w.vpnConsumeBackendHandoff(), '43', 'the handoff carries tunnel 43, not server 8');
-assert.strictEqual(lastDestination(), '/vpn/backends#vpn-backends-title', 'and it goes to the inventory heading');
+assert(lastDestination().startsWith('/vpn/backends#vpn-inspect-'), 'and it goes to its identified inventory arrival');
 assert.strictEqual(w.vpnConsumeBackendHandoff(), null, 'the one-shot slot is consumed exactly once');
 assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'Inspect never opens Advanced Diagnostics');
 if (summary) {
@@ -116,7 +119,7 @@ w.vpnRenderForwarderHealth({
 });
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
 assert.strictEqual(w.vpnConsumeBackendHandoff(), '9', 'a backend whose ids are equal still hands off its id');
-assert.strictEqual(lastDestination(), '/vpn/backends#vpn-backends-title', 'and reaches the inventory heading');
+assert(lastDestination().startsWith('/vpn/backends#vpn-inspect-'), 'and reaches its identified inventory arrival');
 console.log('VPN955_R7_BACKEND_EQUAL_IDS_OK');
 })();
 `, "VPN955_R7_BACKEND_EQUAL_IDS_OK")
