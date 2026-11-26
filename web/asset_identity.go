@@ -34,9 +34,9 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 }
 
 // DeliveredAssets are the /static paths this branch replaced in place: the two
-// policy readout modules, the server page's tab controller, the six VPN modules,
-// the stylesheet every shell links and the table engine the VPN page's reveal
-// depends on. The release
+// gigahost order-status modules, the two policy readout modules, the server
+// page's tab controller, the six VPN modules, the stylesheet every shell links
+// and the table engine the VPN page's reveal depends on. The release
 // version did not move with them, so ?v=<release> is exactly the URL their
 // predecessor served and a returning browser keeps the old bytes. Each one
 // therefore has to be requested through AssetURL, in every shell that loads it.
@@ -55,6 +55,8 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 var DeliveredAssets = []string{
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
+	"/static/js/gigahost_order_status.js",
+	"/static/js/gigahost_order_status_model.js",
 	"/static/js/policy_panels.js",
 	"/static/js/policy_routing.js",
 	"/static/js/server_actions.js",
