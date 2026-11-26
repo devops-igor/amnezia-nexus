@@ -325,3 +325,62 @@ func jsonStringSlice(values []string) string {
 	}
 	return "[" + strings.Join(quoted, ",") + "]"
 }
+
+// TestVPNOverviewEndpointDialog covers the endpoint dialog on the document that
+// owns it: it opens from the configuration strip with the CONFIGURED value, saves
+// a trimmed value, refreshes only the overview, and leaves the form intact with
+// its message when the write is refused.
+func TestVPNOverviewEndpointDialog(t *testing.T) {
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
+	nodePath := fixture.RequireJSDOM()
+
+	script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
+(async () => {
+const opened = [], closed = [], refreshed = [], requests = [];
+w.openModal = (id) => opened.push(id);
+w.closeModal = (id) => closed.push(id);
+w.UI = { toast: () => {}, confirm: async () => true, escapeHtml: (s) => String(s == null ? '' : s) };
+w.vpnLoadOverview = async () => { refreshed.push('overview'); };
+w.API = {
+    get: async () => ({}),
+    post: async () => ({}),
+    request: async (url, opts) => { requests.push({ url, opts }); return {}; },
+};
+
+// The dialog prefills the configured value, not the detected fallback.
+w.vpnConfiguredPublicEndpoint = 'vpn.old.domain:51820';
+w.vpnOpenEditEndpointModal();
+assert(opened.includes('editEndpointModal'), 'the endpoint dialog opens');
+const input = w.document.getElementById('vpnPublicEndpointInput');
+assert.strictEqual(input.value, 'vpn.old.domain:51820', 'the input holds the configured value');
+
+input.value = '  vpn.new.domain:51820 ';
+await w.vpnSubmitEditEndpoint();
+assert.strictEqual(requests.length, 1, 'one PUT is sent');
+assert.strictEqual(requests[0].url, '/api/vpn/config', 'to the existing config route');
+assert.strictEqual(requests[0].opts.method, 'PUT', 'with the existing verb');
+assert.strictEqual(requests[0].opts.body.public_endpoint, 'vpn.new.domain:51820', 'and the trimmed value');
+assert(closed.includes('editEndpointModal'), 'success closes the dialog');
+assert.deepStrictEqual(refreshed, ['overview'], 'success refreshes the overview only');
+
+// Refusal: the dialog stays open, the form keeps its value, and the error shows.
+w.API.request = async () => { throw { data: { detail: 'endpoint refused' } }; };
+input.value = 'vpn.bad.domain';
+await w.vpnSubmitEditEndpoint();
+assert(!closed.includes('editEndpointModal') || closed.length === 1, 'a refusal does not report success');
+assert.strictEqual(input.value, 'vpn.bad.domain', 'the form keeps what the operator typed');
+const errBox = w.document.getElementById('vpnEndpointModalError');
+assert.strictEqual(errBox.style.display, 'block', 'the refusal is shown inline');
+assert(errBox.textContent.includes('endpoint refused'), 'with the API message');
+assert.strictEqual(w.document.getElementById('vpnEditEndpointSubmitBtn').disabled, false, 'the form stays operable');
+console.log('VPN_ENDPOINT_DIALOG_OK');
+})().catch(e => { console.error(e); process.exit(1); });
+`})
+	out, err := execNodeScript(nodePath, script)
+	if err != nil {
+		t.Fatalf("endpoint dialog script failed: %v\nOutput:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "VPN_ENDPOINT_DIALOG_OK") {
+		t.Fatalf("endpoint dialog script did not report its token:\n%s", out)
+	}
+}
