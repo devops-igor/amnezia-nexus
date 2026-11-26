@@ -448,7 +448,20 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A server the provider's inventory no longer lists is not measured: no SSH
+	// session is opened, and the answer says so instead of reporting zeros that
+	// would read as a real sample of a healthy or a dead host. The page renders
+	// this as "not checked", and the row's stored status is untouched.
+	if server.ProviderAbsent() {
+		h.serverNotMeasured(w)
+		return
+	}
+
 	client, err := h.GetSSHClient(ctx, server)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")
 		return
@@ -472,6 +485,10 @@ func (h *Handlers) ServerStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"uptime -p 2>/dev/null || uptime"
 
 	out, _, code, err := client.RunCommand(ctx, combinedCmd)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil || code != 0 {
 		h.JSONError(w, http.StatusBadGateway, "stats_failed", "Failed to collect server statistics")
 		return
@@ -501,7 +518,15 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if server.ProviderAbsent() {
+		h.serverNotMeasured(w)
+		return
+	}
 	client, err := h.GetSSHClient(ctx, server)
+	if errors.Is(err, ssh.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	if err != nil {
 		h.JSON(w, http.StatusOK, models.ServerCheckResponse{
 			Connection:      "failed",
@@ -511,14 +536,22 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
-
 	// Check docker
 	dockerProbe := probeDockerPresence(ctx, client)
-	dockerProbe.logFailure(serverID)
 	dockerInstalled := dockerProbe.Installed
 
 	protocolsStatus := h.queryProtocolsStatus(ctx, server)
+	absent, err := h.db.IsServerProviderAbsent(ctx, serverID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to read server observation")
+		return
+	}
+	if absent {
+		h.serverNotMeasured(w)
+		return
+	}
+	dockerProbe.logFailure(serverID)
+	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
 	if syncDiscoveredProtocols(server, protocolsStatus) {
 		if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
 			slog.Warn("ServerCheckHandler: failed to persist detected protocols", "server_id", serverID, "err", err)
@@ -821,40 +854,33 @@ func (h *Handlers) GetServerReachabilityHandler(w http.ResponseWriter, r *http.R
 
 	status, _ := h.db.GetServerStatus(ctx, serverID)
 
-	sshPort := server.SSHPort
-	if sshPort <= 0 {
-		sshPort = 22
-	}
-
-	// Measure real TCP latency to the server (SSH port).
-	latencyMS := 0
-	reachable := false
-
-	dialFn := h.dialTimeout
-	if dialFn == nil {
-		dialFn = net.DialTimeout
-	}
-
-	start := time.Now()
-	// #nosec G704 -- connecting to managed server host for latency probe
-	serverHost := strings.Trim(strings.TrimSpace(server.Host), "[]")
-	conn, err := dialFn("tcp", net.JoinHostPort(serverHost, strconv.Itoa(sshPort)), 3*time.Second)
-	if err == nil {
-		_ = conn.Close()
-		latencyMS = int(time.Since(start).Milliseconds())
-		if latencyMS <= 0 {
-			latencyMS = 1
+	// A server the provider's inventory no longer lists is not dialed at all: the
+	// page poll would otherwise open a TCP connection to an address the panel
+	// already has durable evidence is not the provider's. Nothing is measured and
+	// the stored reachability observation is left as it was, so this answer stays
+	// distinguishable from a measurement that failed.
+	if server.ProviderAbsent() {
+		absentNow := time.Now().UTC().Format(time.RFC3339)
+		absentReach := map[string]any{
+			"reachable":       false,
+			"latency_ms":      0,
+			"status":          string(status),
+			"last_checked":    absentNow,
+			"provider_absent": true,
 		}
-		reachable = true
-		status = models.ReachabilityOnline
-		_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
-	} else {
-		reachable = false
-		latencyMS = 0
-		if status == models.ReachabilityUnknown {
-			status = models.ReachabilityOffline
-		}
+		h.JSON(w, http.StatusOK, map[string]any{
+			"status":          "ok",
+			"reachable":       false,
+			"reachability":    absentReach,
+			"server_status":   string(status),
+			"latency_ms":      0,
+			"last_checked":    absentNow,
+			"provider_absent": true,
+		})
+		return
 	}
+
+	reachable, latencyMS, status := h.measureServerReachability(ctx, server, status)
 
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	reachMap := map[string]any{
@@ -921,14 +947,16 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 			reachable := s.Status == models.ReachabilityOnline || s.Status == ""
 
 			result = append(result, models.ServerItemResponse{
-				ID:        s.ID,
-				Name:      name,
-				Host:      "",
-				SSHPort:   0,
-				Username:  "",
-				Protocols: sanitizedProtocols,
-				Status:    status,
-				Reachable: &reachable,
+				ID:                  s.ID,
+				Name:                name,
+				Host:                "",
+				SSHPort:             0,
+				Username:            "",
+				Protocols:           sanitizedProtocols,
+				Status:              status,
+				Reachable:           &reachable,
+				ProviderAbsent:      s.ProviderAbsent(),
+				ProviderAbsentSince: s.ProviderAbsentAt,
 			})
 		} else {
 			protoMap := s.Protocols
@@ -944,14 +972,16 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 				createdAt = &s.CreatedAt
 			}
 			item := models.ServerItemResponse{
-				ID:        s.ID,
-				Name:      s.Name,
-				Host:      s.Host,
-				SSHPort:   s.SSHPort,
-				Username:  s.SSHUser,
-				Protocols: protoMap,
-				CreatedAt: createdAt,
-				Status:    status,
+				ID:                  s.ID,
+				Name:                s.Name,
+				Host:                s.Host,
+				SSHPort:             s.SSHPort,
+				Username:            s.SSHUser,
+				Protocols:           protoMap,
+				CreatedAt:           createdAt,
+				Status:              status,
+				ProviderAbsent:      s.ProviderAbsent(),
+				ProviderAbsentSince: s.ProviderAbsentAt,
 			}
 			h.populateServerEngineStatus(ctx, &item, &s, sess != nil && sess.Role == models.RoleAdmin)
 			result = append(result, item)

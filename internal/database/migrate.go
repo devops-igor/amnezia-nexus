@@ -343,6 +343,11 @@ func (d *DB) SaveData(ctx context.Context, data *models.BackupData) error {
 	if err := d.saveSettings(ctx, tx, data.Settings); err != nil {
 		return err
 	}
+	// Full replacement also removes a credential when the import omits it.
+	// Invalidate earlier association authorities in the same transaction.
+	if err := bumpGigahostConfigEpochTx(ctx, tx); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit SaveData transaction: %w", err)

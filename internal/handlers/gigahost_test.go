@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -30,6 +31,8 @@ type mockGigahostClient struct {
 	orderServerSafeFn func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
 	getDeployStatusFn func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error)
 	getServersFn      func(ctx context.Context) ([]gigahost.ServerInfo, error)
+	getServerFn       func(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error)
+	getDashboardFn    func(ctx context.Context) (*gigahost.Dashboard, error)
 
 	// registeredKeys is the account key list this fake provider maintains when a
 	// test does not supply listSSHKeysFn: RegisterSSHKey appends to it (unless
@@ -161,6 +164,26 @@ func (m *mockGigahostClient) GetDeployStatus(ctx context.Context, orderID string
 		return m.getDeployStatusFn(ctx, orderID)
 	}
 	return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusReady, AssignedIP: "192.0.2.1"}, nil
+}
+
+// GetDashboard answers for the account summary. A fixture with no hook reports no
+// service counts, so it certifies nothing: absence must never be enabled by a
+// fixture that forgot to say how many servers the account has.
+func (m *mockGigahostClient) GetDashboard(ctx context.Context) (*gigahost.Dashboard, error) {
+	if m.getDashboardFn != nil {
+		return m.getDashboardFn(ctx)
+	}
+	return &gigahost.Dashboard{ServicesPresent: false}, nil
+}
+
+// GetServer answers for one server. A fixture that supplies no hook refuses the
+// read rather than inventing a server: an unanswered per-server query must never
+// become evidence of anything.
+func (m *mockGigahostClient) GetServer(ctx context.Context, serverID int64) (*gigahost.ServerInfo, error) {
+	if m.getServerFn != nil {
+		return m.getServerFn(ctx, serverID)
+	}
+	return nil, fmt.Errorf("fixture defines no per-server answer for server %d", serverID)
 }
 
 func (m *mockGigahostClient) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {

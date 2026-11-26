@@ -56,7 +56,7 @@ func attemptEligible(t *testing.T, s *Service, serverID int64) (active, ingress 
 		}
 	}
 	s.mu.Lock()
-	cands := s.admissibleIngressCandidatesLocked()
+	cands := s.admissibleIngressCandidatesLocked(nil)
 	s.mu.Unlock()
 	for _, c := range cands {
 		if c.ServerID == serverID {

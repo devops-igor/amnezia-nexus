@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -120,6 +121,12 @@ func (h *Handlers) SetSSHDialerForTest(fn func(context.Context, ssh.Config) (ssh
 }
 
 func (h *Handlers) dialDeploySSH(ctx context.Context, cfg ssh.Config) (ssh.SSHClient, error) {
+	if cfg.ProviderAbsent {
+		// The deployment resolved to a row the provider's inventory no longer
+		// lists. Refuse here as well as in the transport, so the deploy path cannot
+		// reach its dialer with an obsolete target.
+		return nil, ssh.ErrProviderAbsent
+	}
 	if h.sshDialerHook != nil {
 		return h.sshDialerHook(ctx, cfg)
 	}
@@ -283,7 +290,7 @@ func (h *Handlers) registerDeployServer(
 	req GigahostDeployRequest,
 	order *GigahostOrderRecord,
 	nexusServerID, providerServerID int64,
-	assignedIP, fingerprint string,
+	assignedIP, fingerprint, accountID string,
 ) (*models.Server, error) {
 	if h.db == nil {
 		return nil, errors.New("database not available")
@@ -317,6 +324,10 @@ func (h *Handlers) registerDeployServer(
 		sshUser = "root"
 	}
 
+	// The account the deployment acts for is recorded beside the provider server
+	// id, so a later inventory read can only judge this row when it answers for the
+	// same account. An empty association is recorded as unknown rather than
+	// guessed: the row then stays out of every absence decision.
 	newServer := &models.Server{
 		Name:    serverName,
 		Host:    assignedIP,
@@ -328,7 +339,12 @@ func (h *Handlers) registerDeployServer(
 			"provider":           "gigahost",
 			"provider_server_id": providerServerID,
 		},
-		CreatedAt: time.Now().UTC(),
+		ProviderAccountID: strings.TrimSpace(accountID),
+		CreatedAt:         time.Now().UTC(),
+	}
+	if newServer.ProviderAccountID == "" {
+		slog.Warn("Provider account unknown at registration; this server's existence will not be judged by the provider inventory",
+			"provider", gigahostInventoryProvider, "server_id", nexusServerID, "provider_server_id", providerServerID)
 	}
 
 	if err := validateFingerprintFormat(fingerprint); err != nil {
@@ -651,7 +667,12 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 
 	// 3. Server Registration & Deduplication
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
-	server, err := h.registerDeployServer(ctx, req, order, nexusServerID, providerServerID, assignedIP, fingerprint)
+	// 3. Server Registration & Deduplication. The association recorded with the row
+	// is the account the provider says owns this server, read from the server
+	// itself. A key that cannot see it leaves the association unknown rather than
+	// labeling the row with whichever account is configured.
+	accountID := h.gigahostServerAccount(ctx, client, providerServerID)
+	server, err := h.registerDeployServer(ctx, req, order, nexusServerID, providerServerID, assignedIP, fingerprint, accountID)
 	if err != nil {
 		return h.failDeployStatus(ctx, req.OrderID, "server_registration", err, providerServerID, nexusServerID, assignedIP, "", "")
 	}
@@ -728,6 +749,9 @@ func (h *Handlers) installAndEnableDeploy(
 	// 5. Backend Enablement
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusEnablingBackend, DeployStatusEnablingBackend, "", providerServerID, nexusServerID, assignedIP)
 	if err := h.enableDeployBackend(ctx, server, protocol); err != nil {
+		if errors.Is(err, tunnel.ErrProviderAbsent) {
+			return nil, err
+		}
 		// The enablement path already withdrew the backend generation it observed
 		// (durable + runtime quarantine, administrative disable, device detach).
 		// A second disable keyed only by server ID would withdraw whatever owns
@@ -841,6 +865,10 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 // credential is a pause with instructions. Everything else is a real failure, and
 // the ordering below keeps the most specific cause first.
 func (h *Handlers) writeGigahostDeployFailure(w http.ResponseWriter, status *GigahostDeployStatus, err error) {
+	if errors.Is(err, tunnel.ErrProviderAbsent) {
+		h.serverNotMeasured(w)
+		return
+	}
 	var confirmation *ssh.ErrFingerprintRequired
 	if errors.As(err, &confirmation) {
 		h.JSON(w, http.StatusConflict, map[string]any{

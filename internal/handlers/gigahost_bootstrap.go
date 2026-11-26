@@ -75,13 +75,14 @@ func (h *Handlers) resolveDeploySSHClient(ctx context.Context, server *models.Se
 			sshUser = "root"
 		}
 		sshCfg := ssh.Config{
-			Host:       server.Host,
-			Port:       sshPort,
-			User:       sshUser,
-			Password:   server.SSHPass,
-			PrivateKey: server.SSHKey,
-			Timeout:    15 * time.Second,
-			Store:      h.db,
+			Host:           server.Host,
+			Port:           sshPort,
+			User:           sshUser,
+			Password:       server.SSHPass,
+			PrivateKey:     server.SSHKey,
+			Timeout:        15 * time.Second,
+			Store:          h.db,
+			ProviderAbsent: server.ProviderAbsent(),
 		}
 		return h.dialDeploySSH(ctx, sshCfg)
 	}

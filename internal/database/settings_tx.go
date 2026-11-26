@@ -154,5 +154,9 @@ func (t *SettingsTx) Set(key string, value any) error {
 	if err != nil {
 		return fmt.Errorf("failed to set setting %s: %w", key, err)
 	}
+	if key == "gigahost" {
+		// The credential and its authority fence must commit or roll back together.
+		return bumpGigahostConfigEpochTx(t.ctx, t.tx)
+	}
 	return nil
 }

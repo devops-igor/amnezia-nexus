@@ -72,7 +72,7 @@ func TestValidateMigrationTarget(t *testing.T) {
 	}
 
 	t.Run("valid target returns state version", func(t *testing.T) {
-		version, err := svc.validateMigrationTarget(tun1.ID)
+		version, err := svc.validateMigrationTarget(tun1.ID, nil)
 		if err != nil {
 			t.Fatalf("validateMigrationTarget returned unexpected error: %v", err)
 		}
@@ -82,7 +82,7 @@ func TestValidateMigrationTarget(t *testing.T) {
 	})
 
 	t.Run("unknown target rejected", func(t *testing.T) {
-		_, err := svc.validateMigrationTarget(999999)
+		_, err := svc.validateMigrationTarget(999999, nil)
 		if err == nil {
 			t.Fatalf("expected error for non-existent target tunnel, got nil")
 		}
@@ -100,7 +100,7 @@ func TestValidateMigrationTarget(t *testing.T) {
 			_ = svc.pool.SetTunnelEnabled(ctx, s2ID, true, "")
 		}()
 
-		_, err = svc.validateMigrationTarget(tun2.ID)
+		_, err = svc.validateMigrationTarget(tun2.ID, nil)
 		if err == nil {
 			t.Fatalf("expected error for disabled target tunnel, got nil")
 		}
@@ -121,7 +121,7 @@ func TestValidateMigrationTarget(t *testing.T) {
 			_ = svc.pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusActive, 50)
 		}()
 
-		_, err = svc.validateMigrationTarget(tun2.ID)
+		_, err = svc.validateMigrationTarget(tun2.ID, nil)
 		if err == nil {
 			t.Fatalf("expected error for inactive target tunnel, got nil")
 		}
@@ -132,7 +132,7 @@ func TestValidateMigrationTarget(t *testing.T) {
 
 	t.Run("nil pool returns zero and no error", func(t *testing.T) {
 		svcNilPool := &Service{}
-		version, err := svcNilPool.validateMigrationTarget(tun1.ID)
+		version, err := svcNilPool.validateMigrationTarget(tun1.ID, nil)
 		if err != nil {
 			t.Fatalf("expected nil error for nil pool, got: %v", err)
 		}

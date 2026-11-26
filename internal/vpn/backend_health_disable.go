@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
@@ -79,7 +80,7 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 		s.recordHealthFailoverDebt(live)
 		return fmt.Errorf("list established sessions on health-disabled backend %d: %w", live.ID, err)
 	}
-	targets := s.healthDisableTargets(live)
+	targets := s.healthDisableTargets(opCtx, live)
 	if len(targets) == 0 {
 		// F16: no alternative right now. The sessions stay pinned (correct for
 		// this instant) but the obligation is NOT discharged — record it so a
@@ -186,7 +187,7 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 		// version-pinned) under s.mu, so a target that went bad meanwhile is
 		// rejected instead of receiving traffic.
 		target := targets[i%len(targets)]
-		if mErr := s.MigrateSession(ctx, sess.ID, target.ID); mErr != nil {
+		if mErr := s.migrateHealthSession(ctx, sess.ID, targets, i); mErr != nil {
 			// One failed session must not strand the rest; the peer is left on
 			// the disabled backend and stays visible through the log.
 			log.Printf("[vpn] health-disable failover: session %s (peer %s) NOT migrated off backend %d to %d: %v",
@@ -202,18 +203,42 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 	return migrated
 }
 
+// migrateHealthSession visits each candidate at most once within the caller's
+// existing budget. Only a confirmed absence refusal selects another destination;
+// other failures keep their existing compensation and retry-debt semantics.
+func (s *Service) migrateHealthSession(ctx context.Context, sessionID string, targets []*models.BackendTunnel, start int) error {
+	var lastErr error
+	for offset := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		target := targets[(start+offset)%len(targets)]
+		lastErr = s.MigrateSession(ctx, sessionID, target.ID)
+		if !errors.Is(lastErr, database.ErrDestinationProviderAbsent) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
 // healthDisableTargets returns the still-eligible active tunnels of the same
 // protocol family, least-loaded first, so a bulk migration spreads across
 // healthy backends instead of piling onto one. The disabled backend itself is
 // never a candidate: it is no longer in the active set, but the identity check
 // keeps that guarantee explicit.
-func (s *Service) healthDisableTargets(disabled *models.BackendTunnel) []*models.BackendTunnel {
+//
+// A backend the provider has confirmed absent is not a destination either: moving
+// stranded sessions onto a deleted server would strand them again, and its "active"
+// status is only the last health sample. Called without Service.mu held (the caller
+// already performs database work here), so the marks are read here.
+func (s *Service) healthDisableTargets(ctx context.Context, disabled *models.BackendTunnel) []*models.BackendTunnel {
 	if s == nil || s.pool == nil || disabled == nil {
 		return nil
 	}
+	providerAbsent := s.providerAbsentServerIDs(ctx)
 	family := models.NormalizeTunnelProtocol(disabled.Protocol)
 	var targets []*models.BackendTunnel
-	for _, candidate := range s.pool.GetActiveTunnels() {
+	for _, candidate := range withoutProviderAbsent(s.pool.GetActiveTunnels(), providerAbsent) {
 		if candidate == nil || candidate.ID == disabled.ID {
 			continue
 		}

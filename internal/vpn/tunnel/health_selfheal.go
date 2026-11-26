@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -230,6 +231,14 @@ func (hp *HealthProber) probeAndFlapDamp(
 	threshold int,
 ) (latencyMS int64, ready bool, outerFailed bool) {
 	latencyMS, err := hp.probeEndpoint(ctx, tun)
+	if errors.Is(err, ErrProviderAbsent) {
+		// Not measured. Reporting this as an outer failure would send the caller
+		// into the inner-canary recovery path on the strength of an existence
+		// observation, so the sweep simply leaves the backend alone this round.
+		slog.Debug("self-healing probe refused for a server absent from the provider inventory",
+			"server_id", tun.ServerID)
+		return 0, false, false
+	}
 	if err != nil {
 		if hp.updateHealthIfCurrent(tun, func() { hp.successCounts[tun.ServerID] = 0 }) != nil {
 			return 0, false, false

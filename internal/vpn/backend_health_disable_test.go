@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"context"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -253,10 +254,10 @@ func TestHealthDisableTargets(t *testing.T) {
 	source, _ := svc.pool.GetTunnel(sourceServerID)
 	target, _ := svc.pool.GetTunnel(targetServerID)
 
-	if got := svc.healthDisableTargets(nil); got != nil {
+	if got := svc.healthDisableTargets(context.Background(), nil); got != nil {
 		t.Fatalf("nil disabled tunnel must yield no targets, got %d", len(got))
 	}
-	if got := svc.healthDisableTargets(source); len(got) != 1 || got[0].ID != target.ID {
+	if got := svc.healthDisableTargets(context.Background(), source); len(got) != 1 || got[0].ID != target.ID {
 		t.Fatalf("expected only the other active tunnel as a candidate, got %d targets", len(got))
 	}
 
@@ -296,7 +297,7 @@ func TestHealthDisableTargets(t *testing.T) {
 	// Load the second candidate so the idle third tunnel must come first.
 	svc.pool.IncrementConnections(target.ID)
 
-	targets := svc.healthDisableTargets(source)
+	targets := svc.healthDisableTargets(context.Background(), source)
 	if len(targets) != 2 {
 		t.Fatalf("expected 2 candidates, got %d", len(targets))
 	}

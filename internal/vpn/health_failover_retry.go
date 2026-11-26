@@ -167,7 +167,7 @@ func (s *Service) retryOneHealthFailover(ctx context.Context, debt healthFailove
 		s.clearHealthFailoverDebt(debt.tunnelID)
 		return false
 	}
-	if len(s.healthDisableTargets(live)) == 0 {
+	if len(s.healthDisableTargets(ctx, live)) == 0 {
 		// Still no alternative: keep the debt for the next sweep.
 		return false
 	}

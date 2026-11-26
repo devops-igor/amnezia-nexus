@@ -381,6 +381,11 @@ func run(ctx context.Context) error {
 	// NewRouterWithDeps does, so it is applied here explicitly.
 	router.EnsureAWGStatusProvider(hDeps)
 	hSet := handlers.NewHandlers(hDeps)
+	// The provider's server inventory is reconciled inside the same background
+	// cycle that probes reachability, ahead of the probe. Nothing here is on a
+	// request path: a page load never waits for a provider read, and a repeated
+	// pass writes only the rows whose state the provider changed.
+	orch.SetServerInventoryReconciler(hSet.ReconcileGigahostServerInventory)
 	// The dispatcher is supervised, so a browser closing cannot stop delivery
 	// and a panel restart resumes unfinished attempts from the durable outbox.
 	sup.RegisterService(notificationSvc)

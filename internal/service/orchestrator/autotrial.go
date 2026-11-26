@@ -96,6 +96,15 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 	if err != nil || server == nil {
 		return
 	}
+	if server.ProviderAbsent() {
+		// The mimicry rotation reads the backend's clients over SSH. A server the
+		// provider's inventory no longer lists is not dialed, so its auto-trial
+		// connections keep their current profile rather than being rotated through
+		// a host that is not there.
+		slog.Debug("Skipping auto-trial rotation for a server absent from the provider inventory",
+			"server_id", serverID)
+		return
+	}
 
 	var handshakeAges map[string]time.Duration
 	var hasHandshake map[string]bool

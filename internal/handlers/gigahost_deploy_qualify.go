@@ -48,6 +48,9 @@ func (h *Handlers) qualifyProxyBackendTraffic(ctx context.Context, server *model
 	defer cancel()
 
 	latencyMS, err := h.vpnSvc.QualifyProxyTraffic(probeCtx, observed)
+	if errors.Is(err, tunnel.ErrProviderAbsent) {
+		return err // Not measured: preserve ownership, quarantine and prior health.
+	}
 	if err != nil {
 		// Keep the durable quarantine: an unproven payload path must not be
 		// admitted, and reporting ready here was the defect.
