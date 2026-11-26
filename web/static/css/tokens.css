@@ -38,6 +38,12 @@
        card in the light theme, so the readable step is its own pair. */
     --text-success: #34d399;
     --text-danger: #fb7185;
+    /* The ink of a DELETED deployment stage's badge. That badge is normal text at
+       12 px on its own danger fill, so this state keeps a readable step of its own:
+       6.03:1 on the composited fill in this theme, 5.79:1 in the light one. It is a
+       separate role rather than a second use of the status ink above, which is the
+       notification feedback line's and the policy readout answers'. */
+    --text-deleted-badge: #fb7185;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
@@ -120,6 +126,7 @@
     --text-accent: #6366f1;
     --text-success: #047857;
     --text-danger: #be123c;
+    --text-deleted-badge: #be123c;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;

@@ -1,15 +1,18 @@
 package handlers
 
 // The DELETED badge is normal text at 12 px (0.75rem in the card rule), so its ink
-// has to reach 4.5:1 against the fill it is drawn on. In the dark theme it did not:
-// the shared danger token measured 4.42:1 on that fill.
+// has to reach 4.5:1 against the fill it is drawn on. In the dark theme the shared
+// danger token measured 4.42:1 on that fill.
 //
 // The correction is scoped to this one state rather than applied to the shared badge
 // class or the shared token, because the same badge is used by other dialogs that
-// were never measured. This test therefore asserts three things from the shipped
-// stylesheets: the scoped rule exists and uses the readable status-ink token, the
-// ratio it produces is at least 4.5:1 in both themes, and the shared danger badge is
-// still exactly what it was.
+// were never measured. The ink is also this state's own role: the notification
+// feedback line and the policy readout answers own the reserved status ink, so
+// painting a badge with it would spread that role to a third surface. This test
+// therefore asserts four things from the shipped stylesheets: the scoped rule exists
+// and uses the state's own token, the ratio it produces is at least 4.5:1 in both
+// themes, the shared danger badge is still exactly what it was, and the badge no
+// longer reaches for the reserved status ink.
 //
 // The ratio is computed from the declared values with the WCAG 2 relative-luminance
 // formula, and a translucent fill is composited over the card colour first - which is
@@ -28,6 +31,9 @@ import (
 // deletedBadgeSelector is the rule scoped to the deleted order-status badge.
 const deletedBadgeSelector = `.settings-section-card .gigahost-order-status[data-stage="deleted"] .gigahost-order-status-toggle`
 
+// deletedBadgeInk is the ink role that belongs to the deleted stage alone.
+const deletedBadgeInk = "--text-deleted-badge"
+
 func TestDeletedBadgeMeetsContrastInBothThemes(t *testing.T) {
 	settingsCSS := readShippedCSS(t, "static/css/settings.css")
 	tokensCSS := readShippedCSS(t, "static/css/tokens.css")
@@ -37,8 +43,11 @@ func TestDeletedBadgeMeetsContrastInBothThemes(t *testing.T) {
 	if rule == "" {
 		t.Fatalf("settings.css no longer scopes a rule to %s", deletedBadgeSelector)
 	}
-	if !declaresPropertyValue(rule, "color", "var(--text-danger)") {
-		t.Fatalf("the deleted badge must use the readable status-ink token:\n%s", rule)
+	if !declaresPropertyValue(rule, "color", "var("+deletedBadgeInk+")") {
+		t.Fatalf("the deleted badge must use its own ink %s:\n%s", deletedBadgeInk, rule)
+	}
+	if declaresPropertyValue(rule, "color", "var(--text-danger)") {
+		t.Fatalf("the deleted badge reaches for the reserved status ink again:\n%s", rule)
 	}
 	if declaresProperty(rule, "background") || declaresProperty(rule, "background-color") {
 		t.Fatalf("the deleted badge rule must change only the ink, so the shared fill keeps its meaning:\n%s", rule)
@@ -56,7 +65,7 @@ func TestDeletedBadgeMeetsContrastInBothThemes(t *testing.T) {
 	} {
 		card := requireHexToken(t, theme.name, theme.token, "--bg-card")
 		fillRGB, fillAlpha := requireRGBAToken(t, theme.name, theme.token, "--danger-bg")
-		ink := requireHexToken(t, theme.name, theme.token, "--text-danger")
+		ink := requireHexToken(t, theme.name, theme.token, deletedBadgeInk)
 		fill := compositeOver(fillRGB, fillAlpha, card)
 		ratio := contrastRatio(ink, fill)
 		if ratio < 4.5 {
@@ -108,7 +117,7 @@ func declaresPropertyValue(block, prop, value string) bool {
 
 // cssCustomProperties reads the custom-property declarations of one block.
 func cssCustomProperties(css, selector string) map[string]string {
-	block, _ := cssRule(css, selector, 0)
+	block, _ := cssRule(stripCSSComments(css), selector, 0)
 	properties := map[string]string{}
 	for _, declaration := range strings.Split(block, ";") {
 		name, value, ok := strings.Cut(strings.TrimSpace(declaration), ":")
@@ -121,6 +130,24 @@ func cssCustomProperties(css, selector string) map[string]string {
 		}
 	}
 	return properties
+}
+
+// stripCSSComments removes every /* ... */ span, so prose in a block's comments
+// is not read as a declaration. A comment that names a ratio carries a colon, and
+// the last colon-separated piece of it would otherwise be glued to the property
+// that follows, hiding the declaration from the caller.
+func stripCSSComments(css string) string {
+	for {
+		start := strings.Index(css, "/*")
+		if start < 0 {
+			return css
+		}
+		end := strings.Index(css[start:], "*/")
+		if end < 0 {
+			return css[:start]
+		}
+		css = css[:start] + css[start+end+2:]
+	}
 }
 
 // requireHexToken returns the hex value of one custom property.
