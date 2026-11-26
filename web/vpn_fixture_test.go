@@ -160,21 +160,33 @@ function installFetchMock(w) {
 
 // VPNTestFixture provides a centralized harness for testing VPN dashboard templates and scripts.
 type VPNTestFixture struct {
-	t                *testing.T
-	NodePath         string
-	TemplateHTML     string
-	StyleCSS         string
-	SessionsJS       string
-	HealthProblemsJS string
-	HealthSummaryJS  string
-	ChartsJS         string
-	BackendsJS       string
-	PageJS           string
-	ParsedDOM        *xhtml.Node
-	MockFetches      map[string]string
+	t        *testing.T
+	NodePath string
+	// OwnerPage is the VPN document under test: "vpn" (overview), "vpn_backends"
+	// or "vpn_diagnostics". TemplateHTML and CompanionScripts follow it, so a test
+	// renders exactly the document and the modules that page ships.
+	OwnerPage         string
+	TemplateHTML      string
+	StyleCSS          string
+	SessionsJS        string
+	HealthProblemsJS  string
+	HealthSummaryJS   string
+	ChartsJS          string
+	BackendsJS        string
+	CommonJS          string
+	OverviewJS        string
+	BackendsPageJS    string
+	DiagnosticsPageJS string
+	AnchorHandoffJS   string
+	// PageJS is the concatenation of this delivery's page controllers. The single
+	// page controller was split into one per document; the field remains so that
+	// tests which scan "the page's own controller" see all three.
+	PageJS      string
+	ParsedDOM   *xhtml.Node
+	MockFetches map[string]string
 	// TablesJS is the real NexusTable controller, loaded only when a harness asks
 	// for it. It must be read separately because the fixture's own script list is
-	// the six VPN modules and tables.js ships in base.html's head.
+	// the page's VPN modules and tables.js ships in base.html's head.
 	TablesJS string
 }
 
@@ -198,7 +210,14 @@ type JSDOMHarnessOptions struct {
 // In CI environments, missing Node binary fails closed with t.Fatalf.
 func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	t.Helper()
-	return newVPNTestFixtureWithFS(t, StaticFS)
+	return newVPNTestFixtureWithFS(t, StaticFS, "vpn")
+}
+
+// NewVPNTestFixtureForPage builds the fixture around one VPN document. page is
+// the template base name ("vpn", "vpn_backends" or "vpn_diagnostics").
+func NewVPNTestFixtureForPage(t *testing.T, page string) *VPNTestFixture {
+	t.Helper()
+	return newVPNTestFixtureWithFS(t, StaticFS, page)
 }
 
 func readFixtureStaticAsset(staticFS fs.FS, path string) ([]byte, error) {
@@ -208,13 +227,17 @@ func readFixtureStaticAsset(staticFS fs.FS, path string) ([]byte, error) {
 	return fs.ReadFile(staticFS, path)
 }
 
-func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
+func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS, page string) *VPNTestFixture {
 	t.Helper()
+	if page == "" {
+		page = "vpn"
+	}
 	tmplFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("filesystem sub-FS initialization failed: %v", err)
 	}
-	vpnBytes, err := fs.ReadFile(tmplFS, "vpn.html")
+	templateName := page + ".html"
+	vpnBytes, err := fs.ReadFile(tmplFS, templateName)
 	if err != nil {
 		t.Fatalf("failed reading fixture files: %v", err)
 	}
@@ -224,7 +247,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	}
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnBytes)))
 	if err != nil {
-		t.Fatalf("failed to parse vpn.html: %v", err)
+		t.Fatalf("failed to parse %s: %v", templateName, err)
 	}
 	nodePath, err := findNodeBinary()
 	if err != nil && isCIEnvironment() {
@@ -280,15 +303,29 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	}
 	backendsJS := string(backendsBytes)
 
-	pagePath := "static/js/vpn/page.js"
-	pageBytes, err := readFixtureStaticAsset(staticFS, pagePath)
-	if err != nil {
-		t.Fatalf("failed to read static page asset %s: %v", pagePath, err)
+	readModule := func(name string) string {
+		path := "static/js/vpn/" + name
+		body, err := readFixtureStaticAsset(staticFS, path)
+		if err != nil {
+			t.Fatalf("failed to read static page asset %s: %v", path, err)
+		}
+		if len(strings.TrimSpace(string(body))) == 0 {
+			t.Fatalf("failed to read static page asset %s: %v", path, errors.New("empty content"))
+		}
+		return string(body)
 	}
-	if len(strings.TrimSpace(string(pageBytes))) == 0 {
-		t.Fatalf("failed to read static page asset %s: %v", pagePath, errors.New("empty content"))
+	commonJS := readModule("common.js")
+	overviewJS := readModule("overview.js")
+	backendsPageJS := readModule("backends_page.js")
+	diagnosticsPageJS := readModule("diagnostics_page.js")
+	anchorHandoffJS := readModule("anchor_handoff.js")
+	pageJS := overviewJS
+	switch page {
+	case "vpn_backends":
+		pageJS = backendsPageJS
+	case "vpn_diagnostics":
+		pageJS = diagnosticsPageJS
 	}
-	pageJS := string(pageBytes)
 
 	tablesBytes, err := readFixtureStaticAsset(staticFS, "static/js/tables.js")
 	if err != nil {
@@ -300,19 +337,25 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS) *VPNTestFixture {
 	tablesJS := string(tablesBytes)
 
 	return &VPNTestFixture{
-		t:                t,
-		NodePath:         nodePath,
-		TemplateHTML:     string(vpnBytes),
-		StyleCSS:         string(cssBytes),
-		SessionsJS:       sessionsJS,
-		HealthProblemsJS: healthProblemsJS,
-		HealthSummaryJS:  healthSummaryJS,
-		ChartsJS:         chartsJS,
-		BackendsJS:       backendsJS,
-		PageJS:           pageJS,
-		TablesJS:         tablesJS,
-		ParsedDOM:        doc,
-		MockFetches:      make(map[string]string),
+		t:                 t,
+		NodePath:          nodePath,
+		OwnerPage:         page,
+		TemplateHTML:      string(vpnBytes),
+		StyleCSS:          string(cssBytes),
+		SessionsJS:        sessionsJS,
+		HealthProblemsJS:  healthProblemsJS,
+		HealthSummaryJS:   healthSummaryJS,
+		ChartsJS:          chartsJS,
+		BackendsJS:        backendsJS,
+		CommonJS:          commonJS,
+		OverviewJS:        overviewJS,
+		BackendsPageJS:    backendsPageJS,
+		DiagnosticsPageJS: diagnosticsPageJS,
+		AnchorHandoffJS:   anchorHandoffJS,
+		PageJS:            pageJS,
+		TablesJS:          tablesJS,
+		ParsedDOM:         doc,
+		MockFetches:       make(map[string]string),
 	}
 }
 
@@ -374,10 +417,19 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 // vpnCompanionBoundaryMarker separates template HTML from companion JS modules in CombinedSource.
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
-// CompanionScripts returns the concatenated companion JS modules in evaluation order:
-// backends.js -> health_problems.js -> health_summary.js -> charts.js -> sessions.js -> page.js.
+// CompanionScripts returns the JS modules the owner document ships, in
+// evaluation order. Deriving it from the owner page is what makes an asset
+// boundary assertion meaningful: the overview never carries the diagnostics
+// controllers, and diagnostics never carries backend management.
 func (f *VPNTestFixture) CompanionScripts() string {
-	return f.BackendsJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.SessionsJS + "\n" + f.PageJS
+	switch f.OwnerPage {
+	case "vpn_backends":
+		return f.CommonJS + "\n" + f.BackendsJS + "\n" + f.PageJS
+	case "vpn_diagnostics":
+		return f.CommonJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.SessionsJS + "\n" + f.PageJS
+	default:
+		return f.AnchorHandoffJS + "\n" + f.CommonJS + "\n" + f.PageJS
+	}
 }
 
 // CombinedSource returns the concatenated vpn.html template, sessions.js, health_problems.js, health_summary.js, charts.js, backends.js, and page.js scripts.
@@ -423,23 +475,27 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 	if opts.IncludeFetchMock && len(f.MockFetches) > 0 {
 		b.WriteString(buildFetchMockSnippet(f.MockFetches) + "\n")
 	}
-	if len(strings.TrimSpace(f.BackendsJS)) == 0 {
-		f.t.Fatalf("failed to read static backends asset %s: %v", "static/js/vpn/backends.js", errors.New("empty content"))
+	// Every module the fixture loaded must be non-empty, whichever document loads
+	// it: a truncated asset is a defect on any page, and a harness that validated
+	// only its owner's chain would happily hand an empty module to a test.
+	for _, module := range []struct{ name, label, body string }{
+		{"static/js/vpn/anchor_handoff.js", "anchor handoff", f.AnchorHandoffJS},
+		{"static/js/vpn/backends.js", "backends", f.BackendsJS},
+		{"static/js/vpn/backends_page.js", "backends page", f.BackendsPageJS},
+		{"static/js/vpn/charts.js", "charts", f.ChartsJS},
+		{"static/js/vpn/common.js", "common", f.CommonJS},
+		{"static/js/vpn/diagnostics_page.js", "diagnostics page", f.DiagnosticsPageJS},
+		{"static/js/vpn/health_problems.js", "health problems", f.HealthProblemsJS},
+		{"static/js/vpn/health_summary.js", "health summary", f.HealthSummaryJS},
+		{"static/js/vpn/overview.js", "page", f.PageJS},
+		{"static/js/vpn/sessions.js", "sessions", f.SessionsJS},
+	} {
+		if len(strings.TrimSpace(module.body)) == 0 {
+			f.t.Fatalf("failed to read static %s asset %s: %v", module.label, module.name, errors.New("empty content"))
+		}
 	}
-	if len(strings.TrimSpace(f.HealthProblemsJS)) == 0 {
-		f.t.Fatalf("failed to read static health problems asset %s: %v", "static/js/vpn/health_problems.js", errors.New("empty content"))
-	}
-	if len(strings.TrimSpace(f.HealthSummaryJS)) == 0 {
-		f.t.Fatalf("failed to read static health summary asset %s: %v", "static/js/vpn/health_summary.js", errors.New("empty content"))
-	}
-	if len(strings.TrimSpace(f.ChartsJS)) == 0 {
-		f.t.Fatalf("failed to read static charts asset %s: %v", "static/js/vpn/charts.js", errors.New("empty content"))
-	}
-	if len(strings.TrimSpace(f.SessionsJS)) == 0 {
-		f.t.Fatalf("failed to read static sessions asset %s: %v", "static/js/vpn/sessions.js", errors.New("empty content"))
-	}
-	if len(strings.TrimSpace(f.PageJS)) == 0 {
-		f.t.Fatalf("failed to read static page asset %s: %v", "static/js/vpn/page.js", errors.New("empty content"))
+	if len(strings.TrimSpace(f.CompanionScripts())) == 0 {
+		f.t.Fatalf("failed to read the VPN modules for page %q: %v", f.OwnerPage, errors.New("empty content"))
 	}
 	docHTML := fmt.Sprintf("<!DOCTYPE html><html dir=\"%s\"><head><style>%s</style></head><body>%s</body></html>",
 		dir, f.StyleCSS, htmlBody)
@@ -477,11 +533,6 @@ function addScript(code) { const s = w.document.createElement('script'); s.textC
 addScript(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
 addScript(%q);
 addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
-addScript(%q);
 ['vpnCachedServers', 'vpnCurrentBackends', 'vpnConfiguredPublicEndpoint', 'vpnTableInstance', 'vpnShowAllRoutes', 'vpnLastStatus'].forEach(prop => {
     Object.defineProperty(w, prop, {
         get() { return w.eval(prop); },
@@ -489,7 +540,7 @@ addScript(%q);
         configurable: true
     });
 });
-`, docHTML, f.TranslationsJS(lang), tablesScript, f.BackendsJS, f.HealthProblemsJS, f.HealthSummaryJS, f.ChartsJS, f.SessionsJS, f.PageJS))
+`, docHTML, f.TranslationsJS(lang), tablesScript, f.CompanionScripts()))
 	if opts.ExtraJS != "" {
 		b.WriteString("\n" + opts.ExtraJS)
 	}
@@ -831,21 +882,6 @@ func vpnDiagnosticsStaticOracle(rendered string, dict map[string]string) error {
 	for chart := range captions {
 		if !seenCaptions[chart] {
 			return fmt.Errorf("chart %s has no localized caption in the rendered template", chart)
-		}
-	}
-
-	// The four signals must carry localized titles, and the health summary keeps its
-	// live-region semantics.
-	for _, signal := range []struct{ class, key string }{
-		{"backends", "vpn_signal_backends"},
-		{"sessions", "vpn_diag_active_sessions"},
-		{"throughput", "vpn_fwd_kpi_throughput"},
-		{"drops", "vpn_col_packet_loss"},
-	} {
-		pattern := regexp.MustCompile(`data-signal="` + signal.class + `">\s*<div class="stat-card-header">\s*<span class="stat-card-title">([^<]+)</span>`)
-		match := pattern.FindStringSubmatch(rendered)
-		if len(match) != 2 || html.UnescapeString(match[1]) != dict[signal.key] {
-			return fmt.Errorf("signal %s title is not localized", signal.class)
 		}
 	}
 

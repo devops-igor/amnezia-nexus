@@ -38,27 +38,34 @@ func extractVPNTranslationKeys(t *testing.T) (keys []string, staticCount int) {
 
 	keySet := make(map[string]bool)
 
-	// 1. Parse web/templates/vpn.html
-	tmplData, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
-	if err != nil {
-		t.Fatalf("failed to read templates/vpn.html: %v", err)
-	}
-	tmplMatches := tmplI18nRegex.FindAllStringSubmatch(string(tmplData), -1)
-	if len(tmplMatches) == 0 {
-		t.Fatal("expected to find translation keys in templates/vpn.html, found none")
-	}
-	for _, m := range tmplMatches {
-		keySet[m[1]] = true
+	// 1. Parse the three VPN documents. Every user-visible string a document
+	// renders has to exist in all five bundles, so all three are scanned.
+	for _, page := range []string{"vpn", "vpn_backends", "vpn_diagnostics"} {
+		tmplData, err := fs.ReadFile(TemplatesFS, "templates/"+page+".html")
+		if err != nil {
+			t.Fatalf("failed to read templates/%s.html: %v", page, err)
+		}
+		tmplMatches := tmplI18nRegex.FindAllStringSubmatch(string(tmplData), -1)
+		if len(tmplMatches) == 0 {
+			t.Fatalf("expected to find translation keys in templates/%s.html, found none", page)
+		}
+		for _, m := range tmplMatches {
+			keySet[m[1]] = true
+		}
 	}
 
-	// 2. Parse 6 companion scripts
+	// 2. Parse the VPN modules each document loads.
 	companionFiles := []string{
+		"static/js/vpn/anchor_handoff.js",
 		"static/js/vpn/backends.js",
+		"static/js/vpn/backends_page.js",
+		"static/js/vpn/charts.js",
+		"static/js/vpn/common.js",
+		"static/js/vpn/diagnostics_page.js",
 		"static/js/vpn/health_problems.js",
 		"static/js/vpn/health_summary.js",
-		"static/js/vpn/charts.js",
+		"static/js/vpn/overview.js",
 		"static/js/vpn/sessions.js",
-		"static/js/vpn/page.js",
 	}
 
 	var healthProblemsContent string
@@ -226,6 +233,40 @@ func TestVPNTranslationKeyParityAndCoverage(t *testing.T) {
 
 	if err := validateTranslationKeys(keys, dicts); err != nil {
 		t.Fatalf("VPN translation validation failed: %v", err)
+	}
+}
+
+// TestVPNPageSplitLocaleKeys pins the five keys this split introduced. They are
+// the only new user-visible strings: the three navigation entries and the two
+// page titles (each used for both the H1 and the document-title suffix).
+// Extraction only scans the VPN documents, so the navigation keys — which live in
+// the shell — are asserted directly here, in every bundle and non-empty.
+func TestVPNPageSplitLocaleKeys(t *testing.T) {
+	newKeys := []string{
+		"nav_vpn_overview",
+		"nav_vpn_backends",
+		"nav_vpn_diagnostics",
+		"vpn_overview_page_title",
+		"vpn_diagnostics_page_title",
+	}
+	dicts := loadLocaleDictionaries(t)
+	for _, loc := range requiredLocales {
+		dict, ok := dicts[loc]
+		if !ok {
+			t.Fatalf("missing dictionary for locale %q", loc)
+		}
+		seen := make(map[string]string, len(newKeys))
+		for _, key := range newKeys {
+			value, exists := dict[key]
+			if !exists || strings.TrimSpace(value) == "" {
+				t.Errorf("locale %q is missing a non-empty %q", loc, key)
+				continue
+			}
+			if prev, dup := seen[value]; dup {
+				t.Errorf("locale %q uses the same text %q for %q and %q; the three pages must be distinguishable", loc, value, prev, key)
+			}
+			seen[value] = key
+		}
 	}
 }
 

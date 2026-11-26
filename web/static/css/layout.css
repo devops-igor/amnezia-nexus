@@ -111,6 +111,15 @@
     padding: var(--space-md) var(--space-sm) var(--space-xs);
 }
 
+/* A labelled group of sibling entries. It only restores the stack spacing the
+   nav itself applies between direct children, so grouping three links under one
+   heading leaves their alignment unchanged and adds no indentation. */
+.nav-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
 .sidebar-nav-link {
     display: flex;
     align-items: center;

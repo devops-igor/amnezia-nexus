@@ -10,7 +10,7 @@
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/css/tokens.css?v={{ .app_version }}">
     <link rel="stylesheet" href="/static/css/base.css?v={{ .app_version }}">
-    <link rel="stylesheet" href="/static/css/layout.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="{{ asset_url "/static/css/layout.css" }}">
     <link rel="stylesheet" href="/static/css/components.css?v={{ .app_version }}">
     <link rel="stylesheet" href="/static/css/tables.css?v={{ .app_version }}">
     <link rel="stylesheet" href="/static/css/server.css?v={{ .app_version }}">
@@ -19,7 +19,7 @@
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t) }()</script>
     <script src="/static/js/qrcode.min.js"></script>
     <script src="/static/js/api.js?v={{ .app_version }}"></script>
-    <script src="/static/js/ui.js"></script>
+    <script src="{{ asset_url "/static/js/ui.js" }}"></script>
     <script src="{{ asset_url "/static/js/tables.js" }}"></script>
     <script src="/static/js/telemetry.js"></script>
     {{ block "head_extra" . }}{{ end }}
@@ -71,6 +71,14 @@
             </symbol>
             <symbol id="icon-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+            </symbol>
+            <symbol id="icon-alert-triangle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </symbol>
+            <symbol id="icon-cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"></path>
             </symbol>
             <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="12" r="3"></circle>
@@ -300,10 +308,27 @@
                         <span class="nav-icon"><svg class="icon"><use href="#icon-users"></use></svg></span>
                         <span class="nav-label">{{ _ "nav_users" }}</span>
                     </a>
-                    <a href="/vpn" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn" }}active{{ end }}">
-                        <span class="nav-icon"><svg class="icon"><use href="#icon-network"></use></svg></span>
-                        <span class="nav-label">{{ _ "nav_vpn" }}</span>
-                    </a>
+                    {{/* The VPN subject is three documents. The group heading uses the
+                         existing section-label appearance, and the three links are
+                         flat siblings beneath it — no new tier, accordion or
+                         indentation. Each link is marked current by the page handler
+                         that rendered it (never by the shell's href matching), so
+                         /vpn does not also light up on /vpn/backends. */}}
+                    <div class="nav-group" role="group" aria-labelledby="nav-vpn-group-label">
+                        <div class="nav-section-label" id="nav-vpn-group-label">{{ _ "nav_vpn" }}</div>
+                        <a href="/vpn" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn" }} aria-current="page"{{ end }}>
+                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-network"></use></svg></span>
+                            <span class="nav-label">{{ _ "nav_vpn_overview" }}</span>
+                        </a>
+                        <a href="/vpn/backends" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn_backends" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn_backends" }} aria-current="page"{{ end }}>
+                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-server"></use></svg></span>
+                            <span class="nav-label">{{ _ "nav_vpn_backends" }}</span>
+                        </a>
+                        <a href="/vpn/diagnostics" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn_diagnostics" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn_diagnostics" }} aria-current="page"{{ end }}>
+                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-activity"></use></svg></span>
+                            <span class="nav-label">{{ _ "nav_vpn_diagnostics" }}</span>
+                        </a>
+                    </div>
                     {{ end }}
 
                     {{ if has_role .current_user "admin" }}
@@ -403,8 +428,11 @@
                 <svg class="icon"><use href="#icon-users"></use></svg>
                 <span>{{ _ "nav_users" }}</span>
             </a>
-            <a href="/vpn" class="bottom-bar-link {{ if eq .active_page "vpn" }}active{{ end }}">
-                <svg class="icon"><use href="#icon-network"></use></svg>
+            {{/* The single VPN shortcut keeps its slot and its action. It stands for
+                 the VPN overview only, so it is current on /vpn and merely links
+                 back to it from the two child pages. */}}
+            <a href="/vpn" class="bottom-bar-link {{ if eq .active_page "vpn" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn" }} aria-current="page"{{ end }}>
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-network"></use></svg>
                 <span>{{ _ "nav_vpn" }}</span>
             </a>
             {{ end }}
@@ -586,11 +614,17 @@
         // link's own href. The comparison stops at a path segment: a prefix match
         // would paint /routing current on /routing-archive and, worse, paint a link
         // current because another page merely starts with its path.
+        //
+        // Links carrying data-nav-exact are excluded: their pages are siblings
+        // beneath one shared prefix (/vpn, /vpn/backends, /vpn/diagnostics), so a
+        // prefix match would paint Overview current on both children. Those links
+        // are marked by the handler alone, before this runs.
         (function () {
             const path = window.location.pathname;
             document.querySelectorAll('.sidebar-nav-link, .bottom-bar-link, .nav-link').forEach(link => {
                 const href = link.getAttribute('href');
                 if (!href) return;
+                if (link.hasAttribute('data-nav-exact')) return;
                 if (href === '/') {
                     if (path === '/') link.classList.add('active');
                     return;

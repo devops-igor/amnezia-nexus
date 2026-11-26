@@ -20,13 +20,18 @@ func TestRouterVPNCompanionStaticAssetsServing(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
+	// Every module the three VPN documents load, plus the two new shared ones.
 	vpnAssets := []string{
+		"/static/js/vpn/anchor_handoff.js",
 		"/static/js/vpn/backends.js",
+		"/static/js/vpn/backends_page.js",
+		"/static/js/vpn/charts.js",
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/diagnostics_page.js",
 		"/static/js/vpn/health_problems.js",
 		"/static/js/vpn/health_summary.js",
-		"/static/js/vpn/charts.js",
+		"/static/js/vpn/overview.js",
 		"/static/js/vpn/sessions.js",
-		"/static/js/vpn/page.js",
 	}
 
 	for _, asset := range vpnAssets {

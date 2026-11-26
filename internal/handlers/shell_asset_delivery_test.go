@@ -63,7 +63,6 @@ var untouchedBareShellAssets = []string{
 	"/static/js/captcha.js",
 	"/static/js/qrcode.min.js",
 	"/static/js/telemetry.js",
-	"/static/js/ui.js",
 	"/static/js/users.js",
 }
 
@@ -560,10 +559,10 @@ func TestDeliveredAssetURLMovesWithTheBytes(t *testing.T) {
 	const changed = "/static/js/tables.js"
 	const other = "/static/css/vpn.css"
 
-	// base.html also loads the settings sheet through its own identity, so the
-	// root has to hold that asset as well. It is not one of the two URLs this
-	// check follows.
-	root := deliveredStaticCopy(t, changed, other, "/static/css/settings.css")
+	// Include every shell asset resolved through asset_url, even when its URL
+	// is not one of the two this byte-mutation check follows.
+	root := deliveredStaticCopy(t, changed, other, "/static/css/settings.css",
+		"/static/css/layout.css", "/static/js/ui.js")
 	before := renderBaseShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, changed)
 	if beforeURL == "" {
@@ -668,7 +667,11 @@ func TestShellAssetEnumerationRejectsABareOrReleaseVersionedDeliveredAsset(t *te
 // still accepted, so the rule rejects the content address of an undeclared asset
 // rather than every query, and an unchanged asset keeps the identity it carries.
 func TestShellAssetEnumerationRejectsAnUndeclaredAssetAtItsOwnDigest(t *testing.T) {
-	const undeclared = "/static/js/ui.js"
+	// A declared-untouched bare asset, so the unmutated render is accepted and
+	// the rejection below is the reverse rule firing on the digest form. It must
+	// never be named in web.DeliveredAssets; a delivery that registers it has to
+	// move this constant to another bare asset, and the guard below says so.
+	const undeclared = "/static/js/telemetry.js"
 
 	rendered := renderEveryShippedShell(t)["base.html"]["admin"]
 	if rendered == "" {
@@ -831,7 +834,8 @@ func TestServerPageControllerURLMovesWithTheBytes(t *testing.T) {
 	// base.html and server.html ask for through the identity. Only the
 	// controller's URL is followed here.
 	root := deliveredStaticCopy(t, controller, other, "/static/css/settings.css",
-		"/static/js/tables.js", "/static/js/server_telemetry.js")
+		"/static/js/tables.js", "/static/js/server_telemetry.js", "/static/css/layout.css",
+		"/static/js/ui.js")
 	before := renderServerShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, controller)
 	if beforeURL == "" {

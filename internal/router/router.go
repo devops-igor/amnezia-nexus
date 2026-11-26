@@ -365,6 +365,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Get("/server/{server_id}", h.ServerPageHandler)
 		r.Get("/users", h.UsersPageHandler)
 		r.Get("/vpn", h.VPNPageHandler)
+		// The VPN subject is three documents: the overview, the backend
+		// inventory and diagnostics. They share this group's gate, so all three
+		// answer the same refusal to the same roles.
+		r.Get("/vpn/backends", h.VPNBackendsPageHandler)
+		r.Get("/vpn/diagnostics", h.VPNDiagnosticsPageHandler)
 
 		// Root server management aliases matching legacy routes
 		r.Post("/add", h.AddServerHandler)

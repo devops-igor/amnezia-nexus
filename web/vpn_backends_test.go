@@ -8,7 +8,7 @@ import (
 )
 
 func TestVPNRenderBackendRowFleet(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	nodePath := fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
@@ -161,7 +161,7 @@ func TestVPNRenderBackendRowFleet(t *testing.T) {
 }
 
 func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	nodePath := fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
@@ -192,7 +192,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
         }
     };
 
-    w.vpnLoadData = async () => {
+    w.vpnLoadBackends = async () => {
         loadDataCount++;
     };
 
@@ -202,7 +202,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
     assert.strictEqual(uiConfirms.length, 1, 'UI.confirm must be called on disable');
     assert.strictEqual(uiConfirms[0].confirmVariant, 'warning', 'confirmVariant must be warning on disable');
     assert.strictEqual(apiCalls.length, 0, 'API.post must not be called when user cancels disable');
-    assert.strictEqual(loadDataCount, 0, 'vpnLoadData must not be called when cancelled');
+    assert.strictEqual(loadDataCount, 0, 'vpnLoadBackends must not be called when cancelled');
 
     // 2. Toggle backend 'disable' when user confirms
     confirmResult = true;
@@ -210,7 +210,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
     assert.strictEqual(uiConfirms.length, 2, 'second UI.confirm recorded');
     assert.strictEqual(apiCalls.length, 1, 'API.post must be called on confirmed disable');
     assert.strictEqual(apiCalls[0].endpoint, '/api/vpn/backends/101/disable');
-    assert.strictEqual(loadDataCount, 1, 'vpnLoadData must be called after successful disable');
+    assert.strictEqual(loadDataCount, 1, 'vpnLoadBackends must be called after successful disable');
     assert(uiToasts.some(t => t.variant === 'success'), 'success toast emitted on disable');
 
     // 3. Toggle backend 'enable' does NOT require UI.confirm
@@ -221,7 +221,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
     assert.strictEqual(uiConfirms.length, 2, 'enable action must not trigger confirmation');
     assert.strictEqual(apiCalls.length, 1, 'API.post must be called directly on enable');
     assert.strictEqual(apiCalls[0].endpoint, '/api/vpn/backends/102/enable');
-    assert.strictEqual(loadDataCount, 1, 'vpnLoadData must be called after successful enable');
+    assert.strictEqual(loadDataCount, 1, 'vpnLoadBackends must be called after successful enable');
 
     // 4. Delete backend when user cancels confirmation
     apiCalls = [];
@@ -238,7 +238,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
     assert.strictEqual(uiConfirms.length, 4, 'delete confirm recorded');
     assert.strictEqual(apiCalls.length, 1, 'API.post must be called on confirmed delete');
     assert.strictEqual(apiCalls[0].endpoint, '/api/vpn/backends/103/delete', 'delete must POST to /api/vpn/backends/{id}/delete');
-    assert.strictEqual(loadDataCount, 1, 'vpnLoadData must be called after successful delete');
+    assert.strictEqual(loadDataCount, 1, 'vpnLoadBackends must be called after successful delete');
     assert(uiToasts.some(t => t.variant === 'success'), 'success toast emitted on delete');
 
     // 6. Toggle backend when API.post rejects
@@ -270,7 +270,7 @@ func TestVPNBackendToggleAndDeleteInteractions(t *testing.T) {
 }
 
 func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	nodePath := fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
@@ -298,7 +298,7 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
                 .replace(/'/g, '&#39;');
         }
     };
-    w.vpnLoadData = async () => { loadDataCount++; };
+    w.vpnLoadBackends = async () => { loadDataCount++; };
 
     w.API = {
         get: async (endpoint) => {
@@ -362,21 +362,10 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
     await w.vpnSubmitAddBackend();
     assert(apiRequests.some(r => r.endpoint === '/api/vpn/backends/2/enable'), 'POST /api/vpn/backends/2/enable must be called');
     assert(closedModals.includes('addBackendModal'), 'modal must be closed after submit');
-    assert.strictEqual(loadDataCount, 1, 'vpnLoadData must be called after backend enabled');
+    assert.strictEqual(loadDataCount, 1, 'vpnLoadBackends must be called after backend enabled');
 
-    // 5. Submit Edit Endpoint
-    w.vpnConfiguredPublicEndpoint = 'vpn.old.domain:51820';
-    w.vpnOpenEditEndpointModal();
-    assert(openedModals.includes('editEndpointModal'), 'editEndpointModal opened');
-    const input = w.document.getElementById('vpnPublicEndpointInput');
-    assert.strictEqual(input.value, 'vpn.old.domain:51820', 'endpoint input populated from vpnConfiguredPublicEndpoint');
-
-    input.value = 'vpn.new.domain:51820';
-    await w.vpnSubmitEditEndpoint();
-    assert(apiRequests.some(r => r.endpoint === '/api/vpn/config' && r.method === 'PUT' && r.body.public_endpoint === 'vpn.new.domain:51820'),
-        'PUT /api/vpn/config must be called with public_endpoint');
-    assert(closedModals.includes('editEndpointModal'), 'editEndpointModal closed');
-    assert.strictEqual(loadDataCount, 2, 'vpnLoadData called after endpoint update');
+    // 5. The endpoint dialog belongs to the overview document; it is covered by
+    // TestVPNOverviewEndpointDialog, which runs against that page.
 
     // 6. Quick check failure & spinner restoration (finally block)
     select.value = '2';
@@ -391,13 +380,8 @@ func TestVPNBackendModalInteractionsAndQuickCheck(t *testing.T) {
     assert(!w.document.getElementById('vpnQuickCheckIcon').classList.contains('hidden'), 'icon restored on failure');
     assert(w.document.getElementById('vpnModalError').textContent.includes('check server offline'), 'error message displayed in modal error box');
 
-    // 7. Edit endpoint rejection & button restoration (finally block)
-    w.API.request = async () => { throw new Error('endpoint update rejected'); };
-    const editBtn = w.document.getElementById('vpnEditEndpointSubmitBtn');
-    input.value = 'vpn.fail.domain:51820';
-    await w.vpnSubmitEditEndpoint();
-    assert.strictEqual(editBtn.disabled, false, 'edit endpoint button re-enabled on failure');
-    assert(w.document.getElementById('vpnEndpointModalError').textContent.includes('endpoint update rejected'), 'endpoint modal error displayed');
+    // 7. The endpoint dialog's refusal path belongs to the overview document and
+    // is covered by TestVPNOverviewEndpointDialog.
 
     // 8. Add backend enable rejection & button restoration (finally block)
     w.API.post = async (endpoint) => {
@@ -463,7 +447,7 @@ addScript(%q);
 }
 
 func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	nodePath := fixture.RequireJSDOM()
 
 	srcIdx := strings.Index(fixture.TemplateHTML, "<script src=")
@@ -484,7 +468,7 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
 	pageScript := fixture.PageJS
 
 	t.Run("ProductionOrderBootstrapAndState", func(t *testing.T) {
-		testScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.BackendsJS, pageScript, `
+		testScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.CommonJS+"\n"+fixture.BackendsJS, pageScript, `
 (async () => {
   // State variables are lexical bindings, not window properties (H2: no window globals)
   assert.strictEqual(w.vpnCachedServers, undefined, 'vpnCachedServers must not be a window property');
@@ -493,9 +477,8 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
   assert.strictEqual(typeof w.vpnRenderBackendRow, 'function', 'vpnRenderBackendRow exported on window');
 
   // Drive real vpnLoadData()
-  await w.eval('vpnLoadData()');
-  assert.strictEqual(w.eval('vpnCurrentBackends.length'), 1, 'vpnLoadData wrote live lexical binding');
-  assert.strictEqual(w.eval('vpnConfiguredPublicEndpoint'), 'vpn.example.test:443', 'vpnLoadData stored trimmed endpoint');
+  await w.eval('vpnLoadBackends()');
+  assert.strictEqual(w.eval('vpnCurrentBackends.length'), 1, 'vpnLoadBackends wrote live lexical binding');
   assert.strictEqual(tableCtor, 1, 'NexusTable constructed once on nonempty backends');
 
   // Add modal reads live vpnCurrentBackends and reassigns live vpnCachedServers
@@ -505,14 +488,11 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
   assert.ok(!sel.options[2].textContent.includes('Active'), 'unconfigured server not annotated Active');
   assert.strictEqual(w.eval('vpnCachedServers.length'), 2, 'modal reassigned live lexical cache');
 
-  // Edit modal reads configured (trimmed) value
-  w.vpnOpenEditEndpointModal();
-  assert.strictEqual(w.document.getElementById('vpnPublicEndpointInput').value, 'vpn.example.test:443', 'edit modal reads trimmed endpoint');
-
   // Real row rendering with real UI.escapeHtml after reload: name must be text, not markup
-  await w.eval('vpnLoadData()');
+  const refreshBeforeReload = tableRefresh;
+  await w.eval('vpnLoadBackends()');
   assert.strictEqual(tableCtor, 1, 'no second NexusTable instance');
-  assert.strictEqual(tableRefresh, 1, 'NexusTable refreshed on reload');
+  assert.strictEqual(tableRefresh, refreshBeforeReload + 1, 'NexusTable refreshed once on reload');
   const row = w.document.querySelector('#vpn-backends-tbody tr');
   assert.ok(!row.querySelector('img'), 'server name must not inject markup');
   assert.ok(row.textContent.includes('<img src=x'), 'server name rendered as escaped text');
@@ -522,7 +502,7 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
   row.querySelector('button[aria-label="Disable"]').click();
   await new Promise(r => setTimeout(r, 20));
   assert.ok(calls.some(c => c[0] === 'POST' && c[1] === '/api/vpn/backends/7/disable'), 'row disable click dispatched POST');
-  assert.strictEqual(calls.filter(c => c[1] === '/api/vpn/backends').length, before + 1, 'toggle awaited real vpnLoadData exactly once');
+  assert.strictEqual(calls.filter(c => c[1] === '/api/vpn/backends').length, before + 1, 'toggle awaited the real refresh exactly once');
 
   // Delete backend encodes URI component and uses POST
   await w.vpnDeleteBackend('a/b c');
@@ -530,15 +510,11 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
   assert.ok(!calls.some(c => c[0] === 'DELETE'), 'delete must never use HTTP DELETE method');
 
   // Empty list after nonempty: null-guarded refresh path without reconstructing table
+  const refreshBeforeEmpty = tableRefresh;
   backendList = [];
-  await w.eval('vpnLoadData()');
-  assert.strictEqual(tableRefresh, 4, 'refresh called across reloads and empty transition');
+  await w.eval('vpnLoadBackends()');
+  assert.strictEqual(tableRefresh, refreshBeforeEmpty + 1, 'refresh called on the empty transition');
   assert.strictEqual(tableCtor, 1, 'empty path never constructs additional NexusTable');
-
-  // Endpoint PUT trimmed
-  w.document.getElementById('vpnPublicEndpointInput').value = '  new.example.test:443 ';
-  await w.vpnSubmitEditEndpoint();
-  assert.ok(calls.some(c => c[0] === 'PUT' && c[1] === '/api/vpn/config' && c[2].public_endpoint === 'new.example.test:443'), 'endpoint PUT trimmed');
 
   // Submit preflight: server without AWG, rejected check still enables (dynamic fallback)
   w.API.post = async (u) => { calls.push(['POST', u]); if (u.endsWith('/check')) throw new Error('ssh down'); return {}; };
@@ -563,9 +539,9 @@ func TestVPNBackendsProductionOrderBootstrapIntegration(t *testing.T) {
 
 	t.Run("RedeclarationMutationFails", func(t *testing.T) {
 		mutatedBackends := "var vpnTableInstance = null;\n" + fixture.BackendsJS
-		mutatedScript := buildVPNBackendsProductionOrderScript(markup, uiJS, mutatedBackends, pageScript, `
+		mutatedScript := buildVPNBackendsProductionOrderScript(markup, uiJS, fixture.CommonJS+"\n"+mutatedBackends, pageScript, `
 (async () => {
-  await w.eval('vpnLoadData()');
+  await w.eval('vpnLoadBackends()');
   console.log('UNREACHABLE_AFTER_REDECLARATION_MUTATION');
 })().catch(e => { console.error(e); process.exit(1); });
 `)

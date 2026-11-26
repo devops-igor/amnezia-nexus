@@ -1,56 +1,10 @@
 /* ===== VPN Backend Management Interactions Controller ===== */
 // Extracted from web/templates/vpn.html per #498 (Epic #475 Phase 3).
-
-function vpnFormatApiError(err, res, data) {
-    const errMsg = (data && (data.detail || data.message || data.error)) ||
-        (err && err.data && (err.data.detail || err.data.message || err.data.error)) ||
-        (res && `HTTP ${res.status} ${res.statusText || _('error')}`.trim()) ||
-        (err && err.status ? `HTTP ${err.status}` : '') ||
-        (err && err.message) || _('error');
-    return errMsg;
-}
-
-function vpnOpenEditEndpointModal() {
-    const input = document.getElementById('vpnPublicEndpointInput');
-    input.value = vpnConfiguredPublicEndpoint || '';
-    const errBox = document.getElementById('vpnEndpointModalError');
-    if (errBox) {
-        errBox.style.display = 'none';
-        errBox.textContent = '';
-    }
-    openModal('editEndpointModal');
-}
-
-async function vpnSubmitEditEndpoint() {
-    const input = document.getElementById('vpnPublicEndpointInput');
-    const newEndpoint = input.value.trim();
-    const errBox = document.getElementById('vpnEndpointModalError');
-    if (errBox) {
-        errBox.style.display = 'none';
-        errBox.textContent = '';
-    }
-    const submitBtn = document.getElementById('vpnEditEndpointSubmitBtn');
-    submitBtn.disabled = true;
-
-    try {
-        await API.request('/api/vpn/config', {
-            method: 'PUT',
-            body: { public_endpoint: newEndpoint }
-        });
-        UI.toast(_('vpn_endpoint_updated_success'), 'success');
-        closeModal('editEndpointModal');
-        await vpnLoadData();
-    } catch (err) {
-        const errMsg = vpnFormatApiError(err);
-        if (errBox) {
-            errBox.textContent = errMsg;
-            errBox.style.display = 'block';
-        }
-        UI.toast(errMsg, 'error');
-    } finally {
-        submitBtn.disabled = false;
-    }
-}
+//
+// This module owns the backend inventory's interactions: the row renderer, the
+// add/enable/disable/delete paths and the add-backend dialog. The endpoint dialog
+// lives with the overview, and the shared label/error helpers live in common.js,
+// so nothing here runs or requires another page's controller.
 
 function vpnServerHasAwg(srv) {
     if (!srv || !srv.protocols) return false;
@@ -61,37 +15,6 @@ function vpnServerHasAwg(srv) {
         return !!(awg.installed || awg.public_key || (typeof awg.port === 'number' && awg.port > 0));
     }
     return false;
-}
-
-function vpnStatusBadgeClass(status) {
-    switch (status) {
-        case 'active': return 'badge-success';
-        case 'degraded': return 'badge-warn';
-        case 'connecting': return 'badge-info';
-        case 'disabled': return 'badge-danger';
-        default: return 'badge-secondary';
-    }
-}
-
-function vpnStatusLabel(status) {
-    switch (status) {
-        case 'active': return _('active');
-        case 'degraded': return _('vpn_degraded');
-        case 'connecting': return _('connecting');
-        case 'disabled': return _('disabled');
-        default: return String(status);
-    }
-}
-
-function vpnSetListenerBadge(running) {
-    const badge = document.getElementById('vpn-listener-badge');
-    if (!badge) return;
-    badge.className = 'badge ' + (running ? 'badge-success' : 'badge-secondary');
-    badge.textContent = '';
-    const dot = document.createElement('span');
-    dot.className = 'badge-dot';
-    badge.appendChild(dot);
-    badge.appendChild(document.createTextNode(' ' + (running ? _('vpn_running') : _('vpn_stopped'))));
 }
 
 function vpnRenderBackendRow(b) {
@@ -236,7 +159,7 @@ async function vpnToggleBackend(serverId, action) {
     try {
         await API.post('/api/vpn/backends/' + encodeURIComponent(serverId) + '/' + action);
         UI.toast((action === 'enable' ? _('vpn_enable') : _('vpn_disable')) + ' OK', 'success');
-        await vpnLoadData();
+        await vpnLoadBackends();
     } catch (err) {
         UI.toast((_('error') || 'Error') + ': ' + err.message, 'error');
     }
@@ -254,7 +177,7 @@ async function vpnDeleteBackend(serverId) {
     try {
         await API.post('/api/vpn/backends/' + encodeURIComponent(serverId) + '/delete');
         UI.toast((_('vpn_delete') || 'Delete') + ' OK', 'success');
-        await vpnLoadData();
+        await vpnLoadBackends();
     } catch (err) {
         UI.toast((_('error') || 'Error') + ': ' + err.message, 'error');
     }
@@ -505,7 +428,7 @@ async function vpnSubmitAddBackend() {
         await API.post('/api/vpn/backends/' + encodeURIComponent(serverId) + '/enable');
         UI.toast(_('vpn_backend_enabled_success'), 'success');
         closeModal('addBackendModal');
-        await vpnLoadData();
+        await vpnLoadBackends();
     } catch (err) {
         const errMsg = err.message || _('error');
         errBox.textContent = errMsg;
@@ -518,13 +441,7 @@ async function vpnSubmitAddBackend() {
 }
 
 if (typeof window !== 'undefined') {
-    window.vpnFormatApiError = vpnFormatApiError;
-    window.vpnOpenEditEndpointModal = vpnOpenEditEndpointModal;
-    window.vpnSubmitEditEndpoint = vpnSubmitEditEndpoint;
     window.vpnServerHasAwg = vpnServerHasAwg;
-    window.vpnStatusBadgeClass = vpnStatusBadgeClass;
-    window.vpnStatusLabel = vpnStatusLabel;
-    window.vpnSetListenerBadge = vpnSetListenerBadge;
     window.vpnRenderBackendRow = vpnRenderBackendRow;
     window.vpnToggleBackend = vpnToggleBackend;
     window.vpnDeleteBackend = vpnDeleteBackend;

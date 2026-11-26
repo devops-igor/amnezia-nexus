@@ -12,7 +12,7 @@ import (
 )
 
 func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	vpnStr := fixture.TemplateHTML
 	combined := fixture.CombinedSource()
 	cssStr := fixture.StyleCSS
@@ -20,12 +20,12 @@ func TestVPNForwarderRoutesTableFormatting(t *testing.T) {
 	t.Run("TemplateDOMStructure", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(vpnStr))
 		if err != nil {
-			t.Fatalf("failed to parse vpn.html as HTML: %v", err)
+			t.Fatalf("failed to parse vpn_diagnostics.html as HTML: %v", err)
 		}
 
 		table := findHTMLNodeByID(doc, "vpn-fwd-routes-table")
 		if table == nil {
-			t.Fatal("table #vpn-fwd-routes-table not found in vpn.html")
+			t.Fatal("table #vpn-fwd-routes-table not found in vpn_diagnostics.html")
 		}
 
 		// 1. Parent container of #vpn-fwd-routes-table has class table-container
@@ -245,6 +245,7 @@ const dom = new JSDOM('<!DOCTYPE html><html dir="rtl"><head><style>' + %q + '</s
 const w = dom.window;
 w.eval(%q);
 w.eval(%q);
+w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
 
 assert.strictEqual(w.document.documentElement.getAttribute('dir'), 'rtl', 'document has dir=rtl');
@@ -297,7 +298,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('PERSIAN_RTL_PASS');
-`, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
+`, cssStr, renderedHTML, fixture.CommonJS, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
 
 		out := runJSDOMTestScript(t, nodePath, testScript)
 		if !strings.Contains(out, "PERSIAN_RTL_PASS") {
@@ -326,6 +327,7 @@ const w = dom.window;
 w.innerWidth = 375;
 w.outerWidth = 375;
 
+w.eval(%q);
 w.eval(%q);
 w.eval(%q);
 w.eval(%q + "\nwindow.translations = translations;\nwindow._ = _;\n");
@@ -380,7 +382,7 @@ for (let i = 0; i < tbody.children.length; i++) {
 }
 
 console.log('NARROW_VIEWPORT_PASS');
-`, cssStr, cssStr, renderedHTML, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
+`, cssStr, cssStr, renderedHTML, fixture.CommonJS, fixture.HealthProblemsJS, fixture.HealthSummaryJS, translationsJS)
 
 		out := runJSDOMTestScript(t, nodePath, testScript)
 		if !strings.Contains(out, "NARROW_VIEWPORT_PASS") {
@@ -395,8 +397,8 @@ console.log('NARROW_VIEWPORT_PASS');
 				t.Fatalf("extractJSFunction %s from combined source failed: %v", fn, err)
 			}
 		}
-		if _, err := extractJSFunction(fixture.BackendsJS, "function vpnStatusLabel"); err != nil {
-			t.Fatalf("extractJSFunction vpnStatusLabel from BackendsJS failed: %v", err)
+		if _, err := extractJSFunction(fixture.CommonJS, "function vpnStatusLabel"); err != nil {
+			t.Fatalf("extractJSFunction vpnStatusLabel from CommonJS failed: %v", err)
 		}
 		// TemplateHTML must not contain moved functions (scoping strictly limited to source)
 		for _, fn := range []string{"renderSessions", "vpnFormatPeerKey", "vpnStatusLabel"} {
@@ -408,7 +410,7 @@ console.log('NARROW_VIEWPORT_PASS');
 }
 
 func TestVPNSessionsTableSortingAndAccordionPersistence(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 	tmplStr := fixture.TemplateHTML
 	sessionsJS := fixture.SessionsJS
@@ -643,7 +645,7 @@ w.eval(tablesCode);
     console.error(e);
     process.exit(1);
 });
-`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.HealthProblemsJS, fixture.HealthSummaryJS, fixture.BackendsJS)
+`, tmplStr, string(enData), string(tablesJS), string(sessionsJS), fixture.CommonJS, fixture.HealthProblemsJS, fixture.HealthSummaryJS)
 
 	out, err := execNodeScript(node, testScript)
 	if err != nil {
@@ -729,16 +731,16 @@ func requireJSDOMForTransferredGuard(t *testing.T) string {
 // the traffic each session has carried instead of the forwarder drop counter.
 // The drop counters themselves are unchanged and stay in Advanced Diagnostics.
 func TestVPNSessionsTransferredColumn(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 
 	t.Run("HeaderReplacesDataplaneDrops", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(fixture.TemplateHTML))
 		if err != nil {
-			t.Fatalf("failed to parse vpn.html: %v", err)
+			t.Fatalf("failed to parse vpn_diagnostics.html: %v", err)
 		}
 		table := findHTMLNodeByID(doc, "vpnSessionsTable")
 		if table == nil {
-			t.Fatal("sessions table #vpnSessionsTable not found in vpn.html")
+			t.Fatal("sessions table #vpnSessionsTable not found in vpn_diagnostics.html")
 		}
 		thNodes := findHTMLNodesByTag(table, "th")
 		if len(thNodes) != 5 {

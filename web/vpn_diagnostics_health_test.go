@@ -13,7 +13,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
@@ -34,11 +34,6 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn-runtime-details",
 			"vpn-close-diagnostics",
 			"vpn-history-window-toggles",
-			"vpn-session-mismatch",
-			"vpn-signal-backends-value",
-			"vpn-signal-throughput-value",
-			"vpn-signal-drops-value",
-			"vpn-configuration",
 			"vpn-diag-throughput",
 			"vpn-diag-ewma5m",
 			"vpn-diag-ewma1h",
@@ -105,18 +100,22 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		if !(trafficRel < routingRel && routingRel < runtimeRel) {
 			t.Errorf("diagnostic regions out of order: traffic=%d routing=%d runtime=%d", trafficRel, routingRel, runtimeRel)
 		}
-		// The health panel must precede the overview, which must precede diagnostics.
+		// The health panel must precede the diagnostics disclosure. The overview
+		// grid and its four signals belong to the overview document, which asserts
+		// them itself.
 		healthIdx := strings.Index(vpnStr, `id="vpn-forwarder-card"`)
-		overviewIdx := strings.Index(vpnStr, `class="stats-grid vpn-overview"`)
-		if healthIdx < 0 || overviewIdx < 0 {
-			t.Fatal("missing health panel or overview grid")
+		if healthIdx < 0 {
+			t.Fatal("missing health panel")
 		}
-		if !(healthIdx < overviewIdx && overviewIdx < diagStart) {
-			t.Errorf("page order must be health < overview < diagnostics (got %d, %d, %d)", healthIdx, overviewIdx, diagStart)
+		if !(healthIdx < diagStart) {
+			t.Errorf("page order must be health < diagnostics (got %d, %d)", healthIdx, diagStart)
 		}
-		// Exactly four signals in the overview.
-		if got := strings.Count(vpnStr, `data-signal="`); got != 4 {
-			t.Errorf("expected exactly 4 [data-signal] entries, got %d", got)
+		// Diagnostics carries no overview signal grid.
+		if strings.Contains(vpnStr, `class="stats-grid vpn-overview"`) {
+			t.Error("the overview grid must not render on the diagnostics page")
+		}
+		if strings.Contains(vpnStr, `data-signal="`) {
+			t.Error("the four overview signals must not render on the diagnostics page")
 		}
 
 		// The diagnostics panel starts collapsed and its entry says so, so nothing
@@ -151,10 +150,6 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			"vpn_diag_drops_outbound",
 			"vpn_diag_drops_inbound",
 			"vpn_diag_route_integrity",
-			"vpn_signal_backends",
-			"vpn_diag_active_sessions",
-			"vpn_col_packet_loss",
-			"vpn_dataplane_drops_scope",
 		} {
 			expectedTag := fmt.Sprintf(`{{ _ "%s" }}`, labelKey)
 			if !strings.Contains(vpnStr, expectedTag) {
@@ -246,8 +241,8 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 			t.Fatal("Node is required for diagnostics verification")
 		}
 
-		fixture := NewVPNTestFixture(t)
-		runnerScript := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
+		runnerScript := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.CommonJS + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 const mockDoc = document;
 const el = id => mockDoc.getElementById(id);
 const text = id => mockDoc.getElementById(id).textContent;
@@ -270,10 +265,6 @@ assert.strictEqual(text('vpn-fwd-headline-summary'), 'All clear and operational'
 assert.strictEqual(el('vpn-fwd-problem-list').hidden, true, 'healthy renders no problem list at all');
 assert.strictEqual(el('vpn-fwd-problem-list').children.length, 0, 'no nominal green banner row');
 // The overview shows the four measured signals.
-assert.strictEqual(text('vpn-signal-backends-value').replace(/\s+/g, ' ').trim(), '2 / 2');
-assert.strictEqual(text('vpn-sessions'), '5');
-assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g, ' ').trim(), '3.00 Mbps');
-assert.strictEqual(el('vpn-session-mismatch').hidden, true);
 
 // Test 2: DEGRADED state with a condition -- one explicit problem row.
 mockDoc.reset();
@@ -318,10 +309,6 @@ assert.strictEqual(el('vpn-fwd-status-badge').className, 'badge', 'unavailable m
 assert(!el('vpn-fwd-status-badge').className.includes('badge-success'), 'unavailable must never read healthy');
 assert.strictEqual(text('vpn-fwd-status-text'), 'Not reported');
 assert.strictEqual(text('vpn-fwd-headline-summary'), 'Not reported');
-assert.strictEqual(text('vpn-signal-throughput-value'), 'Not measured', 'unmeasured throughput is text, not 0');
-assert.strictEqual(text('vpn-signal-drops-value'), 'Not measured', 'unmeasured drops are text, not 0');
-assert.strictEqual(text('vpn-signal-backends-value'), 'Not measured');
-assert.strictEqual(text('vpn-sessions'), 'Not measured');
 assert.strictEqual(text('vpn-diag-lat-percentiles'), 'Not measured');
 
 // Test 5: a true sampled zero stays numeric; an unmeasured value does not.
@@ -334,9 +321,6 @@ vpnRenderForwarderHealth({
     forward_latency: { p95_health_samples: 1, p95_health_ms: 0, p95_health_window_sec: 60 },
     health_assessment: { status: 'HEALTHY', conditions: [] }
 });
-assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g, ' ').trim(), '0 bps', 'measured zero throughput stays numeric');
-assert.strictEqual(text('vpn-signal-drops-value').replace(/\s+/g, ' ').trim(), '0.00 drops/s', 'measured zero drop rate stays numeric');
-assert(el('vpn-signal-drops-sub').textContent.includes('0 drops since reset'), 'cumulative total keeps its own label');
 assert(!el('vpn-diag-lat-percentiles').textContent.includes('Not measured'), 'a sampled zero percentile is measured');
 assert(el('vpn-diag-lat-percentiles').textContent.includes('0.0'), 'sampled zero p95 shows the numeric value');
 
@@ -359,9 +343,6 @@ vpnRenderForwarderHealth({
     drop_categories: { rates_available: false, total_drops: 46, total_drop_rate_pps: 0 },
     health_assessment: { status: 'HEALTHY', conditions: [] }
 });
-assert.strictEqual(text('vpn-signal-throughput-value'), 'Not measured', 'unavailable rate must not be 0');
-assert.strictEqual(text('vpn-signal-drops-value'), 'Not measured', 'unavailable drop rate must not be 0');
-assert(el('vpn-signal-drops-sub').textContent.includes('46 drops since reset'), 'the cumulative total is still reported independently');
 
 // Test 8: a positive rate is a measurement.
 mockDoc.reset();
@@ -372,13 +353,9 @@ vpnRenderForwarderHealth({
     drop_categories: { rates_available: true, total_drops: 100, total_drop_rate_pps: 3.5 },
     health_assessment: { status: 'HEALTHY', conditions: [] }
 });
-assert.strictEqual(text('vpn-signal-drops-value').replace(/\s+/g, ' ').trim(), '3.50 drops/s');
 // The throughput signal is measured here, so its supporting line states the
 // horizon rather than the no-samples text. This assertion previously read
 // "el(...) === null || true", which cannot fail.
-assert(el('vpn-signal-throughput-sub') !== null, 'the throughput signal keeps its supporting line');
-assert.strictEqual(text('vpn-signal-throughput-sub'), _('vpn_signal_throughput_horizon'), 'a measured throughput states its horizon');
-assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g, ' ').trim(), '1.00 Mbps', 'the rate renders from the payload');
 
 // Test 9: disabled backends are not failures; eligibility unknown does not invent a denominator.
 mockDoc.reset();
@@ -387,15 +364,12 @@ vpnRenderForwarderHealth({
     health_assessment: { status: 'HEALTHY', conditions: [] },
     backends: { eligibility_known: true, healthy_count: 1, enabled_count: 1, disabled_count: 2, total_count: 3 }
 });
-assert.strictEqual(text('vpn-signal-backends-value').replace(/\s+/g, ' ').trim(), '1 / 1', 'disabled backends are excluded from the denominator');
 mockDoc.reset();
 vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: { status: 'HEALTHY', conditions: [] },
     backends: { healthy_count: 2, total_count: 3 }
 });
-assert(el('vpn-signal-backends-value').textContent.includes('2 / 3'), 'unknown eligibility falls back to the configured total');
-assert(!text('vpn-signal-backends-sub').includes('enabled'), 'unknown eligibility must not claim an enabled denominator');
 
 // Test 10: a stale idle handshake alone produces no active-user problem row, and a
 // route mismatch appears only when routing_consistency reports one.
@@ -409,15 +383,12 @@ vpnRenderForwarderHealth({
     connected_sessions: 0
 });
 assert.strictEqual(el('vpn-fwd-problem-list').hidden, true, 'idle handshakes alone are not an active-user problem');
-assert.strictEqual(el('vpn-session-mismatch').hidden, true, 'no mismatch without a reported one');
 mockDoc.reset();
 vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: { status: 'HEALTHY', conditions: [] },
     routing_consistency: { is_consistent: false, active_sessions_count: 16, active_routes_count: 15, sessions_without_route: ['s-1'] }
 });
-assert.strictEqual(el('vpn-session-mismatch').hidden, false, 'a reported mismatch is shown');
-assert(el('vpn-session-mismatch').textContent.includes('1'), 'the mismatch names the reported count');
 
 // Test 11: route pressure renders into the diagnostics route table without opening it.
 mockDoc.reset();
@@ -498,9 +469,9 @@ console.log('VPN_HEALTH_PASS');
 }
 
 func TestVPNOperationalDiagnosticsCardsContract(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
-	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
+	script := vpnDOMMock(t, fixture.TemplateHTML) + "\n" + fixture.TranslationsJS("en") + "\n" + fixture.CommonJS + "\n" + fixture.HealthProblemsJS + "\n" + fixture.HealthSummaryJS + `
 // 1. Nominal / Healthy state with traffic & backends
 vpnRenderForwarderHealth({
     forwarder_available: true,
@@ -638,7 +609,7 @@ func TestVPNForwarderHealthDecouplingAndHorizon(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	source := []byte(fixture.CombinedSource())
 
 	assertions := `
@@ -660,9 +631,6 @@ assert.strictEqual(text('vpn-fwd-status-text'), 'Healthy');
 assert.strictEqual(text('vpn-fwd-counters-since'), 'Counters since: 2026-10-07 06:14 UTC', 'counters_since must be formatted');
 assert.strictEqual(el('vpn-fwd-counters-since').textContent.includes('Not measured'), false, 'a reported timestamp is shown');
 // Overview: the current rate is a rate with a rate unit; the cumulative total is a count.
-assert.strictEqual(el('vpn-signal-drops-value').textContent.replace(/\s+/g, ' ').trim(), '0.00 drops/s', 'current rate keeps its rate unit');
-assert(el('vpn-signal-drops-sub').textContent.includes('109 drops since reset'), 'cumulative total has its own label and count unit');
-assert(!el('vpn-signal-drops-sub').textContent.includes('pps'), 'the cumulative count must not be labelled as a rate');
 
 // 2. Positive active drop rate is a measured value.
 vpnRenderForwarderHealth({
@@ -672,8 +640,6 @@ vpnRenderForwarderHealth({
 	counters_since: '2026-10-07T06:14:40Z',
 	drop_categories: { rates_available: true, total_drop_rate_pps: 3.5, total_drops: 115 }
 });
-assert.strictEqual(el('vpn-signal-drops-value').textContent.replace(/\s+/g, ' ').trim(), '3.50 drops/s');
-assert(el('vpn-signal-drops-sub').textContent.includes('115 drops since reset'));
 assert.strictEqual(el('vpn-diag-drops-total').style.color, 'var(--danger)', 'active loss rate is highlighted in diagnostics');
 
 // 3. Status DOWN displays Down badge.
@@ -687,13 +653,8 @@ assert.strictEqual(text('vpn-fwd-status-text'), 'Down');
 // 4. Unavailable forwarder clears counters_since and every signal.
 vpnRenderForwarderHealth(null);
 assert.strictEqual(text('vpn-fwd-counters-since'), '-');
-assert.strictEqual(text('vpn-signal-drops-value'), 'Not measured');
-assert(text('vpn-signal-drops-sub').includes('not end-to-end packet loss'), 'the dataplane scope is always stated');
-assert(!text('vpn-signal-drops-sub').includes('109'), 'the retired count must not survive as stale data');
 // The value cell already reads "Not measured"; the supporting line must not
 // restate it, so with no independently available total it carries no digits at all.
-assert(!/\\d/.test(text('vpn-signal-drops-sub')), 'no stale number survives in the supporting line');
-assert(text('vpn-signal-throughput-sub') === '', 'an unmeasured throughput states no horizon');
 `
 	script := vpnDiagnosticsHealthScript(t, string(source), assertions)
 	if out, err := execNodeScript(node, script); err != nil {
@@ -712,8 +673,6 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(text('vpn-fwd-status-text'), 'В норме');
 assert.strictEqual(text('vpn-fwd-counters-since'), 'Счетчики с: 2026-10-07 06:14 UTC');
-assert.strictEqual(text('vpn-sessions'), 'Не измерено', 'unmeasured copy is localized');
-assert(text('vpn-signal-drops-sub').includes('109'), 'cumulative count survives localization');
 `
 	ruScript, err := vpnDiagnosticsHealthScriptLocale(t, string(source), "ru", ruAssertions)
 	if err != nil {
@@ -729,7 +688,7 @@ func TestVPNProgressiveDisclosureAndActiveProblems(t *testing.T) {
 	if err != nil {
 		t.Fatal("Node is required for diagnostics verification")
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplStr := fixture.CombinedSource()
 
 	// 1. Invariant: the single Advanced Diagnostics disclosure must exist in the

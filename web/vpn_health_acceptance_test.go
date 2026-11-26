@@ -2,6 +2,7 @@ package web
 
 import (
 	"io/fs"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,12 +16,36 @@ import (
 // vpnHealthAcceptanceScript assembles a JSDOM script for the health surfaces.
 func vpnHealthAcceptanceScript(t *testing.T, lang, assertions string) string {
 	t.Helper()
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	script, err := fixture.AssembleHealthScript(lang, assertions)
 	if err != nil {
 		t.Fatalf("assemble health script: %v", err)
 	}
 	return script
+}
+
+// runVPNSignalAcceptance runs an assertion against the overview document, where
+// the four essential signals live. It uses the plain JSDOM harness because the
+// overview ships no health renderer.
+func runVPNSignalAcceptance(t *testing.T, assertions, wantToken string) {
+	t.Helper()
+	nodePath := requireJSDOM(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
+	fixture.RequireJSDOM()
+	// The assertions run inside the page's own scope, so they address the document
+	// and the exported renderer exactly as a page script would.
+	extra := "w.assert = require('assert');\n" +
+		"w.eval(" + strconv.Quote(assertions+"\nwindow.__acceptanceToken = "+strconv.Quote(wantToken)+";") + ");\n" +
+		"if (w.__acceptanceToken !== " + strconv.Quote(wantToken) + ") { throw new Error('acceptance token missing: ' + w.__acceptanceToken); }\n" +
+		"console.log(" + strconv.Quote(wantToken) + ");"
+	script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: extra})
+	out, err := execNodeScript(nodePath, script)
+	if err != nil {
+		t.Fatalf("overview signal script failed: %v\nOutput:\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), wantToken) {
+		t.Fatalf("overview signal script did not report %q\nOutput:\n%s", wantToken, string(out))
+	}
 }
 
 func runVPNHealthAcceptance(t *testing.T, lang, assertions, wantToken string) {
@@ -37,7 +62,9 @@ func runVPNHealthAcceptance(t *testing.T, lang, assertions, wantToken string) {
 
 // VPN955-01: healthy state is one visible status with no duplicated block.
 func TestVPN955Acceptance01HealthyIsCompactAndUnduplicated(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	// The structure subtest reads the overview document; every health assertion in
+	// this file renders the diagnostics document through the health helper.
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
 	templateHTML := fixture.TemplateHTML
 
 	t.Run("NoRetiredDuplicateSurfaces", func(t *testing.T) {
@@ -61,12 +88,25 @@ func TestVPN955Acceptance01HealthyIsCompactAndUnduplicated(t *testing.T) {
 		if got := len(findHTMLNodesByAttr(doc, "data-signal")); got != 4 {
 			t.Errorf("expected exactly 4 [data-signal] entries, got %d", got)
 		}
-		healthCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
+		// The overview carries the signals and none of the health card.
+		if findHTMLNodeByID(doc, "vpn-forwarder-card") != nil {
+			t.Error("the overview document must not render the health card")
+		}
+
+		diagFixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
+		diagDoc, err := xhtml.Parse(strings.NewReader(diagFixture.TemplateHTML))
+		if err != nil {
+			t.Fatalf("parse vpn_diagnostics.html: %v", err)
+		}
+		healthCard := findHTMLNodeByID(diagDoc, "vpn-forwarder-card")
 		if healthCard == nil {
 			t.Fatal("#vpn-forwarder-card not found")
 		}
 		if nested := findHTMLElementByClassWithin(healthCard, "stats-grid"); nested != nil {
 			t.Error("#vpn-forwarder-card must not contain a nested .stats-grid")
+		}
+		if got := len(findHTMLNodesByAttr(diagDoc, "data-signal")); got != 0 {
+			t.Errorf("the diagnostics document must not render the overview signals, got %d", got)
 		}
 	})
 
@@ -206,20 +246,19 @@ console.log('VPN955_02_STATE_OK');
 		// Real JSDOM, real shipped modules: the claim under test is that Inspect
 		// DELIVERS focus, so it is asserted from document.activeElement, not from a
 		// stubbed drill-down being called.
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireJSDOM()
 		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
 (async () => {
 const assert = require('assert');
 const d = w.document;
 
-// Render a real session row through the shipped renderer; it carries the tabindex
-// the focus path depends on.
+// Seed the real cache: health and Inspect both render the table from this payload.
+w.vpnLastSessions = { sessions: [{ session_id: 'S-100', username: 'alice', status: 'active' }] };
+w.renderSessions(w.vpnLastSessions.sessions);
 const tbody = d.getElementById('vpn-sessions-tbody');
-tbody.textContent = '';
-const tr = w.vpnRenderSessionRow({ session_id: 'S-100', username: 'alice', status: 'active' });
-tbody.appendChild(tr);
-const cell = tr.querySelector('[data-action="vpn-toggle-session"]');
+let tr = w.vpnFindSessionRow('S-100');
+let cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert(cell, 'the rendered session row carries its action cell');
 assert.strictEqual(cell.getAttribute('tabindex'), '-1', 'the action cell is programmatically focusable');
 
@@ -240,7 +279,10 @@ const list = d.getElementById('vpn-fwd-problem-list');
 const action = list.children[0].children[1];
 action.click();
 
-// 1. Focus actually landed on the affected session's action cell.
+// 1. Reacquire the live row after the health renderer and Inspect replaced rows.
+tr = w.vpnFindSessionRow('S-100');
+assert(tr && tr.isConnected, 'the cached session has a current rendered row');
+cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert.strictEqual(d.activeElement, cell, 'Inspect moves focus to the affected session cell');
 assert.strictEqual(d.activeElement.getAttribute('data-session-id'), 'S-100', 'and to the reported session');
 
@@ -253,6 +295,8 @@ assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect mu
 // 3. A SECOND Inspect reveals rather than closes. Toggling would remove the detail
 // the operator is trying to read.
 action.click();
+tr = w.vpnFindSessionRow('S-100');
+cell = tr.querySelector('[data-action="vpn-toggle-session"]');
 assert(tr.classList.contains('row-expanded'), 'a second Inspect keeps the drill-down open');
 assert(tbody.querySelector('.vpn-session-drilldown-row[data-parent-session-id="S-100"]'),
     'a second Inspect keeps the drill-down row present');
@@ -270,25 +314,18 @@ console.log('VPN955_02_FOCUS_OK');
 		}
 	})
 
-	t.Run("BackendActionFocusesBackendRow", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+	t.Run("BackendActionHandsOffToInventory", func(t *testing.T) {
+		// The backend inventory is its own document. A backend Inspect therefore
+		// carries the tunnel id across and leaves focus where it was; the row-level
+		// focus is asserted on the backends document.
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireJSDOM()
 		script := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
 (async () => {
 const assert = require('assert');
 const d = w.document;
-
-w.vpnCachedServers = [{ id: 7, name: 'Beta Relay' }];
-const tbody = d.getElementById('vpn-backends-tbody');
-tbody.textContent = '';
-// The backend record as the API sends it: id is the backend TUNNEL id and
-// server_id is the server id, and both are always present. Inspect matches on the
-// tunnel id, so a fixture that omitted it would not exercise the real path.
-const tr = w.vpnRenderBackendRow({ id: 7, server_id: 7, endpoint: '198.51.100.7:51820', enabled: true, status: 'active', latency_ms: 12, active_connections: 2 });
-tbody.appendChild(tr);
-const nameCell = tr.querySelector('td[data-backend-name]');
-assert(nameCell, 'the rendered backend row exposes its name cell');
-assert.strictEqual(nameCell.getAttribute('tabindex'), '-1', 'the backend name cell is programmatically focusable');
+w.__navDestinations = [];
+w.vpnNavigateToBackends = function (targetId) { w.__navDestinations.push('/vpn/backends#' + targetId); };
 
 d.getElementById('vpn-advanced-entry').focus();
 assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus starts on the diagnostics entry');
@@ -297,15 +334,18 @@ w.vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: {
         status: 'CRITICAL',
-        actionable_problems: [{ severity: 'CRITICAL', message: 'Backend unhealthy', backend_id: 7, category: 'backends' }]
+        actionable_problems: [{ severity: 'CRITICAL', message: 'Backend unhealthy', backend_id: 7, category: 'backend' }]
     }
 });
 assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'diagnostics stayed closed');
 assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'rendering alone must not move focus');
 
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
-assert.strictEqual(d.activeElement, nameCell, 'Inspect moves focus to the affected backend row');
-assert.strictEqual(d.activeElement.getAttribute('data-backend-name'), '7', 'and to the reported backend');
+assert.strictEqual(w.__navDestinations.length, 1, 'Inspect navigates exactly once');
+assert.match(w.__navDestinations[0], /^\/vpn\/backends#vpn-inspect-[A-Za-z0-9_-]+$/, 'the URL carries only the opaque arrival nonce');
+w.history.replaceState(null, '', w.__navDestinations[0]);
+assert.strictEqual(w.vpnConsumeBackendHandoff(), '7', 'the matching arrival carries the backend tunnel id');
+assert.strictEqual(d.activeElement.id, 'vpn-advanced-entry', 'focus stays on the diagnostics entry');
 assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'inspect must NOT open diagnostics');
 console.log('VPN955_02_BACKEND_FOCUS_OK');
 })().catch(e => { console.error(e); process.exit(1); });
@@ -322,7 +362,7 @@ console.log('VPN955_02_BACKEND_FOCUS_OK');
 
 // VPN955-03: one entry, three ordered sections, three working ranges.
 func TestVPN955Acceptance03AdvancedDiagnostics(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 
 	t.Run("SingleEntryThreeOrderedSections", func(t *testing.T) {
 		doc, err := xhtml.Parse(strings.NewReader(fixture.TemplateHTML))
@@ -467,43 +507,56 @@ console.log('VPN955_03_RENDERERS_OK');
 // VPN955-04: not-measured is never a number, and gaps are never zero.
 func TestVPN955Acceptance04NotMeasuredVsMeasuredZero(t *testing.T) {
 	t.Run("UnavailableAndMissingFlags", func(t *testing.T) {
-		runVPNHealthAcceptance(t, "en", `
+		// The four essential signals are on the overview document; the diagnostics
+		// card and the percentile rows are on the diagnostics document. Each is
+		// asserted where it renders.
+		runVPNSignalAcceptance(t, `
 const el = id => document.getElementById(id);
-// Unavailable response.
-vpnRenderForwarderHealth(null);
-assert(!el('vpn-fwd-status-badge').className.includes('badge-success'), 'unavailable is never healthy');
-assert.strictEqual(el('vpn-fwd-status-text').textContent, 'Not reported');
+vpnRenderSignals(null);
 for (const id of ['vpn-signal-throughput-value', 'vpn-signal-drops-value', 'vpn-signal-backends-value', 'vpn-sessions']) {
     assert.strictEqual(el(id).textContent, 'Not measured', id + ' reads not measured, not 0');
     assert(!/^\d/.test(el(id).textContent), id + ' must not print a number');
 }
-assert.strictEqual(el('vpn-diag-lat-percentiles').textContent, 'Not measured');
-
-// Missing flags with numeric sentinels present.
-vpnRenderForwarderHealth({
-    forwarder_available: true,
+vpnRenderSignals({
     rates: { rx_bps: 5000, tx_bps: 5000 },
-    drop_categories: { total_drops: 7, total_drop_rate_pps: 9.5 },
-    forward_latency: { p95_health_ms: 0, p95_health_samples: 0, write_total: 900 }
+    drop_categories: { total_drops: 7, total_drop_rate_pps: 9.5 }
 });
 assert.strictEqual(el('vpn-signal-throughput-value').textContent, 'Not measured', 'absent rate flag means not measured');
 assert.strictEqual(el('vpn-signal-drops-value').textContent, 'Not measured', 'absent drop flag means not measured');
+`, "VPN955_04_SIGNALS_UNAVAILABLE_OK")
+
+		runVPNHealthAcceptance(t, "en", `
+const el = id => document.getElementById(id);
+vpnRenderForwarderHealth(null);
+assert(!el('vpn-fwd-status-badge').className.includes('badge-success'), 'unavailable is never healthy');
+assert.strictEqual(el('vpn-fwd-status-text').textContent, 'Not reported');
+assert.strictEqual(el('vpn-diag-lat-percentiles').textContent, 'Not measured');
+vpnRenderForwarderHealth({
+    forwarder_available: true,
+    forward_latency: { p95_health_ms: 0, p95_health_samples: 0, write_total: 900 }
+});
 assert.strictEqual(el('vpn-diag-lat-percentiles').textContent, 'Not measured', 'no sample count means not measured');
 console.log('VPN955_04_UNAVAILABLE_OK');
 `, "VPN955_04_UNAVAILABLE_OK")
 	})
 
 	t.Run("SampledZeroStaysNumeric", func(t *testing.T) {
+		runVPNSignalAcceptance(t, `
+const el = id => document.getElementById(id);
+vpnRenderSignals({
+    rates: { available: true, rx_bps: 0, tx_bps: 0 },
+    drop_categories: { rates_available: true, total_drops: 0, total_drop_rate_pps: 0 }
+});
+assert.strictEqual(el('vpn-signal-throughput-value').textContent.replace(/ +/g, ' ').trim(), '0 bps', 'sampled zero throughput stays numeric');
+assert.strictEqual(el('vpn-signal-drops-value').textContent.replace(/ +/g, ' ').trim(), '0.00 drops/s', 'sampled zero rate stays numeric');
+`, "VPN955_04_ZERO_SIGNALS_OK")
+
 		runVPNHealthAcceptance(t, "en", `
 const el = id => document.getElementById(id);
 vpnRenderForwarderHealth({
     forwarder_available: true,
-    rates: { available: true, rx_bps: 0, tx_bps: 0 },
-    drop_categories: { rates_available: true, total_drops: 0, total_drop_rate_pps: 0 },
     forward_latency: { p95_health_ms: 0, p95_health_samples: 1, p95_health_window_sec: 60 }
 });
-assert.strictEqual(el('vpn-signal-throughput-value').textContent.replace(/\\s+/g, ' ').trim(), '0 bps', 'sampled zero throughput stays numeric');
-assert.strictEqual(el('vpn-signal-drops-value').textContent.replace(/\\s+/g, ' ').trim(), '0.00 drops/s', 'sampled zero rate stays numeric');
 assert(el('vpn-diag-lat-percentiles').textContent.includes('0.0'), 'a sampled zero percentile is a measurement');
 console.log('VPN955_04_ZERO_OK');
 `, "VPN955_04_ZERO_OK")
@@ -589,20 +642,47 @@ console.log('VPN955_04_STALLS_OK');
 	})
 }
 
-// VPN955-05: no conflated populations, no invented failures.
+// VPN955-05: no conflated populations, no invented failures. The signal
+// populations render on the overview document; the problem list and the single
+// health status render on the diagnostics document.
 func TestVPN955Acceptance05NoConflatedSignals(t *testing.T) {
-	runVPNHealthAcceptance(t, "en", `
+	t.Run("Signals", func(t *testing.T) {
+		runVPNSignalAcceptance(t, `
 const el = id => document.getElementById(id);
 
 // 1. A disabled backend is not a failure.
-vpnRenderForwarderHealth({
-    forwarder_available: true,
-    health_assessment: { status: 'HEALTHY', conditions: [] },
+vpnRenderSignals({
     backends: { eligibility_known: true, healthy_count: 2, enabled_count: 2, disabled_count: 3, total_count: 5 }
 });
-assert.strictEqual(el('vpn-signal-backends-value').textContent.replace(/\\s+/g, ' ').trim(), '2 / 2', 'disabled backends are excluded from the denominator');
+assert.strictEqual(el('vpn-signal-backends-value').textContent.replace(/ +/g, ' ').trim(), '2 / 2', 'disabled backends are excluded from the denominator');
 
-// 2. A stale idle handshake alone is not an active-user problem.
+// 2. Route mismatch appears only when reported.
+assert.strictEqual(el('vpn-session-mismatch').hidden, true, 'no mismatch without a report');
+vpnRenderSignals({
+    routing_consistency: { is_consistent: false, active_sessions_count: 16, active_routes_count: 15, sessions_without_route: ['s-9'] }
+});
+assert.strictEqual(el('vpn-session-mismatch').hidden, false, 'a reported mismatch is shown');
+assert(el('vpn-session-mismatch').textContent.includes('1'), 'the mismatch names the reported count');
+
+// 3. Current rate and cumulative total have distinct labels and units.
+vpnRenderSignals({
+    rates: { available: true, rx_bps: 800000, tx_bps: 0 },
+    drop_categories: { rates_available: true, total_drops: 48, total_drop_rate_pps: 1.25 }
+});
+const rateText = el('vpn-signal-drops-value').textContent.replace(/ +/g, ' ').trim();
+const totalText = el('vpn-signal-drops-sub').textContent;
+assert.strictEqual(rateText, '1.25 drops/s', 'the current rate carries a rate unit');
+assert(totalText.includes('48 drops since reset'), 'the cumulative total is labelled as a count since reset');
+assert(!totalText.includes('drops/s'), 'the cumulative total is not labelled as a rate');
+assert(totalText.includes('not end-to-end'), 'the dataplane scope is stated so it cannot read as end-to-end loss');
+`, "VPN955_05_SIGNALS_OK")
+	})
+
+	t.Run("ProblemPopulations", func(t *testing.T) {
+		runVPNHealthAcceptance(t, "en", `
+const el = id => document.getElementById(id);
+
+// A stale idle handshake alone is not an active-user problem.
 vpnRenderForwarderHealth({
     forwarder_available: true,
     health_assessment: { status: 'HEALTHY', conditions: [] },
@@ -613,35 +693,13 @@ vpnRenderForwarderHealth({
 });
 assert.strictEqual(el('vpn-fwd-problem-list').hidden, true, 'idle handshakes are not an active-user problem');
 assert.strictEqual(el('vpn-fwd-status-badge').className, 'badge badge-success', 'and the page stays healthy');
-
-// 3. Route mismatch appears only when reported.
-assert.strictEqual(el('vpn-session-mismatch').hidden, true, 'no mismatch without a report');
-vpnRenderForwarderHealth({
-    forwarder_available: true,
-    health_assessment: { status: 'HEALTHY', conditions: [] },
-    routing_consistency: { is_consistent: false, active_sessions_count: 16, active_routes_count: 15, sessions_without_route: ['s-9'] }
-});
-assert.strictEqual(el('vpn-session-mismatch').hidden, false, 'a reported mismatch is shown');
-
-// 4. Current rate and cumulative total have distinct labels and units.
-vpnRenderForwarderHealth({
-    forwarder_available: true,
-    rates: { available: true, rx_bps: 800000, tx_bps: 0 },
-    drop_categories: { rates_available: true, total_drops: 48, total_drop_rate_pps: 1.25 }
-});
-const rateText = el('vpn-signal-drops-value').textContent.replace(/\\s+/g, ' ').trim();
-const totalText = el('vpn-signal-drops-sub').textContent;
-assert.strictEqual(rateText, '1.25 drops/s', 'the current rate carries a rate unit');
-assert(totalText.includes('48 drops since reset'), 'the cumulative total is labelled as a count since reset');
-assert(!totalText.includes('drops/s'), 'the cumulative total is not labelled as a rate');
-assert(totalText.includes('not end-to-end'), 'the dataplane scope is stated so it cannot read as end-to-end loss');
 console.log('VPN955_05_OK');
 `, "VPN955_05_OK")
+	})
 }
 
-// VPN955-06: locales, themes and accessibility affordances.
 func TestVPN955Acceptance06LocalesThemesAndA11y(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 
 	t.Run("AllFiveLocalesCarryTheNewCopy", func(t *testing.T) {
 		required := []string{
@@ -854,7 +912,7 @@ func TestVPN955NoNewGlobalInfrastructure(t *testing.T) {
 		}
 	}
 
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	script := fixture.CombinedSource()
 	if strings.Contains(script, "<script>") {
 		t.Error("no inline script may be introduced")
@@ -891,7 +949,10 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 	}
 	subjects := []subject{
 		{"vpn template", "templates/vpn.html", 600},
-		{"vpn stylesheet", "static/css/vpn.css", 1000},
+		// This stylesheet has an approved per-PR SG1 exception for the fragment
+		// landing rule. Pin that exact physical size: the exception allows no
+		// further growth; architecture_health checks the PR-level justification.
+		{"vpn stylesheet", "static/css/vpn.css", 1016},
 		{"health summary module", "static/js/vpn/health_summary.js", 1000},
 		{"health problems module", "static/js/vpn/health_problems.js", 1000},
 	}
@@ -904,7 +965,7 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 				if readErr != nil {
 					t.Fatalf("read %s: %v", s.path, readErr)
 				}
-				if lines := strings.Count(string(body), "\n") + 1; lines > s.maxLines {
+				if lines := strings.Count(strings.TrimSuffix(string(body), "\n"), "\n") + 1; lines > s.maxLines {
 					t.Errorf("%s is %d lines, over the %d ceiling", s.name, lines, s.maxLines)
 				}
 				continue
@@ -917,7 +978,7 @@ func TestVPN955ChangedSurfaceStaysWithinSizeCeilings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", s.path, err)
 		}
-		if lines := strings.Count(string(body), "\n") + 1; lines > s.maxLines {
+		if lines := strings.Count(strings.TrimSuffix(string(body), "\n"), "\n") + 1; lines > s.maxLines {
 			t.Errorf("%s is %d lines, over the %d ceiling", s.name, lines, s.maxLines)
 		}
 	}

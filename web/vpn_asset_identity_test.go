@@ -44,16 +44,33 @@ import (
 // the VPN page depends on stayed outside the previous guard.
 var vpnDeliveredAssets = DeliveredAssets
 
-// vpnScriptDependencyOrder is the synchronous chain vpn.html loads. Each module
-// calls the one before it, so the order is a contract and not a preference.
-var vpnScriptDependencyOrder = []string{
-	"/static/js/vpn/backends.js",
-	"/static/js/vpn/health_problems.js",
-	"/static/js/vpn/health_summary.js",
-	"/static/js/vpn/charts.js",
-	"/static/js/vpn/sessions.js",
-	"/static/js/vpn/page.js",
+// vpnScriptDependencyOrderByPage is the synchronous chain each VPN document
+// loads. Each module calls the one before it (or a shared helper above it), so
+// the order is a contract and not a preference. The single page became three
+// documents, so the chain is per document.
+var vpnScriptDependencyOrderByPage = map[string][]string{
+	"vpn": {
+		"/static/js/vpn/anchor_handoff.js",
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/overview.js",
+	},
+	"vpn_backends": {
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/backends.js",
+		"/static/js/vpn/backends_page.js",
+	},
+	"vpn_diagnostics": {
+		"/static/js/vpn/common.js",
+		"/static/js/vpn/health_problems.js",
+		"/static/js/vpn/health_summary.js",
+		"/static/js/vpn/charts.js",
+		"/static/js/vpn/sessions.js",
+		"/static/js/vpn/diagnostics_page.js",
+	},
 }
+
+// vpnPagesInOrder keeps page iteration deterministic.
+var vpnPagesInOrder = []string{"vpn", "vpn_backends", "vpn_diagnostics"}
 
 // deliveredAssetDigest is the query a URL for path must carry: the SHA-256 of
 // the bytes this build embeds for it, in hex. It is computed here from the
@@ -125,15 +142,15 @@ func renderFileWith(t *testing.T, name string, funcs template.FuncMap) string {
 
 // renderVPNScriptsBlockWith renders the shipped scripts block, resolving the
 // delivered assets against root.
-func renderVPNScriptsBlockWith(t *testing.T, root fs.FS) string {
+func renderVPNScriptsBlockWith(t *testing.T, root fs.FS, page string) string {
 	t.Helper()
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS: %v", err)
 	}
-	tmpl, err := template.New("vpn.html").Funcs(shellFuncMapWith(assetResolverFor(root))).ParseFS(templatesFS, "vpn.html")
+	tmpl, err := template.New(page+".html").Funcs(shellFuncMapWith(assetResolverFor(root))).ParseFS(templatesFS, page+".html")
 	if err != nil {
-		t.Fatalf("parse vpn.html: %v", err)
+		t.Fatalf("parse %s.html: %v", page, err)
 	}
 	var buf strings.Builder
 	if err := tmpl.ExecuteTemplate(&buf, "scripts", nil); err != nil {
@@ -179,36 +196,41 @@ func deliveredStaticCopy(t *testing.T, paths ...string) fstest.MapFS {
 // here is checked against the production helper below, so this is not a
 // different mechanism from the one the page uses.
 func TestVPNScriptsCarryTheAssetBytes(t *testing.T) {
-	block := renderVPNScriptsBlockWith(t, StaticFS)
-	srcs := scriptSrcs(t, block)
+	for _, page := range vpnPagesInOrder {
+		t.Run(page, func(t *testing.T) {
+			block := renderVPNScriptsBlockWith(t, StaticFS, page)
+			srcs := scriptSrcs(t, block)
+			wantOrder := vpnScriptDependencyOrderByPage[page]
 
-	if len(srcs) != len(vpnScriptDependencyOrder) {
-		t.Fatalf("the scripts block loads %d module(s) %v, want %d in dependency order %v",
-			len(srcs), srcs, len(vpnScriptDependencyOrder), vpnScriptDependencyOrder)
-	}
+			if len(srcs) != len(wantOrder) {
+				t.Fatalf("the %s scripts block loads %d module(s) %v, want %d in dependency order %v",
+					page, len(srcs), srcs, len(wantOrder), wantOrder)
+			}
 
-	for i, path := range vpnScriptDependencyOrder {
-		emitted := srcs[i]
-		want := path + "?v=" + deliveredAssetDigest(t, path)
-		if emitted != want {
-			t.Fatalf("module %d is requested at %q, want %q; a browser that cached this module "+
-				"under another URL — the release-version URL the predecessor also served, or the "+
-				"bare path — keeps running the previous bytes against this markup",
-				i, emitted, want)
-		}
+			for i, path := range wantOrder {
+				emitted := srcs[i]
+				want := path + "?v=" + deliveredAssetDigest(t, path)
+				if emitted != want {
+					t.Fatalf("module %d is requested at %q, want %q; a browser that cached this module "+
+						"under another URL — the release-version URL the predecessor also served, or the "+
+						"bare path — keeps running the previous bytes against this markup",
+						i, emitted, want)
+				}
 
-		production, err := AssetURL(path)
-		if err != nil {
-			t.Fatalf("AssetURL(%s): %v", path, err)
-		}
-		if production != want {
-			t.Fatalf("the page must request %s at %q, but the production helper emits %q",
-				path, want, production)
-		}
-		if strings.HasSuffix(want, "v="+vpnTestAppVersion) {
-			t.Fatalf("%s is identified by the release version, so two deliveries inside one release "+
-				"would emit the same URL for different bytes", path)
-		}
+				production, err := AssetURL(path)
+				if err != nil {
+					t.Fatalf("AssetURL(%s): %v", path, err)
+				}
+				if production != want {
+					t.Fatalf("the page must request %s at %q, but the production helper emits %q",
+						path, want, production)
+				}
+				if strings.HasSuffix(want, "v="+vpnTestAppVersion) {
+					t.Fatalf("%s is identified by the release version, so two deliveries inside one release "+
+						"would emit the same URL for different bytes", path)
+				}
+			}
+		})
 	}
 }
 
@@ -219,11 +241,13 @@ func TestVPNScriptsCarryTheAssetBytes(t *testing.T) {
 // the query is an identity rather than a constant.
 func TestVPNScriptURLMovesWithTheAssetBytes(t *testing.T) {
 	const changed = "/static/js/vpn/charts.js"
+	const page = "vpn_diagnostics"
+	order := vpnScriptDependencyOrderByPage[page]
 
-	root := deliveredStaticCopy(t, vpnScriptDependencyOrder...)
-	before := scriptSrcs(t, renderVPNScriptsBlockWith(t, root))
-	if len(before) != len(vpnScriptDependencyOrder) {
-		t.Fatalf("the scripts block loads %d module(s) %v, want %d", len(before), before, len(vpnScriptDependencyOrder))
+	root := deliveredStaticCopy(t, order...)
+	before := scriptSrcs(t, renderVPNScriptsBlockWith(t, root, page))
+	if len(before) != len(order) {
+		t.Fatalf("the scripts block loads %d module(s) %v, want %d", len(before), before, len(order))
 	}
 
 	// Change exactly one module's bytes, the way an edit to that file would.
@@ -231,12 +255,12 @@ func TestVPNScriptURLMovesWithTheAssetBytes(t *testing.T) {
 	original := root[name].Data
 	root[name] = &fstest.MapFile{Data: append(append([]byte{}, original...), []byte("\n// delivered change\n")...)}
 
-	after := scriptSrcs(t, renderVPNScriptsBlockWith(t, root))
+	after := scriptSrcs(t, renderVPNScriptsBlockWith(t, root, page))
 	if len(after) != len(before) {
 		t.Fatalf("the scripts block loads %d module(s) after the byte change, want %d: %v", len(after), len(before), after)
 	}
 
-	for i, path := range vpnScriptDependencyOrder {
+	for i, path := range order {
 		moved := before[i] != after[i]
 		if path == changed {
 			if !moved {
@@ -535,8 +559,10 @@ func TestEveryShellLoadsDeliveredAssetsUnderTheirBytes(t *testing.T) {
 		"/static/css/vpn.css":  {"base.html", "login.html", "setup.html", "change_password.html"},
 		"/static/js/tables.js": {"base.html"},
 	}
-	for _, path := range vpnScriptDependencyOrder {
-		wantShells[path] = []string{"vpn.html"}
+	for _, page := range vpnPagesInOrder {
+		for _, path := range vpnScriptDependencyOrderByPage[page] {
+			wantShells[path] = append(wantShells[path], page+".html")
+		}
 	}
 
 	for path, shells := range wantShells {

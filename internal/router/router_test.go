@@ -773,8 +773,8 @@ func TestRouterVPNPage(t *testing.T) {
 	if !strings.Contains(adminBody, "vpn-listener-badge") {
 		t.Errorf("expected /vpn body to contain 'vpn-listener-badge'")
 	}
-	if !strings.Contains(adminBody, "vpn-backends-tbody") {
-		t.Errorf("expected /vpn body to contain 'vpn-backends-tbody'")
+	if strings.Contains(adminBody, "vpn-backends-tbody") {
+		t.Errorf("the overview document must not render the backend inventory")
 	}
 
 	// 3. Authenticated Support request -> 200 OK with rendered VPN dashboard
