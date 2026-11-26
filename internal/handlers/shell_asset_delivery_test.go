@@ -63,7 +63,6 @@ var untouchedBareShellAssets = []string{
 	"/static/js/captcha.js",
 	"/static/js/qrcode.min.js",
 	"/static/js/telemetry.js",
-	"/static/js/ui.js",
 	"/static/js/users.js",
 }
 

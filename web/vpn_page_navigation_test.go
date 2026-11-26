@@ -234,3 +234,66 @@ func TestVPNPageBackendsDismissRestoresFocusAfterRefresh(t *testing.T) {
 		t.Fatalf("expected PASS_DISMISS_FOCUS, got:\n%s", out)
 	}
 }
+
+// TestVPNPageOverviewColdSessionsFragmentFocusesANamedHeading covers the design
+// re-check's cold case: the Sessions signal value is not focusable, so a fragment
+// naming it must land on the overview's own heading - which therefore has to be
+// focusable - and focus must not stay on the document body.
+func TestVPNPageOverviewColdSessionsFragmentFocusesANamedHeading(t *testing.T) {
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
+	fixture.RequireJSDOM()
+
+	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		ExtraJS: `
+(() => {
+    const assert = require('assert');
+    const value = w.document.getElementById('vpn-sessions');
+    const heading = w.document.querySelector('h1.section-title');
+    assert.ok(value, '#vpn-sessions must exist');
+    assert.ok(heading, 'the overview has a page heading');
+
+    // The value itself cannot take focus, so the heading is the landing.
+    assert.strictEqual(value.getAttribute('tabindex'), null, 'the signal value is not made focusable');
+    assert.strictEqual(heading.getAttribute('tabindex'), '-1', 'the page heading is focusable for the landing');
+    assert.strictEqual(w.document.activeElement, w.document.body, 'focus starts on the document body');
+
+    w.history.replaceState(null, '', '/vpn#vpn-sessions');
+    const landed = w.vpnLandOverviewAnchor();
+    assert.strictEqual(landed, 'vpn-sessions', 'the fragment resolved');
+    assert.strictEqual(w.document.activeElement, heading,
+        'a cold landing on the Sessions signal focuses the overview heading, not the body');
+
+    console.log('PASS_OVERVIEW_COLD_SESSIONS');
+})();
+`,
+	})
+
+	out := fixture.RunJSDOM(testScript)
+	if !strings.Contains(out, "PASS_OVERVIEW_COLD_SESSIONS") {
+		t.Fatalf("expected PASS_OVERVIEW_COLD_SESSIONS, got:\n%s", out)
+	}
+}
+
+// TestVPNSessionsCardHeadingCarriesTheLandingMargin covers the measured phone defect:
+// a landing on #vpn-forwarder-card focuses the Health heading, so that heading needs
+// the shell-chrome scroll margin the other landing targets carry. The delivered bundle
+// is asserted, not the module, because the bundle is what the page links.
+func TestVPNSessionsCardHeadingCarriesTheLandingMargin(t *testing.T) {
+	bundle, err := StaticFS.ReadFile("static/css/style.css")
+	if err != nil {
+		t.Fatalf("read the delivered bundle: %v", err)
+	}
+	css := string(bundle)
+	rule := css[strings.Index(css, "/* ===== Fragment landing geometry ====="):]
+	if end := strings.Index(rule, "}"); end > 0 {
+		rule = rule[:end]
+	}
+	for _, want := range []string{".vpn-health-title", ".vpn-page-title", "#vpn-troubleshooting-title"} {
+		if !strings.Contains(rule, want) {
+			t.Errorf("the landing margin rule does not cover %s, so a landing on it sits behind the shell bar:\n%s", want, rule)
+		}
+	}
+	if !strings.Contains(rule, "scroll-margin-top") || !strings.Contains(rule, "--shell-chrome-height") {
+		t.Errorf("the landing margin rule lost its offset:\n%s", rule)
+	}
+}
