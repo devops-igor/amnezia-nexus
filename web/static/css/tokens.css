@@ -8,6 +8,10 @@
 /* ===== CSS Variables / Tokens ===== */
 :root {
     /* Color palette — refined dark canvas & modern violet/indigo accents */
+    /* Height of the shell's fixed top bar. A fragment landing scrolls its target to
+       the top of the viewport, so anything that lands under this bar would be hidden
+       behind it; the landing targets use this as their scroll margin. */
+    --shell-chrome-height: 88px;
     --bg-primary: #090a0f;
     --bg-surface: #0d0e15;
     --bg-secondary: #12131c;

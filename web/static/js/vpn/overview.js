@@ -244,6 +244,19 @@ async function vpnSubmitEditEndpoint() {
     }
 }
 
+// vpnModalFocusFallback answers where focus goes when the control that opened the
+// endpoint dialog no longer exists. The dialog's opener is permanent, so this is the
+// same control; the configuration region is revealed so it is visible.
+function vpnModalFocusFallback() {
+    const config = document.getElementById('vpn-configuration');
+    if (config) config.open = true;
+    return document.getElementById('vpn-edit-endpoint-btn');
+}
+
+if (typeof window !== 'undefined') {
+    window.vpnModalFocusFallback = vpnModalFocusFallback;
+}
+
 // ---- Delegation ----
 
 const VPN_OVERVIEW_ACTIONS = {
@@ -291,12 +304,20 @@ function initVpnOverviewListeners() {
 // operator. Configuration is revealed when the target is one of its fields, and
 // a target that cannot take focus lands on its summary or the page heading.
 function vpnLandOverviewAnchor() {
-    const id = vpnOwnedAnchorId();
-    if (!id) return null;
+    const rawId = vpnOwnedAnchorId();
+    if (!rawId) return null;
+    // An id inside the endpoint dialog canonicalises to the control that opens it:
+    // a fragment never opens a dialog by itself.
+    const id = (typeof vpnCanonicalAnchorId === 'function') ? vpnCanonicalAnchorId(rawId) : rawId;
     const el = document.getElementById(id);
     if (!el) return null;
     const config = document.getElementById('vpn-configuration');
     if (config && config !== el && typeof config.contains === 'function' && config.contains(el)) {
+        config.open = true;
+    }
+    // The opener lives in the configuration region, so revealing it is part of the
+    // landing when the fragment named something inside the dialog it opens.
+    if (id === 'vpn-edit-endpoint-btn' && config) {
         config.open = true;
     }
     const focusTarget = vpnIsFocusable(el) ? el : vpnNearestHeading(el, null);

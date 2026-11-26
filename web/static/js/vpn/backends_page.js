@@ -97,6 +97,21 @@ function vpnRenderBackendsStaleRow() {
     vpnAnnounceBackends(message);
 }
 
+// vpnModalFocusFallback answers where focus goes when the control that opened a
+// dialog no longer exists: the permanent Add control for the add dialog (the
+// empty-state CTA that may have opened it is replaced by the next render), and the
+// inventory's own heading otherwise.
+function vpnModalFocusFallback(modalId) {
+    if (modalId === 'addBackendModal') {
+        return document.getElementById('vpn-add-backend-btn') || document.getElementById('vpn-backends-title');
+    }
+    return document.getElementById('vpn-backends-title') || document.getElementById('vpn-add-backend-btn');
+}
+
+if (typeof window !== 'undefined') {
+    window.vpnModalFocusFallback = vpnModalFocusFallback;
+}
+
 // vpnLoadBackends refreshes the inventory only.
 async function vpnLoadBackends() {
     let backendData;
@@ -196,8 +211,22 @@ function vpnFocusBackendsHeading() {
 // bookmark or a reload never replays a previous Inspect. A row that is absent
 // after a SUCCESSFUL read is genuinely missing, and the existing missing-entity
 // statement is announced at the destination heading.
+// vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request. The durable slot is
+// read once, when the document starts, because the request belongs to the navigation
+// that carried it: keeping it in tab storage let a later ordinary visit replay an
+// arrival whose first read had failed.
+let vpnPendingInspectTunnelId = (typeof vpnConsumeBackendHandoff === 'function')
+    ? vpnConsumeBackendHandoff()
+    : null;
+
+function vpnTakePendingInspect() {
+    const tunnelId = vpnPendingInspectTunnelId;
+    vpnPendingInspectTunnelId = null;
+    return tunnelId;
+}
+
 function vpnApplyBackendsLanding() {
-    const tunnelId = vpnConsumeBackendHandoff();
+    const tunnelId = vpnTakePendingInspect();
     if (tunnelId) {
         const row = vpnFindBackendRowByTunnelId(document.getElementById('vpn-backends-tbody'), tunnelId);
         const tr = vpnRevealBackendRow(row);

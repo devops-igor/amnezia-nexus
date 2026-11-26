@@ -282,16 +282,28 @@ var VPN_DIAGNOSTICS_ANCHOR_FALLBACK = {
 function vpnApplyDiagnosticsAnchor() {
     const id = vpnOwnedAnchorId();
     if (!id) return null;
+    const fallbackId = VPN_DIAGNOSTICS_ANCHOR_FALLBACK[id] || 'vpn-diagnostics-title';
     const el = document.getElementById(id);
-    if (!el) return null;
+    if (!el) {
+        // A conditional target (the stale banner) is not always rendered. Landing on
+        // the heading that owns it is a visible, named destination; doing nothing
+        // would leave focus on the document body.
+        const fallback = document.getElementById(fallbackId);
+        if (!fallback) return null;
+        vpnScrollToTarget(fallback);
+        vpnFocusIfFocusable(fallback);
+        return id;
+    }
 
     const panel = document.getElementById('vpn-diagnostics');
-    if (panel && panel !== el && typeof panel.contains === 'function' && panel.contains(el)) {
+    // The disclosure's own id is a landing like any other: opening it is what makes
+    // the target - and its title - visible.
+    if (panel && typeof panel.contains === 'function' && (panel === el || panel.contains(el))) {
         if (typeof vpnSetDiagnosticsOpen === 'function') vpnSetDiagnosticsOpen(true, null);
     }
     vpnRevealAncestorDetails(el);
 
-    const fallbackId = VPN_DIAGNOSTICS_ANCHOR_FALLBACK[id] || 'vpn-diagnostics-title';
+
     let focusTarget = el;
     if (!vpnIsFocusable(el)) {
         focusTarget = vpnNearestHeading(el, fallbackId);

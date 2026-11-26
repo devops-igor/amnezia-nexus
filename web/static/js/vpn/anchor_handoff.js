@@ -39,6 +39,15 @@
         'vpnNoServersNotice': 'vpn-add-backend-btn',
         'vpnModalError': 'vpn-add-backend-btn',
         'vpnAddBackendSubmitBtn': 'vpn-add-backend-btn',
+        // The endpoint dialog's own ids: an inspector or an old link that named one
+        // of them lands on the control that opens it, never inside a closed dialog.
+        'editEndpointModal': 'vpn-edit-endpoint-btn',
+        'editEndpointForm': 'vpn-edit-endpoint-btn',
+        'vpnPublicEndpointInput': 'vpn-edit-endpoint-btn',
+        'vpnEditEndpointSubmitBtn': 'vpn-edit-endpoint-btn',
+        'vpnEndpointModalError': 'vpn-edit-endpoint-btn',
+        'vpnEndpointModalTitle': 'vpn-edit-endpoint-btn',
+        'vpn-close-endpoint-modal': 'vpn-edit-endpoint-btn',
         // Transient loading rows: the owning heading is the stable landing.
         'vpn-backends-loading': 'vpn-backends-title',
         'vpn-sessions-loading': 'vpn-troubleshooting-title'
