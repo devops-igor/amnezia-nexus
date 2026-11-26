@@ -181,6 +181,30 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 		return fmt.Errorf("failed to marshal setting %s: %w", key, err)
 	}
 
+	if key == "gigahost" {
+		// A provider-key change must invalidate any outstanding association consent
+		// as part of its OWN write: the setting and the configuration epoch move in
+		// one transaction, so no earlier consent can still look current afterwards.
+		tx, err := d.sqlDB.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin the gigahost settings transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			key, string(b),
+		); err != nil {
+			return fmt.Errorf("failed to set setting %s: %w", key, err)
+		}
+		if err := bumpGigahostConfigEpochTx(ctx, tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit setting %s: %w", key, err)
+		}
+		return nil
+	}
+
 	_, err = d.sqlDB.ExecContext(ctx,
 		"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 		key, string(b),
@@ -242,6 +266,13 @@ func (d *DB) SetSettingsBulk(ctx context.Context, settings map[string]any) error
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert setting %s: %w", key, err)
+		}
+		if key == "gigahost" {
+			// Same rule as SetSetting: the provider configuration version moves in
+			// the same transaction as the setting that changed it.
+			if err := bumpGigahostConfigEpochTx(ctx, tx); err != nil {
+				return err
+			}
 		}
 	}
 

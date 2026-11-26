@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/geodb"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 )
 
 // DefaultCandidateDomains contains well-known high-reputation TLS 1.3 / H2 endpoints.
@@ -29,6 +31,7 @@ var DefaultCandidateDomains = []string{
 
 // ScanResult contains diagnostic and compatibility information for a candidate domain.
 type ScanResult struct {
+	cause           error
 	Domain          string `json:"domain"`
 	Country         string `json:"country,omitempty"`
 	ASN             uint32 `json:"asn,omitempty"`
@@ -174,6 +177,9 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 
 	results := make([]ScanResult, 0, len(domains))
 	for res := range resultsChan {
+		if errors.Is(res.cause, ssh.ErrProviderAbsent) {
+			return nil, ssh.ErrProviderAbsent
+		}
 		results = append(results, res)
 	}
 
@@ -262,6 +268,9 @@ func scanCandidateDomain(
 		DialContext: dialContext,
 	}
 	probeRes := ProbeTLSH2(ctx, domain, probeOpts)
+	if errors.Is(probeRes.cause, ssh.ErrProviderAbsent) {
+		return ScanResult{Domain: domain, cause: probeRes.cause}
+	}
 	if probeRes.Error != "" || !probeRes.TLS13 || !probeRes.X25519 || probeRes.ALPN != "h2" {
 		failReason := probeRes.Error
 		if failReason == "" {

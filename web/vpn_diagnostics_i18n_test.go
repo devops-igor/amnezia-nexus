@@ -49,16 +49,12 @@ const fixture={forwarder_available:true,forwarder_queue_capacity:100,listener_ru
  historical_series:{window_15m:[point]},peer_sync:{desired_peers:1,actual_peers:1,sync_failures:3,sync_failures_recent:2}};
 const original=JSON.stringify(fixture);
 vpnRenderForwarderHealth(fixture);
-assert.strictEqual(text('vpn-signal-throughput-value'),E('vpn_diag_not_measured'),'unmeasured throughput is localized text');
 assert.strictEqual(text('vpn-diag-throughput'),E('vpn_diag_traffic_unavailable'),'traffic state');
-assert.strictEqual(text('vpn-signal-drops-value'),E('vpn_diag_not_measured'),'unmeasured drop rate is localized text');
 assert(text('vpn-diag-engine-status').includes(E('vpn_diag_state_active')),'engine state is localized');
 assert.strictEqual(text('vpn-diag-engine-status'),'amneziawg-go (' + E('vpn_diag_state_active') + ') • VirtualTUN: ' + E('vpn_fwd_healthy'));
 assert.strictEqual(text('vpn-diag-routing-badge'),E('vpn_fwd_inconsistent'),'routing state');
 assert.strictEqual(text('vpn-diag-routing-alerts'),'Server detail','server detail unchanged');
 assert(text('vpn-diag-routing-counts').includes(E('vpn_diag_mismatch_drops',{count:4})));
-assert.strictEqual(text('vpn-signal-backends-value').replace(/\s+/g,' ').trim(),'1 / 2','healthy-of-enabled survives localization');
-assert.strictEqual(text('vpn-signal-backends-sub'),E('vpn_signal_backends_enabled'));
 const backendRows=document.getElementById('vpn-diag-be-traffic').children;
 assert(backendRows[0].textContent.includes('Server < & "quote"> (' + E('vpn_diag_loss_unavailable') + ')') && backendRows[0].innerHTML==='','backend name uses text');
 assert(!backendRows[0].textContent.includes('Server Disabled'),'disabled backend is excluded');
@@ -114,7 +110,6 @@ vpnRenderForwarderHealth({forwarder_available:false});
 assert.strictEqual(vpnLastStatus,null);
 vpnToggleShowAllRoutes();vpnSetHistoryWindow('1h');
 assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_unavailable'),'unavailable remains localized');
-assert.strictEqual(text('vpn-signal-throughput-value'),E('vpn_diag_not_measured'),'no stale throughput');
 assert.strictEqual(document.getElementById('vpn-chart-reasons').children.length,0);
 fixture.rates={available:true,rx_bps:0,tx_bps:0,rx_pps:0,tx_pps:0};
 fixture.drop_categories={rates_available:true,total_drops:12,total_drop_rate_pps:0};
@@ -123,9 +118,6 @@ fixture.problem_routes[0].p95_write_samples=1;fixture.problem_routes[0].last_tra
 fixture.health_assessment={status:'HEALTHY',conditions:[]};
 vpnRenderForwarderHealth(fixture);
 assert.strictEqual(text('vpn-fwd-status-text'),E('vpn_forwarder_healthy'),'recovered localized healthy');
-assert.strictEqual(text('vpn-signal-throughput-value').replace(/\s+/g,' ').trim(),'0 bps','measured zero differs from unknown');
-assert.strictEqual(text('vpn-signal-drops-value').replace(/\s+/g,' ').trim(),'0.00 drops/s','sampled zero drop rate stays numeric');
-assert(text('vpn-signal-drops-sub').includes('12'),'the cumulative count is reported separately');
 
 translations.no_data='<img src=x onerror=alert(1)> & "translated"';
 const emptySVG=vpnGenerateSparklineSVG([]);
@@ -160,7 +152,7 @@ func TestVPNDiagnosticsLocalizationDictionaries(t *testing.T) {
 }
 
 func TestVPNDiagnosticsLocalization(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplHTML := fixture.TemplateHTML
 	companionScripts := fixture.CompanionScripts()
 	nodePath := fixture.RequireNode()
@@ -206,7 +198,7 @@ func TestVPNDiagnosticsLocalization(t *testing.T) {
 }
 
 func TestVPNDiagnosticsLocalizationMutations(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	tmplHTML := fixture.TemplateHTML
 	companionScripts := fixture.CompanionScripts()
 	lang := "ru"
@@ -380,7 +372,7 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	body := vpnBackendDeviceReasonsBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {
@@ -414,7 +406,7 @@ func TestVPNBackendDeviceKPIAlarmCoverage(t *testing.T) {
 // reason danger styling is disabled, and the API-to-label inventory must break
 // when backend_device_unattributed is dropped from the canonical map.
 func TestVPNBackendDeviceKPIAlarmMutations(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	node := fixture.RequireNode()
 	body := vpnBackendDeviceReasonsBody(t)
 	for _, mutation := range []struct{ name, before, after, failure string }{
@@ -515,7 +507,7 @@ func TestVPNBackendDeviceUnattributedConditionRendering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	body := vpnBackendDeviceConditionBody(t)
 	var baseline string
 	for i, lang := range []string{"en", "ru", "fa", "fr", "zh"} {

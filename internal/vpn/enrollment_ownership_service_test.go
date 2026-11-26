@@ -31,7 +31,7 @@ func assertNotAdmittedAfterProbe(t *testing.T, s *Service, serverID int64) {
 	}
 	_, _ = s.ProbeTunnel(context.Background(), cur)
 	s.mu.Lock()
-	candidates := s.admissibleIngressCandidatesLocked()
+	candidates := s.admissibleIngressCandidatesLocked(nil)
 	s.mu.Unlock()
 	for _, c := range candidates {
 		if c.ServerID == serverID {

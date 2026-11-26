@@ -19,7 +19,7 @@ func (d *DB) GetAllServers(ctx context.Context) ([]models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at FROM servers ORDER BY id")
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_absent_account_id, provider_account_id FROM servers ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query servers: %w", err)
 	}
@@ -42,7 +42,7 @@ func (d *DB) GetServer(ctx context.Context, id int64) (*models.Server, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at FROM servers WHERE id = ?", id)
+	row := d.sqlDB.QueryRowContext(ctx, "SELECT id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_absent_at, provider_absent_account_id, provider_account_id FROM servers WHERE id = ?", id)
 	s, err := d.scanServerRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -56,6 +56,58 @@ func (d *DB) GetServer(ctx context.Context, id int64) (*models.Server, error) {
 // GetServerByID is an alias for GetServer.
 func (d *DB) GetServerByID(ctx context.Context, id int64) (*models.Server, error) {
 	return d.GetServer(ctx, id)
+}
+
+// IsServerProviderAbsent reports whether the provider's own inventory has
+// confirmed that a server no longer exists. A row that is not found reports
+// false: nothing is known about it, and a caller must not read "missing" as
+// "provider-confirmed absent".
+func (d *DB) IsServerProviderAbsent(ctx context.Context, id int64) (bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var observed sql.NullString
+	err := d.sqlDB.QueryRowContext(ctx,
+		"SELECT provider_absent_at FROM servers WHERE id = ?", id).Scan(&observed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read provider absence for server %d: %w", id, err)
+	}
+	return observed.Valid && strings.TrimSpace(observed.String) != "", nil
+}
+
+// ListProviderAbsentServerIDs returns the ids of the servers the provider's own
+// inventory has already contradicted.
+//
+// It is the narrow read a selection path needs: one indexed column, no credential
+// decryption, no row materialization, and no interpretation. An empty result means
+// "nothing is confirmed absent", which is also what a caller must assume when the read
+// fails - absence is a positive observation, never a default.
+func (d *DB) ListProviderAbsentServerIDs(ctx context.Context) ([]int64, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.sqlDB.QueryContext(ctx,
+		"SELECT id FROM servers WHERE provider_absent_at IS NOT NULL AND TRIM(provider_absent_at) <> '' ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list provider-absent servers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to read provider-absent server id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list provider-absent servers: %w", err)
+	}
+	return ids, nil
 }
 
 // GetServerCount returns the total number of configured servers.
@@ -88,21 +140,9 @@ type serverInserter interface {
 }
 
 func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Server) (int64, error) {
-	encPass := s.SSHPass
-	encKey := s.SSHKey
-	if s.SSHPass != "" && !security.LooksLikeFernetToken(s.SSHPass) {
-		ep, err := security.EncryptCredential(s.SSHPass, d.secretKey)
-		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt ssh password: %w", err)
-		}
-		encPass = ep
-	}
-	if s.SSHKey != "" && !security.LooksLikeFernetToken(s.SSHKey) {
-		ek, err := security.EncryptCredential(s.SSHKey, d.secretKey)
-		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt ssh key: %w", err)
-		}
-		encKey = ek
+	encPass, encKey, err := d.encryptedCredentials(s.SSHPass, s.SSHKey)
+	if err != nil {
+		return 0, err
 	}
 
 	cleanedProtocols := security.StripSensitiveProtocolFields(s.Protocols)
@@ -122,13 +162,13 @@ func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Serv
 	var res sql.Result
 	if s.ID > 0 {
 		res, err = db.ExecContext(ctx,
-			"INSERT INTO servers (id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			s.ID, s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
+			"INSERT INTO servers (id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			s.ID, s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr, s.ProviderAccountID,
 		)
 	} else {
 		res, err = db.ExecContext(ctx,
-			"INSERT INTO servers (name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
+			"INSERT INTO servers (name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at, provider_account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr, s.ProviderAccountID,
 		)
 	}
 
@@ -142,6 +182,35 @@ func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Serv
 	}
 	s.ID = id
 	return id, nil
+}
+
+// encryptedCredentials encrypts the credentials a row is inserted with. A value
+// that is empty or already carries a Fernet token is passed through unchanged, so
+// a caller that decrypted a stored credential does not wrap it twice.
+//
+// It is separate from the insert so both credentials follow one rule and the
+// insert statement itself stays readable.
+func (d *DB) encryptedCredentials(pass, key string) (string, string, error) {
+	encPass, err := d.encryptCredentialIfNeeded(pass, "ssh password")
+	if err != nil {
+		return "", "", err
+	}
+	encKey, err := d.encryptCredentialIfNeeded(key, "ssh key")
+	if err != nil {
+		return "", "", err
+	}
+	return encPass, encKey, nil
+}
+
+func (d *DB) encryptCredentialIfNeeded(value, what string) (string, error) {
+	if value == "" || security.LooksLikeFernetToken(value) {
+		return value, nil
+	}
+	encrypted, err := security.EncryptCredential(value, d.secretKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt %s: %w", what, err)
+	}
+	return encrypted, nil
 }
 
 // UpdateServer dynamically updates fields on a server, validating against the column allowlist.
@@ -263,6 +332,34 @@ func (d *DB) UpdateServerSSHStatus(ctx context.Context, id int64, status string)
 	return nil
 }
 
+// SetServerProviderAbsence records the provider's current view of a
+// provider-provisioned server. A non-zero observedAt records that the provider's
+// inventory confirmed the server no longer exists; a zero observedAt clears that
+// state, which is what a server the provider lists again must end up with.
+//
+// Only the observation columns are written, together: which account the listing was read
+// from is part of the observation, so a later key change is visible rather than silent.
+// The row's address, credentials, sessions and reachability state are left exactly as
+// they were, because this is a statement about the provider's inventory rather than a
+// deletion or a health verdict.
+func (d *DB) SetServerProviderAbsence(ctx context.Context, id int64, observedAt time.Time, accountID string) error {
+	value, account := "", ""
+	if !observedAt.IsZero() {
+		value = formatTime(observedAt.UTC())
+		account = strings.TrimSpace(accountID)
+	}
+
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	if _, err := d.sqlDB.ExecContext(ctx,
+		"UPDATE servers SET provider_absent_at = ?, provider_absent_account_id = ? WHERE id = ?",
+		value, account, id); err != nil {
+		return fmt.Errorf("failed to record provider absence for server %d: %w", id, err)
+	}
+	return nil
+}
+
 // UpdateServerCredentials updates and encrypts SSH password and private key.
 func (d *DB) UpdateServerCredentials(ctx context.Context, id int64, sshPass, sshKey string) error {
 	return d.UpdateServer(ctx, id, map[string]any{
@@ -352,7 +449,7 @@ type scannable interface {
 
 func (d *DB) scanServer(s scannable) (models.Server, error) {
 	var srv models.Server
-	var sshPass, sshKey, protoJSON, createdAt sql.NullString
+	var sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID sql.NullString
 
 	err := s.Scan(
 		&srv.ID,
@@ -364,27 +461,15 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 		&sshKey,
 		&protoJSON,
 		&createdAt,
+		&providerAbsentAt,
+		&providerAbsentAccountID,
+		&providerAccountID,
 	)
 	if err != nil {
 		return srv, err
 	}
 
-	if sshPass.Valid && sshPass.String != "" {
-		srv.SSHPass = security.DecryptCredentialSafe(sshPass.String, d.secretKey)
-	}
-	if sshKey.Valid && sshKey.String != "" {
-		srv.SSHKey = security.DecryptCredentialSafe(sshKey.String, d.secretKey)
-	}
-
-	srv.Protocols = make(map[string]any)
-	if protoJSON.Valid && protoJSON.String != "" {
-		_ = json.Unmarshal([]byte(protoJSON.String), &srv.Protocols)
-		srv.Protocols = security.StripSensitiveProtocolFields(srv.Protocols)
-	}
-
-	if createdAt.Valid && createdAt.String != "" {
-		srv.CreatedAt = parseTime(createdAt.String)
-	}
+	d.decodeServerColumns(&srv, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID)
 
 	d.reachabilityMu.RLock()
 	if st, ok := d.reachabilityCache[srv.ID]; ok {
@@ -395,6 +480,52 @@ func (d *DB) scanServer(s scannable) (models.Server, error) {
 	d.reachabilityMu.RUnlock()
 
 	return srv, nil
+}
+
+// decodeServerColumns fills the server fields whose stored shape is not a plain
+// value: credentials are decrypted, the protocols blob is decoded and sanitized,
+// and the optional timestamps are parsed only when present.
+func (d *DB) decodeServerColumns(
+	srv *models.Server, sshPass, sshKey, protoJSON, createdAt, providerAbsentAt, providerAbsentAccountID, providerAccountID sql.NullString,
+) {
+	assignOptionalText(&srv.ProviderAbsentAt, providerAbsentAt)
+	assignOptionalText(&srv.ProviderAbsentAccountID, providerAbsentAccountID)
+	assignOptionalText(&srv.ProviderAccountID, providerAccountID)
+
+	if sshPass.Valid && sshPass.String != "" {
+		srv.SSHPass = security.DecryptCredentialSafe(sshPass.String, d.secretKey)
+	}
+	if sshKey.Valid && sshKey.String != "" {
+		srv.SSHKey = security.DecryptCredentialSafe(sshKey.String, d.secretKey)
+	}
+
+	srv.Protocols = decodeServerProtocols(protoJSON)
+
+	if createdAt.Valid && createdAt.String != "" {
+		srv.CreatedAt = parseTime(createdAt.String)
+	}
+}
+
+// assignOptionalText stores a nullable text column on its target when the row carried
+// it, trimmed. The three provider columns are all "empty means not recorded", so they
+// share one rule instead of three copies of it.
+func assignOptionalText(target *string, value sql.NullString) {
+	if value.Valid {
+		*target = strings.TrimSpace(value.String)
+	}
+}
+
+// decodeServerProtocols decodes the stored protocols blob, always returning a
+// non-nil map so a caller never has to nil-check it. A blob that is absent or not
+// valid JSON yields no protocols rather than an error: nothing usable can be read
+// from it, and one unreadable row must not fail the whole listing.
+func decodeServerProtocols(protoJSON sql.NullString) map[string]any {
+	protocols := make(map[string]any)
+	if protoJSON.Valid && protoJSON.String != "" {
+		_ = json.Unmarshal([]byte(protoJSON.String), &protocols)
+		protocols = security.StripSensitiveProtocolFields(protocols)
+	}
+	return protocols
 }
 
 func (d *DB) scanServerRow(row *sql.Row) (models.Server, error) {

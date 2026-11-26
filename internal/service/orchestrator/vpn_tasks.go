@@ -56,12 +56,27 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 
 	tunnelParams := o.resolveTunnelProbeParams(ctx, tunnels)
 
+	// A tunnel whose server the provider's inventory no longer lists is not probed
+	// at all: no handshake, and no health classification either, because a
+	// classification would feed failover decisions with a measurement of an
+	// address the panel has durable evidence is gone. The tunnel row is kept, as
+	// the whole absence design intends; only the dialing stops.
+	absentServers, err := o.providerAbsentServerIDs(ctx)
+	if err != nil {
+		return err
+	}
+
 	var degradedTunnels []int64
 	var healthyTunnels []*models.BackendTunnel
 
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
+		if _, absent := absentServers[t.ServerID]; absent {
+			slog.Debug("Skipping backend tunnel probe for a server absent from the provider inventory",
+				"tunnel_id", t.ID, "server_id", t.ServerID)
+			continue
+		}
 		if !t.Enabled {
 			// Administratively disabled backends are ineligible altogether.
 			continue
@@ -639,12 +654,21 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 		return fmt.Errorf("failed to query backend tunnels for rebalance: %w", err)
 	}
 
+	// The durable query is the source here (the pool snapshot is not), so the absence
+	// rule has to be applied to this list as well. Reading the marks is one indexed
+	// column and happens before any session is touched; an unreadable store leaves the
+	// candidate list exactly as it was, because only CONFIRMED absence disqualifies.
+	absent := o.providerAbsentServers(ctx)
+
 	var activeTunnels []models.BackendTunnel
 	for _, t := range tunnels {
 		if t.Enabled && strings.EqualFold(t.Status, "active") {
 			activeTunnels = append(activeTunnels, t)
 		}
 	}
+	// Every destination decision below uses this filtered set: a backend the provider has
+	// confirmed deleted is not a rebalance target, independently of its last health sample.
+	activeTunnels = models.EligibleTunnelDestinationValues(activeTunnels, absent)
 
 	if len(activeTunnels) < 2 {
 		return nil
@@ -712,7 +736,7 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 				continue
 			}
 			excess := count - threshold
-			drained := o.drainTunnelExcess(ctx, sessionsByTunnel[t.ID], famTunnels, t.ID, counts, excess)
+			drained := o.drainTunnelExcess(ctx, sessionsByTunnel[t.ID], famTunnels, t.ID, counts, excess, absent)
 
 			slog.Info("Rebalanced overloaded backend tunnel",
 				"tunnel_id", t.ID,
@@ -732,7 +756,10 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 // live migration when a SessionMigrator is present (issue #289) or in-place DB
 // UPDATEs that mark rows "draining" (R5) when in DB-only mode. Returns the number moved.
 // counts is updated in place so successive callers see consistent numbers.
-func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.VPNSession, activeTunnels []models.BackendTunnel, sourceID int64, counts map[int64]int, excess int) int {
+func (o *Orchestrator) drainTunnelExcess(
+	ctx context.Context, sessList []models.VPNSession, activeTunnels []models.BackendTunnel,
+	sourceID int64, counts map[int64]int, excess int, providerAbsent models.AbsentServerSet,
+) int {
 	o.mu.RLock()
 	migrator := o.sessionMigrator
 	o.mu.RUnlock()
@@ -743,10 +770,17 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 		var targetTunnelID int64
 		minCount := 999999
 		for _, cand := range activeTunnels {
-			if cand.ID != sourceID && counts[cand.ID] < minCount {
-				minCount = counts[cand.ID]
-				targetTunnelID = cand.ID
+			if cand.ID == sourceID || counts[cand.ID] >= minCount {
+				continue
 			}
+			if !models.TunnelDestinationAllowed(&cand, providerAbsent) {
+				// Belt and brace: the list is already filtered, and the shared decision
+				// is consulted again here so no future caller can pass an unfiltered
+				// list and still move a session onto a deleted backend.
+				continue
+			}
+			minCount = counts[cand.ID]
+			targetTunnelID = cand.ID
 		}
 
 		s := sessList[i]
@@ -755,6 +789,13 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 			if migrator != nil {
 				err = migrator.MigrateSession(ctx, s.ID, targetTunnelID)
 			} else {
+				// DB-only mode has no migration service to revalidate the destination, so
+				// the decision is applied here, immediately before the write.
+				if !o.dbTargetEligible(ctx, targetTunnelID, providerAbsent) {
+					slog.Info("Rebalance skipped a destination the provider has confirmed deleted",
+						"session_id", s.ID, "target_tunnel_id", targetTunnelID)
+					continue
+				}
 				err = o.db.UpdateVPNSessionBackendTunnel(ctx, s.ID, targetTunnelID)
 			}
 			if err == nil {

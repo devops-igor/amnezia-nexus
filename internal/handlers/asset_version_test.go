@@ -215,9 +215,9 @@ func shellDeclaredAssets(t *testing.T, shell string) map[string]shellDeclaredAss
 	return assets
 }
 
-// renderVPNPage returns the real /vpn page through the production handler, so
-// the template helpers, the layout and the scripts block are all the shipped ones.
-func renderVPNPage(t *testing.T) string {
+// renderVPNPageFor returns one of the three VPN documents through its production
+// handler, so the render is the application's own path and not a test assembly.
+func renderVPNPageFor(t *testing.T, page string) string {
 	t.Helper()
 	h, _, _ := setupTestHandlers(t)
 	req := httptest.NewRequest(http.MethodGet, "/vpn", nil)
@@ -227,31 +227,63 @@ func renderVPNPage(t *testing.T) string {
 	})
 	ctx = middleware.WithCSRFToken(ctx, "csrf-test-token")
 	w := httptest.NewRecorder()
-	h.VPNPageHandler(w, req.WithContext(ctx))
+	switch page {
+	case "vpn_backends":
+		h.VPNBackendsPageHandler(w, req.WithContext(ctx))
+	case "vpn_diagnostics":
+		h.VPNDiagnosticsPageHandler(w, req.WithContext(ctx))
+	default:
+		h.VPNPageHandler(w, req.WithContext(ctx))
+	}
 	if w.Code != http.StatusOK {
-		t.Fatalf("GET /vpn = %d, want 200", w.Code)
+		t.Fatalf("GET /vpn (%s) = %d, want 200", page, w.Code)
 	}
 	return w.Body.String()
 }
 
 // TestVPNPageServesEveryModuleUnderItsAssetBytes is the delivery check on the
-// real page: the six modules are requested at the digest of the bytes this build
-// ships, in the order they depend on each other. The reference URL comes from
-// the production helper, so a template that stopped calling it fails here even
-// though the template text would still name each module.
+// real documents: every module a VPN page loads is requested at the digest of the
+// bytes this build ships, in the order the page depends on it. The reference URL
+// comes from the production helper, so a template that stopped calling it fails
+// here even though the template text would still name each module.
 func TestVPNPageServesEveryModuleUnderItsAssetBytes(t *testing.T) {
-	wantOrder := []string{
-		"/static/js/vpn/backends.js",
-		"/static/js/vpn/health_problems.js",
-		"/static/js/vpn/health_summary.js",
-		"/static/js/vpn/charts.js",
-		"/static/js/vpn/sessions.js",
-		"/static/js/vpn/page.js",
+	pages := []struct {
+		name  string
+		order []string
+	}{
+		{"vpn", []string{
+			"/static/js/vpn/anchor_handoff.js",
+			"/static/js/vpn/common.js",
+			"/static/js/vpn/overview.js",
+		}},
+		{"vpn_backends", []string{
+			"/static/js/vpn/common.js",
+			"/static/js/vpn/backends.js",
+			"/static/js/vpn/backends_page.js",
+		}},
+		{"vpn_diagnostics", []string{
+			"/static/js/vpn/common.js",
+			"/static/js/vpn/health_problems.js",
+			"/static/js/vpn/health_summary.js",
+			"/static/js/vpn/charts.js",
+			"/static/js/vpn/sessions.js",
+			"/static/js/vpn/diagnostics_page.js",
+		}},
 	}
+	for _, page := range pages {
+		t.Run(page.name, func(t *testing.T) {
+			wantOrder := page.order
+			assertPageLoadsModulesUnderTheirBytes(t, page.name, wantOrder)
+		})
+	}
+}
 
+// assertPageLoadsModulesUnderTheirBytes renders one document and checks the chain.
+func assertPageLoadsModulesUnderTheirBytes(t *testing.T, page string, wantOrder []string) {
+	t.Helper()
 	emitted := map[string]string{}
 	var gotOrder []string
-	for _, src := range collectShellLinks(t, renderVPNPage(t)).scripts {
+	for _, src := range collectShellLinks(t, renderVPNPageFor(t, page)).scripts {
 		path, _, hasQuery := strings.Cut(src, "?")
 		if !slices.Contains(wantOrder, path) {
 			continue

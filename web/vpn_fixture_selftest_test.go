@@ -9,7 +9,9 @@ import (
 )
 
 func TestVPNTestFixture(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	// The diagnostics document owns the health card, the sessions table and every
+	// controller this self-test exercises.
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	if fixture.TemplateHTML == "" {
 		t.Fatal("expected non-empty TemplateHTML")
 	}
@@ -30,6 +32,7 @@ func TestVPNTestFixture(t *testing.T) {
 		if len(tables) == 0 {
 			t.Fatal("expected at least one table in vpn.html")
 		}
+		// The order contract this fixture validates is the diagnostics document's.
 		if err := fx.ValidateDashboardOrder(); err != nil {
 			t.Fatalf("dashboard DOM order validation failed: %v", err)
 		}
@@ -103,10 +106,14 @@ func TestVPNTestFixture(t *testing.T) {
 	t.Run("CombinedSourceAndExactBoundaryExtraction", func(t *testing.T) {
 		fx := fixture.WithT(t)
 		combined := fx.CombinedSource()
-		if !strings.Contains(combined, fx.TemplateHTML) || !strings.Contains(combined, fx.SessionsJS) ||
-			!strings.Contains(combined, fx.HealthProblemsJS) || !strings.Contains(combined, fx.HealthSummaryJS) ||
-			!strings.Contains(combined, fx.ChartsJS) || !strings.Contains(combined, fx.BackendsJS) {
-			t.Fatal("CombinedSource must contain TemplateHTML, SessionsJS, HealthProblemsJS, HealthSummaryJS, ChartsJS, and BackendsJS")
+		// CombinedSource is the owner document plus exactly the modules it ships.
+		for _, module := range []string{fx.SessionsJS, fx.HealthProblemsJS, fx.HealthSummaryJS, fx.ChartsJS, fx.CommonJS, fx.DiagnosticsPageJS} {
+			if !strings.Contains(combined, module) {
+				t.Fatal("CombinedSource must contain every module the owner document loads")
+			}
+		}
+		if strings.Contains(combined, fx.BackendsJS) {
+			t.Fatal("CombinedSource must not carry another document's backend controller")
 		}
 		if fx.CombinedVPNSessionsSource() != combined {
 			t.Fatal("CombinedVPNSessionsSource must match CombinedSource")
@@ -148,8 +155,6 @@ func TestVPNTestFixture(t *testing.T) {
 			"vpnRenderHistoryCharts",
 			"vpnSetHistoryWindow",
 			"vpnFormatApiError",
-			"vpnOpenEditEndpointModal",
-			"vpnSubmitEditEndpoint",
 			"vpnServerHasAwg",
 			"vpnStatusBadgeClass",
 			"vpnStatusLabel",
@@ -169,8 +174,31 @@ func TestVPNTestFixture(t *testing.T) {
 			if _, err := extractJSFunction(fx.TemplateHTML, "function "+name); err == nil {
 				t.Fatalf("expected extractJSFunction %s from TemplateHTML to fail, but succeeded", name)
 			}
-			if _, err := extractJSFunction(fx.CombinedSource(), "function "+name); err != nil {
-				t.Fatalf("expected extractJSFunction %s from CombinedSource to succeed: %v", name, err)
+		}
+		// Each moved function lives in the module that now owns it, and in no
+		// document's markup. Naming the owner is what keeps this check honest: a
+		// single "combined source contains it" assertion would pass for a function
+		// that stayed behind in another page's controller.
+		owners := map[string]string{
+			"vpnStatusBadgeClass":    fx.CommonJS,
+			"vpnStatusLabel":         fx.CommonJS,
+			"vpnSetListenerBadge":    fx.CommonJS,
+			"vpnRenderBackendRow":    fx.BackendsJS,
+			"vpnToggleBackend":       fx.BackendsJS,
+			"vpnDeleteBackend":       fx.BackendsJS,
+			"vpnResetAddModal":       fx.BackendsJS,
+			"vpnOpenAddBackendModal": fx.BackendsJS,
+			"vpnOnServerSelected":    fx.BackendsJS,
+			"vpnTriggerQuickCheck":   fx.BackendsJS,
+			"vpnSubmitAddBackend":    fx.BackendsJS,
+			"vpnToggleShowAllRoutes": fx.PageJS,
+		}
+		for name, owner := range owners {
+			if _, err := extractJSFunction(fx.TemplateHTML, "function "+name); err == nil {
+				t.Fatalf("expected extractJSFunction %s from TemplateHTML to fail, but succeeded", name)
+			}
+			if _, err := extractJSFunction(owner, "function "+name); err != nil {
+				t.Fatalf("expected extractJSFunction %s from its owning module to succeed: %v", name, err)
 			}
 		}
 		for _, name := range []string{
@@ -183,29 +211,31 @@ func TestVPNTestFixture(t *testing.T) {
 				t.Fatalf("expected extractJSFunction %s from ChartsJS to succeed: %v", name, err)
 			}
 		}
-		for _, name := range []string{
-			"vpnFormatApiError",
-			"vpnOpenEditEndpointModal",
-			"vpnSubmitEditEndpoint",
-			"vpnServerHasAwg",
-			"vpnStatusBadgeClass",
-			"vpnStatusLabel",
-			"vpnSetListenerBadge",
-			"vpnRenderBackendRow",
-			"vpnToggleBackend",
-			"vpnDeleteBackend",
-			"vpnResetAddModal",
-			"vpnOpenAddBackendModal",
-			"vpnOnServerSelected",
-			"vpnTriggerQuickCheck",
-			"vpnSubmitAddBackend",
+		for name, module := range map[string]string{
+			// Shared helpers any VPN document may use.
+			"vpnFormatApiError":   fx.CommonJS,
+			"vpnStatusBadgeClass": fx.CommonJS,
+			"vpnStatusLabel":      fx.CommonJS,
+			"vpnSetListenerBadge": fx.CommonJS,
+			// Backend management.
+			"vpnServerHasAwg":        fx.BackendsJS,
+			"vpnRenderBackendRow":    fx.BackendsJS,
+			"vpnToggleBackend":       fx.BackendsJS,
+			"vpnDeleteBackend":       fx.BackendsJS,
+			"vpnResetAddModal":       fx.BackendsJS,
+			"vpnOpenAddBackendModal": fx.BackendsJS,
+			"vpnOnServerSelected":    fx.BackendsJS,
+			"vpnTriggerQuickCheck":   fx.BackendsJS,
+			"vpnSubmitAddBackend":    fx.BackendsJS,
+			// The endpoint dialog belongs to the overview.
+			"vpnOpenEditEndpointModal": fx.OverviewJS,
+			"vpnSubmitEditEndpoint":    fx.OverviewJS,
 		} {
-			if _, err := extractJSFunction(fx.BackendsJS, "function "+name); err != nil {
-				t.Fatalf("expected extractJSFunction %s from BackendsJS to succeed: %v", name, err)
+			if _, err := extractJSFunction(module, "function "+name); err != nil {
+				t.Fatalf("expected extractJSFunction %s from its owning module to succeed: %v", name, err)
 			}
 		}
 		for _, name := range []string{
-			"vpnLoadData",
 			"vpnToggleShowAllRoutes",
 		} {
 			if _, err := extractJSFunction(fx.PageJS, "function "+name); err != nil {
@@ -279,7 +309,7 @@ func TestVPNFixtureAssetFailClosed(t *testing.T) {
 }
 
 func TestHealthSummaryFailsClosedWithoutHealthProblems(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	nodePath := fixture.RequireNode()
 
 	// 1. Available forwarder with CRITICAL status throws ReferenceError when health_problems.js is missing
@@ -343,7 +373,7 @@ func TestSuppliedSourceIsolationInHealthScriptLocale(t *testing.T) {
 
 func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	t.Run("HealthProblemsModuleExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.HealthProblemsJS = "throw new Error('AUDIT_MODULE_EXECUTION_FAILURE');\n" + fixture.HealthProblemsJS
 
@@ -362,7 +392,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("HealthSummaryModuleExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.HealthSummaryJS = "throw new Error('SUMMARY_MODULE_INIT_FAILURE');\n" + fixture.HealthSummaryJS
 
@@ -381,7 +411,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("TroubleshootingHarnessHealthProblemsExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.HealthProblemsJS = "throw new Error('TROUBLESHOOTING_MODULE_FAILURE');\n" + fixture.HealthProblemsJS
 
@@ -396,7 +426,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("ChartsModuleExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.ChartsJS = "throw new Error('CHARTS_MODULE_FAILURE');\n" + fixture.ChartsJS
 
@@ -415,7 +445,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("ChartsModuleJSDOMExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireJSDOM()
 		fixture.ChartsJS = "throw new Error('CHARTS_JSDOM_FAILURE');\n" + fixture.ChartsJS
 
@@ -433,7 +463,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("BackendsModuleJSDOMExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 		nodePath := fixture.RequireJSDOM()
 		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
 
@@ -453,66 +483,43 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 		}
 	})
 
-	t.Run("BackendsModuleHealthScriptExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
-		nodePath := fixture.RequireNode()
-		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
-
-		script, err := vpnDiagnosticsHealthScriptLocale(t, fixture.CombinedSource(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
-		if err != nil {
-			t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+	// The three subtests below used to prove that a broken backend module also broke
+	// the health, troubleshooting and localization scripts, because all four modules
+	// shipped in one page. They are separate documents now, and the stronger property
+	// is the separation itself: a backend module that throws cannot affect any
+	// diagnostics script, because no diagnostics document loads it.
+	t.Run("BrokenBackendsModuleCannotAffectDiagnostics", func(t *testing.T) {
+		diagnostics := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
+		nodePath := diagnostics.RequireNode()
+		if strings.Contains(diagnostics.CompanionScripts(), diagnostics.BackendsJS) {
+			t.Fatal("the diagnostics chain must not contain the backend controller")
 		}
 
-		out, err := execNodeScript(nodePath, script)
-		if err == nil {
-			t.Fatalf("expected execution failure on injected companion module error in health script, got nil error\nOutput:\n%s", string(out))
-		}
-		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
-			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
-		}
-		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
-			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
-		}
-	})
-
-	t.Run("BackendsModuleTroubleshootingHarnessExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
-		nodePath := fixture.RequireNode()
-		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
-
-		script := vpnConnectionTroubleshootingScriptLocale(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en", `console.log('UNREACHABLE_AFTER_BACKENDS_ERROR');`)
-		out, err := execNodeScript(nodePath, script)
-		if err == nil {
-			t.Fatalf("expected execution failure on injected companion module error in troubleshooting harness, got nil error\nOutput:\n%s", string(out))
-		}
-		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
-			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
-		}
-		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
-			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
-		}
-	})
-
-	t.Run("BackendsModuleLocalizationScriptExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
-		nodePath := fixture.RequireNode()
-		fixture.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + fixture.BackendsJS
-
-		script := vpnDiagnosticsLocalizationScript(t, fixture.TemplateHTML, fixture.CompanionScripts(), "en") + "\nconsole.log('UNREACHABLE_AFTER_BACKENDS_ERROR');\n"
-		out, err := execNodeScript(nodePath, script)
-		if err == nil {
-			t.Fatalf("expected execution failure on injected companion module error in localization script, got nil error\nOutput:\n%s", string(out))
-		}
-		if !strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
-			t.Fatalf("expected output to mention BACKENDS_MODULE_FAILURE, got:\n%s", string(out))
-		}
-		if strings.Contains(string(out), "UNREACHABLE_AFTER_BACKENDS_ERROR") {
-			t.Fatalf("downstream marker UNREACHABLE_AFTER_BACKENDS_ERROR must be absent, got:\n%s", string(out))
+		broken := NewVPNTestFixtureForPage(t, "vpn_backends")
+		broken.BackendsJS = "throw new Error('BACKENDS_MODULE_FAILURE');\n" + broken.BackendsJS
+		for _, harness := range []string{
+			func() string {
+				script, err := vpnDiagnosticsHealthScriptLocale(t, diagnostics.CombinedSource(), "en", `console.log('DIAGNOSTICS_HEALTH_OK');`)
+				if err != nil {
+					t.Fatalf("vpnDiagnosticsHealthScriptLocale failed: %v", err)
+				}
+				return script
+			}(),
+			vpnConnectionTroubleshootingScriptLocale(t, diagnostics.TemplateHTML, diagnostics.CompanionScripts(), "en", `console.log('DIAGNOSTICS_TROUBLESHOOTING_OK');`),
+			vpnDiagnosticsLocalizationScript(t, diagnostics.TemplateHTML, diagnostics.CompanionScripts(), "en"),
+		} {
+			out, err := execNodeScript(nodePath, harness)
+			if err != nil {
+				t.Fatalf("a diagnostics script failed while only the backends module was broken: %v\nOutput:\n%s", err, string(out))
+			}
+			if strings.Contains(string(out), "BACKENDS_MODULE_FAILURE") {
+				t.Fatalf("the diagnostics script executed the backend controller:\n%s", string(out))
+			}
 		}
 	})
 
 	t.Run("PageModuleJSDOMExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireJSDOM()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
@@ -533,7 +540,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("PageModuleHealthScriptExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
@@ -555,7 +562,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("PageModuleTroubleshootingHarnessExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
@@ -573,7 +580,7 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 	})
 
 	t.Run("PageModuleLocalizationScriptExecutionError", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		fixture.PageJS = "throw new Error('PAGE_MODULE_FAILURE');\n" + fixture.PageJS
 
@@ -592,24 +599,25 @@ func TestBrokenCompanionModuleExecutionFailsInHarness(t *testing.T) {
 }
 
 func TestVPNBackendsExportAuthorityFailsClosed(t *testing.T) {
-	fixture := NewVPNTestFixture(t)
+	// The inventory document loads both the row renderer and the shared labels.
+	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	nodePath := fixture.RequireJSDOM()
 
-	fnCode, err := extractJSFunction(fixture.BackendsJS, "function vpnStatusLabel")
+	fnCode, err := extractJSFunction(fixture.CommonJS, "function vpnStatusLabel")
 	if err != nil {
-		t.Fatalf("extractJSFunction vpnStatusLabel from BackendsJS failed: %v", err)
+		t.Fatalf("extractJSFunction vpnStatusLabel from CommonJS failed: %v", err)
 	}
-	strippedBackends := strings.Replace(fixture.BackendsJS, fnCode, "", 1)
+	strippedCommon := strings.Replace(fixture.CommonJS, fnCode, "", 1)
 
 	// 1. Static extraction of missing export function must fail closed
-	if _, err := extractJSFunction(strippedBackends, "function vpnStatusLabel"); err == nil {
+	if _, err := extractJSFunction(strippedCommon, "function vpnStatusLabel"); err == nil {
 		t.Fatal("expected extractJSFunction for vpnStatusLabel to fail when stripped, got nil")
 	}
 
 	// 2. Harness execution with stripped export must fail closed
 	t.Run("JSDOMHarnessExecutionFails", func(t *testing.T) {
 		fx := fixture.WithT(t)
-		fx.BackendsJS = strippedBackends
+		fx.CommonJS = strippedCommon
 		script := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
 			ExtraJS: `
 assert.strictEqual(typeof w.vpnStatusLabel, 'function', 'vpnStatusLabel must be exported');
@@ -629,7 +637,7 @@ console.log('UNREACHABLE_AFTER_EXPORT_STRIP');
 	// 3. Sessions and routes runner depending on vpnStatusLabel must fail closed
 	t.Run("SessionsRoutesRunnerFails", func(t *testing.T) {
 		fx := fixture.WithT(t)
-		fx.BackendsJS = strippedBackends
+		fx.CommonJS = strippedCommon
 		script := fx.BuildJSDOMHarness(JSDOMHarnessOptions{
 			ExtraJS: `
 const row = w.vpnRenderBackendRow({ server_id: 1, endpoint: '203.0.113.1:51820', enabled: true, status: 'active', latency_ms: 10 });
@@ -650,14 +658,18 @@ console.log('UNREACHABLE_AFTER_ROW_RENDER_WITHOUT_STATUS_LABEL');
 func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 	if mode := os.Getenv("TEST_VPN_LOADER_SEAM_CASE"); mode != "" {
 		baseFS := fstest.MapFS{
-			"static/css/style.css":             &fstest.MapFile{Data: []byte("body { margin: 0; }")},
-			"static/js/vpn/sessions.js":        &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
-			"static/js/vpn/health_problems.js": &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
-			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
-			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
-			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
-			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
-			"static/js/tables.js":              &fstest.MapFile{Data: []byte("function NexusTable() {}")},
+			"static/css/style.css":              &fstest.MapFile{Data: []byte("body { margin: 0; }")},
+			"static/js/vpn/sessions.js":         &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
+			"static/js/vpn/health_problems.js":  &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
+			"static/js/vpn/health_summary.js":   &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
+			"static/js/vpn/charts.js":           &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
+			"static/js/vpn/backends.js":         &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
+			"static/js/vpn/common.js":           &fstest.MapFile{Data: []byte("function vpnAssignText() {}")},
+			"static/js/vpn/overview.js":         &fstest.MapFile{Data: []byte("function vpnLoadOverview() {}")},
+			"static/js/vpn/backends_page.js":    &fstest.MapFile{Data: []byte("function vpnLoadBackends() {}")},
+			"static/js/vpn/diagnostics_page.js": &fstest.MapFile{Data: []byte("function vpnLoadDiagnostics() {}")},
+			"static/js/vpn/anchor_handoff.js":   &fstest.MapFile{Data: []byte("function vpnAnchorOwner() {}")},
+			"static/js/tables.js":               &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
 		switch mode {
 		case "missing_charts":
@@ -678,19 +690,37 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			baseFS["static/js/vpn/backends.js"] = &fstest.MapFile{Data: []byte("")}
 		case "whitespace_backends":
 			baseFS["static/js/vpn/backends.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
+		case "missing_common":
+			delete(baseFS, "static/js/vpn/common.js")
+		case "decoy_alternate_root_common":
+			delete(baseFS, "static/js/vpn/common.js")
+			baseFS["js/vpn/common.js"] = &fstest.MapFile{Data: []byte("function vpnAssignText() { /* decoy */ }")}
+		case "empty_common":
+			baseFS["static/js/vpn/common.js"] = &fstest.MapFile{Data: []byte("")}
+		case "whitespace_common":
+			baseFS["static/js/vpn/common.js"] = &fstest.MapFile{Data: []byte("   \n\t  \r\n")}
+		case "missing_overview":
+			delete(baseFS, "static/js/vpn/overview.js")
+		case "decoy_alternate_root_overview":
+			delete(baseFS, "static/js/vpn/overview.js")
+			baseFS["js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("function vpnLoadOverview() { /* decoy */ }")}
+		case "empty_overview":
+			baseFS["static/js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("")}
+		case "whitespace_overview":
+			baseFS["static/js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("   \n\t  \r\n")}
 		case "missing_page":
-			delete(baseFS, "static/js/vpn/page.js")
+			delete(baseFS, "static/js/vpn/overview.js")
 		case "decoy_alternate_root_page":
-			delete(baseFS, "static/js/vpn/page.js")
-			baseFS["js/vpn/page.js"] = &fstest.MapFile{Data: []byte("function vpnLoadData() { /* decoy */ }")}
+			delete(baseFS, "static/js/vpn/overview.js")
+			baseFS["js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("function vpnLoadOverview() { /* decoy */ }")}
 		case "empty_page":
-			baseFS["static/js/vpn/page.js"] = &fstest.MapFile{Data: []byte("")}
+			baseFS["static/js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("")}
 		case "whitespace_page":
-			baseFS["static/js/vpn/page.js"] = &fstest.MapFile{Data: []byte("   \n	  \r\n")}
+			baseFS["static/js/vpn/overview.js"] = &fstest.MapFile{Data: []byte("   \n\t  \r\n")}
 		default:
 			t.Fatalf("unknown test mode: %s", mode)
 		}
-		newVPNTestFixtureWithFS(t, baseFS)
+		newVPNTestFixtureWithFS(t, baseFS, "vpn")
 		return
 	}
 
@@ -706,10 +736,14 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		{"decoy_alternate_root_backends", "failed to read static backends asset static/js/vpn/backends.js"},
 		{"empty_backends", "failed to read static backends asset static/js/vpn/backends.js: empty content"},
 		{"whitespace_backends", "failed to read static backends asset static/js/vpn/backends.js: empty content"},
-		{"missing_page", "failed to read static page asset static/js/vpn/page.js"},
-		{"decoy_alternate_root_page", "failed to read static page asset static/js/vpn/page.js"},
-		{"empty_page", "failed to read static page asset static/js/vpn/page.js: empty content"},
-		{"whitespace_page", "failed to read static page asset static/js/vpn/page.js: empty content"},
+		{"missing_common", "failed to read static page asset static/js/vpn/common.js"},
+		{"decoy_alternate_root_common", "failed to read static page asset static/js/vpn/common.js"},
+		{"empty_common", "failed to read static page asset static/js/vpn/common.js: empty content"},
+		{"whitespace_common", "failed to read static page asset static/js/vpn/common.js: empty content"},
+		{"missing_overview", "failed to read static page asset static/js/vpn/overview.js"},
+		{"decoy_alternate_root_overview", "failed to read static page asset static/js/vpn/overview.js"},
+		{"empty_overview", "failed to read static page asset static/js/vpn/overview.js: empty content"},
+		{"whitespace_overview", "failed to read static page asset static/js/vpn/overview.js: empty content"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestVPNFixtureLoaderSeamAssetFailClosed$")
@@ -726,16 +760,20 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 
 	t.Run("ValidMapFS", func(t *testing.T) {
 		validFS := fstest.MapFS{
-			"static/css/style.css":             &fstest.MapFile{Data: []byte("body { margin: 0; }")},
-			"static/js/vpn/sessions.js":        &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
-			"static/js/vpn/health_problems.js": &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
-			"static/js/vpn/health_summary.js":  &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
-			"static/js/vpn/charts.js":          &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
-			"static/js/vpn/backends.js":        &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
-			"static/js/vpn/page.js":            &fstest.MapFile{Data: []byte("function vpnLoadData() {}")},
-			"static/js/tables.js":              &fstest.MapFile{Data: []byte("function NexusTable() {}")},
+			"static/css/style.css":              &fstest.MapFile{Data: []byte("body { margin: 0; }")},
+			"static/js/vpn/sessions.js":         &fstest.MapFile{Data: []byte("function vpnRenderSessions() {}")},
+			"static/js/vpn/health_problems.js":  &fstest.MapFile{Data: []byte("function vpnEvaluateHealth() {}")},
+			"static/js/vpn/health_summary.js":   &fstest.MapFile{Data: []byte("function vpnRenderForwarderHealth() {}")},
+			"static/js/vpn/charts.js":           &fstest.MapFile{Data: []byte("function vpnRenderHistoryCharts() {}")},
+			"static/js/vpn/backends.js":         &fstest.MapFile{Data: []byte("function vpnRenderBackendRow() {}")},
+			"static/js/vpn/common.js":           &fstest.MapFile{Data: []byte("function vpnAssignText() {}")},
+			"static/js/vpn/overview.js":         &fstest.MapFile{Data: []byte("function vpnLoadOverview() {}")},
+			"static/js/vpn/backends_page.js":    &fstest.MapFile{Data: []byte("function vpnLoadBackends() {}")},
+			"static/js/vpn/diagnostics_page.js": &fstest.MapFile{Data: []byte("function vpnLoadDiagnostics() {}")},
+			"static/js/vpn/anchor_handoff.js":   &fstest.MapFile{Data: []byte("function vpnAnchorOwner() {}")},
+			"static/js/tables.js":               &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
-		fx := newVPNTestFixtureWithFS(t, validFS)
+		fx := newVPNTestFixtureWithFS(t, validFS, "vpn")
 		if fx == nil {
 			t.Fatal("expected non-nil fixture from valid MapFS")
 		}
@@ -745,8 +783,11 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 		if fx.BackendsJS != "function vpnRenderBackendRow() {}" {
 			t.Fatalf("unexpected BackendsJS content: %s", fx.BackendsJS)
 		}
-		if fx.PageJS != "function vpnLoadData() {}" {
+		if fx.PageJS != "function vpnLoadOverview() {}" {
 			t.Fatalf("unexpected PageJS content: %s", fx.PageJS)
+		}
+		if fx.DiagnosticsPageJS != "function vpnLoadDiagnostics() {}" {
+			t.Fatalf("unexpected DiagnosticsPageJS content: %s", fx.DiagnosticsPageJS)
 		}
 	})
 }

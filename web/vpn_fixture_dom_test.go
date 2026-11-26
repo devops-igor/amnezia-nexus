@@ -130,68 +130,33 @@ func countHTMLNodesByID(root *xhtml.Node, id string) int {
 	return count
 }
 
-func findTopLevelStatsGrid(doc *xhtml.Node) *xhtml.Node {
-	var walk func(*xhtml.Node) *xhtml.Node
-	walk = func(n *xhtml.Node) *xhtml.Node {
-		if n == nil {
-			return nil
-		}
-		if n.Type == xhtml.ElementNode && hasHTMLClass(n, "stats-grid") {
-			// Top-level KPI grid must not be enclosed inside another card (e.g. forwarder card)
-			if findClosestEnclosingCard(n) == nil {
-				return n
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if found := walk(c); found != nil {
-				return found
-			}
-		}
-		return nil
-	}
-	return walk(doc)
-}
-
+// validateVPNDashboardDOMOrder validates the diagnostics document's own order.
+//
+// The VPN subject is three documents now, so there is no single page order to
+// check across the health card, the signals, the inventory and the sessions
+// table. Each document validates its own sequence here, and the page tests
+// assert the other two:
+//
+//   - overview: the four-signal grid, then the configuration disclosure;
+//   - backends: one inventory card;
+//   - diagnostics: the health card, then Advanced Diagnostics, then the sessions
+//     table. Health is deliberately ABOVE the disclosure, and the disclosure
+//     above the sessions, so a collapsed panel never sits above the answer it
+//     belongs to.
 func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 	if doc == nil {
 		return errors.New("nil document")
 	}
 
-	// #955 layout: VPN Health first (the answer to "is it working"), then the
-	// four-signal overview, then Advanced Diagnostics, the configuration strip and
-	// finally the backend and session tables. The health panel is deliberately
-	// ABOVE the overview now, and the overview grid is the only .stats-grid on the
-	// page: a second one inside #vpn-forwarder-card is exactly what this issue
-	// removed.
 	if count := countHTMLNodesByID(doc, "vpn-forwarder-card"); count != 1 {
 		return fmt.Errorf("expected exactly 1 #vpn-forwarder-card element, found %d", count)
 	}
 	healthCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
-	if healthCard == nil {
-		return errors.New("#vpn-forwarder-card not found")
-	}
 	if !hasHTMLClass(healthCard, "card") {
 		return errors.New("#vpn-forwarder-card must be a .card")
 	}
-
-	overview := findTopLevelStatsGrid(doc)
-	if overview == nil {
-		return errors.New("top-level .stats-grid container not found")
-	}
-	if isHTMLDescendant(overview, healthCard) || isHTMLDescendant(healthCard, overview) {
-		return errors.New("the overview grid and #vpn-forwarder-card must not be nested in each other")
-	}
-
-	// The health card must carry exactly the four signals, and no KPI tiles.
-	signals := findHTMLNodesByAttr(doc, "data-signal")
-	if len(signals) != 4 {
-		return fmt.Errorf("expected exactly 4 [data-signal] entries, found %d", len(signals))
-	}
-	for _, signal := range signals {
-		if !isHTMLDescendant(overview, signal) {
-			return errors.New("[data-signal] entry is not inside the overview grid")
-		}
-	}
+	// The diagnostics document carries no overview signal grid: the signals are the
+	// overview's answer, and a second copy here would duplicate them.
 	if n := findHTMLNodeWithIDPrefix(doc, "vpn-kpi-"); n != nil {
 		return fmt.Errorf("obsolete KPI tile %q must not exist", getHTMLNodeAttr(n, "id"))
 	}
@@ -199,19 +164,16 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		return errors.New("#vpn-forwarder-card must not contain a nested .stats-grid")
 	}
 
-	// Ordered page regions, each appearing exactly once.
 	type region struct {
 		id   string
 		name string
 	}
 	regions := []region{
 		{"vpn-diagnostics", "#vpn-diagnostics"},
-		{"vpn-configuration", "#vpn-configuration"},
-		{"vpnBackendsTable", "#vpnBackendsTable"},
 		{"vpnSessionsTable", "#vpnSessionsTable"},
 	}
-	nodes := []*xhtml.Node{healthCard, overview}
-	names := []string{"vpn-forwarder-card", "overview grid"}
+	nodes := []*xhtml.Node{healthCard}
+	names := []string{"vpn-forwarder-card"}
 	for _, r := range regions {
 		if count := countHTMLNodesByID(doc, r.id); count != 1 {
 			return fmt.Errorf("expected exactly 1 %s element, found %d", r.name, count)
@@ -231,23 +193,19 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		}
 	}
 
-	// A table card must be the OUTERMOST card of its region: the backends table may
-	// not be nested inside another card that also holds the sessions table, because
-	// then one card owns two regions and the section order below would be measured
-	// through a shared ancestor instead of real page order.
-	for _, id := range []string{"vpnBackendsTable", "vpnSessionsTable"} {
-		node := findHTMLNodeByID(doc, id)
+	// A table card must be the OUTERMOST card of its region: the sessions table may
+	// not be nested inside another card, because then one card owns two regions and
+	// the order above is measured through a shared ancestor instead of page order.
+	if node := findHTMLNodeByID(doc, "vpnSessionsTable"); node != nil {
 		outer := findClosestEnclosingCard(node)
 		if outer == nil {
-			return fmt.Errorf("closest enclosing .card for #%s not found", id)
+			return errors.New("closest enclosing .card for #vpnSessionsTable not found")
 		}
 		if inner := findHTMLElementByClassWithin(outer, "card"); inner != nil {
-			return fmt.Errorf("card owning #%s must not contain another .card", id)
+			return errors.New("card owning #vpnSessionsTable must not contain another .card")
 		}
 	}
 
-	// Advanced Diagnostics must be ordered after the health card and overview, so
-	// a collapsed panel can never sit above the answer it belongs to.
 	order := documentOrder(doc)
 	index := func(n *xhtml.Node) int {
 		for i, candidate := range order {

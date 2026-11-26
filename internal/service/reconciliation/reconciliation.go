@@ -175,6 +175,28 @@ func (r *Reconciler) setStopped() {
 	r.running = false
 }
 
+// remoteAuditEligible drops the servers the provider's own inventory no longer
+// lists.
+//
+// Every phase of this service reaches a server over SSH: the container check, the
+// legacy-peer adoption and the zombie-peer audit all read the backend, and a host
+// the provider has removed cannot answer any of them. The absence fact is applied
+// once here rather than in each phase, so a later phase cannot be added without
+// it, and the retained rows are left exactly as they are - this service performs
+// no deletion for them.
+func remoteAuditEligible(servers []models.Server) []models.Server {
+	eligible := make([]models.Server, 0, len(servers))
+	for _, server := range servers {
+		if server.ProviderAbsent() {
+			slog.Debug("Skipping remote audit for a server absent from the provider inventory",
+				"server_id", server.ID)
+			continue
+		}
+		eligible = append(eligible, server)
+	}
+	return eligible
+}
+
 // CleanupStaleProtocols performs a three-phase cleanup:
 // Phase 1 (DB-only): Removes user_connections for protocols no longer in server.protocols.
 // Phase 2 (SSH-based): Verifies installed containers/binaries on each server; if missing, removes connections and protocol.
@@ -192,9 +214,9 @@ func (r *Reconciler) CleanupStaleProtocols(ctx context.Context) error {
 	r.cleanupPhase1DBOnly(ctx, servers)
 
 	if r.registry != nil {
-		r.cleanupPhase2Remote(ctx, servers)
+		r.cleanupPhase2Remote(ctx, remoteAuditEligible(servers))
 		_ = r.AdoptLegacyPeers(ctx)
-		r.cleanupPhase3ZombiePeers(ctx, servers)
+		r.cleanupPhase3ZombiePeers(ctx, remoteAuditEligible(servers))
 	}
 
 	return nil
@@ -346,7 +368,7 @@ func (r *Reconciler) AdoptLegacyPeers(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch servers for legacy peer adoption: %w", err)
 	}
 
-	for _, server := range servers {
+	for _, server := range remoteAuditEligible(servers) {
 		serverID := server.ID
 		srvCopy := server
 		for protoKey := range server.Protocols {
@@ -470,7 +492,7 @@ func (r *Reconciler) CleanupZombiePeers(ctx context.Context) error {
 
 	if r.registry != nil {
 		_ = r.AdoptLegacyPeers(ctx)
-		r.cleanupPhase3ZombiePeers(ctx, servers)
+		r.cleanupPhase3ZombiePeers(ctx, remoteAuditEligible(servers))
 	}
 
 	return nil

@@ -14,7 +14,7 @@ func TestVPNDiagnosticsCurrentObservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	source := []byte(fixture.CombinedSource())
 	script := vpnDiagnosticsHealthScript(t, string(source), `
 const text = id => document.getElementById(id).textContent;
@@ -114,7 +114,6 @@ for (const [desired,actual] of [[3,3],[3,1]]) {
   desired_peers:desired,actual_peers:actual,sync_failures:1,add_failures:1,enqueue_failures:2}});
  assert.strictEqual(text('vpn-diag-peers-status'),desired+' / '+actual);
  // The Sessions signal is the live count, never the peer-sync pair.
- assert.strictEqual(text('vpn-sessions'),'Not measured','peer counts must not become live sessions');
 }
 vpnRenderForwarderHealth(base);
 assert.strictEqual(text('vpn-diag-peers-status'),'Unavailable');
@@ -132,7 +131,7 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := NewVPNTestFixture(t)
+	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	source := []byte(fixture.CombinedSource())
 	mutated := strings.Replace(string(source), `id="vpn-diag-throughput"`, `id="vpn-diag-throughput-typo"`, 1)
 	script := vpnDiagnosticsHealthScript(t, mutated, `vpnRenderForwarderHealth({forwarder_available:true});`)
@@ -143,25 +142,42 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 }
 
 func TestVPNDiagnosticsPollingContract(t *testing.T) {
-	pageSource, err := fs.ReadFile(StaticFS, "static/js/vpn/page.js")
+	pageSource, err := fs.ReadFile(StaticFS, "static/js/vpn/diagnostics_page.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for token, want := range map[string]int{
-		"NexusTelemetry.poll('vpn-status'": 1,
-		"API.get('/api/vpn/status')":       1,
+		"NexusTelemetry.poll('vpn-diagnostics'": 1,
+		"API.get('/api/vpn/status')":            1,
+		"API.get('/api/vpn/sessions')":          1,
 	} {
 		if got := strings.Count(string(pageSource), token); got != want {
 			t.Errorf("%s count=%d, want%d", token, got, want)
 		}
 	}
-	for _, token := range []string{"vpnRenderForwarderHealth(status)", "vpnRenderForwarderHealth(null)"} {
+	// The diagnostics document reads none of the configuration, backend
+	// inventory or server list: those belong to the other two pages.
+	for _, foreign := range []string{
+		"API.get('/api/vpn/config')",
+		"API.get('/api/vpn/backends')",
+		"API.get('/api/servers')",
+	} {
+		if strings.Contains(string(pageSource), foreign) {
+			t.Errorf("diagnostics controller must not request %s", foreign)
+		}
+	}
+	for _, token := range []string{"vpnRenderForwarderHealth(status)"} {
 		if !strings.Contains(string(pageSource), token) {
 			t.Errorf("polling must handle %s", token)
 		}
 	}
+	// A failed status read renders the unavailable state instead of aborting the
+	// tick: the loader keeps its last value as null and renders that.
+	if !strings.Contains(string(pageSource), "status = null") {
+		t.Error("polling must render the unavailable state when the status read fails")
+	}
 
-	tmplSource, err := TemplatesFS.ReadFile("templates/vpn.html")
+	tmplSource, err := TemplatesFS.ReadFile("templates/vpn_diagnostics.html")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,18 +186,18 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 	// did not move in this change, so a bare path or ?v=<release> is the URL the
 	// predecessor served and a returning browser keeps running that controller
 	// against this markup.
-	if !strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>`) {
-		t.Errorf("expected templates/vpn.html to request the VPN controller through its asset bytes: %s",
-			`<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>`)
+	if !strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`) {
+		t.Errorf("expected templates/vpn_diagnostics.html to request the VPN diagnostics controller through its asset bytes: %s",
+			`<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`)
 	}
-	if strings.Contains(tmplStr, `<script src="/static/js/vpn/page.js"></script>`) {
-		t.Errorf("templates/vpn.html still requests /static/js/vpn/page.js bare, which is the URL the " +
+	if strings.Contains(tmplStr, `<script src="/static/js/vpn/diagnostics_page.js"></script>`) {
+		t.Errorf("templates/vpn_diagnostics.html still requests /static/js/vpn/diagnostics_page.js bare, which is the URL the " +
 			"predecessor served and a warm cache still holds")
 	}
 
 	inlineScriptRegex := regexp.MustCompile(`(?s)<script(?:\s+type="[^"]*")?>\s*[^<]`)
 	if inlineScriptRegex.MatchString(tmplStr) {
-		t.Errorf("templates/vpn.html must not contain inline <script> blocks")
+		t.Errorf("templates/vpn_diagnostics.html must not contain inline <script> blocks")
 	}
 }
 
@@ -190,182 +206,126 @@ func TestVPNDashboardSectionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
 	if err != nil {
-		t.Fatalf("failed to parse vpn.html: %v", err)
+		t.Fatalf("failed to parse vpn_diagnostics.html: %v", err)
 	}
 
 	if err := validateVPNDashboardDOMOrder(doc); err != nil {
 		t.Fatalf("vpn.html failed dashboard section order validation: %v", err)
 	}
 
+	// The fixtures below are diagnostics-shaped: the health card, the disclosure and
+	// the sessions table. The overview grid, the configuration strip and the backend
+	// table are other documents now, so a fixture that required them no longer
+	// describes any page.
+	parseFixture := func(t *testing.T, html string) *xhtml.Node {
+		t.Helper()
+		doc, err := xhtml.Parse(strings.NewReader(html))
+		if err != nil {
+			t.Fatalf("failed to parse fixture: %v", err)
+		}
+		return doc
+	}
+
 	t.Run("RejectsDecoyComments", func(t *testing.T) {
 		// Ordered ID strings placed inside an HTML comment must not satisfy the
 		// structural check.
-		decoyHTML := `
-			<div class="card" id="vpn-forwarder-card"></div>
-			<!-- id="vpnBackendsTable" id="vpnSessionsTable" id="vpn-diagnostics" id="vpn-configuration" -->
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
-			<div class="card"><table id="vpnSessionsTable"></table></div>
-		`
-		decoyDoc, err := xhtml.Parse(strings.NewReader(decoyHTML))
-		if err != nil {
-			t.Fatalf("failed to parse decoy HTML: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(decoyDoc); err == nil {
+		decoy := parserWithCommentFixture(t)
+		if err := validateVPNDashboardDOMOrder(decoy); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject decoy comment fixture, but it passed")
 		}
 	})
 
-	t.Run("RejectsNestedCards", func(t *testing.T) {
-		// The sessions card nested inside the backends card.
-		nestedHTML := `
-			<div class="card" id="vpn-forwarder-card"></div>
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card">
-				<table id="vpnBackendsTable"></table>
-				<div class="card"><table id="vpnSessionsTable"></table></div>
-			</div>
-		`
-		nestedDoc, err := xhtml.Parse(strings.NewReader(nestedHTML))
-		if err != nil {
-			t.Fatalf("failed to parse nested HTML: %v", err)
+	t.Run("RejectsSessionsBeforeDiagnostics", func(t *testing.T) {
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-forwarder-card"></section>
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+			<section class="card" id="vpn-diagnostics"></section>
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject the sessions table above the disclosure")
 		}
-		if err := validateVPNDashboardDOMOrder(nestedDoc); err == nil {
+	})
+
+	t.Run("RejectsHealthBelowDiagnostics", func(t *testing.T) {
+		// The answer must come first: health is the first thing on the page.
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-diagnostics"></section>
+			<section class="card" id="vpn-forwarder-card"></section>
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
+			t.Fatal("expected validateVPNDashboardDOMOrder to reject health below the disclosure")
+		}
+	})
+
+	t.Run("RejectsNestedCards", func(t *testing.T) {
+		// One card owning two regions: the sessions table nested inside another card
+		// that itself contains a card.
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-forwarder-card"></section>
+			<section class="card" id="vpn-diagnostics"></section>
+			<div class="card"><div class="card"></div><table id="vpnSessionsTable"></table></div>
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject nested card fixture, but it passed")
 		}
 	})
 
-	t.Run("RejectsSwappedSections", func(t *testing.T) {
-		// Sessions table above the backends table.
-		swappedHTML := `
-			<div class="card" id="vpn-forwarder-card"></div>
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card"><table id="vpnSessionsTable"></table></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
-		`
-		swappedDoc, err := xhtml.Parse(strings.NewReader(swappedHTML))
-		if err != nil {
-			t.Fatalf("failed to parse swapped HTML: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(swappedDoc); err == nil {
-			t.Fatal("expected validateVPNDashboardDOMOrder to reject swapped sections fixture, but it passed")
-		}
-	})
-
-	t.Run("RejectsHealthBelowOverview", func(t *testing.T) {
-		// The overview above the health panel: the answer must come first.
-		belowHTML := `
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card" id="vpn-forwarder-card"></div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
-			<div class="card"><table id="vpnSessionsTable"></table></div>
-		`
-		belowDoc, err := xhtml.Parse(strings.NewReader(belowHTML))
-		if err != nil {
-			t.Fatalf("failed to parse fixture: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(belowDoc); err == nil {
-			t.Fatal("expected validateVPNDashboardDOMOrder to reject an overview above the health panel")
-		}
-	})
-
 	t.Run("RejectsNestedStatsGridInHealth", func(t *testing.T) {
-		// A second grid inside the health panel is the duplication #955 removed.
-		nestedGridHTML := `
-			<div class="card" id="vpn-forwarder-card"><div class="stats-grid"></div></div>
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-forwarder-card"><div class="stats-grid"></div></section>
+			<section class="card" id="vpn-diagnostics"></section>
 			<div class="card"><table id="vpnSessionsTable"></table></div>
-		`
-		nestedGridDoc, err := xhtml.Parse(strings.NewReader(nestedGridHTML))
-		if err != nil {
-			t.Fatalf("failed to parse fixture: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(nestedGridDoc); err == nil {
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject a nested .stats-grid in the health panel")
 		}
 	})
 
 	t.Run("RejectsKpiTiles", func(t *testing.T) {
-		kpiHTML := `
-			<div class="card" id="vpn-forwarder-card"></div>
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-forwarder-card"></section>
 			<div class="card"><div id="vpn-kpi-throughput">-</div></div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
+			<section class="card" id="vpn-diagnostics"></section>
 			<div class="card"><table id="vpnSessionsTable"></table></div>
-		`
-		kpiDoc, err := xhtml.Parse(strings.NewReader(kpiHTML))
-		if err != nil {
-			t.Fatalf("failed to parse fixture: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(kpiDoc); err == nil {
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject a leftover #vpn-kpi-* tile")
 		}
 	})
 
 	t.Run("RejectsDuplicateIDs", func(t *testing.T) {
-		dupHTML := `
-			<div class="card" id="vpn-forwarder-card"></div>
-			<div class="stats-grid">			<div class="card stat-card" data-signal="backends"></div>
-			<div class="card stat-card" data-signal="sessions"></div>
-			<div class="card stat-card" data-signal="throughput"></div>
-			<div class="card stat-card" data-signal="drops"></div>
-</div>
-			<div class="card" id="vpn-diagnostics"></div>
-			<div class="card" id="vpn-configuration"></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
-			<div class="card"><table id="vpnBackendsTable"></table></div>
+		doc := parseFixture(t, `
+			<section class="card" id="vpn-forwarder-card"></section>
+			<section class="card" id="vpn-diagnostics"></section>
 			<div class="card"><table id="vpnSessionsTable"></table></div>
-		`
-		dupDoc, err := xhtml.Parse(strings.NewReader(dupHTML))
-		if err != nil {
-			t.Fatalf("failed to parse duplicate ID HTML: %v", err)
-		}
-		if err := validateVPNDashboardDOMOrder(dupDoc); err == nil {
+			<div class="card"><table id="vpnSessionsTable"></table></div>
+		`)
+		if err := validateVPNDashboardDOMOrder(doc); err == nil {
 			t.Fatal("expected validateVPNDashboardDOMOrder to reject duplicate ID fixture, but it passed")
 		}
 	})
+}
+
+// parserWithCommentFixture parses ids that appear only inside a comment. It is the
+// decoy case: ordered id strings in a comment must not satisfy a structural check.
+func parserWithCommentFixture(t *testing.T) *xhtml.Node {
+	t.Helper()
+	doc, err := xhtml.Parse(strings.NewReader(`
+		<!-- id="vpn-forwarder-card" id="vpn-diagnostics" id="vpnSessionsTable" -->
+		<div class="card"></div>
+	`))
+	if err != nil {
+		t.Fatalf("failed to parse decoy HTML: %v", err)
+	}
+	return doc
 }
 
 // TestVPNHistoricalChartsContract verifies that the historical trends panel contains
@@ -376,13 +336,13 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
 	if err != nil {
-		t.Fatalf("failed to parse vpn.html: %v", err)
+		t.Fatalf("failed to parse vpn_diagnostics.html: %v", err)
 	}
 
 	chartIDs := []string{
@@ -446,10 +406,11 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	}
 
 	t.Run("JSRenderContract", func(t *testing.T) {
-		fixture := NewVPNTestFixture(t)
+		fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 		nodePath := fixture.RequireNode()
 		script := vpnDOMMock(t, string(vpnData)) + "\n" +
 			fixture.TranslationsJS("en") + "\n" +
+			fixture.CommonJS + "\n" +
 			fixture.HealthProblemsJS + "\n" +
 			fixture.ChartsJS + `
 const series = {

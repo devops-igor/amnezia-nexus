@@ -207,42 +207,76 @@ func TestPageHandlers(t *testing.T) {
 			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
 		}
 		body := w.Body.String()
+		// The overview document renders the listener/endpoint configuration and the
+		// four signals. The inventory and the sessions table are other documents now.
 		if !strings.Contains(body, "vpn-listener-badge") {
 			t.Errorf("expected rendered vpn.html to contain 'vpn-listener-badge', got:\n%s", body)
 		}
-		if !strings.Contains(body, "vpn-backends-tbody") {
-			t.Errorf("expected rendered vpn.html to contain 'vpn-backends-tbody'")
+		for _, moved := range []string{"vpn-backends-tbody", "vpn-add-backend-btn", "addBackendModal", "vpnServerSelect", "vpnAddBackendSubmitBtn", "vpnSessionsTable"} {
+			if strings.Contains(body, moved) {
+				t.Errorf("the overview document must not render %q; it belongs to a child page", moved)
+			}
 		}
-		if !strings.Contains(body, "vpn-add-backend-btn") {
-			t.Errorf("expected rendered vpn.html to contain 'vpn-add-backend-btn'")
-		}
-		if !strings.Contains(body, "addBackendModal") {
-			t.Errorf("expected rendered vpn.html to contain 'addBackendModal'")
-		}
-		if !strings.Contains(body, "vpnServerSelect") {
-			t.Errorf("expected rendered vpn.html to contain 'vpnServerSelect'")
-		}
-		if !strings.Contains(body, "vpnAddBackendSubmitBtn") {
-			t.Errorf("expected rendered vpn.html to contain 'vpnAddBackendSubmitBtn'")
-		}
-		if !strings.Contains(body, "vpn-open-add-backend") {
-			t.Errorf("expected rendered vpn.html to contain delegated data-action 'vpn-open-add-backend'")
-		}
-		if !strings.Contains(body, "/static/js/vpn/backends.js") {
-			t.Errorf("expected rendered vpn.html to load '/static/js/vpn/backends.js'")
-		}
-		backendsJS, err := fs.ReadFile(web.StaticFS, "static/js/vpn/backends.js")
-		if err != nil {
-			t.Fatalf("failed to read static/js/vpn/backends.js from web.StaticFS: %v", err)
-		}
-		if !strings.Contains(string(backendsJS), "data.detail || data.message || data.error") {
-			t.Errorf("expected backends.js to extract detailed error messages")
-		}
-		if !strings.Contains(string(backendsJS), "HTTP ${res.status}") {
-			t.Errorf("expected backends.js to have HTTP status fallback for non-JSON errors")
+		if !strings.Contains(body, `/static/js/vpn/overview.js`) {
+			t.Errorf("expected rendered vpn.html to load the overview controller")
 		}
 		if strings.Contains(body, "Template Not Found") {
 			t.Fatalf("CRITICAL REGRESSION: /vpn returned 'Template Not Found'")
+		}
+	})
+
+	t.Run("VPNBackendsPageHandler", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vpn/backends", nil)
+		reqCtx := middleware.WithSession(req.Context(), adminSess)
+		w := httptest.NewRecorder()
+		h.VPNBackendsPageHandler(w, req.WithContext(reqCtx))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		for _, want := range []string{"vpn-backends-title", "vpn-backends-tbody", "vpn-add-backend-btn", "addBackendModal", "vpnServerSelect", "vpnAddBackendSubmitBtn", `data-action="vpn-open-add-backend"`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("expected rendered vpn_backends.html to contain %q", want)
+			}
+		}
+		if !strings.Contains(body, `/static/js/vpn/backends.js`) {
+			t.Errorf("expected rendered vpn_backends.html to load '/static/js/vpn/backends.js'")
+		}
+		if strings.Contains(body, "vpn-listener-badge") || strings.Contains(body, "vpnSessionsTable") {
+			t.Errorf("the backends document must not render another page's blocks")
+		}
+		backendsJS, err := fs.ReadFile(web.StaticFS, "static/js/vpn/common.js")
+		if err != nil {
+			t.Fatalf("failed to read static/js/vpn/common.js from web.StaticFS: %v", err)
+		}
+		if !strings.Contains(string(backendsJS), "data.detail || data.message || data.error") {
+			t.Errorf("expected the shared API error helper to extract detailed error messages")
+		}
+		if !strings.Contains(string(backendsJS), "HTTP ${res.status}") {
+			t.Errorf("expected the shared API error helper to have an HTTP status fallback for non-JSON errors")
+		}
+	})
+
+	t.Run("VPNDiagnosticsPageHandler", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vpn/diagnostics", nil)
+		reqCtx := middleware.WithSession(req.Context(), adminSess)
+		w := httptest.NewRecorder()
+		h.VPNDiagnosticsPageHandler(w, req.WithContext(reqCtx))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		for _, want := range []string{"vpn-forwarder-card", "vpn-diagnostics", "vpnSessionsTable", "vpn-troubleshooting-title"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("expected rendered vpn_diagnostics.html to contain %q", want)
+			}
+		}
+		for _, moved := range []string{"vpn-listener-badge", "vpn-backends-tbody", "addBackendModal"} {
+			if strings.Contains(body, moved) {
+				t.Errorf("the diagnostics document must not render %q", moved)
+			}
 		}
 	})
 

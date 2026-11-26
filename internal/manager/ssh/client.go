@@ -45,26 +45,50 @@ type SSHClient interface {
 	InUse() bool
 }
 
+// ErrProviderAbsent reports that an SSH session was refused because the
+// provider's own inventory no longer lists the server it would be opened to.
+//
+// It is a refusal, not a transport failure: no connection was attempted, so a
+// caller must not report it as an unreachable host or record it as a health
+// sample. Pool admission and subsequent operations both enforce this refusal.
+var ErrProviderAbsent = errors.New("ssh refused: the provider's inventory no longer lists this server")
+
 // Config specifies the connection parameters for an SSH client.
 type Config struct {
-	Host                      string
-	Port                      int
-	User                      string
-	Password                  string
-	PrivateKey                string
-	Passphrase                string
-	Timeout                   time.Duration
-	KeepAlivePeriod           time.Duration
+	Host            string
+	Port            int
+	User            string
+	Password        string
+	PrivateKey      string
+	Passphrase      string
+	Timeout         time.Duration
+	KeepAlivePeriod time.Duration
+	// ReplyTimeout bounds one liveness exchange: the presence gate, the
+	// keepalive request and the peer's reply. Expiry is reported as "not
+	// measured", never as a dead connection, because the budget can be spent
+	// waiting for the durable observation rather than for the peer.
+	ReplyTimeout              time.Duration
 	ServerID                  *int64
 	Store                     HostKeyStore
 	RequireFingerprintConfirm bool
 	HostKeyCallback           gossh.HostKeyCallback
+	// ProviderAbsent carries the server row's durable provider-absence
+	// observation. Every config built from a stored row sets it, and checkout
+	// refuses before opening a socket when it is true.
+	ProviderAbsent bool
+	presenceStore  ProviderPresenceStore
 }
+
+// defaultReplyTimeout bounds a liveness exchange when the caller sets none.
+const defaultReplyTimeout = 5 * time.Second
 
 // Client implements the SSHClient interface with pooling, sudo, and SFTP support.
 type Client struct {
-	cfg                 Config
-	sshClient           *gossh.Client
+	cfg       Config
+	sshClient *gossh.Client
+	// presence is the same wrapper the gossh client uses, kept so validation can
+	// observe which phase of an exchange its budget covered.
+	presence            *presenceConn
 	sftpClient          *sftp.Client
 	isRoot              bool
 	capturedFingerprint string
@@ -89,6 +113,9 @@ func NewClient(cfg Config) *Client {
 	if cfg.KeepAlivePeriod <= 0 {
 		cfg.KeepAlivePeriod = 30 * time.Second
 	}
+	if cfg.ReplyTimeout <= 0 {
+		cfg.ReplyTimeout = defaultReplyTimeout
+	}
 
 	client := &Client{
 		cfg:    cfg,
@@ -100,11 +127,10 @@ func NewClient(cfg Config) *Client {
 
 // Dial creates a new Client and immediately establishes an SSH connection.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
-	c := NewClient(cfg)
-	if err := c.Connect(ctx); err != nil {
-		return nil, err
-	}
-	return c, nil
+	// One-shot connections use the same admission path as reusable connections,
+	// without background workers or ownership beyond the returned client.
+	pool := &SSHClientPool{conns: make(map[string]*pooledEntry)}
+	return pool.getOrCreate(ctx, PoolKey(cfg.Host, cfg.Port, cfg.User), cfg)
 }
 
 // DialFromServer constructs a Client from a models.Server instance and establishes connection.
@@ -123,13 +149,22 @@ func DialFromServer(ctx context.Context, server *models.Server, store HostKeySto
 		Store:           store,
 		Timeout:         15 * time.Second,
 		KeepAlivePeriod: 30 * time.Second,
+		ProviderAbsent:  server.ProviderAbsent(),
 	}
 
 	return Dial(ctx, cfg)
 }
 
-// Connect establishes the SSH transport connection and completes the handshake.
-func (c *Client) Connect(ctx context.Context) error {
+// connect establishes a transport only after pool admission.
+func (c *Client) connect(ctx context.Context) error {
+	// The durable observation is read outside the client lock: it reaches the
+	// store, and no store I/O may run under an internal mutex. Refusing here,
+	// before a socket exists, is what keeps a config snapshot taken before the
+	// observation from opening a connection to a removed address.
+	if err := checkProviderPresence(ctx, c.cfg); err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -141,26 +176,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		return errors.New("host is required")
 	}
 
-	authMethods, err := BuildAuthMethods(c.cfg.Password, c.cfg.PrivateKey, c.cfg.Passphrase)
+	sshConfig, err := c.buildClientConfig(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to configure authentication: %w", err)
-	}
-
-	hostKeyCB := c.cfg.HostKeyCallback
-	if hostKeyCB == nil {
-		hostKeyCB = NewHostKeyCallback(ctx, HostKeyCallbackOptions{
-			ServerID:               c.cfg.ServerID,
-			Store:                  c.cfg.Store,
-			RequireConfirm:         c.cfg.RequireFingerprintConfirm,
-			CapturedFingerprintOut: &c.capturedFingerprint,
-		})
-	}
-
-	sshConfig := &gossh.ClientConfig{
-		User:            c.cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCB,
-		Timeout:         c.cfg.Timeout,
+		return err
 	}
 
 	host := strings.Trim(strings.TrimSpace(c.cfg.Host), "[]")
@@ -185,42 +203,82 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.sftpClient = nil
 	}
 
-	c.sshClient = gossh.NewClient(sshConn, chans, reqs)
+	presence := &presenceConn{Conn: sshConn, cfg: c.cfg}
+	c.presence = presence
+	c.sshClient = gossh.NewClient(presence, chans, reqs)
 	c.closed = false
 	c.lastActive.Store(time.Now().UnixNano())
 
 	return nil
 }
 
+// buildClientConfig resolves the authentication methods and the host-key policy
+// into the configuration the transport handshake uses. It is split out of Connect
+// so that function stays a sequence of decisions about the connection itself.
+func (c *Client) buildClientConfig(ctx context.Context) (*gossh.ClientConfig, error) {
+	authMethods, err := BuildAuthMethods(c.cfg.Password, c.cfg.PrivateKey, c.cfg.Passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure authentication: %w", err)
+	}
+
+	hostKeyCB := c.cfg.HostKeyCallback
+	if hostKeyCB == nil {
+		hostKeyCB = NewHostKeyCallback(ctx, HostKeyCallbackOptions{
+			ServerID:               c.cfg.ServerID,
+			Store:                  c.cfg.Store,
+			RequireConfirm:         c.cfg.RequireFingerprintConfirm,
+			CapturedFingerprintOut: &c.capturedFingerprint,
+		})
+	}
+
+	return &gossh.ClientConfig{
+		User:            c.cfg.User,
+		Auth:            authMethods,
+		HostKeyCallback: hostKeyCB,
+		Timeout:         c.cfg.Timeout,
+	}, nil
+}
+
 // getSFTP returns an initialized SFTP client instance, creating one if not present or refreshing if stale.
 func (c *Client) getSFTP() (*sftp.Client, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed || c.sshClient == nil {
+	cached, transport, closed := c.sftpClient, c.sshClient, c.closed
+	c.mu.Unlock()
+	if closed || transport == nil {
 		return nil, ErrNotConnected
 	}
-
-	if c.sftpClient != nil {
-		// Verify if cached SFTP client session is still healthy
-		if _, err := c.sftpClient.Getwd(); err == nil {
-			return c.sftpClient, nil
+	if cached != nil {
+		if _, err := cached.Getwd(); err == nil {
+			return cached, nil
 		}
-		// Stale / broken SFTP client session -> close and recreate
-		_ = c.sftpClient.Close()
-		c.sftpClient = nil
+		_ = cached.Close()
 	}
-
-	sftpClient, err := sftp.NewClient(c.sshClient)
+	candidate, err := sftp.NewClient(transport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize sftp client: %w", err)
 	}
-	c.sftpClient = sftpClient
-	return c.sftpClient, nil
+	c.mu.Lock()
+	if c.closed || c.sshClient != transport {
+		c.mu.Unlock()
+		_ = candidate.Close()
+		return nil, ErrNotConnected
+	}
+	if current := c.sftpClient; current != nil && current != cached {
+		c.mu.Unlock()
+		_ = candidate.Close()
+		return current, nil
+	}
+	c.sftpClient = candidate
+	c.mu.Unlock()
+	return candidate, nil
 }
 
 // RunCommand executes a command remotely and returns stdout, stderr, and exit code.
 func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
@@ -235,6 +293,10 @@ func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, in
 
 // RunSudoCommand executes a command with sudo privileges, delivering passwords via stdin safely.
 func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	cleanCmd := CleanSudoCommand(cmd)
 	if c.isRoot {
@@ -261,6 +323,10 @@ func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string
 
 // RunScript executes a multi-line shell script via bash stdin.
 func (c *Client) RunScript(ctx context.Context, script string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
@@ -276,6 +342,10 @@ func (c *Client) RunScript(ctx context.Context, script string) (string, string, 
 
 // RunSudoScript executes a multi-line script with root privileges.
 func (c *Client) RunSudoScript(ctx context.Context, script string) (string, string, int, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return "", "", -1, err
+	}
 	defer c.startOp()()
 	if c.isRoot {
 		return c.RunScript(ctx, script)
@@ -299,6 +369,10 @@ func (c *Client) RunSudoScript(ctx context.Context, script string) (string, stri
 
 // UploadFile uploads content to a remote path via SFTP.
 func (c *Client) UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -309,13 +383,17 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 
 // UploadSudoFile uploads content to a root-owned remote path via atomic temp write and sudo move.
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer c.startOp()()
 
 	stagingDir := GenerateRandomTempPath("stage")
 	// Registered before staging and bound to an independent context so a failed or
 	// canceled upload still removes any partially staged secret from /tmp.
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", EscapeShellArg(stagingDir)))
 	}()
@@ -362,6 +440,10 @@ func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content 
 
 // DownloadFile downloads the complete content of a remote file via SFTP.
 func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -372,6 +454,10 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, e
 
 // DownloadSudoFile downloads a root-owned remote file, elevating reads for non-root SSH users.
 func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if c.isRoot {
 		return c.DownloadFile(ctx, remotePath)
 	}
@@ -388,6 +474,10 @@ func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byt
 
 // FileExists checks if a remote file or directory exists via SFTP.
 func (c *Client) FileExists(ctx context.Context, remotePath string) (bool, error) {
+	ctx, err := c.operationContext(ctx)
+	if err != nil {
+		return false, err
+	}
 	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
@@ -410,25 +500,70 @@ func (c *Client) TestConnection(ctx context.Context) (string, error) {
 
 // IsAlive checks if the SSH transport connection is alive by sending a keepalive global request.
 func (c *Client) IsAlive() bool {
-	c.mu.Lock()
-	if c.closed || c.sshClient == nil {
-		c.mu.Unlock()
-		return false
+	alive, _ := c.alive(context.Background())
+	return alive
+}
+
+// alive distinguishes a refused, unanswered or unresponsive check from a dead
+// transport so the pool never evicts an in-use connection merely because its
+// observation became absent, and never hoards a socket that stopped answering.
+//
+// The request wrapper re-reads the observation, so the refusal can arrive here
+// as the keepalive's own error even when this validation's first read still saw
+// the row listed. That outcome is a refusal, not a dead connection, and it is
+// returned as one: maintenance parks the entry and checkout refuses it, while a
+// genuine transport failure still reports the connection dead.
+//
+// The reply budget covers the wrapper's own presence read as well as the peer's
+// answer, and an observation lookup legitimately waits on the database. The
+// wrapper reports when its gate admits the exchange, which separates the two
+// outcomes that share the budget:
+//
+//   - the gate never answered: the exchange was not measured. The lookup may
+//     still be pending, so this is unknown and nothing is retired on it;
+//   - the gate admitted and the request was written, but the peer did not
+//     complete the exchange: the socket itself is unresponsive and must be
+//     replaced on the next acquisition.
+func (c *Client) alive(ctx context.Context) (bool, error) {
+	if err := checkProviderPresence(ctx, c.cfg); err != nil {
+		return false, err
 	}
-	client := c.sshClient
+	c.mu.Lock()
+	if c.closed || c.sshClient == nil || c.presence == nil {
+		c.mu.Unlock()
+		return false, nil
+	}
+	presence := c.presence
+	budget := c.cfg.ReplyTimeout
 	c.mu.Unlock()
 
+	admitted := make(chan struct{})
 	doneCh := make(chan error, 1)
 	go func() {
-		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		_, _, err := presence.SendGatedRequest("keepalive@openssh.com", true, nil, func() { close(admitted) })
 		doneCh <- err
 	}()
 
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
 	select {
 	case err := <-doneCh:
-		return err == nil
-	case <-time.After(5 * time.Second):
-		return false
+		if isPresenceBlocked(err) {
+			return false, err
+		}
+		return err == nil, nil
+	case <-timer.C:
+		select {
+		case <-admitted:
+			// The gate admitted and the request was written; the peer did not
+			// answer within its own budget. The socket is unresponsive.
+			return false, fmt.Errorf("%w after %s", errLivenessUnresponsive, budget)
+		default:
+			// The gate may be blocked on the store, so no request need have been
+			// sent. Unknown leaves the entry exactly as it is.
+			return false, fmt.Errorf("%w after %s (presence gate may be pending)", errLivenessUnknown, budget)
+		}
 	}
 }
 
@@ -440,6 +575,7 @@ func (c *Client) Close() error {
 	ssh := c.sshClient
 	c.sftpClient = nil
 	c.sshClient = nil
+	c.presence = nil
 	c.mu.Unlock()
 
 	var errs []error
@@ -462,6 +598,9 @@ func (c *Client) Close() error {
 
 // GetUnderlyingClient returns the raw *golang.org/x/crypto/ssh.Client.
 func (c *Client) GetUnderlyingClient() *gossh.Client {
+	if checkProviderPresence(context.Background(), c.cfg) != nil {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sshClient

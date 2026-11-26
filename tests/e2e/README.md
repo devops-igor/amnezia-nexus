@@ -117,8 +117,8 @@ The diagnostics module uses the existing lifecycle fixture for read-only dashboa
 | `test_my_connections.py` | 4 | User login+list, create, view config, role access denied |
 | `test_settings.py` | 6 | Page load, change title, captcha toggle, backup download, upstream status API & UI |
 | `test_share.py` | 3 | Enable sharing, access share link, download config |
-| `test_vpn_diagnostics.py` | 11 | Read-only forwarder lifecycle, schema2 status/privacy/history, charts and metrics histogram/authentication |
-| `test_vpn_health_surface.py` | 3 | Problem-first health summary, the four overview signals and the Advanced Diagnostics disclosure |
+| `test_vpn_diagnostics.py` | 11 | Read-only forwarder lifecycle, schema2 status/privacy/history, charts and metrics histogram/authentication; block cases run on `/vpn/diagnostics` or `/vpn/backends` and the layout case asserts per-page order and exclusivity |
+| `test_vpn_health_surface.py` | 3 | Problem-first health summary and the Advanced Diagnostics disclosure on `/vpn/diagnostics`, and the four overview signals on `/vpn` |
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
 **Total: 73 test functions across 12 lifecycle suites (4 in Stage 1, 4 in Stage 2, 65 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
@@ -198,11 +198,11 @@ The existing platform coverage matrix is retained below, with eight read-only di
 | `test_traffic.py` | `test_docker_preflight` | None (Local Docker Daemon) | None | Local Exec |
 | `test_traffic.py` | `test_dataplane_traffic_verification` | None (Data Plane Tunnel) | `/api/servers/`<br>`/api/servers/{server_id}/check`<br>`/api/users/add`<br>`/api/users/{user_id}/connections/add`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>POST<br>POST<br>POST<br>POST |
 
-| `test_vpn_health_surface.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn` (Forwarder Health Dashboard) | None (health banner and retired-tile absence) | GET (UI) |
+| `test_vpn_health_surface.py` | `test_vpn_dashboard_navigation_and_banner` | `/vpn/diagnostics` (Forwarder Health Dashboard) | None (health banner and retired-tile absence) | GET (UI) |
 | `test_vpn_health_surface.py` | `test_vpn_overview_signals` | `/vpn` (Forwarder Health Dashboard) | `/api/vpn/status` | GET (UI) |
-| `test_vpn_health_surface.py` | `test_vpn_diagnostic_panels` | `/vpn` (Advanced Diagnostics) | `/api/vpn/status` | GET (UI) |
-| `test_vpn_diagnostics.py` | `test_vpn_sparklines_window_toggle` | `/vpn` (Interactive Trends) | None (15m/1h/24h toggle interaction) | GET (UI) |
-| `test_vpn_diagnostics.py` | `test_vpn_problem_routes_toggle` | `/vpn` (Problem Routes Section) | None (Problem / all routes toggle) | GET (UI) |
+| `test_vpn_health_surface.py` | `test_vpn_diagnostic_panels` | `/vpn/diagnostics` (Advanced Diagnostics) | `/api/vpn/status` | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_sparklines_window_toggle` | `/vpn/diagnostics` (Interactive Trends) | None (15m/1h/24h toggle interaction) | GET (UI) |
+| `test_vpn_diagnostics.py` | `test_vpn_problem_routes_toggle` | `/vpn/diagnostics` (Problem Routes Section) | None (Problem / all routes toggle) | GET (UI) |
 | `test_vpn_diagnostics.py` | `test_vpn_status_api` | None (Direct REST API) | `/api/vpn/status` | GET |
 | `test_vpn_diagnostics.py` | `test_vpn_metrics_api` | VPN API | `/api/vpn/metrics` | GET |
 | `test_vpn_diagnostics.py` | `test_vpn_metrics_requires_authentication` | Anonymous API | `/api/vpn/metrics` | GET |

@@ -135,8 +135,15 @@ func (h *Handlers) verifyDeploySSHAccess(ctx context.Context, assignedIP string,
 	if err != nil {
 		return "", err
 	}
+	// A deployment that resolved to a stored row the provider no longer lists has
+	// nothing to verify: refuse before the socket is opened rather than dial an
+	// address the panel already has durable evidence is gone.
+	providerAbsent, absentErr := h.deployTargetProviderAbsent(ctx, serverID)
+	if absentErr != nil {
+		return "", absentErr
+	}
 	var captured string
-	cfg := ssh.Config{Host: assignedIP, Port: sshPort, User: user, Password: req.SSHPassword, PrivateKey: req.SSHPrivateKey, Timeout: 15 * time.Second, Store: h.db, ServerID: serverID, RequireFingerprintConfirm: true,
+	cfg := ssh.Config{Host: assignedIP, Port: sshPort, User: user, Password: req.SSHPassword, PrivateKey: req.SSHPrivateKey, Timeout: 15 * time.Second, Store: h.db, ServerID: serverID, RequireFingerprintConfirm: true, ProviderAbsent: providerAbsent,
 		HostKeyCallback: h.buildDeployHostKeyCallback(ctx, req, serverID, &captured)}
 	client, err := h.dialDeploySSH(ctx, cfg)
 	if err != nil {
@@ -153,6 +160,16 @@ func (h *Handlers) verifyDeploySSHAccess(ctx context.Context, assignedIP string,
 		return "", errors.New("verified SSH identity does not match expected fingerprint")
 	}
 	return captured, nil
+}
+
+// deployTargetProviderAbsent answers whether the stored row a deployment resolved
+// to has been confirmed absent by the provider's inventory. A deployment without a
+// stored row (a fresh host) has nothing to answer for, so it reports false.
+func (h *Handlers) deployTargetProviderAbsent(ctx context.Context, serverID *int64) (bool, error) {
+	if serverID == nil || *serverID <= 0 || h.db == nil {
+		return false, nil
+	}
+	return h.db.IsServerProviderAbsent(ctx, *serverID)
 }
 
 func validateFingerprintFormat(fp string) error {

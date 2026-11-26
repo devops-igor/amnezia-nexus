@@ -79,7 +79,7 @@ func TestRework4HostIdentityBeforeAuthentication(t *testing.T) {
 	if err != nil || fp != required.Fingerprint || authentications.Load() != 1 {
 		t.Fatalf("confirmed handshake failed: %v", err)
 	}
-	server, err := h.registerDeployServer(t.Context(), req, nil, 0, 999, "127.0.0.1", fp)
+	server, err := h.registerDeployServer(t.Context(), req, nil, 0, 999, "127.0.0.1", fp, "")
 	if err != nil {
 		t.Fatal(err)
 	}

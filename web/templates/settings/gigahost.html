@@ -87,5 +87,45 @@
                     </div>
                 </div>
             </div>
+
+            <div class="divider settings-divider"></div>
+
+            <!-- One-time association of the servers this panel registered before it
+                 recorded which hosting account owns them. Such a row carries no
+                 account, and no account means unknown: every inventory read skips it,
+                 including the read that would report a server the provider has
+                 already deleted. The preview is its own step, so the administrator
+                 sees how many rows can be associated - and what happens to the ones
+                 this account no longer lists - before anything is written. -->
+            <div id="gigahostAssociationSection" class="settings-subsection" data-dirty-ignore>
+                <div class="settings-subsection-header">
+                    <div class="settings-inline">
+                        <svg class="icon"><use href="#icon-server"></use></svg>
+                        <h4 class="settings-subsection-title">{{ _ "gigahost_association_title" }}</h4>
+                    </div>
+                </div>
+                <p class="form-hint mb-sm">{{ _ "gigahost_association_desc" }}</p>
+                <button type="button" class="btn btn-secondary btn-sm" id="btnGigahostAssociationPreview">
+                    <svg class="icon"><use href="#icon-activity"></use></svg>
+                    <span>{{ _ "gigahost_association_check" }}</span>
+                </button>
+                <!-- The consequence for rows this account no longer lists is the
+                     administrator's own decision, so it is a separate control that
+                     only appears once the preview has shown the count. It starts
+                     hidden through the shared .hidden class: this element's own
+                     display rule is what a bare hidden attribute would lose to. -->
+                <label class="switch-container mb-sm hidden" id="gigahostAssociationUnlistedChoice">
+                    <span class="switch">
+                        <input type="checkbox" id="gigahostAssociationIncludeUnlisted">
+                        <span class="switch-slider"></span>
+                    </span>
+                    <span class="switch-label-text">{{ _ "gigahost_association_include_unlisted" }}</span>
+                </label>
+                <div id="gigahostAssociationOutcome" role="status" class="form-hint mb-sm hidden"></div>
+                <button type="button" class="btn btn-primary btn-sm hidden" id="btnGigahostAssociationConfirm">
+                    <span>{{ _ "gigahost_association_confirm" }}</span>
+                    <div class="spinner spinner-sm hidden" id="gigahostAssociationSpinner"></div>
+                </button>
+            </div>
         </div>
 {{- end }}

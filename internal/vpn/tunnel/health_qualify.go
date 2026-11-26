@@ -73,6 +73,19 @@ func (hp *HealthProber) QualifyProxyTraffic(ctx context.Context, tunnel *models.
 		return 0, errors.New("tunnel is nil")
 	}
 
+	if hp.providerAbsent(ctx, tunnel.ServerID) {
+		return 0, ErrProviderAbsent
+	}
+	latency, err := hp.qualifyProxyTraffic(ctx, tunnel)
+	if hp.providerAbsent(ctx, tunnel.ServerID) {
+		return 0, ErrProviderAbsent
+	}
+	return latency, err
+}
+
+// qualifyProxyTraffic owns protocol dispatch; admission and result publication
+// remain in QualifyProxyTraffic, including injected exchanges.
+func (hp *HealthProber) qualifyProxyTraffic(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
 	hp.mu.RLock()
 	fn := hp.proxyTrafficProbeFn
 	timeout := hp.cfg.Timeout
