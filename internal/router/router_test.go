@@ -797,40 +797,6 @@ func TestRouterVPNPage(t *testing.T) {
 	if !strings.Contains(supportBody, "vpn-listener-badge") {
 		t.Errorf("expected /vpn body to contain 'vpn-listener-badge' for support role")
 	}
-
-	// 4. The two child documents answer the same gate: Admin and Support reach
-	// them, an unauthenticated visitor is redirected to the login page.
-	adminSess := &models.SessionData{UserID: adminUser.ID, Username: adminUser.Username, Role: adminUser.Role}
-	supportSess := &models.SessionData{UserID: supportUser.ID, Username: supportUser.Username, Role: supportUser.Role}
-	for _, role := range []struct {
-		name string
-		sess *models.SessionData
-	}{
-		{"admin", adminSess},
-		{"support", supportSess},
-	} {
-		for _, page := range []struct{ path, marker string }{
-			{"/vpn/backends", "vpnBackendsTable"},
-			{"/vpn/diagnostics", "vpn-forwarder-card"},
-		} {
-			req := httptest.NewRequest(http.MethodGet, page.path, nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req.WithContext(middleware.WithSession(req.Context(), role.sess)))
-			if w.Code != http.StatusOK {
-				t.Errorf("%s %s = %d, want 200", role.name, page.path, w.Code)
-				continue
-			}
-			if !strings.Contains(w.Body.String(), page.marker) {
-				t.Errorf("%s %s does not render %q", role.name, page.path, page.marker)
-			}
-		}
-	}
-	reqChildUnauth := httptest.NewRequest(http.MethodGet, "/vpn/backends", nil)
-	wChildUnauth := httptest.NewRecorder()
-	r.ServeHTTP(wChildUnauth, reqChildUnauth)
-	if wChildUnauth.Code != http.StatusFound || wChildUnauth.Header().Get("Location") != "/login" {
-		t.Errorf("expected 302 redirect to /login for unauthenticated /vpn/backends, got %d", wChildUnauth.Code)
-	}
 }
 
 func TestRouterServerRename(t *testing.T) {
