@@ -262,9 +262,9 @@ func (d *DB) BindServerProviderAccountUnderAuthority(
 	return affected > 0, nil
 }
 
-// BumpGigahostConfigEpoch advances the durable provider-configuration version. The
-// caller is responsible for running it inside the same transaction as the settings
-// write it accompanies; SetSetting and SetSettingsBulk do this for the gigahost key.
+// bumpGigahostConfigEpochTx advances the durable provider-configuration version.
+// Every gigahost settings writer must call it in its own transaction, including
+// the settings card and full database replacement.
 func bumpGigahostConfigEpochTx(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, "UPDATE gigahost_config_epoch SET epoch = epoch + 1 WHERE id = 1"); err != nil {
 		return fmt.Errorf("failed to advance the provider configuration epoch: %w", err)
