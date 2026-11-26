@@ -1146,5 +1146,6 @@
   "gigahost_association_reason_provider_refused": "le fournisseur ne permet pas à cette clé de les voir",
   "gigahost_association_reason_provider_unanswered": "le fournisseur n'a pas répondu",
   "gigahost_association_reason_provider_unnamed": "le fournisseur n'a pas indiqué leur compte",
-  "gigahost_association_reason_write_failed": "le panneau n'a pas pu les enregistrer"
+  "gigahost_association_reason_write_failed": "le panneau n'a pas pu les enregistrer",
+  "gigahost_association_reason_unlisted_not_confirmed": "suppression non confirmée"
 }

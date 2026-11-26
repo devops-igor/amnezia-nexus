@@ -79,12 +79,12 @@ type Handlers struct {
 	notificationSvc *notifications.Service
 	gigahostClient  gigahost.Client
 	gigahostMu      sync.RWMutex
-	// associationPreviews holds the consent each preview issued, keyed by its
-	// token: the account that answered and the unlisted rows it showed. The map is
-	// per-process, so a restart simply makes every outstanding consent stale, which
-	// is the safe direction.
-	associationMu       sync.Mutex
-	associationPreviews map[string]gigahostAssociationPreviewRecord
+	// associationAuthorities holds the single consent each administrator may hold,
+	// keyed by administrator: the account and configuration that answered, and the
+	// rows the preview showed as unlisted. The map is per-process, so a restart
+	// simply makes every outstanding consent stale, which is the safe direction.
+	associationMu          sync.Mutex
+	associationAuthorities map[string]gigahostAssociationAuthority
 	// purchaseMu serializes the duplicate-purchase check with the durable intent
 	// row that makes its decision visible, so two concurrent order attempts cannot
 	// both pass the check. It is deliberately released before the provider call:

@@ -1146,5 +1146,6 @@
   "gigahost_association_reason_provider_refused": "提供商不允许此密钥查看它们",
   "gigahost_association_reason_provider_unanswered": "提供商没有响应",
   "gigahost_association_reason_provider_unnamed": "提供商没有说明其账户",
-  "gigahost_association_reason_write_failed": "面板无法记录它们"
+  "gigahost_association_reason_write_failed": "面板无法记录它们",
+  "gigahost_association_reason_unlisted_not_confirmed": "删除未确认"
 }

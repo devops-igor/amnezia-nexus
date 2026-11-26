@@ -1146,5 +1146,6 @@
   "gigahost_association_reason_provider_refused": "the provider does not let this key see them",
   "gigahost_association_reason_provider_unanswered": "the provider did not answer",
   "gigahost_association_reason_provider_unnamed": "the provider did not name their account",
-  "gigahost_association_reason_write_failed": "the panel could not record them"
+  "gigahost_association_reason_write_failed": "the panel could not record them",
+  "gigahost_association_reason_unlisted_not_confirmed": "deletion not confirmed"
 }

@@ -156,7 +156,8 @@ const translations = {
   gigahost_association_reason_provider_refused: 'refused',
   gigahost_association_reason_provider_unanswered: 'did-not-answer',
   gigahost_association_reason_provider_unnamed: 'unnamed',
-  gigahost_association_reason_write_failed: 'not-recorded'
+  gigahost_association_reason_write_failed: 'not-recorded',
+  gigahost_association_reason_unlisted_not_confirmed: 'deletion-not-confirmed'
 };
 w._ = key => translations[key] || key;
 
@@ -223,6 +224,11 @@ const click = id => w.document.getElementById(id).click();
     w.gigahostAssociationOutcomeText({associated:0, unattributed:1,
       reasons:[{reason:'provider_unanswered', count:1}]}),
     '1 unattributed: did-not-answer');
+  // A row excluded by the unlisted consent is still a row that needs an answer.
+  assert.equal(
+    w.gigahostAssociationOutcomeText({associated:0, unattributed:1,
+      reasons:[{reason:'unlisted_not_confirmed', count:1}]}),
+    '1 unattributed: deletion-not-confirmed');
   assert.notEqual(
     w.gigahostAssociationOutcomeText({associated:0, unattributed:1,
       reasons:[{reason:'provider_unanswered', count:1}]}),

@@ -14,6 +14,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -122,4 +123,151 @@ func TestAssociationConsentCannotCoverRowsThePreviewNeverShowed(t *testing.T) {
 	if got := f.row(live); got.ProviderAccountKnown() {
 		t.Fatal("the refused confirmation associated the provider-named row anyway")
 	}
+}
+
+// TestAssociationNewerPreviewRetiresTheOlderOne is the first ordering: two Settings
+// tabs both preview the same mixed batch. The newer tab confirms without the unlisted
+// switch, then the older tab confirms with its earlier opt-in. The older consent was
+// retired when the second preview was issued, so it is refused and the unlisted row
+// stays unknown - the write-once predicate would otherwise make that binding permanent.
+func TestAssociationNewerPreviewRetiresTheOlderOne(t *testing.T) {
+	f := newInventoryFixture(t)
+	named := f.seedLegacyServer("Legacy-live", 701)
+	unlisted := f.seedLegacyServer("Legacy-deleted", 702)
+
+	f.provider.set(inventoryJSON(701))
+	f.provider.answerPerServer(701, http.StatusOK)
+	f.provider.answerPerServer(702, http.StatusNotFound)
+
+	older := f.associationPreviewCall()
+	newer := f.associationPreviewCall()
+	if older.PreviewID == "" || newer.PreviewID == "" || older.PreviewID == newer.PreviewID {
+		t.Fatalf("two previews must issue two distinct consents: %q / %q", older.PreviewID, newer.PreviewID)
+	}
+
+	// The newer tab confirms with the switch off: the named row is associated, the
+	// unlisted one is left alone and reported as still needing an answer.
+	result := f.associationActionCallWithPreview(newer.PreviewID, false)
+	if result.Associated != 1 || result.Unlisted != 0 || result.Unattributed != 1 {
+		t.Fatalf("the newer confirmation = %+v, want 1 associated, 0 unlisted, 1 still needing an answer", result)
+	}
+	if got := f.row(unlisted); got.ProviderAccountKnown() {
+		t.Fatalf("the newer confirmation associated the unlisted row with %q", got.ProviderAccountID)
+	}
+
+	// The older tab then confirms with its earlier opt-in. That consent is gone.
+	rec := f.associationActionRaw(`{"preview_id":"` + older.PreviewID + `","include_unlisted":true}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("the superseded confirmation answered %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "gigahost_association_preview_superseded") {
+		t.Fatalf("the refusal is not the superseded-consent one: %s", rec.Body.String())
+	}
+	if got := f.row(unlisted); got.ProviderAccountKnown() {
+		t.Fatalf("the superseded confirmation associated the unlisted row with %q", got.ProviderAccountID)
+	}
+	if got := f.row(named); got.ProviderAccountID != fixtureAccount {
+		t.Fatalf("the newer confirmation did not record the named row: %q", got.ProviderAccountID)
+	}
+}
+
+// TestAssociationCommitIsFencedByTheEffectiveConfiguration is the second ordering: a
+// confirmation is paused inside the provider detail read, the administrator replaces
+// the key, and the reply then resumes. The fence is established inside the commit path
+// against live state, so the older answer cannot bind the row under the account it was
+// previewed with.
+func TestAssociationCommitIsFencedByTheEffectiveConfiguration(t *testing.T) {
+	f := newInventoryFixture(t)
+	row := f.seedLegacyServer("Legacy", 703)
+
+	f.provider.set(inventoryJSON())
+	f.provider.answerPerServer(703, http.StatusNotFound)
+	preview := f.associationPreviewCall()
+	if preview.Unlisted != 1 || preview.PreviewID == "" {
+		t.Fatalf("preview = %+v, want one unlisted row and a consent", preview)
+	}
+
+	// While the confirmation is inside the detail read, the effective configuration is
+	// replaced - the same thing a settings save of a new key does.
+	replaced := false
+	f.provider.onDetail = func() {
+		if replaced {
+			return
+		}
+		replaced = true
+		f.h.SetGigahostClient(f.h.gigahostClient)
+	}
+
+	rec := f.associationActionRaw(`{"preview_id":"` + preview.PreviewID + `","include_unlisted":true}`)
+	if !replaced {
+		t.Fatal("the confirmation never reached the provider detail read, so the fence was not exercised")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("the confirmation across a configuration change answered %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "gigahost_association_configuration_changed") {
+		t.Fatalf("the refusal is not the configuration fence: %s", rec.Body.String())
+	}
+	if got := f.row(row); got.ProviderAccountKnown() {
+		t.Fatalf("the fenced confirmation associated the row with %q", got.ProviderAccountID)
+	}
+}
+
+// TestAssociationRepeatWithoutConsentKeepsTheUnlistedRowCounted is the reporting half:
+// a mixed preview confirmed with the switch off must keep reporting the row it left
+// alone, and only a run that genuinely leaves nothing may report an all-clear.
+func TestAssociationRepeatWithoutConsentKeepsTheUnlistedRowCounted(t *testing.T) {
+	f := newInventoryFixture(t)
+	named := f.seedLegacyServer("Legacy-live", 704)
+	unlisted := f.seedLegacyServer("Legacy-deleted", 705)
+
+	f.provider.set(inventoryJSON(704))
+	f.provider.answerPerServer(704, http.StatusOK)
+	f.provider.answerPerServer(705, http.StatusNotFound)
+	preview := f.associationPreviewCall()
+
+	first := f.associationActionCallWithPreview(preview.PreviewID, false)
+	if first.Associated != 1 || first.Unattributed != 1 {
+		t.Fatalf("the first confirmation = %+v, want 1 associated and 1 still needing an answer", first)
+	}
+	if !hasReason(first.Reasons, string(gigahostAssociationNotConfirmed)) {
+		t.Fatalf("the excluded row is not reported with its reason: %+v", first.Reasons)
+	}
+
+	// The same request repeated: nothing further is written, and the excluded row is
+	// still counted rather than reported as an all-clear.
+	repeat := f.associationActionCallWithPreview(preview.PreviewID, false)
+	if repeat.Associated != 0 {
+		t.Fatalf("the repeat associated %d rows, want 0", repeat.Associated)
+	}
+	if repeat.Unattributed != 1 || !hasReason(repeat.Reasons, string(gigahostAssociationNotConfirmed)) {
+		t.Fatalf("the repeat = %+v, want the excluded row and its reason", repeat)
+	}
+	if got := f.row(unlisted); got.ProviderAccountKnown() {
+		t.Fatalf("the repeat associated the excluded row with %q", got.ProviderAccountID)
+	}
+	if got := f.row(named); got.ProviderAccountID != fixtureAccount {
+		t.Fatalf("the named row lost its association: %q", got.ProviderAccountID)
+	}
+
+	// With the consent the same preview offered, the row is associated and the result
+	// leaves nothing.
+	withConsent := f.associationActionCallWithPreview(preview.PreviewID, true)
+	if withConsent.Associated != 1 || withConsent.Unlisted != 1 || withConsent.Unattributed != 0 {
+		t.Fatalf("the consented confirmation = %+v, want 1 associated, 1 unlisted, 0 remaining", withConsent)
+	}
+	allClear := f.associationActionCallWithPreview(preview.PreviewID, true)
+	if allClear.Associated != 0 || allClear.Unattributed != 0 || len(allClear.Reasons) != 0 {
+		t.Fatalf("the genuine no-op repeat = %+v, want an empty all-clear", allClear)
+	}
+}
+
+// hasReason reports whether a decoded result carries one reason token.
+func hasReason(reasons []associationReasonCount, token string) bool {
+	for _, reason := range reasons {
+		if reason.Reason == token && reason.Count > 0 {
+			return true
+		}
+	}
+	return false
 }

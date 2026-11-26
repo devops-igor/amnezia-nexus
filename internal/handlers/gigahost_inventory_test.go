@@ -59,6 +59,10 @@ type inventoryProvider struct {
 	// inventoryCalls counts /servers reads only, so "one inventory read per
 	// pass" stays measurable now that each pass also resolves the account.
 	inventoryCalls int
+	// onDetail, when set, runs on every per-server read before it is answered. A
+	// test uses it to change the effective provider configuration while a
+	// confirmation is inside that read.
+	onDetail func()
 	// perServerCalls counts GET /servers/{id} reads, and perServer holds the
 	// answers a test has registered: a status code per server id. An id with no
 	// registered answer answers like a server that does not exist (404), which is
@@ -221,6 +225,7 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	perServerStatus := 0
 	detailArray, detailBody := p.detailArray, p.detailBody
+	onDetail := p.onDetail
 	if id, ok := perServerPathID(r.URL.Path); ok {
 		p.perServerCalls++
 		perServerStatus = p.perServer[id]
@@ -252,6 +257,9 @@ func (p *inventoryProvider) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if id, ok := perServerPathID(r.URL.Path); ok {
+		if onDetail != nil {
+			onDetail()
+		}
 		switch perServerStatus {
 		case http.StatusOK:
 			w.Header().Set("Content-Type", "application/json")

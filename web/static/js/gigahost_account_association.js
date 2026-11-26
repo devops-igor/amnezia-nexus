@@ -36,7 +36,10 @@ const gigahostAssociationReasonKeys = {
     provider_refused: 'gigahost_association_reason_provider_refused',
     provider_unanswered: 'gigahost_association_reason_provider_unanswered',
     provider_unnamed: 'gigahost_association_reason_provider_unnamed',
-    write_failed: 'gigahost_association_reason_write_failed'
+    write_failed: 'gigahost_association_reason_write_failed',
+    // A row the account no longer lists, left alone because this confirmation did
+    // not authorise its deletion. It still records no account.
+    unlisted_not_confirmed: 'gigahost_association_reason_unlisted_not_confirmed'
 };
 
 function gigahostAssociationReasonText(reasons) {

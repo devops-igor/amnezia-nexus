@@ -1146,5 +1146,6 @@
   "gigahost_association_reason_provider_refused": "ارائه‌دهنده اجازه نمی‌دهد این کلید آن‌ها را ببیند",
   "gigahost_association_reason_provider_unanswered": "ارائه‌دهنده پاسخ نداد",
   "gigahost_association_reason_provider_unnamed": "ارائه‌دهنده حساب آن‌ها را اعلام نکرد",
-  "gigahost_association_reason_write_failed": "پنل نتوانست آن‌ها را ثبت کند"
+  "gigahost_association_reason_write_failed": "پنل نتوانست آن‌ها را ثبت کند",
+  "gigahost_association_reason_unlisted_not_confirmed": "حذف تأیید نشده"
 }
