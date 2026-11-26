@@ -799,6 +799,7 @@
   "gigahost_status_not_checked": "Pas encore vérifié",
   "gigahost_status_never": "Jamais enregistré",
   "gigahost_status_step": "Étape en cours",
+  "gigahost_status_recorded_step": "Dernière étape enregistrée",
   "gigahost_status_failure": "Échec signalé",
   "gigahost_status_next_action": "Action suivante",
   "gigahost_status_next_action_wait": "Attendez la fin du déploiement chez le fournisseur",

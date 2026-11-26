@@ -799,6 +799,7 @@
   "gigahost_status_not_checked": "Not checked yet",
   "gigahost_status_never": "Never recorded",
   "gigahost_status_step": "Current step",
+  "gigahost_status_recorded_step": "Last recorded step",
   "gigahost_status_failure": "Reported failure",
   "gigahost_status_next_action": "Next action",
   "gigahost_status_next_action_wait": "Wait for the provider to finish deploying",

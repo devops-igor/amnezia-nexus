@@ -1,0 +1,233 @@
+package handlers
+
+// The DELETED badge is normal text at 12 px (0.75rem in the card rule), so its ink
+// has to reach 4.5:1 against the fill it is drawn on. In the dark theme it did not:
+// the shared danger token measured 4.42:1 on that fill.
+//
+// The correction is scoped to this one state rather than applied to the shared badge
+// class or the shared token, because the same badge is used by other dialogs that
+// were never measured. This test therefore asserts three things from the shipped
+// stylesheets: the scoped rule exists and uses the readable status-ink token, the
+// ratio it produces is at least 4.5:1 in both themes, and the shared danger badge is
+// still exactly what it was.
+//
+// The ratio is computed from the declared values with the WCAG 2 relative-luminance
+// formula, and a translucent fill is composited over the card colour first - which is
+// the sampling method the design review used (a pixel sampled inside the label
+// region).
+
+import (
+	"math"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/devops-igor/amnezia-nexus/web"
+)
+
+// deletedBadgeSelector is the rule scoped to the deleted order-status badge.
+const deletedBadgeSelector = `.settings-section-card .gigahost-order-status[data-stage="deleted"] .gigahost-order-status-toggle`
+
+func TestDeletedBadgeMeetsContrastInBothThemes(t *testing.T) {
+	settingsCSS := readShippedCSS(t, "static/css/settings.css")
+	tokensCSS := readShippedCSS(t, "static/css/tokens.css")
+	componentsCSS := readShippedCSS(t, "static/css/components.css")
+
+	rule, _ := cssRule(settingsCSS, deletedBadgeSelector, 0)
+	if rule == "" {
+		t.Fatalf("settings.css no longer scopes a rule to %s", deletedBadgeSelector)
+	}
+	if !declaresPropertyValue(rule, "color", "var(--text-danger)") {
+		t.Fatalf("the deleted badge must use the readable status-ink token:\n%s", rule)
+	}
+	if declaresProperty(rule, "background") || declaresProperty(rule, "background-color") {
+		t.Fatalf("the deleted badge rule must change only the ink, so the shared fill keeps its meaning:\n%s", rule)
+	}
+
+	dark := cssCustomProperties(tokensCSS, ":root")
+	light := cssCustomProperties(tokensCSS, `[data-theme="light"]`)
+
+	for _, theme := range []struct {
+		name  string
+		token map[string]string
+	}{
+		{name: "dark", token: dark},
+		{name: "light", token: light},
+	} {
+		card := requireHexToken(t, theme.name, theme.token, "--bg-card")
+		fillRGB, fillAlpha := requireRGBAToken(t, theme.name, theme.token, "--danger-bg")
+		ink := requireHexToken(t, theme.name, theme.token, "--text-danger")
+		fill := compositeOver(fillRGB, fillAlpha, card)
+		ratio := contrastRatio(ink, fill)
+		if ratio < 4.5 {
+			t.Errorf("the %s DELETED badge measures %.2f:1 (ink %s on fill %s), below the 4.5:1 "+
+				"normal-text minimum", theme.name, ratio, ink, fill)
+		}
+	}
+
+	// The shared badge class is untouched: every other consumer still paints --danger
+	// on --danger-bg, so this correction cannot restyle another dialog.
+	shared, _ := cssRule(componentsCSS, ".badge-danger", 0)
+	if !declaresPropertyValue(shared, "color", "var(--danger)") {
+		t.Fatalf("the shared .badge-danger ink changed; other dialogs were not measured:\n%s", shared)
+	}
+	if !declaresPropertyValue(shared, "background", "var(--danger-bg)") {
+		t.Fatalf("the shared .badge-danger fill changed; other dialogs were not measured:\n%s", shared)
+	}
+	if got, want := dark["--danger"], "#f43f5e"; strings.TrimSpace(got) != want {
+		t.Fatalf("the shared danger token changed in the dark theme: %q, want %q", got, want)
+	}
+	if got, want := dark["--danger-bg"], "rgba(244, 63, 94, 0.12)"; strings.TrimSpace(got) != want {
+		t.Fatalf("the shared danger fill changed in the dark theme: %q, want %q", got, want)
+	}
+}
+
+// readShippedCSS reads one shipped stylesheet from the embedded assets.
+func readShippedCSS(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := web.StaticFS.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(raw)
+}
+
+// declaresPropertyValue reports whether a declaration block assigns prop exactly value.
+func declaresPropertyValue(block, prop, value string) bool {
+	for _, declaration := range strings.Split(block, ";") {
+		name, got, ok := strings.Cut(strings.TrimSpace(declaration), ":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(name) == prop && strings.TrimSpace(got) == value {
+			return true
+		}
+	}
+	return false
+}
+
+// cssCustomProperties reads the custom-property declarations of one block.
+func cssCustomProperties(css, selector string) map[string]string {
+	block, _ := cssRule(css, selector, 0)
+	properties := map[string]string{}
+	for _, declaration := range strings.Split(block, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(declaration), ":")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if strings.HasPrefix(name, "--") {
+			properties[name] = strings.TrimSpace(value)
+		}
+	}
+	return properties
+}
+
+// requireHexToken returns the hex value of one custom property.
+func requireHexToken(t *testing.T, theme string, token map[string]string, name string) string {
+	t.Helper()
+	value, ok := token[name]
+	if !ok {
+		t.Fatalf("%s theme declares no %s", theme, name)
+	}
+	if _, ok := parseHexRGB(value); !ok {
+		t.Fatalf("%s theme's %s is not a hex colour: %q", theme, name, value)
+	}
+	return value
+}
+
+// requireRGBAToken returns the components and alpha of one rgba() custom property.
+func requireRGBAToken(t *testing.T, theme string, token map[string]string, name string) ([3]float64, float64) {
+	t.Helper()
+	value, ok := token[name]
+	if !ok {
+		t.Fatalf("%s theme declares no %s", theme, name)
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(value, " ", ""), "rgba("), ")")
+	parts := strings.Split(inner, ",")
+	if len(parts) != 4 {
+		t.Fatalf("%s theme's %s is not an rgba() colour: %q", theme, name, value)
+	}
+	var rgb [3]float64
+	for i := 0; i < 3; i++ {
+		component, err := strconv.ParseFloat(parts[i], 64)
+		if err != nil {
+			t.Fatalf("%s theme's %s component %d is not a number: %q", theme, name, i, value)
+		}
+		rgb[i] = component
+	}
+	alpha, err := strconv.ParseFloat(parts[3], 64)
+	if err != nil {
+		t.Fatalf("%s theme's %s alpha is not a number: %q", theme, name, value)
+	}
+	return rgb, alpha
+}
+
+// parseHexRGB parses a #rrggbb colour into its channels.
+func parseHexRGB(value string) ([3]float64, bool) {
+	var rgb [3]float64
+	text := strings.TrimSpace(value)
+	if len(text) != 7 || text[0] != '#' {
+		return rgb, false
+	}
+	for i := 0; i < 3; i++ {
+		component, err := strconv.ParseInt(text[1+i*2:3+i*2], 16, 64)
+		if err != nil {
+			return rgb, false
+		}
+		rgb[i] = float64(component)
+	}
+	return rgb, true
+}
+
+// compositeOver composites a translucent rgb() colour over an opaque hex background
+// and returns the resulting opaque hex colour.
+func compositeOver(rgb [3]float64, alpha float64, background string) string {
+	bg, ok := parseHexRGB(background)
+	if !ok {
+		return background
+	}
+	var out [3]float64
+	for i := 0; i < 3; i++ {
+		out[i] = math.Round(alpha*rgb[i] + (1-alpha)*bg[i])
+	}
+	return "#" + hexPair(out[0]) + hexPair(out[1]) + hexPair(out[2])
+}
+
+// hexPair renders one 0..255 channel as two lowercase hex digits.
+func hexPair(value float64) string {
+	text := strconv.FormatInt(int64(value), 16)
+	if len(text) < 2 {
+		return "0" + text
+	}
+	return text
+}
+
+// contrastRatio computes the WCAG 2 contrast ratio between two opaque colours.
+func contrastRatio(a, b string) float64 {
+	luminanceA, okA := relativeLuminance(a)
+	luminanceB, okB := relativeLuminance(b)
+	if !okA || !okB {
+		return 0
+	}
+	high, low := math.Max(luminanceA, luminanceB), math.Min(luminanceA, luminanceB)
+	return (high + 0.05) / (low + 0.05)
+}
+
+// relativeLuminance computes WCAG relative luminance for an opaque hex colour.
+func relativeLuminance(hex string) (float64, bool) {
+	rgb, ok := parseHexRGB(hex)
+	if !ok {
+		return 0, false
+	}
+	return 0.2126*linearChannel(rgb[0]) + 0.7152*linearChannel(rgb[1]) + 0.0722*linearChannel(rgb[2]), true
+}
+
+// linearChannel converts one sRGB channel to its linear value.
+func linearChannel(value float64) float64 {
+	channel := value / 255
+	if channel <= 0.04045 {
+		return channel / 12.92
+	}
+	return math.Pow((channel+0.055)/1.055, 2.4)
+}

@@ -799,6 +799,7 @@
   "gigahost_status_not_checked": "Ещё не проверялось",
   "gigahost_status_never": "Не зафиксировано",
   "gigahost_status_step": "Текущий шаг",
+  "gigahost_status_recorded_step": "Последний записанный шаг",
   "gigahost_status_failure": "Сообщённая ошибка",
   "gigahost_status_next_action": "Следующее действие",
   "gigahost_status_next_action_wait": "Дождитесь завершения развёртывания у провайдера",

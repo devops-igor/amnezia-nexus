@@ -799,6 +799,7 @@
   "gigahost_status_not_checked": "尚未检查",
   "gigahost_status_never": "从未记录",
   "gigahost_status_step": "当前步骤",
+  "gigahost_status_recorded_step": "最后记录的步骤",
   "gigahost_status_failure": "报告的错误",
   "gigahost_status_next_action": "下一步",
   "gigahost_status_next_action_wait": "等待服务商完成部署",

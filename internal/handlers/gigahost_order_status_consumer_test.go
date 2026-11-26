@@ -36,10 +36,14 @@ import (
 // gigahostOrderStatusResponses holds the three response bodies the view consumes,
 // captured from the real handlers rather than authored by the test.
 type gigahostOrderStatusResponses struct {
-	Orders     string
-	Detail     string
-	Intents    string
-	Backends   string
+	Orders   string
+	Detail   string
+	Intents  string
+	Backends string
+	// Details is the deploy read for every order the list returned, keyed by order id.
+	// The view reads one detail per row, so a harness that can serve only one order
+	// cannot exercise a list at all - and a list is where the five-row default lives.
+	Details    map[string]string
 	ObservedAt time.Time
 }
 
@@ -73,12 +77,33 @@ func gigahostOrderStatusRead(t *testing.T, h *Handlers, orderID string) gigahost
 		Orders:     read("/orders"),
 		Intents:    read("/intents"),
 		Backends:   `{"status":"ok","backends":[]}`,
+		Details:    map[string]string{},
 		ObservedAt: time.Now().UTC(),
 	}
 	if orderID != "" {
 		responses.Detail = read("/orders/" + orderID + "/status")
 	}
 	return responses
+}
+
+// readGigahostOrderStatusDetail reads one order's deploy status through the
+// production handler and returns its response body.
+//
+// It is separate from gigahostOrderStatusRead because a fixture that renders a list
+// needs a body per row, while the single-order callers stay on exactly the request
+// sequence they have always made.
+func readGigahostOrderStatusDetail(t *testing.T, h *Handlers, orderID string) string {
+	t.Helper()
+	router := chi.NewRouter()
+	router.Get("/orders/{order_id}/status", h.GigahostDeployStatusHandler)
+	req := httptest.NewRequest(http.MethodGet, "/orders/"+orderID+"/status", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("detail read for %s answered %d, body %s", orderID, w.Code, w.Body.String())
+	}
+	return w.Body.String()
 }
 
 // gigahostOrderStatusProviderObservation extracts the additive observation the real
@@ -126,12 +151,13 @@ func runGigahostOrderStatusRendererLoads(t *testing.T, responses gigahostOrderSt
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedOrders, _ := json.Marshal(responses.Orders)
 	encodedDetail, _ := json.Marshal(responses.Detail)
+	encodedDetails, _ := json.Marshal(responses.Details)
 	encodedIntentsResp, _ := json.Marshal(responses.Intents)
 	encodedBackends, _ := json.Marshal(responses.Backends)
 	encodedOrderID, _ := json.Marshal(orderID)
 
 	script := gigahostOrderStatusJSDOMBootstrap + fmt.Sprintf(`
-const ordersBody = %s, detailBody = %s, intentsBody = %s, backendsBody = %s, orderID = %s;
+const ordersBody = %s, detailBody = %s, detailsBody = %s, intentsBody = %s, backendsBody = %s, orderID = %s;
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
 w._ = key => key;
@@ -141,12 +167,21 @@ w.prompt = () => null;
 w.confirm = () => false;
 // The real response bodies are replayed verbatim: the assertions below therefore
 // measure what the handlers returned, not what the test wishes they returned.
+// Every row the view renders is classified from its own deploy read, so a list
+// fixture supplies one body per order id.
 w.API = {
   get: async url => {
     if (url === '/api/admin/hosting/gigahost/orders') return JSON.parse(ordersBody);
     if (url === '/api/admin/hosting/gigahost/setup-intents') return JSON.parse(intentsBody);
     if (url === '/api/vpn/backends') return JSON.parse(backendsBody);
-    if (url === '/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderID) + '/status') return JSON.parse(detailBody);
+    const m = url.match(/^\/api\/admin\/hosting\/gigahost\/orders\/(.+)\/status$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      if (detailsBody && Object.prototype.hasOwnProperty.call(detailsBody, id)) {
+        return JSON.parse(detailsBody[id]);
+      }
+      if (detailBody && id === orderID) return JSON.parse(detailBody);
+    }
     throw new Error('unexpected GET ' + url);
   },
   post: async () => { throw new Error('the status view must not POST'); },
@@ -167,7 +202,25 @@ const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
     // The row's identity and the actions it offers are part of what the view claims, so
     // a test can assert that a state changed the row without losing either.
     identity: flat(container.querySelector('.gigahost-order-identity')),
+    // The accessible name is what a screen reader hears; a state that changes the
+    // claim must be assertable there too.
+    label: (cell && cell.querySelector('.gigahost-order-status-toggle'))
+      ? cell.querySelector('.gigahost-order-status-toggle').getAttribute('aria-label')
+      : null,
     actions: Array.from(container.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => flat(b)),
+    // Every rendered row, in order: the list is a surface in its own right, and a
+    // hidden row cannot be distinguished from an absent one by inspecting one cell.
+    rows: Array.from(container.querySelectorAll('.gigahost-order-row')).map(row => {
+      const status = row.querySelector('.gigahost-order-status');
+      const toggle = row.querySelector('.gigahost-order-status-toggle');
+      return {
+        orderId: status ? status.getAttribute('data-order-id') : null,
+        stage: status ? status.getAttribute('data-stage') : null,
+        identity: flat(row.querySelector('.gigahost-order-identity')),
+        label: toggle ? toggle.getAttribute('aria-label') : null,
+        actions: Array.from(row.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => flat(b))
+      };
+    }),
     stale: container.getAttribute('data-stale'),
     staleNotice: !!container.querySelector('#recentOrdersStale'),
     lastSuccessAt: w.gigahostOrderStatusRefreshState().lastSuccessAt
@@ -175,7 +228,7 @@ const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
   process.stdout.write('RENDER_RESULT=' + JSON.stringify(summary) + '\n');
   dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedOrders), string(encodedDetail), string(encodedIntentsResp), string(encodedBackends),
+`, string(encodedOrders), string(encodedDetail), string(encodedDetails), string(encodedIntentsResp), string(encodedBackends),
 		string(encodedOrderID), string(encodedIntents), string(encodedModel), string(encodedStatus))
 
 	cmd := exec.Command(node)

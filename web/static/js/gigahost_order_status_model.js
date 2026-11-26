@@ -101,6 +101,13 @@ function gigahostOrderStatusNow() {
     return new Date();
 }
 
+/* gigahostOrderStatusStageInFlight reports whether a stage is one the deployment can
+ * still be making progress on. A terminal stage is an outcome, not a step in flight:
+ * the attempt is over, so nothing drawn for that row may claim a step is current. */
+function gigahostOrderStatusStageInFlight(stage) {
+    return gigahostOrderStatusStages.indexOf(stage) !== -1;
+}
+
 /* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
  * stage. It reads no address: a VPS is ready only when the provider said so, and an
  * order the provider has accepted without starting is still `requested` rather than

@@ -812,6 +812,11 @@ func (h *Handlers) GetGigahostDeployStatus(ctx context.Context, orderID string) 
 		}
 	}
 
+	// The absence question is asked about the identity the order registered, which for a
+	// saved setup that paused after registration is journalled on the intent rather than
+	// mirrored onto this ledger row yet.
+	registeredServerID := h.registeredServerIDForOrder(ctx, order.OrderID, nexusServerID)
+
 	return &GigahostDeployStatus{
 		OrderID:          order.OrderID,
 		ProviderServerID: order.ServerID,
@@ -821,7 +826,7 @@ func (h *Handlers) GetGigahostDeployStatus(ctx context.Context, orderID string) 
 		AssignedIP:       order.AssignedIP,
 		Error:            lastError,
 		UpdatedAt:        order.UpdatedAt,
-		ProviderAbsent:   h.deploymentProviderAbsent(ctx, nexusServerID),
+		ProviderAbsent:   h.deploymentProviderAbsent(ctx, registeredServerID),
 	}, nil
 }
 
@@ -842,6 +847,28 @@ func (h *Handlers) deploymentProviderAbsent(ctx context.Context, nexusServerID i
 		return false
 	}
 	return absent
+}
+
+// registeredServerIDForOrder resolves the panel server an order registered, for a
+// presence question that must not depend on which writer recorded the id.
+//
+// The onboarding journal mirrors the id onto the order ledger when the install
+// completes, while a saved setup journals it on the setup intent at registration and
+// may pause for a long time before that. Reading only the ledger therefore answers
+// "registered no server" for a deployment whose server is registered, which is how a
+// deleted server stayed actionable. The intent is read by the order id the
+// registration was made for - never from an address or the provider's own numeric id -
+// and a failed lookup falls back to the ledger value, so the ordinary treatment is
+// kept rather than an absence invented.
+func (h *Handlers) registeredServerIDForOrder(ctx context.Context, orderID string, ledgerServerID int64) int64 {
+	if ledgerServerID > 0 || h.db == nil || strings.TrimSpace(orderID) == "" {
+		return ledgerServerID
+	}
+	intent, found, err := h.db.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil || !found || intent == nil || intent.NexusServerID <= 0 {
+		return ledgerServerID
+	}
+	return intent.NexusServerID
 }
 
 // GigahostDeployHandler handles POST /api/admin/hosting/gigahost/deploy.

@@ -227,9 +227,14 @@ function setupIntentRow(i) {
     right.style.gap = '6px';
 
     const badge = document.createElement('span');
-    badge.className = 'badge ' + setupIntentBadgeClass(i.state);
+    // A job whose registered server the provider's own inventory no longer lists is
+    // shown as what it is, rather than as a paused install with nothing to press: the
+    // state badge and the action area must not disagree about the same job.
+    badge.className = 'badge ' + (setupIntentProviderAbsent(i) ? 'badge-danger' : setupIntentBadgeClass(i.state));
     badge.style.fontSize = '0.75rem';
-    badge.textContent = _('setup_state_' + i.state) || (i.state || '');
+    badge.textContent = setupIntentProviderAbsent(i)
+        ? _('gigahost_status_stage_deleted')
+        : (_('setup_state_' + i.state) || (i.state || ''));
     right.appendChild(badge);
 
     setupIntentActions(i).forEach(btn => right.appendChild(btn));
@@ -261,6 +266,17 @@ function setupIntentDisplayedIdentity(i) {
     return (i.host_fingerprint || '').trim();
 }
 
+/* setupIntentProviderAbsent reports the panel's durable record that the provider's own
+ * inventory no longer lists the server this job registered.
+ *
+ * It is the same presence fact the Recent Deployments row reads, resolved from the
+ * identity the job journaled at registration - a saved job can be paused after that
+ * point, before the order ledger mirrors the id. Only an explicit true counts; a job
+ * with no such record keeps its ordinary treatment. */
+function setupIntentProviderAbsent(i) {
+    return !!i && i.provider_absent === true;
+}
+
 /* setupIntentActions returns the buttons a state allows.
  *
  * Only a pending approval can be revoked: a job past the install handoff is
@@ -268,7 +284,12 @@ function setupIntentDisplayedIdentity(i) {
  * follow. Only a paused job can be resumed, because a resume is the
  * administrator's statement that an unproven outcome may be retried. Only a
  * trust pause asks for an identity confirmation, and it carries the exact
- * fingerprint the panel displayed for this job - never a value from this page. */
+ * fingerprint the panel displayed for this job - never a value from this page.
+ *
+ * Every one of those actions except revocation ends in a connection to the server
+ * the job registered, so none of them may be offered once the provider's inventory
+ * has confirmed that server is gone. Revocation stays: it is a local decision about
+ * the panel's own approval and contacts nothing. */
 function setupIntentActions(i) {
     const buttons = [];
     const add = (label, kind, handler) => {
@@ -285,6 +306,7 @@ function setupIntentActions(i) {
     if (i.state === 'pending') {
         add(_('setup_intents_cancel'), 'secondary', () => cancelSetupIntent(i.order_id));
     }
+    if (setupIntentProviderAbsent(i)) return buttons;
     const displayed = setupIntentDisplayedIdentity(i);
     if (i.state === 'install_paused' || i.state === 'awaiting_credentials') {
         add(_('setup_intents_resume'), 'primary', () => resumeSetupIntent(i.order_id));

@@ -29,6 +29,21 @@ type deletedDeploymentRender struct {
 	Identity string   `json:"identity"`
 	Actions  []string `json:"actions"`
 	Panel    string   `json:"panel"`
+	// Label is the status control's accessible name, which is where a screen reader
+	// hears any claim the row makes about a step being in flight.
+	Label string `json:"label"`
+	// Rows is every rendered row in order, so a test can assert what the list shows
+	// rather than only inspecting its first cell.
+	Rows []deletedDeploymentRow `json:"rows"`
+}
+
+// deletedDeploymentRow is one rendered row of the recent-deployments list.
+type deletedDeploymentRow struct {
+	OrderID  string   `json:"orderId"`
+	Stage    string   `json:"stage"`
+	Identity string   `json:"identity"`
+	Label    string   `json:"label"`
+	Actions  []string `json:"actions"`
 }
 
 // renderDeletedDeployment parses one renderer summary.
@@ -129,6 +144,21 @@ func TestRecentDeploymentsShowsADeletedDeploymentWithoutContactActions(t *testin
 	// No control is offered, because every one of them would contact the server.
 	if len(deleted.Actions) != 0 {
 		t.Fatalf("a deleted deployment must offer no contact action, got %v", deleted.Actions)
+	}
+	// R5-01: the recorded step stays visible, and nothing on this row calls it current.
+	// The attempt is over, so "Current step: installing_protocol" beside "Nothing to do"
+	// reads as progress that is not happening.
+	if !strings.Contains(deleted.Panel, DeployStatusInstallingProtocol) {
+		t.Fatalf("the deleted deployment lost the recorded step it saved: %s", deleted.Panel)
+	}
+	if strings.Contains(deleted.Panel, "gigahost_status_step") {
+		t.Fatalf("a finished attempt must not label its recorded step as the current one: %s", deleted.Panel)
+	}
+	if !strings.Contains(deleted.Panel, "gigahost_status_recorded_step") {
+		t.Fatalf("the recorded step must still be shown, labelled as historical: %s", deleted.Panel)
+	}
+	if strings.Contains(deleted.Label, "gigahost_status_current_step") {
+		t.Fatalf("the deleted row's accessible name must not claim a step is current: %q", deleted.Label)
 	}
 
 	// Phase 3 - criterion 6: the provider lists the server again.

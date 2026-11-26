@@ -799,6 +799,7 @@
   "gigahost_status_not_checked": "هنوز بررسی نشده",
   "gigahost_status_never": "هرگز ثبت نشده",
   "gigahost_status_step": "گام کنونی",
+  "gigahost_status_recorded_step": "آخرین گام ثبت‌شده",
   "gigahost_status_failure": "خطای گزارش‌شده",
   "gigahost_status_next_action": "اقدام بعدی",
   "gigahost_status_next_action_wait": "منتظر پایان استقرار در ارائه‌دهنده بمانید",

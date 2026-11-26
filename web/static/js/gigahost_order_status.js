@@ -136,11 +136,16 @@ function gigahostOrderStatusPanel(model) {
     return panel;
 }
 
-/* gigahostOrderStatusStepDetail shows the step in flight, from the deploy read when
- * it answered and from the saved approval otherwise. */
+/* gigahostOrderStatusStepDetail shows the recorded step. A terminal order is not in
+ * flight, so its step is the last one that was attempted: the fact is kept and the
+ * claim changes, because "Current step" beside "Next action: Nothing to do" reads as
+ * progress on a finished attempt. */
 function gigahostOrderStatusStepDetail(panel, model) {
     const step = model.step || (model.setupIntent && model.setupIntent.step) || '';
-    if (step) gigahostOrderStatusDetail(panel, 'gigahost_status_step', step);
+    if (!step) return;
+    gigahostOrderStatusDetail(panel,
+        gigahostOrderStatusStageInFlight(model.stage) ? 'gigahost_status_step' : 'gigahost_status_recorded_step',
+        step);
 }
 
 /* gigahostOrderStatusFailureDetail shows the reported reason as text: a provider
@@ -232,8 +237,10 @@ function gigahostOrderStatusCell(order, context, classification) {
     });
     // The name carries the visible progression followed by the step in flight, so the
     // visible text is still part of the name (label-in-name) and the current step is
-    // announced. No second visible label is added.
-    if (model.chain.some((entry) => entry.state === 'current')) {
+    // announced. No second visible label is added. A terminal stage has no step in
+    // flight to announce: saying so would claim progress on an ended attempt.
+    if (gigahostOrderStatusStageInFlight(model.stage) &&
+        model.chain.some((entry) => entry.state === 'current')) {
         toggle.setAttribute('aria-label', toggle.textContent + '. ' +
             _('gigahost_status_current_step') + ': ' + _('gigahost_status_stage_' + model.stage));
     }
@@ -616,8 +623,12 @@ async function readGigahostOrderDeploy(orderId, signal) {
  * cell and the actions this state allows. The setup, retry and saved-approval
  * actions are the pre-existing ones, unchanged; the status cell replaced the raw
  * status label, which was neither interactive nor able to separate provider
- * readiness from setup and backend health. */
-function gigahostOrderStatusRow(order, context) {
+ * readiness from setup and backend health.
+ *
+ * `classification` is optional: the list already classifies every row to decide which
+ * of them it renders, so passing that decision in keeps the row from classifying the
+ * same order a second time - and keeps the surface and its affordances on one model. */
+function gigahostOrderStatusRow(order, context, classification) {
     const row = document.createElement('div');
     // Layout is owned by settings.css (.gigahost-order-row and its two sides), so the
     // row wraps instead of widening the card. Markup here only decides what the row says.
@@ -644,14 +655,18 @@ function gigahostOrderStatusRow(order, context) {
     right.className = 'gigahost-order-state';
     // One classification decides both what the row says and what it offers, so the
     // status cell and the action area can never disagree about the same order.
-    const classification = gigahostOrderStatusModel(order, context);
-    right.appendChild(gigahostOrderStatusCell(order, context, classification));
+    const model = classification || gigahostOrderStatusModel(order, context);
+    right.appendChild(gigahostOrderStatusCell(order, context, model));
 
-    // A deployment the provider's inventory has confirmed gone gets no action. Every
-    // action here - retry, immediate setup, a saved approval - ends in a connection to
-    // the deployment's address, and the panel already holds durable evidence that
-    // address is no longer the provider's server.
-    if (classification.providerAbsent) {
+    // A deployment that reads as deleted gets no action, whichever fact produced that
+    // state: the provider's own `deleted` answer, or the panel's durable inventory
+    // mark. Both are combined into the stage already, so the affordances read that one
+    // decision rather than either input. Every action here - retry, immediate setup, a
+    // saved approval - ends in a connection to the deployment's address.
+    //
+    // A cancelled order is deliberately not in this class: cancellation stops the order
+    // while its VPS may still be running, which is why it keeps its actions.
+    if (model.stage === 'deleted') {
         row.appendChild(left);
         row.appendChild(right);
         return row;
@@ -835,16 +850,29 @@ async function gigahostOrderStatusReadOnce(signal) {
     };
 }
 
-/* gigahostOrderStatusRenderList renders the first five orders and keeps any stale
- * notice above them, so a stale label survives a rerender of the same rows. */
+/* GIGAHOST_ORDER_STATUS_RECENT_LIMIT is how many orders the recent list shows by
+ * default. The cap is pre-existing and unchanged: only a row the view classifies as
+ * deleted is rendered beyond it, because such a row is hidden from the Servers grid by
+ * design and would otherwise have no surface that names its order at all. */
+const GIGAHOST_ORDER_STATUS_RECENT_LIMIT = 5;
+
+/* gigahostOrderStatusRenderList renders the recent list: the default five, plus every
+ * older row that reads as deleted, and keeps any stale notice above them so a stale
+ * label survives a rerender of the same rows.
+ *
+ * One classification per order decides both what the row says and whether it is
+ * rendered, so the surface and its affordances cannot disagree about the same order. */
 function gigahostOrderStatusRenderList(container, merged, details, setupIndex, observations, checkedAt) {
     const list = document.createElement('div');
     list.style.display = 'flex';
     list.style.flexDirection = 'column';
     list.style.gap = '6px';
-    merged.slice(0, 5).forEach((order, index) => {
-        list.appendChild(gigahostOrderStatusRow(order,
-            gigahostOrderStatusContext(order, details[index], setupIndex, checkedAt, observations)));
+    const contexts = merged.map((order, index) =>
+        gigahostOrderStatusContext(order, details[index], setupIndex, checkedAt, observations));
+    const models = merged.map((order, index) => gigahostOrderStatusModel(order, contexts[index]));
+    merged.forEach((order, index) => {
+        if (index >= GIGAHOST_ORDER_STATUS_RECENT_LIMIT && models[index].stage !== 'deleted') return;
+        list.appendChild(gigahostOrderStatusRow(order, contexts[index], models[index]));
     });
     const stale = container.querySelector('#recentOrdersStale');
     container.replaceChildren(list);

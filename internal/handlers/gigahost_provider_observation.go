@@ -156,6 +156,9 @@ func (h *Handlers) gigahostOrderObservations(
 	const maxDeployQueries = 10
 	for i := range orders {
 		if isTerminalStatus(orders[i].Status) {
+			if observation, spoke := h.repairDeletedOrderFromInventory(ctx, servers, inventoryKnown, &orders[i]); spoke {
+				observations[orders[i].OrderID] = observation
+			}
 			continue
 		}
 		updated := false
@@ -237,4 +240,52 @@ func (h *Handlers) gigahostListObservations(
 		return observations
 	}
 	return h.gigahostOrderObservations(ctx, client, orders)
+}
+
+// isDeletedStatus reports the one terminal vocabulary that claims the *server* is gone,
+// as opposed to an order that ended while its VPS could still be running.
+//
+// The distinction decides whether a later affirmative inventory listing may repair a
+// recorded ending: a deletion recorded by the provider is the panel's copy of an
+// observation about the server, and a server the provider now lists is a correction of
+// that observation. A cancellation or a failure is the order's outcome, which an
+// inventory read cannot decide and must not overwrite.
+func isDeletedStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	return s == "deleted" || s == "terminated"
+}
+
+// repairDeletedOrderFromInventory applies this response's inventory to a terminal row
+// whose recorded ending is a deletion.
+//
+// A terminal row is not asked about again through the order detail: the order has ended,
+// and re-reading an ended order changes nothing. The inventory read is different in kind -
+// this response already made it for every order - and an entry that names this order as
+// live is an affirmative answer about the same deployed server.
+//
+// Only a recorded DELETION is repaired this way, because it is the one terminal value that
+// claims the server is gone: the panel's copy of that observation is what a live listing
+// corrects. A cancellation or a failure is the order's own outcome, which an inventory read
+// cannot decide and must not overwrite. Without the deletion case the row kept its value
+// forever, because the next list read skipped it as terminal before consulting the
+// inventory again, while the server itself had already returned to the grid. An inventory
+// that failed, or that does not mention this order, changes nothing, so an unknown read is
+// never rendered as presence.
+//
+// It reports the observation and whether the inventory spoke about this row at all.
+func (h *Handlers) repairDeletedOrderFromInventory(
+	ctx context.Context, servers []gigahost.ServerInfo, inventoryKnown bool, order *GigahostOrderRecord,
+) (GigahostProviderObservation, bool) {
+	if !isDeletedStatus(order.Status) || !inventoryKnown || !gigahostProviderServerLive(servers, order.OrderID) {
+		return GigahostProviderObservation{}, false
+	}
+	updated := h.refreshOrderFromServers(servers, order)
+	observation := GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
+	if status, ok := gigahostProviderServerStatus(servers, order.OrderID); ok {
+		observation = GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
+	}
+	if updated {
+		_ = h.updateGigahostOrder(ctx, order)
+	}
+	return observation, true
 }

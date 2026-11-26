@@ -4273,6 +4273,15 @@ td[data-backend-name]:focus-visible {
     text-underline-offset: 2px;
 }
 
+/* The DELETED stage's ink belongs to that state, not to the shared danger badge. On the
+   dark canvas the shared token measures 4.42:1 against the badge fill this card draws,
+   under the 4.5:1 normal-text minimum at the 12px this widget sets. --text-danger is the
+   readable status-ink step in both themes (6.03:1 dark, 5.79:1 light on the same fill),
+   and scoping it to this one stage leaves every other danger badge exactly as it was. */
+.settings-section-card .gigahost-order-status[data-stage="deleted"] .gigahost-order-status-toggle {
+    color: var(--text-danger);
+}
+
 @media (max-width: 600px) {
     .settings-section-card .gigahost-order-row {
         flex-direction: column;
