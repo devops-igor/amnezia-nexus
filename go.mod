@@ -10,7 +10,7 @@ require (
 	github.com/caddyserver/certmagic v0.25.6
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/google/uuid v1.6.0
-	github.com/klauspost/compress v1.20.4
+	github.com/klauspost/compress v1.20.5
 	github.com/metacubex/utls v1.8.8
 	github.com/miekg/dns v1.1.73
 	github.com/pkg/sftp v1.13.12
@@ -20,10 +20,10 @@ require (
 	github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d
 	github.com/wenlng/go-captcha/v2 v2.0.5
 	golang.org/x/crypto v0.59.0
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0
-	modernc.org/sqlite v1.62.0
+	modernc.org/sqlite v1.63.0
 )
 
 require (
