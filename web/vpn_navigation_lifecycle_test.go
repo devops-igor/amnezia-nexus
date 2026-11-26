@@ -47,8 +47,12 @@ func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
    await pending;
    assert.strictEqual(reads, before + 1, 'success really refreshed the owner');
    assert.strictEqual(opener.isConnected, false, 'refresh replaced the activated row');
-   assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'success keeps terminal owner focus');
-   if (action === 'disable') assert(d.querySelector('[data-backend-action="enable"]'), 'Disable refresh renders the now-disabled backend');
+   if (action === 'delete') assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'removed backend falls back to its owner heading');
+   if (action === 'disable') {
+     const replacement = d.querySelector('[data-backend-action="enable"]');
+     assert(replacement, 'Disable refresh renders the now-disabled backend');
+     assert.strictEqual(d.activeElement, replacement, 'Disable keeps terminal focus on its equivalent live row control');
+   }
  }
  rows = [];
  await w.vpnLoadBackends();

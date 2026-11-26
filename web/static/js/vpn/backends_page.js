@@ -112,6 +112,19 @@ if (typeof window !== 'undefined') {
     window.vpnModalFocusFallback = vpnModalFocusFallback;
 }
 
+// Resolve a replaced row control by its action and server identity, never by
+// row position. A removed or filtered-out row falls back to the stable heading.
+function vpnReplacementBackendFocus(focused, tbody) {
+    if (focused.dataset.action === 'vpn-open-add-backend') {
+        return document.getElementById('vpn-add-backend-btn');
+    }
+    const equivalent = Array.from(tbody.querySelectorAll('[data-action]')).find(function (candidate) {
+        return candidate.dataset.action === focused.dataset.action && candidate.dataset.serverId === focused.dataset.serverId;
+    });
+    if (equivalent && equivalent.closest('tr').style.display !== 'none') return equivalent;
+    return document.getElementById('vpn-backends-title');
+}
+
 // vpnLoadBackends refreshes the inventory only.
 async function vpnLoadBackends() {
     // The arrival's Inspect request is taken off durable storage before the read, so a
@@ -140,8 +153,6 @@ async function vpnLoadBackends() {
     const focused = document.activeElement;
     const tbodyBefore = document.getElementById('vpn-backends-tbody');
     const replacingFocus = tbodyBefore && tbodyBefore.contains(focused);
-    const focusFallback = replacingFocus && focused.closest('[data-action="vpn-open-add-backend"]')
-        ? 'vpn-add-backend-btn' : 'vpn-backends-title';
     if (!backends.length) {
         vpnRenderBackendsEmpty();
     } else {
@@ -154,7 +165,7 @@ async function vpnLoadBackends() {
         if (vpnTableInstance) vpnTableInstance.refresh();
     }
 
-    if (replacingFocus) vpnFocusIfFocusable(document.getElementById(focusFallback));
+    if (replacingFocus) vpnFocusIfFocusable(vpnReplacementBackendFocus(focused, tbodyBefore));
 
     if (!vpnBackendsAnchorApplied) {
         vpnBackendsAnchorApplied = true;
