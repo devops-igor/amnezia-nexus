@@ -6,9 +6,23 @@ import (
 	"testing"
 )
 
+// requireVPNNavigationRuntime fails closed: a missing optional DOM dependency
+// must not silently remove the navigation regression guards from a green run.
+func requireVPNNavigationRuntime(t *testing.T, f *VPNTestFixture) string {
+	t.Helper()
+	if f.NodePath == "" {
+		t.Fatal("VPN navigation regressions require Node.js (see CONTRIBUTING.md)")
+	}
+	out, err := execNodeScript(f.NodePath, jsdomBootstrapSnippet+`console.log('VPN_NAV_RUNTIME_READY');`)
+	if err != nil || !strings.Contains(string(out), "VPN_NAV_RUNTIME_READY") {
+		t.Fatalf("VPN navigation regressions require jsdom: %v\n%s", err, out)
+	}
+	return f.NodePath
+}
+
 func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
 	f := NewVPNTestFixtureForPage(t, "vpn_backends")
-	f.RequireJSDOM()
+	requireVPNNavigationRuntime(t, f)
 	script := f.BuildJSDOMHarness(JSDOMHarnessOptions{IncludeNexusTable: true, IncludeFakeClock: true, ExtraJS: `
 (async () => {
  const d = w.document;
@@ -72,7 +86,7 @@ func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
 
 func TestVPNPageDirectModalFragmentsResolveVisibleOpener(t *testing.T) {
 	f := NewVPNTestFixtureForPage(t, "vpn_backends")
-	f.RequireJSDOM()
+	requireVPNNavigationRuntime(t, f)
 	out := f.RunJSDOM(f.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
 (() => {
  const d = w.document, modal = d.getElementById('addBackendModal');
@@ -100,7 +114,7 @@ func TestVPNPageDirectModalFragmentsResolveVisibleOpener(t *testing.T) {
 
 func TestVPNPageHiddenTooltipPositionsVisibleFallback(t *testing.T) {
 	f := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
-	f.RequireJSDOM()
+	requireVPNNavigationRuntime(t, f)
 	out := f.RunJSDOM(f.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
 (() => {
  let scrolled = null;
@@ -122,7 +136,7 @@ func TestVPNPageHiddenTooltipPositionsVisibleFallback(t *testing.T) {
 func TestVPNPageInspectUsesOnlyItsRequestedDocument(t *testing.T) {
 	source := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	dest := NewVPNTestFixtureForPage(t, "vpn_backends")
-	source.RequireJSDOM()
+	requireVPNNavigationRuntime(t, source)
 	sourceScript := source.BuildJSDOMHarness(JSDOMHarnessOptions{ExtraJS: `
 Object.defineProperty(w, 'sessionStorage', {value: shared.storage});
 w.vpnNavigateToBackends = id => { shared.arrival = '/vpn/backends#' + id; };
