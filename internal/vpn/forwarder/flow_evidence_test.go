@@ -432,7 +432,7 @@ func TestFlowEvidenceRefusesAttributionForASupersededRoute(t *testing.T) {
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(fix.client), dst, 41000, 443, 0x02, nil)
 	err := fix.fwd.routeDirectDecision(fix.dem, stale, fix.peerKey, pkt, int64(len(pkt)),
 		proxyBackend{tunnelID: fix.backendID, queue: fix.fwd.backendQueues[fix.backendID]}, nil, fix.session, "conn-1",
-		FlowDecision{Reason: EgressReasonEvidenceDirect, PolicyGeneration: "gen-flow", DecidedAt: time.Now()})
+		FlowDecision{Reason: EgressReasonAllocationDirect, PolicyGeneration: "gen-flow", DecidedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("fallback dispatch: %v", err)
 	}
