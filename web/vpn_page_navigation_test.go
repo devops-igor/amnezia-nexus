@@ -107,41 +107,65 @@ func TestVPNPageOverviewModalAnchorLandsOnItsOpener(t *testing.T) {
 	}
 }
 
-// TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation proves a failed arrival is
-// not replayed by a later ordinary visit, and that the retry still lands.
+// TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation proves the Inspect request
+// belongs to the arrival that carried it: the failed first read consumes it off tab
+// storage and keeps it page-local, the retry in the same arrival still reveals and
+// focuses the row, and a fresh document - which is what an ordinary later visit is -
+// finds nothing left to replay.
 func TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation(t *testing.T) {
 	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
 	fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
+		// The real table engine: a reveal focuses the row's name cell, which only
+		// the engine marks as focusable.
+		IncludeNexusTable: true,
 		ExtraJS: `
 (async () => {
     const assert = require('assert');
     const tbody = w.document.getElementById('vpn-backends-tbody');
     const announcement = w.document.getElementById('vpn-backends-announcement');
-    w.NexusTable = function () { this.refresh = () => {}; this.revealRow = () => true; };
 
+    // The delivered row shape: the row's tunnel id is the backend's own id.
     const backends = [
-        { tunnel_id: 't-1', server_id: 1, endpoint: '198.51.100.1:51820', enabled: true, status: 'active' },
-        { tunnel_id: 't-2', server_id: 2, endpoint: '198.51.100.2:51820', enabled: true, status: 'active' }
+        { id: 't-1', server_id: 1, endpoint: '198.51.100.1:51820', enabled: true, status: 'active' },
+        { id: 't-2', server_id: 2, endpoint: '198.51.100.2:51820', enabled: true, status: 'active' }
     ];
     const rowCount = () => Array.from(tbody.children).filter(tr => !tr.classList.contains('table-empty-state')).length;
 
-    // The arrival that carries an Inspect request, whose first read fails.
+    // 1. The arrival that carries an Inspect request, whose first read fails.
     w.sessionStorage.setItem('vpn.backend-inspect.tunnel', 't-2');
-    w.API = { get: async () => { throw new Error('first read refused'); }, post: async () => ({}) };
+    let mode = 'reject';
+    w.API = {
+        get: async () => { if (mode === 'reject') throw new Error('first read refused'); return { backends: backends }; },
+        post: async () => ({})
+    };
     await w.vpnLoadBackends();
     assert.ok(tbody.querySelector('tr.table-empty-state'), 'the refused first read is stated');
     assert.strictEqual(announcement.textContent, '', 'a failed arrival announces nothing about a missing entity');
+    assert.strictEqual(w.sessionStorage.getItem('vpn.backend-inspect.tunnel'), null,
+        'the arrival took the durable request off tab storage');
+    assert.strictEqual(w.eval('vpnPendingInspectTunnelId'), 't-2',
+        'the request stays page-local for the retry in this arrival');
 
-    // A later ordinary visit: the durable slot was consumed at the arrival above, so
-    // nothing is replayed even though the entity is now present.
-    w.sessionStorage.removeItem('vpn.backend-inspect.tunnel');
-    w.API = { get: async () => ({ backends: backends }), post: async () => ({}) };
+    // 2. The retry in the same arrival may still use the request: it is page-local,
+    //    not lost with the storage slot. The reveal-and-focus itself is pinned by the
+    //    retained reveal oracle (TestVPN955R9BackendReveal), including which cell takes
+    //    focus; here the request's survival is what this case owns.
+    mode = 'ok';
     await w.vpnLoadBackends();
-    assert.strictEqual(rowCount(), 2, 'the inventory rendered');
-    assert.notStrictEqual(w.document.activeElement && w.document.activeElement.getAttribute
-        ? w.document.activeElement.getAttribute('data-tunnel-id') : null, 't-2',
+    assert.strictEqual(rowCount(), 2, 'the inventory rendered on the retry');
+    assert.strictEqual(w.eval('vpnPendingInspectTunnelId'), null, 'the request was used once');
+    assert.strictEqual(announcement.textContent, '', 'a revealed row announces nothing');
+
+    // 3. An ordinary later visit is a fresh document: nothing page-local survives, and
+    //    storage holds nothing to replay.
+    w.eval('vpnPendingInspectTunnelId = null');
+    w.eval('vpnBackendsAnchorApplied = false');
+    w.document.activeElement.blur();
+    await w.vpnLoadBackends();
+    assert.strictEqual(rowCount(), 2, 'the inventory is still rendered');
+    assert.strictEqual(w.document.activeElement, w.document.body,
         'an ordinary visit must not focus the previous Inspect entity');
     assert.strictEqual(announcement.textContent, '', 'an ordinary visit must not announce a missing entity');
 

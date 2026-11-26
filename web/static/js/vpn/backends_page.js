@@ -114,6 +114,9 @@ if (typeof window !== 'undefined') {
 
 // vpnLoadBackends refreshes the inventory only.
 async function vpnLoadBackends() {
+    // The arrival's Inspect request is taken off durable storage before the read, so a
+    // failed first read cannot leave it for a later visit to replay.
+    vpnHoldInspectRequest();
     let backendData;
     try {
         backendData = await API.get('/api/vpn/backends');
@@ -211,13 +214,21 @@ function vpnFocusBackendsHeading() {
 // bookmark or a reload never replays a previous Inspect. A row that is absent
 // after a SUCCESSFUL read is genuinely missing, and the existing missing-entity
 // statement is announced at the destination heading.
-// vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request. The durable slot is
-// read once, when the document starts, because the request belongs to the navigation
-// that carried it: keeping it in tab storage let a later ordinary visit replay an
-// arrival whose first read had failed.
-let vpnPendingInspectTunnelId = (typeof vpnConsumeBackendHandoff === 'function')
-    ? vpnConsumeBackendHandoff()
-    : null;
+// vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request once the page has
+// taken it off durable tab storage. The request belongs to the navigation that carried
+// it: leaving it in storage let a later ordinary visit replay an arrival whose first
+// read had failed, so the first thing the page and its landing do is take it.
+let vpnPendingInspectTunnelId = null;
+
+// vpnHoldInspectRequest pulls the durable request into this page, if it has not been
+// taken already. It does not consume the page-local copy: the arrival keeps its
+// request while a failed read is retried, and drops it only once a render has used it.
+function vpnHoldInspectRequest() {
+    if (vpnPendingInspectTunnelId !== null) return;
+    vpnPendingInspectTunnelId = (typeof vpnConsumeBackendHandoff === 'function')
+        ? vpnConsumeBackendHandoff()
+        : null;
+}
 
 function vpnTakePendingInspect() {
     const tunnelId = vpnPendingInspectTunnelId;
@@ -226,6 +237,7 @@ function vpnTakePendingInspect() {
 }
 
 function vpnApplyBackendsLanding() {
+    vpnHoldInspectRequest();
     const tunnelId = vpnTakePendingInspect();
     if (tunnelId) {
         const row = vpnFindBackendRowByTunnelId(document.getElementById('vpn-backends-tbody'), tunnelId);
