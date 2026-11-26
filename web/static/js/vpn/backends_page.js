@@ -75,18 +75,49 @@ function vpnEnsureBackendsTable() {
     });
 }
 
+// vpnRenderBackendsStaleRow states that the last refresh failed without discarding
+// the rows it could not replace: a silent failure would leave a populated table
+// looking current, and clearing it would lose the last known inventory.
+function vpnRenderBackendsStaleRow() {
+    const tbody = document.getElementById('vpn-backends-tbody');
+    if (!tbody) return;
+    const message = _('vpn_backends_stale') || 'Backend list unavailable - showing last known values';
+    let stale = document.getElementById('vpnBackendsStaleBanner');
+    if (!stale) {
+        stale = document.createElement('tr');
+        stale.id = 'vpnBackendsStaleBanner';
+        stale.className = 'table-empty-state';
+        const cell = document.createElement('td');
+        cell.colSpan = 6;
+        cell.style.textAlign = 'center';
+        stale.appendChild(cell);
+    }
+    stale.querySelector('td').textContent = message;
+    tbody.insertBefore(stale, tbody.firstChild);
+    vpnAnnounceBackends(message);
+}
+
 // vpnLoadBackends refreshes the inventory only.
 async function vpnLoadBackends() {
     let backendData;
     try {
         backendData = await API.get('/api/vpn/backends');
     } catch (err) {
-        vpnRenderBackendsError(_('error'));
+        // A cold page has nothing to keep, so it states the failure in place of the
+        // inventory. A populated one keeps its rows and says the refresh failed
+        // instead of looking current, which is what the sessions table does too.
+        if (Array.isArray(vpnCurrentBackends) && vpnCurrentBackends.length) {
+            vpnRenderBackendsStaleRow();
+        } else {
+            vpnRenderBackendsError(_('error'));
+        }
         return null;
     }
 
     const backends = (backendData && (backendData.backends || backendData.tunnels)) || [];
     vpnCurrentBackends = backends;
+    const staleBanner = document.getElementById('vpnBackendsStaleBanner');
+    if (staleBanner) staleBanner.remove();
 
     if (!backends.length) {
         vpnRenderBackendsEmpty();

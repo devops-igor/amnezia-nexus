@@ -1134,5 +1134,7 @@
   "policy_sync_error_details": "Détails de l'erreur",
   "policy_no_error_detail": "Aucun détail d'erreur signalé",
   "policy_sync_now": "Synchroniser",
-  "policy_sync_unavailable_hint": "Le split egress n'est pas actif : une synchronisation des règles ne peut pas le démarrer. Activez d'abord le routage par politique."
+  "policy_sync_unavailable_hint": "Le split egress n'est pas actif : une synchronisation des règles ne peut pas le démarrer. Activez d'abord le routage par politique.",
+  "vpn_sessions_unavailable": "Les sessions n'ont pas pu être lues",
+  "vpn_backends_stale": "Liste des backends indisponible - valeurs connues affichées"
 }

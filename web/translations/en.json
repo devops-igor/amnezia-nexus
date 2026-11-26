@@ -1134,5 +1134,7 @@
   "policy_sync_error_details": "Error details",
   "policy_no_error_detail": "No error detail reported",
   "policy_sync_now": "Sync now",
-  "policy_sync_unavailable_hint": "Split egress is not active, so a rule sync cannot start it. Enable policy routing first."
+  "policy_sync_unavailable_hint": "Split egress is not active, so a rule sync cannot start it. Enable policy routing first.",
+  "vpn_sessions_unavailable": "Sessions could not be read",
+  "vpn_backends_stale": "Backend list unavailable - showing last known values"
 }

@@ -55,7 +55,11 @@ function vpnSetSignalSub(id, text, isProblem) {
 // active-session count feeds the Sessions signal, and a route mismatch appears
 // only when routing_consistency actually reports one.
 function vpnRenderSignals(status) {
-    const s = (status && typeof status === 'object') ? status : null;
+    // An unavailable forwarder response is not a set of measurements: it arrives as
+    // forwarder_available:false with zeroed counters, and rendering those as 0 would
+    // report a value nobody read as a measured one. The single long document passed
+    // null for exactly this response, so the signals render not-measured instead.
+    const s = (status && typeof status === 'object' && status.forwarder_available !== false) ? status : null;
 
     // Backends: disabled inventory is never counted as failed, and when
     // eligibility is unknown the enabled denominator is not invented.

@@ -578,6 +578,36 @@ function vpnWrapSessionsTableRender(tableInstance) {
     tableInstance.render = wrapped;
 }
 
+// vpnRenderSessionsUnavailable renders the table's refusal state.
+//
+// A refused read with no earlier snapshot has nothing to show and nothing cached, so
+// the table must say that instead of an empty list (which would claim there are no
+// sessions) or a permanent loading row. The stale banner still appears beside it: it
+// is the statement that the read failed, and it stays conditional on that failure.
+function vpnRenderSessionsUnavailable() {
+    const tbody = document.getElementById('vpn-sessions-tbody');
+    if (!tbody) return;
+    tbody.textContent = '';
+    vpnRenderSessionsStaleBanner();
+
+    const tr = document.createElement('tr');
+    tr.className = 'table-empty-state';
+    const td = document.createElement('td');
+    td.colSpan = 5;
+    td.style.padding = 'var(--space-2xl) var(--space-md)';
+    td.style.textAlign = 'center';
+    td.className = 'vpn-not-measured';
+    td.textContent = _('vpn_sessions_unavailable') || 'Sessions could not be read';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+
+    const countBadge = document.getElementById('vpn-sessions-count-badge');
+    if (countBadge) {
+        // Not "0": the count was not read, so it is not a measurement.
+        countBadge.textContent = '\u2014';
+    }
+}
+
 function renderSessions(sessions) {
     const tbody = document.getElementById('vpn-sessions-tbody');
     if (!tbody) return;
@@ -693,4 +723,5 @@ if (typeof window !== 'undefined') {
     window.vpnSyncExpandedDrilldowns = vpnSyncExpandedDrilldowns;
     window.vpnWrapSessionsTableRender = vpnWrapSessionsTableRender;
     window.renderSessions = renderSessions;
+    window.vpnRenderSessionsUnavailable = vpnRenderSessionsUnavailable;
 }

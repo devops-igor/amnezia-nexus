@@ -1134,5 +1134,7 @@
   "policy_sync_error_details": "错误详情",
   "policy_no_error_detail": "未报告错误详情",
   "policy_sync_now": "立即同步",
-  "policy_sync_unavailable_hint": "分离出口未启用，规则同步无法启动它。请先启用策略路由。"
+  "policy_sync_unavailable_hint": "分离出口未启用，规则同步无法启动它。请先启用策略路由。",
+  "vpn_sessions_unavailable": "无法读取会话",
+  "vpn_backends_stale": "后端列表不可用 - 显示上次已知的值"
 }

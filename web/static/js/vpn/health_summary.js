@@ -475,6 +475,10 @@ function vpnRenderForwarderHealth(status) {
             if (typeof renderSessions === 'function') {
                 renderSessions(window.vpnLastSessions.sessions);
             }
+        } else if (typeof vpnRenderSessionsUnavailable === 'function') {
+            // A refused read with no earlier snapshot has nothing to render and must
+            // not leave the table on Loading: state the refusal instead.
+            vpnRenderSessionsUnavailable();
         }
 
         return isAvailable;
@@ -548,6 +552,10 @@ function vpnRenderForwarderHealth(status) {
         if (typeof renderSessions === 'function') {
             renderSessions(window.vpnLastSessions.sessions);
         }
+    } else if (typeof vpnRenderSessionsUnavailable === 'function') {
+        // A refused read with no earlier snapshot has nothing to render and must not
+        // leave the table on Loading: state the refusal instead.
+        vpnRenderSessionsUnavailable();
     }
 
     return isAvailable;
