@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -48,10 +49,9 @@ func (d *DB) AllocateAWGClientIP(
 
 	clientID = strings.TrimSpace(clientID)
 	clientPubKey = strings.TrimSpace(clientPubKey)
-	storedClientID := clientPubKey
-	if storedClientID == "" {
-		storedClientID = clientID
-	}
+	// The row is stored under the single identity rule that release also uses
+	// (public key when supplied, otherwise the explicit client identifier).
+	storedClientID := awg.AllocationKey(clientID, clientPubKey)
 
 	const maxRetries = 50
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -205,6 +205,13 @@ func mergeUsedIPs(usedConfigIPs, allocatedIPs []string) []string {
 }
 
 // ReleaseAWGClientIP removes or frees the allocated IP record for a client on the specified server.
+//
+// clientID is the allocation identity produced by awg.AllocationKey (the public
+// key when one exists), i.e. exactly the identity AllocateAWGClientIP stored. A
+// release that matches no row leaves the address reserved, so it is reported via
+// the structured log instead of returning silently; it is not an error because a
+// caller releasing an already-released or mismatched pair must not fail the
+// surrounding removal.
 func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
@@ -215,19 +222,20 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 		return nil
 	}
 
+	var res sql.Result
 	var err error
 	if clientID != "" && ip != "" {
-		_, err = d.sqlDB.ExecContext(ctx,
+		res, err = d.sqlDB.ExecContext(ctx,
 			"DELETE FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND ip = ?",
 			serverID, clientID, ip,
 		)
 	} else if ip != "" {
-		_, err = d.sqlDB.ExecContext(ctx,
+		res, err = d.sqlDB.ExecContext(ctx,
 			"DELETE FROM awg_ip_allocations WHERE server_id = ? AND ip = ?",
 			serverID, ip,
 		)
 	} else {
-		_, err = d.sqlDB.ExecContext(ctx,
+		res, err = d.sqlDB.ExecContext(ctx,
 			"DELETE FROM awg_ip_allocations WHERE server_id = ? AND client_id = ?",
 			serverID, clientID,
 		)
@@ -235,6 +243,21 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 
 	if err != nil {
 		return fmt.Errorf("failed to release AWG client IP: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected for AWG client IP release: %w", err)
+	}
+	if rows == 0 {
+		// The identity this release was made through matches no stored allocation:
+		// the row is held under another identity (or never existed), so the address
+		// stays reserved. Report it rather than returning as if it had been freed.
+		slog.Warn("AWG IP release matched no allocation row: the address remains reserved",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
+		)
 	}
 	return nil
 }
@@ -282,10 +305,7 @@ func (d *DB) AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID
 	if ip == "" || net.ParseIP(ip) == nil {
 		return false, nil
 	}
-	storedClientID := clientPubKey
-	if storedClientID == "" {
-		storedClientID = clientID
-	}
+	storedClientID := awg.AllocationKey(clientID, clientPubKey)
 	if storedClientID == "" {
 		return false, nil
 	}
