@@ -727,36 +727,48 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vp
 	}
 }
 
-// VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
-func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Body == nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
-		return
+func isImmutablePortalKeyField(name string) bool {
+	return strings.EqualFold(name, "server_private_key") || strings.EqualFold(name, "server_public_key") ||
+		strings.EqualFold(name, "ServerPrivateKey") || strings.EqualFold(name, "ServerPublicKey")
+}
+
+func validateVPNConfigUpdateFields(raw map[string]json.RawMessage, cfg models.VPNConfig, present vpnConfigPresence) string {
+	for name := range raw {
+		if isImmutablePortalKeyField(name) {
+			return "Portal key fields cannot be updated"
+		}
 	}
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
-	if err != nil || len(bodyBytes) == 0 {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
+	if !present.dataPlaneI1 {
+		return ""
+	}
+	if cfg.VPNDataPlaneI1Protocol == "" {
+		return "invalid vpn_data_plane_i1_protocol: expected sip or dns"
+	}
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func decodeVPNConfigUpdateBody(r *http.Request) (models.VPNConfig, vpnConfigPresence, string) {
+	if r.Body == nil {
+		return models.VPNConfig{}, vpnConfigPresence{}, "Request body is empty"
 	}
 	defer r.Body.Close()
 
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
+	if err != nil || len(bodyBytes) == 0 {
+		return models.VPNConfig{}, vpnConfigPresence{}, "Invalid request body"
+	}
+
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-	for name := range raw {
-		if strings.EqualFold(name, "server_private_key") || strings.EqualFold(name, "server_public_key") ||
-			strings.EqualFold(name, "ServerPrivateKey") || strings.EqualFold(name, "ServerPublicKey") {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", "Portal key fields cannot be updated")
-			return
-		}
+		return models.VPNConfig{}, vpnConfigPresence{}, "Invalid request body"
 	}
 
 	var cfg models.VPNConfig
 	if err := json.Unmarshal(bodyBytes, &cfg); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
+		return models.VPNConfig{}, vpnConfigPresence{}, "Invalid request body"
 	}
 
 	present := vpnConfigPresence{
@@ -767,34 +779,43 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		enableMultiProtocolBackends: hasRawKey(raw, "enable_multi_protocol_backends"),
 		pbrEnabled:                  hasRawKey(raw, "pbr_enabled"),
 	}
-
-	ctx := r.Context()
-	if present.dataPlaneI1 {
-		if cfg.VPNDataPlaneI1Protocol == "" {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", "invalid vpn_data_plane_i1_protocol: expected sip or dns")
-			return
-		}
-		if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-			return
-		}
+	if errMsg := validateVPNConfigUpdateFields(raw, cfg, present); errMsg != "" {
+		return models.VPNConfig{}, vpnConfigPresence{}, errMsg
 	}
+
+	return cfg, present, ""
+}
+
+func (h *Handlers) persistVPNConfigUpdate(ctx context.Context, cfg *models.VPNConfig, present vpnConfigPresence) error {
 	if h.vpnSvc != nil {
 		if current, err := h.vpnSvc.GetConfig(ctx); err == nil && current != nil {
-			mergeVPNConfig(current, &cfg, present)
+			mergeVPNConfig(current, cfg, present)
 		}
-		if err := h.vpnSvc.UpdateConfig(ctx, &cfg); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
-			return
+		return h.vpnSvc.UpdateConfig(ctx, cfg)
+	}
+	if h.db != nil {
+		current, err := h.db.GetVPNConfig(ctx)
+		if err != nil {
+			return err
 		}
-	} else if h.db != nil {
-		if current, err := h.db.GetVPNConfig(ctx); err == nil && current != nil {
-			mergeVPNConfig(current, &cfg, present)
+		if current != nil {
+			mergeVPNConfig(current, cfg, present)
 		}
-		if err := h.db.SaveVPNConfig(ctx, &cfg); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
-			return
-		}
+		return h.db.SaveVPNConfig(ctx, cfg)
+	}
+	return nil
+}
+
+// VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
+func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request) {
+	cfg, present, errMsg := decodeVPNConfigUpdateBody(r)
+	if errMsg != "" {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", errMsg)
+		return
+	}
+	if err := h.persistVPNConfigUpdate(r.Context(), &cfg, present); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to update VPN configuration")
+		return
 	}
 
 	h.audit(r, "vpn.config_update", map[string]any{"algorithm": string(cfg.Algorithm), "listen_port": cfg.ListenPort, "public_endpoint": cfg.PublicEndpoint})
