@@ -20,15 +20,16 @@ func AllocationKey(clientID, clientPubKey string) string {
 	return strings.TrimSpace(clientID)
 }
 
-// validateAllocationIdentity refuses an explicit client identifier that names a
+// ValidateAllocationIdentity refuses an explicit client identifier that names a
 // different client than the supplied public key.
 //
 // AllocationKey would otherwise store the row under the public key and drop the
 // explicit identifier, so a later release made through that identifier would
 // match no row and leave the address reserved with no trace of why. The conflict
 // is reported at the boundary that accepted the identifier (the client-add path)
-// rather than silently resolved there.
-func validateAllocationIdentity(clientID, clientPubKey string) error {
+// rather than silently resolved there; the persistence layer applies the same
+// rule so an unequal pair can never be stored under one identity.
+func ValidateAllocationIdentity(clientID, clientPubKey string) error {
 	explicitID := strings.TrimSpace(clientID)
 	pubKey := strings.TrimSpace(clientPubKey)
 	if explicitID == "" || pubKey == "" || explicitID == pubKey {
@@ -52,7 +53,7 @@ func resolveEffectiveClientID(clientParams map[string]any, clientPubKey string) 
 	if cid, ok := clientParams["client_id"].(string); ok {
 		explicitID = cid
 	}
-	if err := validateAllocationIdentity(explicitID, clientPubKey); err != nil {
+	if err := ValidateAllocationIdentity(explicitID, clientPubKey); err != nil {
 		return "", err
 	}
 	return AllocationKey(explicitID, clientPubKey), nil

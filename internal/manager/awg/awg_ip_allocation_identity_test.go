@@ -27,7 +27,7 @@ func TestAllocationKey(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				if err := validateAllocationIdentity(tc.clientID, tc.clientPub); err != nil {
+				if err := ValidateAllocationIdentity(tc.clientID, tc.clientPub); err != nil {
 					t.Fatalf("consistent identities were refused: %v", err)
 				}
 				if key := AllocationKey(tc.clientID, tc.clientPub); key != tc.wantKey {
@@ -43,7 +43,7 @@ func TestAllocationKey(t *testing.T) {
 			{clientID: "  portal-user-1  ", clientPub: " pub-key "},
 		}
 		for _, tc := range cases {
-			err := validateAllocationIdentity(tc.clientID, tc.clientPub)
+			err := ValidateAllocationIdentity(tc.clientID, tc.clientPub)
 			if err == nil {
 				t.Fatalf("conflicting identities %q/%q were accepted", tc.clientID, tc.clientPub)
 			}

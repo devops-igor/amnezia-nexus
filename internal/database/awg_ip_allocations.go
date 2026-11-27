@@ -49,25 +49,27 @@ func (d *DB) AllocateAWGClientIP(
 
 	clientID = strings.TrimSpace(clientID)
 	clientPubKey = strings.TrimSpace(clientPubKey)
+	// Enforce the same identity rule the client-add path applies: an explicit
+	// identifier naming a different client than the public key is refused before
+	// any row is read or written, so the pair can never be stored under one
+	// identity while the other is silently dropped.
+	if err := awg.ValidateAllocationIdentity(clientID, clientPubKey); err != nil {
+		return "", err
+	}
 	// The row is stored under the single identity rule that release also uses
 	// (public key when supplied, otherwise the explicit client identifier).
 	storedClientID := awg.AllocationKey(clientID, clientPubKey)
 
 	const maxRetries = 50
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// 1. Idempotency: Check if clientID or clientPubKey already has an active allocation on this server
-		existingIP, err := d.findExistingAllocation(ctx, serverID, clientID, clientPubKey)
+		// 1. Idempotency: reuse the active allocation already stored for the
+		// canonical identity on this server.
+		existingIP, reuse, err := d.reusableAllocation(ctx, serverID, storedClientID)
 		if err != nil {
 			return "", err
 		}
-		if existingIP != "" {
-			claimed, claimErr := d.isAllocationClaimedByOther(ctx, serverID, existingIP, clientID, clientPubKey)
-			if claimErr != nil {
-				return "", claimErr
-			}
-			if !claimed {
-				return existingIP, nil
-			}
+		if reuse {
+			return existingIP, nil
 		}
 
 		// 2. Query all existing allocated IPs for this server
@@ -105,31 +107,39 @@ func (d *DB) AllocateAWGClientIP(
 	return "", fmt.Errorf("failed to allocate AWG IP after %d attempts due to collisions", maxRetries)
 }
 
-func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, clientID, clientPubKey string) (string, error) {
-	clientID = strings.TrimSpace(clientID)
-	clientPubKey = strings.TrimSpace(clientPubKey)
-	if clientID == "" && clientPubKey == "" {
+// reusableAllocation returns the active IP already allocated to the canonical
+// identity on this server when the caller may keep it. reuse is false when there
+// is no row for this identity, or when the row found is claimed by another
+// identity, so the caller allocates a fresh address instead.
+func (d *DB) reusableAllocation(ctx context.Context, serverID int64, storedClientID string) (string, bool, error) {
+	existingIP, err := d.findExistingAllocation(ctx, serverID, storedClientID)
+	if err != nil {
+		return "", false, err
+	}
+	if existingIP == "" {
+		return "", false, nil
+	}
+	claimed, err := d.isAllocationClaimedByOther(ctx, serverID, existingIP, storedClientID)
+	if err != nil {
+		return "", false, err
+	}
+	return existingIP, !claimed, nil
+}
+
+// findExistingAllocation returns the active IP already allocated to the canonical
+// identity on this server. It searches by that single identity only: the caller
+// has already refused an explicit identifier that disagrees with the public key,
+// so there is exactly one identity a row could be stored under.
+func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, storedClientID string) (string, error) {
+	if storedClientID == "" {
 		return "", nil
 	}
 
 	var existingIP string
-	var err error
-	if clientID != "" && clientPubKey != "" && clientID != clientPubKey {
-		err = d.sqlDB.QueryRowContext(ctx,
-			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?) LIMIT 1",
-			serverID, clientID, clientPubKey,
-		).Scan(&existingIP)
-	} else {
-		lookupID := clientPubKey
-		if lookupID == "" {
-			lookupID = clientID
-		}
-		err = d.sqlDB.QueryRowContext(ctx,
-			"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND client_id = ? LIMIT 1",
-			serverID, lookupID,
-		).Scan(&existingIP)
-	}
-
+	err := d.sqlDB.QueryRowContext(ctx,
+		"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND client_id = ? LIMIT 1",
+		serverID, storedClientID,
+	).Scan(&existingIP)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -139,25 +149,35 @@ func (d *DB) findExistingAllocation(ctx context.Context, serverID int64, clientI
 	return existingIP, nil
 }
 
-func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip, clientID, clientPubKey string) (bool, error) {
-	clientID = strings.TrimSpace(clientID)
-	clientPubKey = strings.TrimSpace(clientPubKey)
+// ipLeaseOwner reports whether ip is currently allocated on this server and, if
+// so, which identity holds it. It is the shared read behind both the adoption
+// check and the allocation ownership check.
+func (d *DB) ipLeaseOwner(ctx context.Context, serverID int64, ip string) (bool, string, error) {
 	var ownerID string
 	err := d.sqlDB.QueryRowContext(ctx,
 		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
 		serverID, ip,
 	).Scan(&ownerID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return false, "", nil
 	}
+	if err != nil {
+		return false, "", err
+	}
+	return true, ownerID, nil
+}
+
+// isAllocationClaimedByOther reports whether ip is held on this server by an
+// identity other than the canonical one.
+func (d *DB) isAllocationClaimedByOther(ctx context.Context, serverID int64, ip, storedClientID string) (bool, error) {
+	found, ownerID, err := d.ipLeaseOwner(ctx, serverID, ip)
 	if err != nil {
 		return false, fmt.Errorf("failed to verify AWG IP ownership: %w", err)
 	}
-	ownerID = strings.TrimSpace(ownerID)
-	if (clientID != "" && ownerID == clientID) || (clientPubKey != "" && ownerID == clientPubKey) {
+	if !found {
 		return false, nil
 	}
-	return true, nil
+	return strings.TrimSpace(ownerID) != storedClientID, nil
 }
 
 func (d *DB) fetchAllocatedIPs(ctx context.Context, serverID int64) ([]string, error) {
@@ -208,10 +228,12 @@ func mergeUsedIPs(usedConfigIPs, allocatedIPs []string) []string {
 //
 // clientID is the allocation identity produced by awg.AllocationKey (the public
 // key when one exists), i.e. exactly the identity AllocateAWGClientIP stored. A
-// release that matches no row leaves the address reserved, so it is reported via
-// the structured log instead of returning silently; it is not an error because a
-// caller releasing an already-released or mismatched pair must not fail the
-// surrounding removal.
+// release that matches no row leaves the address reserved, so it is reported
+// rather than swallowed: a row still held under another identity is logged at
+// ERROR (visible even when LOG_LEVEL=ERROR filters warnings) and an absent row --
+// indistinguishable from an intentional repeat release -- at INFO. It is not an
+// error because a caller releasing an already-released or mismatched pair must
+// not fail the surrounding removal.
 func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
@@ -250,16 +272,64 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 		return fmt.Errorf("failed to check rows affected for AWG client IP release: %w", err)
 	}
 	if rows == 0 {
-		// The identity this release was made through matches no stored allocation:
-		// the row is held under another identity (or never existed), so the address
-		// stays reserved. Report it rather than returning as if it had been freed.
-		slog.Warn("AWG IP release matched no allocation row: the address remains reserved",
+		d.reportReleaseMiss(ctx, serverID, clientID, ip)
+	}
+	return nil
+}
+
+// reportReleaseMiss reports a release whose DELETE matched no row.
+//
+// Two different situations produce a zero-row release and they must not be
+// described as the same thing:
+//   - A row for the address still exists under a different identity. That is a
+//     genuine miss: the address is still reserved and the release did nothing.
+//     It is reported at ERROR so it survives the documented LOG_LEVEL=ERROR
+//     configuration, which is exactly the silent-reserved-address failure this
+//     diagnostic exists to surface.
+//   - No row exists at all. That is indistinguishable from an intentional
+//     repeat release (already freed), so it is reported at INFO and never claims
+//     the address is still reserved; the caller still gets the idempotent nil.
+//
+// The return value stays nil in both cases so a retry is never turned into a
+// failure; observability, not control flow, is what changes with the level.
+func (d *DB) reportReleaseMiss(ctx context.Context, serverID int64, clientID, ip string) {
+	if ip == "" {
+		// Released by identity only and nothing matched: no allocation row exists
+		// for this client. Nothing was found, so nothing is claimed to be held.
+		slog.Info("AWG IP release matched no allocation row: no allocation exists for this client identity",
+			"server_id", serverID,
+			"client_id", clientID,
+		)
+		return
+	}
+
+	var ownerID string
+	err := d.sqlDB.QueryRowContext(ctx,
+		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
+		serverID, ip,
+	).Scan(&ownerID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		slog.Info("AWG IP release matched no allocation row: no allocation exists for this address",
 			"server_id", serverID,
 			"client_id", clientID,
 			"ip", ip,
 		)
+	case err != nil:
+		slog.Warn("AWG IP release matched no allocation row and the surviving holder could not be checked",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
+			"error", err,
+		)
+	default:
+		slog.Error("AWG IP release matched no allocation row: the address is still held by another identity",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
+			"owner_id", strings.TrimSpace(ownerID),
+		)
 	}
-	return nil
 }
 
 // TransferAWGClientIPLease transfers the allocation record to a new client ID or public key
@@ -302,6 +372,11 @@ func (d *DB) AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID
 	clientID = strings.TrimSpace(clientID)
 	clientPubKey = strings.TrimSpace(clientPubKey)
 	ip = strings.TrimSpace(ip)
+	// Same identity rule as the client-add path and AllocateAWGClientIP: refuse
+	// before reading, adopting or updating anything when the pair disagrees.
+	if err := awg.ValidateAllocationIdentity(clientID, clientPubKey); err != nil {
+		return false, err
+	}
 	if ip == "" || net.ParseIP(ip) == nil {
 		return false, nil
 	}
@@ -310,49 +385,31 @@ func (d *DB) AdoptAWGClientIPLease(ctx context.Context, serverID int64, clientID
 		return false, nil
 	}
 
-	// Check if this IP is already allocated on this server
-	var ownerID string
-	err := d.sqlDB.QueryRowContext(ctx,
-		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
-		serverID, ip,
-	).Scan(&ownerID)
-	if err == nil {
-		ownerID = strings.TrimSpace(ownerID)
-		if (storedClientID != "" && ownerID == storedClientID) || (clientID != "" && ownerID == clientID) || (clientPubKey != "" && ownerID == clientPubKey) {
-			return true, nil
-		}
-		return false, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	found, ownerID, err := d.ipLeaseOwner(ctx, serverID, ip)
+	if err != nil {
 		return false, fmt.Errorf("failed to check existing IP allocation for adoption: %w", err)
+	}
+	if found {
+		return strings.TrimSpace(ownerID) == storedClientID, nil
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	return d.adoptClientLease(ctx, serverID, storedClientID, ip, now)
+}
 
-	// Check if this client already has an active allocation on this server
-	var existingClientIP string
-	err = d.sqlDB.QueryRowContext(ctx,
-		"SELECT ip FROM awg_ip_allocations WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?) LIMIT 1",
-		serverID, storedClientID, clientID,
-	).Scan(&existingClientIP)
-	if err == nil {
-		if existingClientIP == ip {
-			return true, nil
-		}
-		// If the client currently has a different active allocation on this server that was marked 'allocated',
-		// but ip is unallocated to any other client: update the old allocation to status = 'superseded' and activate ip.
-		_, err = d.sqlDB.ExecContext(ctx,
-			"UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE server_id = ? AND status = 'allocated' AND (client_id = ? OR client_id = ?)",
-			now, serverID, storedClientID, clientID,
-		)
-		if err != nil {
-			return false, fmt.Errorf("failed to supersede existing allocation for client: %w", err)
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("failed to check client allocation for adoption: %w", err)
+// adoptClientLease upserts ip as an allocated lease for the identity and
+// supersedes any other active allocation that identity holds on the server. The
+// caller has already established that ip is not allocated to anyone, so any
+// active row for this identity belongs to a different address.
+func (d *DB) adoptClientLease(ctx context.Context, serverID int64, storedClientID, ip, now string) (bool, error) {
+	if _, err := d.sqlDB.ExecContext(ctx,
+		"UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE server_id = ? AND status = 'allocated' AND client_id = ?",
+		now, serverID, storedClientID,
+	); err != nil {
+		return false, fmt.Errorf("failed to supersede existing allocation for client: %w", err)
 	}
 
-	_, err = d.sqlDB.ExecContext(ctx,
+	_, err := d.sqlDB.ExecContext(ctx,
 		`INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at)
 		VALUES (?, ?, ?, 'allocated', ?, ?)
 		ON CONFLICT(server_id, ip) DO UPDATE SET

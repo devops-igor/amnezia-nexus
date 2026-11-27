@@ -40,16 +40,21 @@ type SSHProvider interface {
 //
 // Identity contract (see AllocationKey): a row is stored under exactly one
 // identity -- the client public key when supplied, otherwise the explicit client
-// identifier -- and ReleaseAWGClientIP must be called with that same identity. A
-// release matching no row is reported rather than swallowed, and an explicit
-// client_id naming a different client than the public key is refused, not dropped.
+// identifier -- and ReleaseAWGClientIP must be called with that same identity. An
+// explicit client_id naming a different client than the public key is refused at
+// the client-add path and again at every persistence entry point (allocate and
+// adopt), so an unequal pair is never stored under one identity and dropped. A
+// release matching a row held under another identity is reported at ERROR; a
+// release that finds no row is reported at INFO and never claims the address is
+// still reserved.
 //
 // Contract:
 //   - AllocateAWGClientIP:
 //   - clientID: explicit client identifier supplied by the caller, if any.
 //   - clientPubKey: WireGuard / AmneziaWG public key for the peer.
-//   - The allocation is idempotent: if an allocation already exists for either clientID or
-//     clientPubKey on serverID, the previously allocated IP is retained and returned.
+//   - The allocation is idempotent: if an allocation already exists for the
+//     resolved identity on serverID, the previously allocated IP is retained and
+//     returned.
 //   - Concurrent allocations on the same server are synchronized and serialized to guarantee
 //     zero IP collisions within the subnet.
 //   - ReleaseAWGClientIP:
