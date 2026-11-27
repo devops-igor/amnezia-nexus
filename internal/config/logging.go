@@ -7,7 +7,7 @@ import (
 
 // parseLogLevel maps a documented LOG_LEVEL value (README: DEBUG, INFO, WARN,
 // ERROR) to a slog.Level. Any other value falls back to INFO, the documented
-// default, so an unrecognised setting cannot silently hide more than the default.
+// default, so an unrecognized setting cannot silently hide more than the default.
 func parseLogLevel(name string) slog.Level {
 	switch name {
 	case "DEBUG":

@@ -230,7 +230,7 @@ func mergeUsedIPs(usedConfigIPs, allocatedIPs []string) []string {
 // key when one exists), i.e. exactly the identity AllocateAWGClientIP stored. A
 // release that matches no row leaves whatever the allocator still excludes in
 // place, so it is described rather than swallowed: a zero match is classified
-// against the reservations the pool honours (any status except 'released'), and
+// against the reservations the pool honors (any status except 'released'), and
 // a surviving reservation is logged at ERROR so LOG_LEVEL=ERROR cannot hide it.
 // Only a release that finds no reservation at all is reported, at INFO, where it
 // cannot be mistaken for a still-held address. It is not an error because a
@@ -280,7 +280,7 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 }
 
 // releaseMiss describes what a zero-row release found still in place. It is read
-// against the reservations the allocator actually honours, not against the exact
+// against the reservations the allocator actually honors, not against the exact
 // predicate that failed: fetchAllocatedIPs excludes an address for every status
 // except 'released', so a lease superseded by an ordinary adoption reserves its
 // address exactly like an allocated one.
