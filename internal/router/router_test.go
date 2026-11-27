@@ -320,7 +320,7 @@ func TestRouterEndpointDispatch(t *testing.T) {
 		{http.MethodPost, "/api/vpn/backends/1/delete", nil, nil, http.StatusUnauthorized},
 		{http.MethodGet, "/api/vpn/tunnels", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/config", adminSession, nil, http.StatusOK},
-		{http.MethodGet, "/api/my/connections", adminSession, nil, http.StatusOK},
+		{http.MethodGet, "/api/connections", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/my-connection", adminSession, nil, http.StatusOK},
 	}
 
@@ -576,11 +576,10 @@ func TestRouterServersRoleBasedAccess(t *testing.T) {
 	})
 }
 
-func TestLegacyMyConnectionsRoutesParity(t *testing.T) {
+func TestCanonicalConnectionsRoutes(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
 	ctx := context.Background()
 
-	// Seed regular user and connection
 	_, err := db.CreateUser(ctx, &models.User{
 		ID:        "user-legacy-1",
 		Username:  "legacy_user",
@@ -592,30 +591,22 @@ func TestLegacyMyConnectionsRoutesParity(t *testing.T) {
 		t.Fatalf("failed to create user: %v", err)
 	}
 
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		ID:        "conn-legacy-1",
-		UserID:    "user-legacy-1",
-		ServerID:  1,
-		Protocol:  "awg",
-		ClientID:  "client-1",
-		Name:      "Legacy-Conn",
-		CreatedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create connection 1: %v", err)
-	}
-
-	_, err = db.CreateConnection(ctx, &models.UserConnection{
-		ID:        "conn-legacy-2",
-		UserID:    "user-legacy-1",
-		ServerID:  1,
-		Protocol:  "awg",
-		ClientID:  "client-2",
-		Name:      "Legacy-Conn-2",
-		CreatedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create connection 2: %v", err)
+	for _, tc := range []struct{ id, clientID, name string }{
+		{"conn-legacy-1", "client-1", "Legacy-Conn"},
+		{"conn-legacy-2", "client-2", "Legacy-Conn-2"},
+	} {
+		_, err = db.CreateConnection(ctx, &models.UserConnection{
+			ID:        tc.id,
+			UserID:    "user-legacy-1",
+			ServerID:  1,
+			Protocol:  "awg",
+			ClientID:  tc.clientID,
+			Name:      tc.name,
+			CreatedAt: time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("failed to create connection %s: %v", tc.id, err)
+		}
 	}
 
 	r := NewRouter(cfg, db, nil)
@@ -627,90 +618,103 @@ func TestLegacyMyConnectionsRoutesParity(t *testing.T) {
 	})
 	userCtx = middleware.WithCSRFToken(userCtx, "csrf-token-123")
 
-	// 1. GET /api/my/connections and /api/connections
-	for _, path := range []string{"/api/my/connections", "/api/my/connections/", "/api/connections", "/api/connections/"} {
-		t.Run("GET "+path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(userCtx)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code != http.StatusOK {
-				t.Errorf("expected 200 OK for GET %s, got %d (body: %s)", path, w.Code, w.Body.String())
-			}
-		})
-	}
-
-	// 2. POST /api/my/connections/add vs POST /api/connections/add
-	for _, path := range []string{"/api/my/connections/add", "/api/connections/add"} {
-		t.Run("POST "+path, func(t *testing.T) {
-			// Sending empty body -> should return 400 Bad Request (not 404 Not Found)
-			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)).WithContext(userCtx)
-			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-123"})
-			req.Header.Set(middleware.CSRFHeaderName, "csrf-token-123")
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code == http.StatusNotFound {
-				t.Errorf("got unexpected 404 Not Found for POST %s", path)
-			}
-			if w.Code != http.StatusBadRequest {
-				t.Errorf("expected 400 Bad Request for empty add request on %s, got %d", path, w.Code)
-			}
-		})
-	}
-
-	// 3. POST /api/my/connections/{id}/rename vs POST /api/connections/{id}/rename
-	for _, path := range []string{"/api/my/connections/conn-legacy-1/rename", "/api/connections/conn-legacy-1/rename"} {
-		t.Run("POST "+path, func(t *testing.T) {
-			body := strings.NewReader(`{"name":"Renamed-Legacy"}`)
-			req := httptest.NewRequest(http.MethodPost, path, body).WithContext(userCtx)
-			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-123"})
-			req.Header.Set(middleware.CSRFHeaderName, "csrf-token-123")
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code == http.StatusNotFound {
-				t.Errorf("got unexpected 404 Not Found for POST %s", path)
-			}
-			if w.Code != http.StatusOK {
-				t.Errorf("expected 200 OK for rename on %s, got %d (body: %s)", path, w.Code, w.Body.String())
-			}
-		})
-	}
-
-	// 4. POST /api/my/connections/{id}/config and POST /api/connections/{id}/config
-	// For server_id=1 without server in DB, should return 404 Connection/Server not found from handler logic, NOT 404 from unrouted path
-	for _, path := range []string{
-		"/api/my/connections/conn-legacy-1/config",
-		"/api/connections/conn-legacy-1/config",
-	} {
-		t.Run("POST "+path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, path, nil).WithContext(userCtx)
-			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-123"})
-			req.Header.Set(middleware.CSRFHeaderName, "csrf-token-123")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if !strings.Contains(w.Body.String(), "not_found") {
-				t.Errorf("expected handler JSON error for %s, got %d (body: %s)", path, w.Code, w.Body.String())
-			}
-		})
-	}
-
-	// 5. Both delete routes fail closed when their remote server is missing.
 	for _, tc := range []struct {
-		name string
-		path string
+		method      string
+		path        string
+		body        string
+		wantCode    int
+		wantBodySub string
 	}{
-		{"Legacy path", "/api/my/connections/conn-legacy-1/delete"},
-		{"Standard path", "/api/connections/conn-legacy-2/delete"},
+		{http.MethodGet, "/api/connections", "", http.StatusOK, "connections"},
+		{http.MethodGet, "/api/connections/", "", http.StatusOK, "connections"},
+		{http.MethodPost, "/api/connections/add", `{}`, http.StatusBadRequest, ""},
+		{http.MethodPost, "/api/connections/conn-legacy-1/rename", `{"name":"Renamed-Canonical"}`, http.StatusOK, ""},
+		{http.MethodPost, "/api/connections/conn-legacy-1/config", "", http.StatusNotFound, "not_found"},
+		{http.MethodPost, "/api/connections/conn-legacy-2/delete", "", http.StatusInternalServerError, "remote_removal_failed"},
 	} {
-		t.Run("POST "+tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, tc.path, nil).WithContext(userCtx)
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)).WithContext(userCtx)
 			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-123"})
 			req.Header.Set(middleware.CSRFHeaderName, "csrf-token-123")
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
-			if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "remote_removal_failed") {
-				t.Errorf("expected fail-closed remote_removal_failed on %s, got %d (body: %s)", tc.path, w.Code, w.Body.String())
+			if w.Code != tc.wantCode || (tc.wantBodySub != "" && !strings.Contains(w.Body.String(), tc.wantBodySub)) {
+				t.Errorf("%s %s = %d (body: %s), want %d containing %q", tc.method, tc.path, w.Code, w.Body.String(), tc.wantCode, tc.wantBodySub)
+			}
+		})
+	}
+}
+
+func TestRetiredLegacyRouteAliasesReturn404(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	ctx := context.Background()
+
+	_, err := db.CreateUser(ctx, &models.User{
+		ID:        "user-legacy-1",
+		Username:  "legacy_user",
+		Role:      models.RoleUser,
+		Enabled:   true,
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	r := NewRouter(cfg, db, nil)
+
+	userSession := &models.SessionData{UserID: "user-legacy-1", Username: "legacy_user", Role: models.RoleUser}
+	adminSession := &models.SessionData{UserID: "admin-id", Username: "admin", Role: models.RoleAdmin}
+
+	retiredRoutes := []struct {
+		method  string
+		path    string
+		session *models.SessionData
+	}{
+		{http.MethodGet, "/api/my/connections", userSession},
+		{http.MethodGet, "/api/my/connections/", userSession},
+		{http.MethodPost, "/api/my/connections/add", userSession},
+		{http.MethodPost, "/api/my/connections/conn-legacy-1/config", userSession},
+		{http.MethodPost, "/api/my/connections/conn-legacy-1/rename", userSession},
+		{http.MethodPost, "/api/my/connections/conn-legacy-1/delete", userSession},
+		{http.MethodPost, "/add", adminSession},
+		{http.MethodPost, "/confirm-fingerprint", adminSession},
+		{http.MethodPost, "/1/clear", adminSession},
+		{http.MethodPost, "/1/delete", adminSession},
+		{http.MethodPost, "/1/reboot", adminSession},
+		{http.MethodPost, "/1/stats", adminSession},
+		{http.MethodPost, "/1/check", adminSession},
+		{http.MethodPost, "/1/install", adminSession},
+		{http.MethodPost, "/1/uninstall", adminSession},
+		{http.MethodPost, "/1/container/toggle", adminSession},
+		{http.MethodPost, "/1/server_config", adminSession},
+		{http.MethodPost, "/1/server_config/save", adminSession},
+		{http.MethodGet, "/1/connections", adminSession},
+		{http.MethodPost, "/1/connections/add", adminSession},
+		{http.MethodPost, "/1/connections/client-1/rotate-mimicry", adminSession},
+		{http.MethodGet, "/1/reachability", adminSession},
+		{http.MethodPost, "/1/connections/auto-trial", adminSession},
+		{http.MethodPost, "/1/connections/remove", adminSession},
+		{http.MethodPost, "/1/connections/edit", adminSession},
+		{http.MethodPost, "/1/connections/config", adminSession},
+		{http.MethodPost, "/1/connections/toggle", adminSession},
+		{http.MethodGet, "/1/awg/clients", adminSession},
+	}
+
+	for _, tc := range retiredRoutes {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			reqCtx := middleware.WithSession(ctx, tc.session)
+			reqCtx = middleware.WithCSRFToken(reqCtx, "csrf-token-123")
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)).WithContext(reqCtx)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-123"})
+			req.Header.Set(middleware.CSRFHeaderName, "csrf-token-123")
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusNotFound || strings.TrimSpace(w.Body.String()) != "404 page not found" {
+				t.Errorf("expected unrouted 404 Not Found for retired route %s %s, got %d (body: %q)", tc.method, tc.path, w.Code, w.Body.String())
 			}
 		})
 	}

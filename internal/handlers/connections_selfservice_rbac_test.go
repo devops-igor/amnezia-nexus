@@ -73,9 +73,7 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 
 	router := chi.NewRouter()
 	router.Post("/api/connections/add", h.UserAddConnectionHandler)
-	router.Post("/api/my/connections/add", h.UserAddConnectionHandler)
 	router.Post("/api/connections/{connection_id}/config", h.UserGetConnectionConfigHandler)
-	router.Post("/api/my/connections/{connection_id}/config", h.UserGetConnectionConfigHandler)
 	router.Post("/api/connections/{connection_id}/rename", h.UserRenameConnectionHandler)
 	router.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
 	router.Post("/api/users/{user_id}/share/setup", h.SetupUserShareHandler)
@@ -137,8 +135,8 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	}{
 		{name: "vless canonical", protocol: models.ProtocolVLESS, path: "/api/connections/add", isVLESS: true},
 		{name: "naive canonical", protocol: models.ProtocolNaive, path: "/api/connections/add", isVLESS: false},
-		{name: "vless legacy alias", protocol: "vless-reality", path: "/api/my/connections/add", isVLESS: true},
-		{name: "naive legacy alias", protocol: "naiveproxy", path: "/api/my/connections/add", isVLESS: false},
+		{name: "vless legacy alias", protocol: "vless-reality", path: "/api/connections/add", isVLESS: true},
+		{name: "naive legacy alias", protocol: "naiveproxy", path: "/api/connections/add", isVLESS: false},
 	}
 	for _, tc := range addCases {
 		for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport, models.RoleAdmin} {

@@ -182,7 +182,7 @@ The existing platform coverage matrix is retained below, with eight read-only di
 | `test_connections.py` | `test_connection_config_and_qr` | Server Detail / Config Modal & QR View | `/api/servers/`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/connections`<br>`/api/servers/{server_id}/connections/config`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>GET<br>POST<br>GET<br>POST<br>POST |
 | `test_connections.py` | `test_toggle_connection` | Server Detail / Connection Actions | `/api/servers/`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/connections`<br>`/api/servers/{server_id}/connections/toggle`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>GET<br>POST<br>GET<br>POST<br>POST |
 | `test_connections.py` | `test_delete_connection` | Server Detail / Connection Actions | `/api/users/add`<br>`/api/users/?size=100`<br>`/api/servers/`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/connections`<br>`/api/servers/{server_id}/connections/remove`<br>`/api/users/{user_id}/delete` | POST<br>GET<br>GET<br>POST<br>GET<br>POST<br>POST |
-| `test_my_connections.py` | `test_user_login_and_list` | `/login`, `/logout`, `/my` | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/my/connections` | POST<br>POST<br>GET<br>GET |
+| `test_my_connections.py` | `test_user_login_and_list` | `/login`, `/logout`, `/my` | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/connections` | POST<br>POST<br>GET<br>GET |
 | `test_my_connections.py` | `test_create_connection` | `/my` (Self-Service Add Connection) | `/api/servers/`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/delete` | GET<br>POST<br>GET<br>POST<br>POST |
 | `test_my_connections.py` | `test_view_connection_config` | `/my` (View Config Modal) | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/servers/`<br>`/api/users/{user_id}/connections/add`<br>`/api/users/{user_id}/connections`<br>`/api/servers/{server_id}/connections/config`<br>`/api/users/{user_id}/delete` | POST<br>POST<br>GET<br>GET<br>POST<br>GET<br>POST<br>POST |
 | `test_my_connections.py` | `test_role_access_denied` | `/login`, `/logout`, `/settings` (Admin Guard) | `/api/auth/login`<br>`/api/users/add`<br>`/api/users/?size=100`<br>`/api/settings` | POST<br>POST<br>GET<br>GET |
@@ -244,7 +244,7 @@ The E2E test suite exercises 26 distinct REST API routes across the platform, in
 - `POST /api/users/{user_id}/share/setup` - Enables or disables web share links and configures share password protection
 
 ### 6. User Self-Service Portal (1 endpoint)
-- `GET /api/my/connections` - Fetches authenticated user's self-service connections and quota limits
+- `GET /api/connections` - Fetches authenticated user's self-service connections and quota limits
 
 ### 7. System Settings & Maintenance (3 endpoints)
 - `GET /api/settings` - Retrieves global panel configuration (appearance, security, limits)

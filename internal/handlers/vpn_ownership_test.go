@@ -900,8 +900,8 @@ func TestUserDeleteConnectionHandler_SharedWithAnotherEnabledUser(t *testing.T) 
 		}
 	}
 	r := chi.NewRouter()
-	r.Post("/api/my/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
-	req := httptest.NewRequest(http.MethodPost, "/api/my/connections/alice/delete", nil)
+	r.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
+	req := httptest.NewRequest(http.MethodPost, "/api/connections/alice/delete", nil)
 	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

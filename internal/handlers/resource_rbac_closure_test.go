@@ -349,7 +349,7 @@ func TestResourceRBACClosureMyConnections(t *testing.T) {
 		createResourceRBACConnection(t, db, "my-awg-"+string(role), sess.UserID, serverID, models.ProtocolAWG, "awg-secret")
 
 		t.Run(string(role), func(t *testing.T) {
-			w := resourceRBACRequest(t, setupFullConnectionsRouter(h), http.MethodGet, "/api/my/connections", sess, nil)
+			w := resourceRBACRequest(t, setupFullConnectionsRouter(h), http.MethodGet, "/api/connections", sess, nil)
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
 			}
