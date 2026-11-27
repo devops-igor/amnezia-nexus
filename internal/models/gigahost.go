@@ -25,7 +25,9 @@ type GigahostOrder struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 
 	// LiveRepairedAt is the affirmative inventory observation that contradicted a
-	// recorded deletion. Nil means no repair is known, not an inferred repair.
+	// recorded deletion, recorded as the instant that observation was requested - never
+	// the moment an answer was processed, which the listing cannot speak for.
+	// Nil means no repair is known, not an inferred repair.
 	// It is internal evidence, independent of the onboarding journal and provider spelling.
 	LiveRepairedAt *time.Time `json:"-"`
 

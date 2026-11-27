@@ -169,7 +169,7 @@ func TestDeletedOrderRepairRequiresAffirmativeIdentity(t *testing.T) {
 			if err := h.db.UpdateGigahostOrder(context.Background(), order); err != nil {
 				t.Fatal(err)
 			}
-			_, spoke := h.repairDeletedOrderFromInventory(context.Background(), []gigahost.ServerInfo{test.server}, test.known, order)
+			_, spoke := h.repairDeletedOrderFromInventory(context.Background(), []gigahost.ServerInfo{test.server}, test.known, order, time.Now().UTC())
 			if spoke != test.want {
 				t.Fatalf("repair=%t want %t", spoke, test.want)
 			}

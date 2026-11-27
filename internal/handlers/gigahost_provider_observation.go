@@ -123,6 +123,12 @@ func (h *Handlers) gigahostOrderObservations(
 		observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
 
+	// The inventory answer describes the account, and it can only be evidence about the
+	// instant this read was requested. Nothing that happens later is answered by it -
+	// including a removal the provider performs while the remaining reads of this same
+	// response are in flight - so this instant, not the moment an answer is applied, is
+	// what a repair recorded from this listing is stamped with.
+	inventoryObservedAt := time.Now().UTC()
 	servers, serversErr := client.GetServers(ctx)
 	inventoryKnown := serversErr == nil
 	if !inventoryKnown {
@@ -143,14 +149,14 @@ func (h *Handlers) gigahostOrderObservations(
 	const maxDeployQueries = 10
 	for i := range orders {
 		if isTerminalStatus(orders[i].Status) {
-			if observation, spoke := h.repairDeletedOrderFromInventory(ctx, servers, inventoryKnown, &orders[i]); spoke {
+			if observation, spoke := h.repairDeletedOrderFromInventory(ctx, servers, inventoryKnown, &orders[i], inventoryObservedAt); spoke {
 				observations[orders[i].OrderID] = observation
 			}
 			continue
 		}
 		observedRepair := orders[i].LiveRepairedAt
 		updated := false
-		if inventoryKnown && h.refreshOrderFromServers(servers, &orders[i]) {
+		if inventoryKnown && h.refreshOrderFromServers(servers, &orders[i], inventoryObservedAt) {
 			updated = true
 		}
 		// An inventory entry naming this order with a status is a provider answer,
@@ -164,7 +170,7 @@ func (h *Handlers) gigahostOrderObservations(
 		if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
 			if isRefreshableOrderID(orders[i].OrderID) {
 				deployQueries++
-				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i], servers, inventoryKnown)
+				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i], servers, inventoryKnown, inventoryObservedAt)
 				if rowUpdated {
 					updated = true
 				}
@@ -275,6 +281,7 @@ func isDeletedStatus(status string) bool {
 // claim about the server, which is why a live listing does not contradict it.
 func (h *Handlers) gigahostDetailDeletionDeferral(
 	ctx context.Context, order *GigahostOrderRecord, inventoryKnown bool, live []gigahost.ServerInfo, detail *gigahost.DeployStatusResponse,
+	inventoryObservedAt time.Time,
 ) *GigahostProviderObservation {
 	if !isDeletedStatus(detail.Status) {
 		return nil
@@ -282,7 +289,10 @@ func (h *Handlers) gigahostDetailDeletionDeferral(
 	if inventoryKnown && inventoryListsOrderLive(live, order) {
 		// This answer contradicts even a detail newer than a previous repair.
 		// Remember this contradiction too, or the next omission would accept it again.
-		rememberContradictedDetail(order, detail)
+		// The repair is stamped with the listing's own instant, so a deletion that
+		// postdates the listing stays recordable instead of being retired by the
+		// processing time of this answer.
+		rememberContradictedDetail(order, detail, inventoryObservedAt)
 		return gigahostDeferredDeletionObservation(live, order.OrderID)
 	}
 	if !inventoryKnown ||
@@ -364,12 +374,13 @@ func panelOrderStatusFromProvider(status string) string {
 // It reports the observation and whether the inventory spoke about this row at all.
 func (h *Handlers) repairDeletedOrderFromInventory(
 	ctx context.Context, servers []gigahost.ServerInfo, inventoryKnown bool, order *GigahostOrderRecord,
+	inventoryObservedAt time.Time,
 ) (GigahostProviderObservation, bool) {
 	if !isDeletedStatus(order.Status) || !inventoryKnown || !inventoryListsOrderLive(servers, order) {
 		return GigahostProviderObservation{}, false
 	}
 	observedRepair := order.LiveRepairedAt
-	updated := h.refreshOrderFromServers(servers, order)
+	updated := h.refreshOrderFromServers(servers, order, inventoryObservedAt)
 	server, _ := inventoryServerForOrder(servers, order)
 	observation := GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: server.Status}
 	if updated {
@@ -412,7 +423,7 @@ func gigahostInventoryStatusRecorded(inventoryStatus, recordedStatus string) boo
 // (panelOrderStatusFromProvider), so an inventory read cannot put a provider spelling into
 // the shared column. The server identity and the address are always applied, because they
 // are facts about the deployment rather than a verdict on it.
-func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order *GigahostOrderRecord) bool {
+func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order *GigahostOrderRecord, inventoryObservedAt time.Time) bool {
 	s, found := inventoryServerForOrder(servers, order)
 	if !found {
 		return false
@@ -420,8 +431,12 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 	wasDeleted := isDeletedStatus(order.Status)
 	updated := applyInventoryStatus(order, s.Status)
 	if wasDeleted && isGigahostReady(s.Status) {
-		now := time.Now().UTC()
-		order.LiveRepairedAt = &now
+		// The repair is this listing, so it is stamped with the instant the listing was
+		// requested. Stamping the moment it was applied would put the evidence after any
+		// removal the provider performed while this response was in flight, and that
+		// genuinely newer deletion would then be retired as older than its own repair.
+		repair := inventoryObservedAt.UTC()
+		order.LiveRepairedAt = &repair
 	}
 	if applyInventoryIdentity(order, s) {
 		updated = true
@@ -467,7 +482,7 @@ func applyInventoryIdentity(order *GigahostOrderRecord, s gigahost.ServerInfo) b
 // read succeeded. Together they decide one thing - whether a "no such order" answer may be
 // trusted as a cancellation. An inventory that could not be read is not evidence that the
 // order is gone, so it must not be allowed to stand in for absence.
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo, inventoryKnown bool, inventoryObservedAt time.Time) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
@@ -475,14 +490,14 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 	if deployErr != nil {
 		return gigahostMissingDetailOutcome(order, deployErr, live, inventoryKnown)
 	}
-	return h.gigahostApplyDeployDetail(ctx, order, statusResp, live, inventoryKnown)
+	return h.gigahostApplyDeployDetail(ctx, order, statusResp, live, inventoryKnown, inventoryObservedAt)
 }
 
 // gigahostApplyDeployDetail records one provider detail answer on the row and reports whether
 // the row changed and what the answer established.
 func (h *Handlers) gigahostApplyDeployDetail(
 	ctx context.Context, order *GigahostOrderRecord, statusResp *gigahost.DeployStatusResponse,
-	live []gigahost.ServerInfo, inventoryKnown bool,
+	live []gigahost.ServerInfo, inventoryKnown bool, inventoryObservedAt time.Time,
 ) (bool, GigahostProviderObservation) {
 	if statusResp == nil {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationUnconfirmed}
@@ -490,7 +505,7 @@ func (h *Handlers) gigahostApplyDeployDetail(
 	updated := false
 	if status := panelOrderStatusFromProvider(statusResp.Status); status != "" && status != order.Status {
 		observedRepair := order.LiveRepairedAt
-		if deferred := h.gigahostDetailDeletionDeferral(ctx, order, inventoryKnown, live, statusResp); deferred != nil {
+		if deferred := h.gigahostDetailDeletionDeferral(ctx, order, inventoryKnown, live, statusResp, inventoryObservedAt); deferred != nil {
 			// A new contradiction changes evidence even when status stays live.
 			return order.LiveRepairedAt != observedRepair, *deferred
 		}
