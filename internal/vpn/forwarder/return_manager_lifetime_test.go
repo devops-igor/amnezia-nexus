@@ -119,6 +119,32 @@ func (fix *managerLifetimeFixture) waitDelivered(t *testing.T, want int) {
 	t.Fatalf("client writer accepted %d packets, want %d", len(fix.capture.getPackets()), want)
 }
 
+// waitAttributedDelivered waits for both the client writer capture (dev.Write)
+// and the post-write flow evidence recording (evidence.recordReturnDelivered)
+// to reach wantPackets and wantFlowDelivered respectively, and asserts the
+// matched/admitted/delivered chain on the resulting flow snapshot.
+func (fix *managerLifetimeFixture) waitAttributedDelivered(t *testing.T, label string, wantPackets int, wantFlowDelivered uint64) SessionFlow {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(fix.capture.getPackets()) >= wantPackets {
+			if flow, ok := fix.findFlow(); ok && flow.ReturnDelivered >= wantFlowDelivered {
+				if flow.ReturnMatched != wantFlowDelivered || flow.ReturnAdmitted != wantFlowDelivered || flow.ReturnDelivered != wantFlowDelivered {
+					t.Fatalf("%s return = matched %d / admitted %d / delivered %d, want %d/%d/%d",
+						label, flow.ReturnMatched, flow.ReturnAdmitted, flow.ReturnDelivered,
+						wantFlowDelivered, wantFlowDelivered, wantFlowDelivered)
+				}
+				return flow
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	flow := fix.flow(t)
+	t.Fatalf("%s: client writer accepted %d/%d packets and flow recorded %d/%d delivered",
+		label, len(fix.capture.getPackets()), wantPackets, flow.ReturnDelivered, wantFlowDelivered)
+	return SessionFlow{}
+}
+
 // TestReturnObservationFollowsManagerLifetime is the live/nil/re-attached control for the
 // reply path. Attribution follows the manager the forwarder actually holds, and a reply
 // keeps reaching the client even while no manager is configured.
@@ -133,12 +159,7 @@ func TestReturnObservationFollowsManagerLifetime(t *testing.T) {
 	if err := fix.reply(t); err != nil {
 		t.Fatalf("live reply refused: %v", err)
 	}
-	fix.waitDelivered(t, 1)
-	flow := fix.flow(t)
-	if flow.ReturnMatched != 1 || flow.ReturnAdmitted != 1 || flow.ReturnDelivered != 1 {
-		t.Fatalf("live return = matched %d / admitted %d / delivered %d, want 1/1/1",
-			flow.ReturnMatched, flow.ReturnAdmitted, flow.ReturnDelivered)
-	}
+	fix.waitAttributedDelivered(t, "live", 1, 1)
 
 	// Detached manager: nothing is attributed, and the reply is still delivered.
 	unmatched := fix.fwd.proxyReturnsUnmatched.Load()
@@ -159,10 +180,7 @@ func TestReturnObservationFollowsManagerLifetime(t *testing.T) {
 	if err := fix.reply(t); err != nil {
 		t.Fatalf("re-attached reply refused: %v", err)
 	}
-	fix.waitDelivered(t, 3)
-	if got := fix.flow(t).ReturnMatched; got != 2 {
-		t.Errorf("re-attached return matched %d, want 2", got)
-	}
+	fix.waitAttributedDelivered(t, "re-attached", 3, 2)
 }
 
 // TestReturnObservationToleratesClosedManagerStillAttached covers the real disable order:
@@ -175,7 +193,7 @@ func TestReturnObservationToleratesClosedManagerStillAttached(t *testing.T) {
 	if err := fix.reply(t); err != nil {
 		t.Fatalf("live reply refused: %v", err)
 	}
-	fix.waitDelivered(t, 1)
+	fix.waitAttributedDelivered(t, "live", 1, 1)
 
 	if err := fix.dem.Close(); err != nil {
 		t.Fatalf("close manager: %v", err)
@@ -183,12 +201,7 @@ func TestReturnObservationToleratesClosedManagerStillAttached(t *testing.T) {
 	if err := fix.reply(t); err != nil {
 		t.Fatalf("reply through a closed manager refused: %v", err)
 	}
-	fix.waitDelivered(t, 2)
-	flow := fix.flow(t)
-	if flow.ReturnMatched != 2 || flow.ReturnDelivered != 2 {
-		t.Errorf("closed-manager return = matched %d / delivered %d, want 2/2",
-			flow.ReturnMatched, flow.ReturnDelivered)
-	}
+	fix.waitAttributedDelivered(t, "closed-manager", 2, 2)
 }
 
 // TestDispatchObservationFollowsManagerLifetime is the live/nil/re-attached/closed control
