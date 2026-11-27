@@ -151,12 +151,16 @@ func TestDurablyRecordedDeletionSurvivesAHistoricalJournalStep(t *testing.T) {
 	}
 }
 
-// TestJournalOnlyFailureAndCancellationAreNotDeletions is the other direction: a status the
-// onboarding journal writes is an install outcome, not a provider deletion, so the ending
-// correction must not reach it. Both rows keep the treatment they had, and both are states
-// in which a deletion would have removed the controls, so "an action is still offered"
-// distinguishes the outcome from the deletion rather than from an empty screen.
-func TestJournalOnlyFailureAndCancellationAreNotDeletions(t *testing.T) {
+// TestJournalOnlyOutcomesAreNotProviderEndings is the other direction: a status the
+// onboarding journal writes is an install outcome, not a provider observation, so the
+// ending correction must not turn one into a deletion the provider never performed.
+//
+// A recorded failure stays the failure it is and keeps the retry its state allows,
+// because nothing has said the deployment is gone. A recorded cancellation is a final
+// decision about the order itself, so the interface presents the deletion it is and
+// offers nothing: every control it could offer would contact a deployment the cancelled
+// order no longer covers, and the status is never asked about again.
+func TestJournalOnlyOutcomesAreNotProviderEndings(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
 
@@ -190,17 +194,29 @@ func TestJournalOnlyFailureAndCancellationAreNotDeletions(t *testing.T) {
 	if len(rendered.Rows) != len(rows) {
 		t.Fatalf("both journal-only outcomes must still be listed, got %+v", rendered.Rows)
 	}
-	expected := map[string]string{rows[0].orderID: rows[0].status, rows[1].orderID: rows[1].status}
+	expected := map[string]string{
+		// A journal-only failure is setup execution, never a provider state, so the
+		// provider axis is presented as unknown rather than letting the install outcome
+		// wear the provider's name.
+		rows[0].orderID: "unknown",
+		rows[1].orderID: "deleted",
+	}
 	for _, row := range rendered.Rows {
 		status, ok := expected[row.OrderID]
 		if !ok {
 			t.Fatalf("the list returned a row this fixture did not seed: %+v", row)
 		}
-		if row.Stage == "deleted" {
-			t.Fatalf("a journal-only %s must not be promoted to a deletion: %+v", status, row)
+		if row.Stage != status {
+			t.Fatalf("a journal-only %s rendered as %q, want %q: %+v", row.OrderID, row.Stage, status, row)
+		}
+		if status == "deleted" {
+			if len(row.Actions) != 0 {
+				t.Fatalf("a cancelled order offers no action, got %+v", row)
+			}
+			continue
 		}
 		if len(row.Actions) == 0 {
-			t.Fatalf("a journal-only %s keeps the controls a deletion would remove, got %+v", status, row)
+			t.Fatalf("a journal-only failure keeps the retry a deletion would remove, got %+v", row)
 		}
 	}
 }

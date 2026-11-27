@@ -964,8 +964,13 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
+	// The server read is what can say which provider account an order belongs to when
+	// the order registered a panel server, so it is part of attributing the inventory
+	// answer below. A failed read is not fatal to the page: the association stays
+	// unknown for those rows, and an unknown association never justifies absence.
+	panelServers, _ := h.db.GetAllServers(r.Context())
 
-	observations := h.gigahostListObservations(r.Context(), r, orders)
+	observations := h.gigahostListObservations(r.Context(), r, orders, panelServers)
 	absence := h.gigahostOrderAbsenceMarks(r.Context(), orders)
 
 	h.JSONOK(w, map[string]any{

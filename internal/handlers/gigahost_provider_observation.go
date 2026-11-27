@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
@@ -114,7 +115,7 @@ func isRefreshableOrderID(orderID string) bool {
 // one actually answered, per order. The rows are modified in place exactly as before;
 // the returned map is the only new fact.
 func (h *Handlers) gigahostOrderObservations(
-	ctx context.Context, client gigahost.Client, orders []GigahostOrderRecord,
+	ctx context.Context, client gigahost.Client, orders []GigahostOrderRecord, panelServers []models.Server,
 ) map[string]GigahostProviderObservation {
 	// Every order starts at "no read was attempted", which is the truth for a terminal
 	// row and the base each successful read below overwrites.
@@ -131,6 +132,7 @@ func (h *Handlers) gigahostOrderObservations(
 	inventoryObservedAt := time.Now().UTC()
 	servers, serversErr := client.GetServers(ctx)
 	inventoryKnown := serversErr == nil
+	h.gigahostReconcileOrderExistence(ctx, client, orders, panelServers, servers, inventoryKnown, inventoryObservedAt)
 	if !inventoryKnown {
 		// An inventory that could not be read answers for nobody. Every non-terminal
 		// order it would have covered is reported unavailable, which is the one thing
@@ -152,6 +154,14 @@ func (h *Handlers) gigahostOrderObservations(
 			if observation, spoke := h.repairDeletedOrderFromInventory(ctx, servers, inventoryKnown, &orders[i], inventoryObservedAt); spoke {
 				observations[orders[i].OrderID] = observation
 			}
+			continue
+		}
+		// A recorded absence is the panel's own existence answer: the provider has
+		// already been asked, in a read that succeeded, and answered that it does not
+		// hold this order. Asking again every list read is the polling this record
+		// exists to stop, and no answer could change a durable observation except a
+		// listing that names the order, which the reconciliation above already reads.
+		if orders[i].ProviderAbsent() {
 			continue
 		}
 		observedRepair := orders[i].LiveRepairedAt
@@ -212,7 +222,7 @@ func (h *Handlers) gigahostOrderObservations(
 // could not be reached - and leaving it at not_checked would let a stale ledger row display
 // with no warning. Terminal rows keep not_checked, since re-reading them changes nothing.
 func (h *Handlers) gigahostListObservations(
-	ctx context.Context, r *http.Request, orders []GigahostOrderRecord,
+	ctx context.Context, r *http.Request, orders []GigahostOrderRecord, panelServers []models.Server,
 ) map[string]GigahostProviderObservation {
 	observations := make(map[string]GigahostProviderObservation, len(orders))
 	for i := range orders {
@@ -235,7 +245,7 @@ func (h *Handlers) gigahostListObservations(
 	if len(orders) == 0 {
 		return observations
 	}
-	return h.gigahostOrderObservations(ctx, client, orders)
+	return h.gigahostOrderObservations(ctx, client, orders, panelServers)
 }
 
 // isDeletedStatus reports the one terminal vocabulary that claims the *server* is gone,

@@ -112,6 +112,44 @@ function gigahostOrderStatusStageInFlight(stage) {
     return gigahostOrderStatusStages.indexOf(stage) !== -1;
 }
 
+/* gigahostOrderStatusPresentedStage maps a provider stage to the stage this view
+ * presents. One mapping exists, and it is about a finished order:
+ *
+ * A cancellation is the final decision about an order, so it is presented as the
+ * deletion it is rather than as a state that still awaits an operator. Nothing about a
+ * cancelled order is actionable - every control this view could offer would contact a
+ * deployment the order no longer covers - and presenting it as "not usable yet" was how
+ * a cancelled order came to look like one still waiting for setup.
+ *
+ * The provider/ledger spelling stays available through gigahostOrderStatusProviderStage;
+ * this function decides only what the interface claims. */
+function gigahostOrderStatusPresentedStage(stage) {
+    if (stage === 'cancelled') return 'deleted';
+    return stage;
+}
+
+/* gigahostOrderStatusLedgerStage classifies one order from its recorded row and the
+ * list's durable absence record, without any per-order provider read. It answers the
+ * question a read has to ask before it asks anything: is there still an order at the
+ * provider that this read could learn something about?
+ *
+ * It exists so the refresh performs no status request for a retired order, and so the
+ * decision to skip that request is made from the same vocabulary the rendered row uses. */
+function gigahostOrderStatusLedgerStage(order, providerAbsent) {
+    if (providerAbsent === true) return 'deleted';
+    const id = String((order && order.order_id) || '');
+    if (gigahostOrderStatusIsPlaceholderID(id)) return 'unknown';
+    return gigahostOrderStatusPresentedStage(gigahostOrderStatusProviderStage(order && order.status));
+}
+
+/* gigahostOrderStatusPollable reports whether a per-order status request may be issued
+ * for this order at all. A deleted or cancelled order is finished: the panel holds the
+ * decision already, and a status request could only re-ask a provider that has nothing
+ * left to say about it. */
+function gigahostOrderStatusPollable(order, providerAbsent) {
+    return gigahostOrderStatusLedgerStage(order, providerAbsent) !== 'deleted';
+}
+
 /* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
  * stage. It reads no address: a VPS is ready only when the provider said so, and an
  * order the provider has accepted without starting is still `requested` rather than
@@ -307,7 +345,8 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     // that still reports the order as ready while its server inventory no longer lists
     // the server is exactly the state this exists to present as DELETED.
     const providerAbsent = record.provider_absent === true;
-    const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusProviderStage(claimed.status || record.status);
+    const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusPresentedStage(
+        gigahostOrderStatusProviderStage(claimed.status || record.status));
     const stage = providerAbsent
         ? 'deleted'
         : (gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage);

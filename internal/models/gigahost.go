@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // GigahostOrder is one persisted Gigahost hourly order attempt.
 //
@@ -48,6 +51,11 @@ type GigahostOrder struct {
 	// Currency is the order's billing currency. Empty means "not recorded"
 	// and is treated as NOK, the pre-existing assumption.
 	Currency string `json:"currency"`
+	// Step is the onboarding journal's last recorded step for this order, as the
+	// journal writer stored it. It is the panel's own execution record, never a
+	// provider observation, and it is served so a row whose status is no longer
+	// asked about still shows the step that was reached.
+	Step string `json:"step,omitempty"`
 
 	// PurchaseOrigin records who created this row, and is the only evidence the
 	// setup pipeline accepts that this panel actually purchased the order. See
@@ -58,6 +66,32 @@ type GigahostOrder struct {
 	// PurchaseRecordedAt is when the purchase intent was committed. It is recorded
 	// with the stamp in the same INSERT so the two cannot disagree.
 	PurchaseRecordedAt time.Time `json:"purchase_recorded_at,omitempty"`
+
+	// ProviderAccountID is the provider account the order was observed under: the
+	// account whose own answer named this order or the server it registered. Empty
+	// means unknown, and an unknown association may never justify a durable absence,
+	// because one account's listing says nothing about another account's orders.
+	ProviderAccountID string `json:"-"`
+
+	// ProviderAbsentAt records when a successful, complete provider inventory read
+	// omitted this order, as an RFC3339 UTC timestamp. Empty means no such
+	// observation: the provider still lists it, or no successful read has judged it.
+	// It is an observation about the provider's view of one order, never a deletion
+	// of the ledger row, and it is what lets an order that never registered a panel
+	// server be retired rather than polled forever.
+	ProviderAbsentAt string `json:"-"`
+
+	// ProviderAbsentAccountID records which provider account the listing that
+	// produced the absence observation answered for. It is written and cleared with
+	// the observation, so a later credential change is visible rather than silent.
+	ProviderAbsentAccountID string `json:"-"`
+}
+
+// ProviderAbsent reports whether a successful provider inventory read has
+// recorded that this order is gone. A failed or unanswered read never writes the
+// column, so an empty value is the only "not absent" answer the panel holds.
+func (o GigahostOrder) ProviderAbsent() bool {
+	return strings.TrimSpace(o.ProviderAbsentAt) != ""
 }
 
 // GigahostOrderCredential is the managed SSH credential attached to one order

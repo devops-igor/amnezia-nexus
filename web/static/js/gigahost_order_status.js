@@ -844,7 +844,18 @@ async function gigahostOrderStatusReadOnce(signal) {
     const checkedAt = gigahostOrderStatusNow().toISOString();
     const setupIndex = await readGigahostSetupIntents(signal);
     const backendIndex = await readGigahostBackendIndex(signal);
-    const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id, signal)));
+    // Only an order the provider can still say something about is asked about. A row
+    // the panel has recorded as gone, and a cancelled one, are both finished, so the
+    // status request is not issued for them at all - the decision the panel already
+    // holds is the answer. The classification is the same one the row renders, taken
+    // from the recorded row and the list's own absence record.
+    const details = await Promise.all(orders.map((order) => {
+        const orderID = order && order.order_id;
+        if (!gigahostOrderStatusPollable(order, absence[String(orderID || '')])) {
+            return {deploy: null, detailOK: true, skipped: true};
+        }
+        return readGigahostOrderDeploy(orderID, signal);
+    }));
     const merged = orders.map((order, index) => mergeGigahostOrderDetail(
         order,
         (details[index] || {}).deploy,

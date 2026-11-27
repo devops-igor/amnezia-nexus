@@ -136,8 +136,15 @@ func TestRepairedOrderRequiresNewIdentifiedDetail(t *testing.T) {
 				t.Fatalf("detail wrote %q, want %q: %v", stored.Status, test.want, err)
 			}
 			row := renderedRowFor(t, renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, "ord_evidence")), "ord_evidence")
-			if row.Stage != test.want {
-				t.Fatalf("rendered %q, want %q", row.Stage, test.want)
+			// The durable status is not always the presented stage: a cancellation is a
+			// final decision about the order, so the interface presents the deletion it
+			// is rather than a state that still awaits an operator.
+			wantStage := test.want
+			if test.want == statusCancelled {
+				wantStage = "deleted"
+			}
+			if row.Stage != wantStage {
+				t.Fatalf("rendered %q, want %q", row.Stage, wantStage)
 			}
 		})
 	}

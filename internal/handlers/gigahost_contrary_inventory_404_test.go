@@ -116,6 +116,10 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 				switch {
 				case r.URL.Path == "/servers":
 					_, _ = w.Write([]byte(tc.inventory))
+				case r.URL.Path == "/account":
+					// The order list attributes its inventory answer to the account that
+					// answered it, so the fixture serves the documented account document.
+					_, _ = w.Write([]byte(`{"data":{"cust_id":9001,"cust_name":"Fixture"}}`))
 				case strings.HasPrefix(r.URL.Path, "/deploy/status"):
 					detailCalls++
 					w.WriteHeader(tc.detailStatus)

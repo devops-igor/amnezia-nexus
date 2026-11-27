@@ -37,8 +37,12 @@ func TestRecentDeploymentsKeepsARecordedAbsenceAcrossAFailedDetailRead(t *testin
  // PHASE 1 - the per-order status request fails for every row.
  failList = true;
  await w.loadRecentOrders();
- assert.deepEqual(calls.filter(c => /\/status$/.test(c.url)).map(c => c.url).length, orders.length,
-   'the fixture must actually request a detail per order, got ' + JSON.stringify(calls.map(c => c.url)));
+ // The recorded deletion is not asked about at all, so the fixture requests one detail
+ // for each of the five rows the panel still holds an open question about.
+ assert.deepEqual(calls.filter(c => /\/status$/.test(c.url)).map(c => c.url).length, orders.length - 1,
+   'the fixture must actually request a detail per live order, got ' + JSON.stringify(calls.map(c => c.url)));
+ assert.deepEqual(calls.map(c => c.url).filter(u => u.indexOf('ord_gone') !== -1 && /\/status$/.test(u)), [],
+   'a recorded deletion must not be asked about at the provider');
  const failedRows = Array.from(container().querySelectorAll('.gigahost-order-row'));
  assert.equal(failedRows.length, 6,
    'a recorded deletion older than the five shown must still be listed while the detail read fails, got ' +
@@ -122,14 +126,14 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
  await w.loadRecentOrders();
 
  const stages = cells().map(c => c.getAttribute('data-stage'));
- assert.deepEqual(stages, ['deleted','deleted','cancelled','failed'],
-   'both terminal provider spellings are deletions, and cancelled and failed stay distinct, got ' +
+ assert.deepEqual(stages, ['deleted','deleted','deleted','failed'],
+   'both terminal provider spellings and a cancellation are deletions, and a failure stays the distinct outcome it was, got ' +
    JSON.stringify(stages));
 
- cells().slice(0, 2).forEach((cell, index) => {
+ cells().slice(0, 3).forEach((cell, index) => {
    const actions = Array.from(cell.parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
    assert.deepEqual(actions, [],
-     'a ' + (index === 0 ? 'provider-terminated' : 'ledger-terminated') + ' order must offer no contact action, got ' +
+     'a ' + ['provider-terminated','ledger-terminated','cancelled'][index] + ' order must offer no contact action, got ' +
      JSON.stringify(actions));
    const chain = Array.from(cell.querySelectorAll('.gigahost-order-status-stage'))
      .map(s => s.getAttribute('data-stage') + ':' + s.getAttribute('data-state'));
@@ -139,10 +143,8 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
      /gigahost_status_stage_deleted/, 'the row must name the deleted stage');
  });
 
- // The two non-deletion outcomes are unchanged: a cancellation keeps its affordance and
- // a failed order keeps the retry that its state allows.
- const cancelActions = Array.from(cells()[2].parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
- assert.ok(cancelActions.length > 0, 'a cancelled order keeps the setup affordance it had');
+ // The failure that is not a recorded ending keeps the retry its state allows, so the
+ // assertion above is about the ending rather than about every terminal outcome.
  assert.deepEqual(
    Array.from(cells()[3].parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent),
    ['deploy_retry_btn'], 'a failed order keeps its retry control');

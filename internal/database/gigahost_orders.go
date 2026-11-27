@@ -39,7 +39,10 @@ var gigahostOrdersSchema = `CREATE TABLE IF NOT EXISTS gigahost_orders (
 	updated_at TEXT NOT NULL,
 	price_id INTEGER DEFAULT 0,
 	monthly_cap_nok REAL DEFAULT 0.0,
-	currency TEXT DEFAULT ''
+	currency TEXT DEFAULT '',
+	provider_account_id TEXT NOT NULL DEFAULT '',
+	provider_absent_at TEXT NOT NULL DEFAULT '',
+	provider_absent_account_id TEXT NOT NULL DEFAULT ''
 )`
 
 // gigahostOrderColumns lists every optional column added after the original
@@ -65,6 +68,13 @@ var gigahostOrderColumns = []struct {
 	{"purchase_recorded_at", `ALTER TABLE gigahost_orders ADD COLUMN purchase_recorded_at TEXT NOT NULL DEFAULT ''`},
 	// Unknown historical rows remain NULL: neither identity nor registration proves repair.
 	{"live_repaired_at", `ALTER TABLE gigahost_orders ADD COLUMN live_repaired_at TEXT`},
+	// The order-level existence record. Absence used to be recordable only on the
+	// server row an order registered, so an order that never registered one could not
+	// be retired at all. Every existing row starts with an empty observation, which is
+	// exactly "nothing has been observed", never an inferred deletion.
+	{"provider_account_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_account_id TEXT NOT NULL DEFAULT ''`},
+	{"provider_absent_at", `ALTER TABLE gigahost_orders ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`},
+	{"provider_absent_account_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_absent_account_id TEXT NOT NULL DEFAULT ''`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -157,7 +167,8 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 // this order, so a second reader cannot drift from the first.
 const gigahostOrderSelectColumns = `id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
              created_at, updated_at, price_id, monthly_cap_nok, currency,
-             purchase_origin, purchase_recorded_at, live_repaired_at, nexus_server_id`
+             purchase_origin, purchase_recorded_at, live_repaired_at, nexus_server_id,
+             provider_account_id, provider_absent_at, provider_absent_account_id, step`
 
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
@@ -451,11 +462,13 @@ func scanGigahostOrder(row gigahostOrderRowScanner) (*models.GigahostOrder, erro
 	var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
 	var priceID, nexusServerID sql.NullInt64
 	var monthlyCap sql.NullFloat64
+	var providerAccountID, providerAbsentAt, providerAbsentAccountID, step sql.NullString
 	if err := row.Scan(
 		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 		&priceID, &monthlyCap, &currency,
 		&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt, &nexusServerID,
+		&providerAccountID, &providerAbsentAt, &providerAbsentAccountID, &step,
 	); err != nil {
 		return nil, err
 	}
@@ -467,6 +480,10 @@ func scanGigahostOrder(row gigahostOrderRowScanner) (*models.GigahostOrder, erro
 	o.PurchaseOrigin = purchaseOrigin.String
 	o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
 	o.LiveRepairedAt = parseGigahostRepairTime(liveRepairedAt)
+	o.ProviderAccountID = strings.TrimSpace(providerAccountID.String)
+	o.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
+	o.ProviderAbsentAccountID = strings.TrimSpace(providerAbsentAccountID.String)
+	o.Step = strings.TrimSpace(step.String)
 	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return &o, nil

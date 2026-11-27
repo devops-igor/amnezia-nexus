@@ -230,17 +230,22 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  assert.match(flat(panel()), /gigahost_status_next_action_check_provider/);
  assert.match(flat(panel()), /gigahost_status_ip_while_provisioning/);
 
- // 8. A cancelled order is terminal: it reports nothing to do, and the stepper does
- //    not claim it ever deployed. The setup affordance itself is the pre-existing
- //    one and is preserved, because revoking an approval never cancelled the VPS.
+ // 8. A cancelled order is a final decision, so it is presented as the deletion it is:
+ //    it reports nothing to do, the stepper does not claim it ever deployed, and no
+ //    status request is issued for it at all. It is not presented as a deployment that
+ //    still awaits an operator, which is what made a cancelled order read like one.
  orders = [{order_id:'ord-cancel', status:'cancelled'}];
  observationByOrder = { 'ord-cancel': {outcome:'confirmed', status:'cancelled'} };
  deployByOrder = { 'ord-cancel': {} };
+ const beforeCancel = calls.length;
  await w.loadRecentOrders();
- assert.equal(cell().getAttribute('data-stage'), 'cancelled');
+ assert.equal(cell().getAttribute('data-stage'), 'deleted');
  assert.match(flat(panel()), /gigahost_status_next_action_none/);
  const cancelChain = Array.from(toggle().querySelectorAll('.gigahost-order-status-stage')).map(s => s.getAttribute('data-stage'));
- assert.deepEqual(cancelChain, ['requested','cancelled'], 'a cancelled order must not claim the deploying step');
+ assert.deepEqual(cancelChain, ['requested','deleted'], 'a cancelled order must not claim the deploying step');
+ assert.deepEqual(calls.slice(beforeCancel).filter(c => /\/status$/.test(c.url)), [],
+   'a cancelled order must not be asked about at the provider, got ' +
+   JSON.stringify(calls.slice(beforeCancel).map(c => c.url)));
 `)
 }
 
