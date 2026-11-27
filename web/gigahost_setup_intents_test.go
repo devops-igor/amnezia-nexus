@@ -52,9 +52,16 @@ func TestGigahostSetupIntentsConsumerDOM(t *testing.T) {
 	}
 	templates := settingsTemplateText(t)
 	// The template must load the extracted module: an inline copy would silently
-	// diverge from the file this test exercises.
-	if !strings.Contains(templates, versionedTemplateAsset("/static/js/gigahost_setup_intents.js")) {
-		t.Fatal("settings.html does not load the extracted setup-intents module")
+	// diverge from the file this test exercises. The form is the content-derived one
+	// because this delivery changed the module's bytes without moving the release
+	// version; the assertion below is about the reference, and the identity form it
+	// must carry is proved where the URL is emitted and in the asset-delivery checks.
+	const moduleReference = `<script src="{{ asset_url "/static/js/gigahost_setup_intents.js" }}"></script>`
+	if !strings.Contains(templates, moduleReference) {
+		t.Fatalf("settings.html does not request the saved-setup module through asset_url; "+
+			"the release-version URL is the one its predecessor also served, so a browser "+
+			"holding it keeps running a module that never re-reads a paused job. Want %s",
+			moduleReference)
 	}
 	if !strings.Contains(templates, `id="setupIntentsContainer"`) {
 		t.Fatal("settings.html has no container for saved setup approvals")

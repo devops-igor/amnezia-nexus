@@ -34,14 +34,21 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 }
 
 // DeliveredAssets are the /static paths this delivery replaced in place: the two
-// gigahost order-status modules, the two policy readout modules, the server
-// page's tab controller, the shared modal script, the VPN page modules (the
-// split produced four new ones and retired the single page controller), the
-// stylesheets every shell links and the table engine the VPN page's reveal
+// gigahost order-status modules, the saved-setup module, the two policy readout
+// modules, the server page's tab controller, the shared modal script, the VPN page
+// modules (the split produced four new ones and retired the single page controller),
+// the stylesheets every shell links and the table engine the VPN page's reveal
 // depends on. The release
 // version did not move with them, so ?v=<release> is exactly the URL their
 // predecessor served and a returning browser keeps the old bytes. Each one
 // therefore has to be requested through AssetURL, in every shell that loads it.
+//
+// The saved-setup module is here for the same reason as the tab controller: this
+// delivery changed what it does (a paused job now re-reads its own row, so a server
+// the provider no longer lists stops offering Resume without a reload), and the
+// release version did not move. A browser that cached the previous module under
+// ?v=<release> keeps running the version that never re-read, against a page whose
+// Recent Deployments list does.
 //
 // The tab controller is here because this delivery changed its bytes without
 // moving the release version: a browser that cached the previous controller
@@ -60,6 +67,7 @@ var DeliveredAssets = []string{
 	"/static/css/vpn.css",
 	"/static/js/gigahost_order_status.js",
 	"/static/js/gigahost_order_status_model.js",
+	"/static/js/gigahost_setup_intents.js",
 	"/static/js/policy_panels.js",
 	"/static/js/policy_routing.js",
 	"/static/js/server_actions.js",
