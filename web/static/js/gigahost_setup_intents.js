@@ -23,9 +23,14 @@ const setupIntentsInFlight = new Set();
  * job whose row still offers a contact action is re-observed: the mark that the
  * provider no longer lists its server is written by the panel's own inventory pass,
  * which runs on a schedule of its own, so this waits for an observation that has had
- * time to arrive instead of re-reading a settled list every few seconds. */
+ * time to arrive instead of re-reading a settled list every few seconds.
+ * SETUP_INTENTS_RETRY_MS and SETUP_INTENTS_RETRY_MAX bound the reads a failed one may
+ * cause: a rejected list is retried a few times at the same pace, and then the view
+ * stops asking rather than holding a permanent poll of an unreachable panel. */
 const SETUP_INTENTS_MOVING_REFRESH_MS = 4000;
 const SETUP_INTENTS_PRESENCE_REFRESH_MS = 30000;
+const SETUP_INTENTS_RETRY_MS = 30000;
+const SETUP_INTENTS_RETRY_MAX = 5;
 
 /* withSetupIntentAction runs one action for one order under that guard.
  *
@@ -149,17 +154,12 @@ function isPlaceholderOrderID(orderId) {
 async function loadSetupIntents() {
     const container = document.getElementById('setupIntentsContainer');
     if (!container) return;
-    const renderEmpty = () => {
-        const emptySpan = document.createElement('span');
-        emptySpan.className = 'text-muted';
-        emptySpan.textContent = _('setup_intents_none');
-        container.replaceChildren(emptySpan);
-    };
     try {
         const res = await API.get('/api/admin/hosting/gigahost/setup-intents', {silent: true});
         const intents = (res && res.setup_intents) ? res.setup_intents : [];
+        window.setupIntentsRetryAttempts = 0;
         if (intents.length === 0) {
-            renderEmpty();
+            renderSetupIntentsEmpty(container);
             return;
         }
         const list = document.createElement('div');
@@ -168,10 +168,45 @@ async function loadSetupIntents() {
         list.style.gap = '6px';
         intents.forEach(i => list.appendChild(setupIntentRow(i)));
         container.replaceChildren(list);
+        container.removeAttribute('data-stale');
         scheduleSetupIntentsPolling(intents);
     } catch (_) {
-        renderEmpty();
+        /* A failed read is not an empty list.
+         *
+         * The panel answers this list from its own database, so a rejected request says
+         * nothing about which jobs exist: rendering "no setup approval has been recorded"
+         * hid a paused job that was still there, and because the timer had already cleared
+         * itself before the read it also stopped the view from ever reading again, so a
+         * later observation could not reach the operator without a reload. The row is
+         * kept, the container records that its freshness is unproven, and a bounded retry
+         * keeps asking so the corrected list can arrive on its own. */
+        if (!container.firstChild) {
+            renderSetupIntentsFailed(container);
+        }
+        container.setAttribute('data-stale', 'true');
+        scheduleSetupIntentsRetry();
     }
+}
+
+/* renderSetupIntentsEmpty is the "no saved jobs" statement. It is only made when a read
+ * answered and the answer was empty, because it is a claim about what the panel holds. */
+function renderSetupIntentsEmpty(container) {
+    const emptySpan = document.createElement('span');
+    emptySpan.className = 'text-muted';
+    emptySpan.textContent = _('setup_intents_none');
+    container.replaceChildren(emptySpan);
+    container.removeAttribute('data-stale');
+}
+
+/* renderSetupIntentsFailed is what an unreadable list says when there is no earlier row to
+ * keep. It states that the read failed, which is the fact the operator needs, rather than
+ * presenting an unanswered read as an empty list. */
+function renderSetupIntentsFailed(container) {
+    const failedSpan = document.createElement('span');
+    failedSpan.className = 'text-muted';
+    failedSpan.textContent = _('gigahost_status_load_failed');
+    container.replaceChildren(failedSpan);
+    container.setAttribute('data-stale', 'true');
 }
 
 /* setupIntentRow builds one saved job. The left side is the record, the right
@@ -358,6 +393,25 @@ function scheduleSetupIntentsPolling(intents) {
     }, delay);
 }
 
+/* scheduleSetupIntentsRetry re-arms the list after a failed read.
+ *
+ * It is deliberately bounded: the point is to survive a transient failure, not to keep a
+ * panel that is down under a permanent poll. The attempt counter is reset by the next
+ * successful read, so a long outage costs a fixed handful of requests and a recovery
+ * restores the ordinary watch. It shares the one timer field with the watch above, so the
+ * view never has two refreshes racing to render the same list. */
+function scheduleSetupIntentsRetry() {
+    const attempts = window.setupIntentsRetryAttempts || 0;
+    if (attempts >= SETUP_INTENTS_RETRY_MAX) return;
+    if (window.setupIntentsPollTimer) return;
+    window.setupIntentsRetryAttempts = attempts + 1;
+    bindSetupIntentsLifecycle();
+    window.setupIntentsPollTimer = setTimeout(() => {
+        window.setupIntentsPollTimer = null;
+        loadSetupIntents();
+    }, SETUP_INTENTS_RETRY_MS);
+}
+
 /* setupIntentsContactable reports whether a saved job offers an action that ends
  * in a connection to the server it registered, which is the state a fresh
  * observation can change. Revocation is deliberately not one of them: it is a
@@ -376,12 +430,27 @@ function stopSetupIntentsPolling() {
     window.setupIntentsPollTimer = null;
 }
 
-/* bindSetupIntentsLifecycle stops the refresh when the page goes away. It is
- * bound once, by the load that arms the first timer. */
+/* bindSetupIntentsLifecycle stops the refresh when the page goes away, and re-observes the
+ * list when the browser hands the document back. It is bound once, by the load that arms
+ * the first timer. */
 function bindSetupIntentsLifecycle() {
     if (window.setupIntentsLifecycleBound || typeof window === 'undefined' || !window.addEventListener) return;
     window.addEventListener('pagehide', stopSetupIntentsPolling);
+    window.addEventListener('pageshow', setupIntentsRestored);
     window.setupIntentsLifecycleBound = true;
+}
+
+/* setupIntentsRestored re-observes the list when the browser restores this document from
+ * its page cache.
+ *
+ * `pagehide` clears the refresh before the document is frozen and a restored document is
+ * not rendered again, so without this the rows on screen kept offering an action the panel
+ * had since decided against - the same stale list the watch exists to prevent, reachable
+ * only by navigating away and back. The event's `persisted` flag is what separates a
+ * restore from the initial page load, which renders the list itself. */
+function setupIntentsRestored(event) {
+    if (!event || !event.persisted) return;
+    loadSetupIntents();
 }
 
 /* cancelSetupIntent revokes an approval. The confirmation is explicit because

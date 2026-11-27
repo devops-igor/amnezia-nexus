@@ -248,10 +248,24 @@ async function render(intents) {
  assert.equal(root.textContent.indexOf('FIXTURE-PRIVATE-MATERIAL'), -1, 'a private key reached the DOM');
  assert.equal(root.textContent.indexOf('fixture-password'), -1, 'a password reached the DOM');
 
- // 14. An unreadable list degrades to the empty state instead of throwing.
+ // 14. A failed read is not an empty list. With a row already on screen the row and its
+ //     action are kept and the container records that its freshness is unproven; with
+ //     nothing on screen the failure is stated as a failed read. Before this change both
+ //     cases rendered "no saved jobs" and stopped the view's refresh altogether, so a
+ //     later observation could not reach the operator without a reload.
  w.API.get = async () => { throw new Error('offline'); };
  await w.loadSetupIntents();
- assert.match(container.textContent, /setup_intents_none/);
+ assert.doesNotMatch(container.textContent, /setup_intents_none/,
+   'a failed read was presented as "no saved jobs"');
+ assert.ok(container.textContent.indexOf('ord-evil') !== -1,
+   'a failed read dropped the row that was on screen');
+ assert.equal(container.getAttribute('data-stale'), 'true',
+   'a failed read was presented as fresh');
+ container.replaceChildren();
+ await w.loadSetupIntents();
+ assert.doesNotMatch(container.textContent, /setup_intents_none/,
+   'a failed read with nothing on screen was presented as "no saved jobs"');
+ assert.match(container.textContent, /gigahost_status_load_failed/);
 
  console.log('SETUP_INTENTS_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});

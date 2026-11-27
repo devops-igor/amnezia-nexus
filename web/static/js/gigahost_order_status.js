@@ -720,7 +720,7 @@ function mergeGigahostOrderDetail(order, deploy) {
         // ordinary treatment rather than reading a missing field as agreement.
         if (deploy.provider_absent === true) merged.provider_absent = true;
         if (deploy.status === 'failed') merged.status = 'failed';
-        else if (deploy.status === 'ready' && deploy.server_id > 0) merged.nexus_onboarded = true;
+        else if (gigahostOrderStatusRecordedOnboarding(deploy)) merged.nexus_onboarded = true;
     }
     return merged;
 }

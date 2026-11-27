@@ -387,6 +387,23 @@ function gigahostOrderStatusJournalEvidence(deploy) {
 }
 
 
+/* gigahostOrderStatusRecordedOnboarding reports whether the deploy read carries the panel's
+ * own durable evidence that onboarding completed: a registered Nexus server and the
+ * completed step in the install journal.
+ *
+ * It deliberately does not read the provider's status spelling. `ready` and `active` are the
+ * provider's words for a running VPS, and it may use either on identical reads, so a row
+ * recognised by that word switched between "installed" and "not installed" while nothing
+ * about the backend changed - which re-offered Setup Backend and Approve on a backend that
+ * was already installed. The journal's completed step plus the panel server it registered is
+ * the fact, and the provider cannot rename it. */
+function gigahostOrderStatusRecordedOnboarding(deploy) {
+    const detail = deploy || {};
+    if (!(Number(detail.server_id || 0) > 0)) return false;
+    return String(detail.step || '').trim().toLowerCase() === 'ready';
+}
+
+
 /* gigahostOrderStatusModel is the whole classification, and it is pure: the same
  * inputs always produce the same model, so the rendered view can be asserted
  * without a browser. context carries what the page already read:

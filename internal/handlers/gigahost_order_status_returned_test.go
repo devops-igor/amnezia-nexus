@@ -240,9 +240,18 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 				},
 				getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
 					detailReads++
-					// The detail keeps answering the same ending for the whole sequence,
-					// which is what a stale terminal record looks like. A fixture that made
-					// it helpful here would not exercise the rule at all.
+					// The detail keeps answering the same ending for the sequence, which is
+					// what a stale terminal record looks like. In the non-matching-inventory
+					// phase it answers the live state instead: that phase is about what an
+					// inventory naming a different deployment does, and an un-onboarded
+					// order's own detail answer is recorded rather than deferred (see
+					// TestFirstGenuineDeletionIsRecordedForAnOrderWhoseProviderIDIsKnown).
+					if mode == returnedOrderOtherOrder {
+						return &gigahost.DeployStatusResponse{
+							OrderID: orderID, Status: liveSpelling,
+							ServerID: providerServerID, AssignedIP: address,
+						}, nil
+					}
 					return &gigahost.DeployStatusResponse{
 						OrderID: orderID, Status: deletedProviderStatus,
 						ServerID: providerServerID, AssignedIP: address,
@@ -250,7 +259,7 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 				},
 			})
 
-			snapshot := func(label string) (string, deletedDeploymentRender, int) {
+			snapshot := func(label string) (string, deletedDeploymentRender, int, string) {
 				t.Helper()
 				read := gigahostOrderStatusRead(t, h, orderID)
 				read.Details = map[string]string{orderID: read.Detail}
@@ -258,12 +267,14 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 				if err != nil || order == nil {
 					t.Fatalf("%s: reload the ledger row: %v", label, err)
 				}
-				return order.Status, renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, orderID)), detailReads
+				observation := gigahostOrderStatusProviderObservation(t, read.Orders, orderID)
+				observed, _ := observation["status"].(string)
+				return order.Status, renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, orderID)), detailReads, observed
 			}
 
 			// Phase 1 - the provider's literal deletion, while the panel does not yet know
 			// which provider server this order is.
-			status, row, _ := snapshot("literal deletion")
+			status, row, _, _ := snapshot("literal deletion")
 			if status != deletedProviderStatus {
 				t.Fatalf("the literal deletion must reach the ledger, got %q", status)
 			}
@@ -272,12 +283,18 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 			}
 
 			// Phase 2 - the same server is listed again. The ledger has to record it: the
-			// view reading it correctly is not the same fact as the panel remembering it.
+			// view reading it correctly is not the same fact as the panel remembering it,
+			// and the value it remembers is the panel's own word for a running server. The
+			// provider's spelling stays in the observation, which is where it belongs.
 			mode = returnedOrderLive
-			status, row, _ = snapshot("live return (" + liveSpelling + ")")
-			if status != liveSpelling {
-				t.Fatalf("an affirmative live listing must be persisted, got ledger status %q, want %q",
-					status, liveSpelling)
+			status, row, _, observed := snapshot("live return (" + liveSpelling + ")")
+			if status != gigahost.StatusReady {
+				t.Fatalf("an affirmative live listing must be persisted as the panel's status, "+
+					"got ledger status %q, want %q", status, gigahost.StatusReady)
+			}
+			if observed != liveSpelling {
+				t.Fatalf("the observation must keep the provider's own spelling, got %q want %q",
+					observed, liveSpelling)
 			}
 			if row.Stage == "deleted" {
 				t.Fatalf("a deployment the provider lists again still renders deleted: %+v", row)
@@ -290,14 +307,14 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 			// the read that used to re-delete the row, because the inventory changed nothing
 			// and the detail was therefore asked again.
 			beforeDetail := detailReads
-			status, row, afterDetail := snapshot("identical inventory read")
+			status, row, afterDetail, _ := snapshot("identical inventory read")
 			if afterDetail == beforeDetail {
 				t.Fatalf("the fixture must still ask the order detail, otherwise this phase " +
 					"does not exercise the stale answer it exists for")
 			}
-			if status != liveSpelling {
+			if status != gigahost.StatusReady {
 				t.Fatalf("an unchanged terminal detail answer re-deleted the row: ledger status %q, want %q",
-					status, liveSpelling)
+					status, gigahost.StatusReady)
 			}
 			if row.Stage == "deleted" {
 				t.Fatalf("an unchanged terminal detail answer re-deleted the rendered row: %+v", row)
@@ -307,10 +324,10 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 			// evidence that the server is gone, so the same stale detail answer must not bring
 			// the deletion back.
 			mode = returnedOrderOutage
-			status, row, _ = snapshot("inventory outage")
-			if status != liveSpelling {
+			status, row, _, _ = snapshot("inventory outage")
+			if status != gigahost.StatusReady {
 				t.Fatalf("an inventory outage exposed the deletion again: ledger status %q, want %q",
-					status, liveSpelling)
+					status, gigahost.StatusReady)
 			}
 			if row.Stage == "deleted" {
 				t.Fatalf("an inventory outage re-deleted the rendered row: %+v", row)
@@ -318,12 +335,20 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 
 			// Phase 5 - the inventory answers with a different deployment at the same
 			// address. It names neither this order nor its provider server id, so it says
-			// nothing about this deployment and must change nothing.
+			// nothing about this deployment and must change nothing; the detail here answers
+			// the same live state it reported before.
+			//
+			// A stale deleted detail alongside an omission is a different question: for an
+			// order this panel registered no server for, that answer is the only existence
+			// evidence the panel will ever get, so it is recorded (see
+			// TestFirstGenuineDeletionIsRecordedForAnOrderWhoseProviderIDIsKnown). It is not
+			// recorded for a registered deployment, where the inventory pass owns the fact
+			// (see TestRegisteredDeploymentLetsTheInventoryPassRecordTheAbsence).
 			mode = returnedOrderOtherOrder
-			status, row, _ = snapshot("non-matching inventory")
-			if status != liveSpelling {
+			status, row, _, _ = snapshot("non-matching inventory")
+			if status != gigahost.StatusReady {
 				t.Fatalf("a non-matching inventory changed the ledger row: status %q, want %q",
-					status, liveSpelling)
+					status, gigahost.StatusReady)
 			}
 			if row.Stage == "deleted" {
 				t.Fatalf("a non-matching inventory re-deleted the rendered row: %+v", row)
@@ -333,7 +358,7 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 			// this order's server with a terminal status, that answer is recorded, so the rule
 			// above suppresses a stale detail answer rather than making an ending unreachable.
 			mode = returnedOrderTerminal
-			status, row, _ = snapshot("provider's terminal listing")
+			status, row, _, _ = snapshot("provider's terminal listing")
 			if status != deletedProviderStatus {
 				t.Fatalf("the provider's own terminal status for this server must still be recorded, got %q", status)
 			}
