@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
@@ -109,21 +110,6 @@ func isRefreshableOrderID(orderID string) bool {
 		!strings.HasPrefix(orderID, "intent_")
 }
 
-// gigahostProviderServerLive reports whether the inventory lists a live server for this
-// order, i.e. a match whose provider status is not a terminal one.
-//
-// It answers a narrower question than gigahostProviderServerStatus on purpose. A row may
-// legitimately be terminal in the panel while the provider still lists it, so "the
-// inventory mentions this order" alone is not enough to argue against a cancellation -
-// only a match that the provider itself reports as live is.
-func gigahostProviderServerLive(servers []gigahost.ServerInfo, orderID string) bool {
-	status, ok := gigahostProviderServerStatus(servers, orderID)
-	if !ok {
-		return false
-	}
-	return !isTerminalStatus(status)
-}
-
 // gigahostOrderObservations performs the list's provider reads and records what each
 // one actually answered, per order. The rows are modified in place exactly as before;
 // the returned map is the only new fact.
@@ -162,16 +148,17 @@ func (h *Handlers) gigahostOrderObservations(
 			}
 			continue
 		}
+		observedRepair := orders[i].LiveRepairedAt
 		updated := false
-		if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
+		if inventoryKnown && h.refreshOrderFromServers(servers, &orders[i]) {
 			updated = true
 		}
 		// An inventory entry naming this order with a status is a provider answer,
 		// whether or not it changed the row.
-		if status, ok := gigahostProviderServerStatus(servers, orders[i].OrderID); ok {
+		if server, found := inventoryServerForOrder(servers, &orders[i]); inventoryKnown && found && server.Status != "" {
 			observations[orders[i].OrderID] = GigahostProviderObservation{
 				Outcome: gigahostObservationConfirmed,
-				Status:  status,
+				Status:  server.Status,
 			}
 		}
 		if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
@@ -201,7 +188,9 @@ func (h *Handlers) gigahostOrderObservations(
 			}
 		}
 		if updated {
-			_ = h.updateGigahostOrder(ctx, &orders[i])
+			if err := h.persistOrderObservation(ctx, &orders[i], observedRepair); err != nil {
+				observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: "provider observation could not be committed"}
+			}
 		}
 	}
 	return observations
@@ -269,13 +258,11 @@ func isDeletedStatus(status string) bool {
 // lists the same server. The next inventory outage then exposes that ending again, and the
 // row loses the ordinary actions for a deployment that exists.
 //
-// Three things defer the ending. The read has to be one the panel could interpret: an
-// inventory that could not be read is not evidence that the server is gone, so nothing it
-// failed to report may settle the order. The inventory may not name this order live: that is
-// the affirmative answer which corrects the ending. And the panel may already hold a
-// registered Nexus server for this order, in which case the account-scoped inventory pass
-// records existence on that server row - the panel's durable existence observation for the
-// deployment - so a detail answer is not the surface that decides it.
+// The persisted repair timestamp is the evidence that an earlier deletion was
+// contradicted. Only an identified detail with a strictly newer provider timestamp
+// may replace it. Neither a known provider ID nor registration establishes repair.
+// Registered deployments retain their separate account-scoped server-mark authority.
+// Failed inventory and affirmative live inventory still defer detail deletion.
 //
 // What does not defer it is the provider's own numeric server id. That id says the provider
 // has a server; it does not say this panel registered one, and no absence record can ever
@@ -287,12 +274,19 @@ func isDeletedStatus(status string) bool {
 // A cancellation is deliberately not covered: it is the order's own outcome rather than a
 // claim about the server, which is why a live listing does not contradict it.
 func (h *Handlers) gigahostDetailDeletionDeferral(
-	ctx context.Context, order *GigahostOrderRecord, inventoryKnown bool, live []gigahost.ServerInfo, detailStatus string,
+	ctx context.Context, order *GigahostOrderRecord, inventoryKnown bool, live []gigahost.ServerInfo, detail *gigahost.DeployStatusResponse,
 ) *GigahostProviderObservation {
-	if !isDeletedStatus(detailStatus) {
+	if !isDeletedStatus(detail.Status) {
 		return nil
 	}
-	if !inventoryKnown || gigahostProviderServerLive(live, order.OrderID) ||
+	if inventoryKnown && inventoryListsOrderLive(live, order) {
+		// This answer contradicts even a detail newer than a previous repair.
+		// Remember this contradiction too, or the next omission would accept it again.
+		rememberContradictedDetail(order, detail)
+		return gigahostDeferredDeletionObservation(live, order.OrderID)
+	}
+	if !inventoryKnown ||
+		(order.LiveRepairedAt != nil && !detailPostdatesRepair(order, detail)) ||
 		h.gigahostOrderHasRegisteredServer(ctx, order.OrderID) {
 		return gigahostDeferredDeletionObservation(live, order.OrderID)
 	}
@@ -371,16 +365,17 @@ func panelOrderStatusFromProvider(status string) string {
 func (h *Handlers) repairDeletedOrderFromInventory(
 	ctx context.Context, servers []gigahost.ServerInfo, inventoryKnown bool, order *GigahostOrderRecord,
 ) (GigahostProviderObservation, bool) {
-	if !isDeletedStatus(order.Status) || !inventoryKnown || !gigahostProviderServerLive(servers, order.OrderID) {
+	if !isDeletedStatus(order.Status) || !inventoryKnown || !inventoryListsOrderLive(servers, order) {
 		return GigahostProviderObservation{}, false
 	}
+	observedRepair := order.LiveRepairedAt
 	updated := h.refreshOrderFromServers(servers, order)
-	observation := GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
-	if status, ok := gigahostProviderServerStatus(servers, order.OrderID); ok {
-		observation = GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
-	}
+	server, _ := inventoryServerForOrder(servers, order)
+	observation := GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: server.Status}
 	if updated {
-		_ = h.updateGigahostOrder(ctx, order)
+		if err := h.persistOrderObservation(ctx, order, observedRepair); err != nil {
+			return GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: "live repair could not be committed"}, true
+		}
 	}
 	return observation, true
 }
@@ -418,16 +413,20 @@ func gigahostInventoryStatusRecorded(inventoryStatus, recordedStatus string) boo
 // the shared column. The server identity and the address are always applied, because they
 // are facts about the deployment rather than a verdict on it.
 func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order *GigahostOrderRecord) bool {
-	for _, s := range servers {
-		if s.OrderID != "" && s.OrderID == order.OrderID {
-			updated := applyInventoryStatus(order, s.Status)
-			if applyInventoryIdentity(order, s) {
-				updated = true
-			}
-			return updated
-		}
+	s, found := inventoryServerForOrder(servers, order)
+	if !found {
+		return false
 	}
-	return false
+	wasDeleted := isDeletedStatus(order.Status)
+	updated := applyInventoryStatus(order, s.Status)
+	if wasDeleted && isGigahostReady(s.Status) {
+		now := time.Now().UTC()
+		order.LiveRepairedAt = &now
+	}
+	if applyInventoryIdentity(order, s) {
+		updated = true
+	}
+	return updated
 }
 
 // applyInventoryStatus records the panel's word for one inventory status, when the inventory
@@ -490,10 +489,10 @@ func (h *Handlers) gigahostApplyDeployDetail(
 	}
 	updated := false
 	if status := panelOrderStatusFromProvider(statusResp.Status); status != "" && status != order.Status {
-		if deferred := h.gigahostDetailDeletionDeferral(ctx, order, inventoryKnown, live, statusResp.Status); deferred != nil {
-			// The ending is not recorded, and this read says what it did establish
-			// instead of presenting the ending.
-			return updated, *deferred
+		observedRepair := order.LiveRepairedAt
+		if deferred := h.gigahostDetailDeletionDeferral(ctx, order, inventoryKnown, live, statusResp); deferred != nil {
+			// A new contradiction changes evidence even when status stays live.
+			return order.LiveRepairedAt != observedRepair, *deferred
 		}
 		order.Status = status
 		updated = true
@@ -562,10 +561,10 @@ func gigahostMissingDetailOutcome(order *GigahostOrderRecord, deployErr error, l
 	// Only a cancellation nothing contradicts: live inventory for this order means the missing
 	// detail record is a partial read failure, and the terminal value would be sticky, so later
 	// reads would skip the row and inventory could never repair it.
-	if gigahostProviderServerLive(live, order.OrderID) {
+	if inventoryListsOrderLive(live, order) || order.LiveRepairedAt != nil {
 		return false, GigahostProviderObservation{
 			Outcome: gigahostObservationUnconfirmed,
-			Error:   "provider has no detail record for this order while inventory still lists it",
+			Error:   "provider has no detail record that contradicts the recorded live observation",
 		}
 	}
 	order.Status = statusCancelled

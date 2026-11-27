@@ -24,6 +24,11 @@ type GigahostOrder struct {
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 
+	// LiveRepairedAt is the affirmative inventory observation that contradicted a
+	// recorded deletion. Nil means no repair is known, not an inferred repair.
+	// It is internal evidence, independent of the onboarding journal and provider spelling.
+	LiveRepairedAt *time.Time `json:"-"`
+
 	// PriceID is the catalog price id the order was placed with. It is the
 	// order-time selection key and is preserved because the provider does not
 	// return it on later reads.

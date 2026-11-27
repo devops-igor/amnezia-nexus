@@ -63,6 +63,8 @@ var gigahostOrderColumns = []struct {
 	// reads as "not purchased by this panel" and can never gain the stamp later.
 	{"purchase_origin", `ALTER TABLE gigahost_orders ADD COLUMN purchase_origin TEXT NOT NULL DEFAULT ''`},
 	{"purchase_recorded_at", `ALTER TABLE gigahost_orders ADD COLUMN purchase_recorded_at TEXT NOT NULL DEFAULT ''`},
+	// Unknown historical rows remain NULL: neither identity nor registration proves repair.
+	{"live_repaired_at", `ALTER TABLE gigahost_orders ADD COLUMN live_repaired_at TEXT`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -155,7 +157,7 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 // this order, so a second reader cannot drift from the first.
 const gigahostOrderSelectColumns = `id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
              created_at, updated_at, price_id, monthly_cap_nok, currency,
-             purchase_origin, purchase_recorded_at`
+             purchase_origin, purchase_recorded_at, live_repaired_at`
 
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
@@ -198,14 +200,14 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		var o models.GigahostOrder
 		var createdAt, updatedAt string
 		var assignedIP, currency sql.NullString
-		var purchaseOrigin, purchaseRecordedAt sql.NullString
+		var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
 		var priceID sql.NullInt64
 		var monthlyCap sql.NullFloat64
 		if err := rows.Scan(
 			&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 			&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 			&priceID, &monthlyCap, &currency,
-			&purchaseOrigin, &purchaseRecordedAt,
+			&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -215,6 +217,7 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		o.MonthlyCapNOK = monthlyCap.Float64
 		o.PurchaseOrigin = purchaseOrigin.String
 		o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
+		o.LiveRepairedAt = parseGigahostRepairTime(liveRepairedAt)
 		o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 		list = append(list, o)
@@ -274,25 +277,44 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 	if d == nil || d.sqlDB == nil {
 		return nil
 	}
+	return d.updateGigahostOrder(ctx, o, o.LiveRepairedAt, false)
+}
+
+func (d *DB) updateGigahostOrder(ctx context.Context, o *models.GigahostOrder, observedRepair *time.Time, fenced bool) error {
 	o.UpdatedAt = time.Now().UTC()
 	q := `UPDATE gigahost_orders
 	      SET order_id = ?, server_id = ?, status = ?, assigned_ip = ?, updated_at = ?,
 	          price_id = CASE WHEN ? > 0 THEN ? ELSE price_id END,
 	          monthly_cap_nok = CASE WHEN ? > 0 THEN ? ELSE monthly_cap_nok END,
 	          hourly_price_nok = CASE WHEN ? > 0 THEN ? ELSE hourly_price_nok END,
-	          currency = CASE WHEN ? != '' THEN ? ELSE currency END
-	      WHERE id = ? OR (order_id = ? AND order_id != '')`
+	          currency = CASE WHEN ? != '' THEN ? ELSE currency END,
+	          live_repaired_at = CASE WHEN ? THEN ? ELSE live_repaired_at END
+	      WHERE (id = ? OR (order_id = ? AND order_id != ''))
+	        AND (? = 0 OR live_repaired_at IS ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
-	_, err := d.sqlDB.ExecContext(ctx, q,
+	result, err := d.sqlDB.ExecContext(ctx, q,
 		o.OrderID, o.ServerID, o.Status, o.AssignedIP, o.UpdatedAt.Format(time.RFC3339),
 		o.PriceID, o.PriceID,
 		o.MonthlyCapNOK, o.MonthlyCapNOK,
 		o.HourlyPriceNOK, o.HourlyPriceNOK,
 		o.Currency, o.Currency,
-		o.ID, o.OrderID,
+		fenced, gigahostRepairTimeValue(o.LiveRepairedAt),
+		o.ID, o.OrderID, fenced, gigahostRepairTimeValue(observedRepair),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if fenced {
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return ErrGigahostObservationRetired
+		}
+	}
+	return nil
 }
 
 // orderCredentialQuery is the shared SELECT for one credential row. Both readers
@@ -416,7 +438,7 @@ func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.Giga
 	}
 	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
 	             created_at, updated_at, price_id, monthly_cap_nok, currency,
-	             purchase_origin, purchase_recorded_at
+	             purchase_origin, purchase_recorded_at, live_repaired_at
 	      FROM gigahost_orders WHERE order_id = ? ORDER BY id DESC LIMIT 1`
 	row := d.sqlDB.QueryRowContext(ctx, q, orderID)
 	order, err := scanGigahostOrderRow(row)
@@ -435,14 +457,14 @@ func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
 	var o models.GigahostOrder
 	var createdAt, updatedAt string
 	var assignedIP, currency sql.NullString
-	var purchaseOrigin, purchaseRecordedAt sql.NullString
+	var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
 	var priceID sql.NullInt64
 	var monthlyCap sql.NullFloat64
 	if err := row.Scan(
 		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 		&priceID, &monthlyCap, &currency,
-		&purchaseOrigin, &purchaseRecordedAt,
+		&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -452,6 +474,7 @@ func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
 	o.MonthlyCapNOK = monthlyCap.Float64
 	o.PurchaseOrigin = purchaseOrigin.String
 	o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
+	o.LiveRepairedAt = parseGigahostRepairTime(liveRepairedAt)
 	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return &o, nil

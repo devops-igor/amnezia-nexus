@@ -240,18 +240,8 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 				},
 				getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
 					detailReads++
-					// The detail keeps answering the same ending for the sequence, which is
-					// what a stale terminal record looks like. In the non-matching-inventory
-					// phase it answers the live state instead: that phase is about what an
-					// inventory naming a different deployment does, and an un-onboarded
-					// order's own detail answer is recorded rather than deferred (see
-					// TestFirstGenuineDeletionIsRecordedForAnOrderWhoseProviderIDIsKnown).
-					if mode == returnedOrderOtherOrder {
-						return &gigahost.DeployStatusResponse{
-							OrderID: orderID, Status: liveSpelling,
-							ServerID: providerServerID, AssignedIP: address,
-						}, nil
-					}
+					// The detail keeps answering the exact ending already contradicted by
+					// inventory, including when later inventory names only other orders.
 					return &gigahost.DeployStatusResponse{
 						OrderID: orderID, Status: deletedProviderStatus,
 						ServerID: providerServerID, AssignedIP: address,
@@ -335,15 +325,8 @@ func TestAffirmativeReturnStaysRecordedWhileTheProviderKeepsListingTheServer(t *
 
 			// Phase 5 - the inventory answers with a different deployment at the same
 			// address. It names neither this order nor its provider server id, so it says
-			// nothing about this deployment and must change nothing; the detail here answers
-			// the same live state it reported before.
-			//
-			// A stale deleted detail alongside an omission is a different question: for an
-			// order this panel registered no server for, that answer is the only existence
-			// evidence the panel will ever get, so it is recorded (see
-			// TestFirstGenuineDeletionIsRecordedForAnOrderWhoseProviderIDIsKnown). It is not
-			// recorded for a registered deployment, where the inventory pass owns the fact
-			// (see TestRegisteredDeploymentLetsTheInventoryPassRecordTheAbsence).
+			// nothing about this deployment and must change nothing. The detail still repeats
+			// the same contradicted deletion; omission cannot make it new evidence.
 			mode = returnedOrderOtherOrder
 			status, row, _, _ = snapshot("non-matching inventory")
 			if status != gigahost.StatusReady {
