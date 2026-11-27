@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
+	"github.com/devops-igor/amnezia-nexus/internal/version"
 )
 
 type mockUpstreamService struct {
@@ -37,13 +38,13 @@ func TestGetUpstreamStatusHandler_Success(t *testing.T) {
 			{
 				Name:            "amneziawg-go",
 				Repo:            "amnezia-vpn/amneziawg-go",
-				PinnedVersion:   upstream.PinnedAWGGoVersion,
-				LatestVersion:   upstream.PinnedAWGGoVersion,
+				PinnedVersion:   version.PinnedAWGGoVersion,
+				LatestVersion:   version.PinnedAWGGoVersion,
 				UpdateAvailable: false,
 				ReleaseURL:      "https://github.com/amnezia-vpn/amneziawg-go/releases/tag/v3.1.20261116",
 			},
 		},
-		BaseImage: upstream.PinnedAWGBaseImage,
+		BaseImage: version.PinnedAWGBaseImage,
 	}
 
 	mockSvc := &mockUpstreamService{status: mockStatus}
@@ -86,7 +87,7 @@ func TestGetUpstreamStatusHandler_ForceRefresh(t *testing.T) {
 			Status:          "update_available",
 			UpdateAvailable: true,
 			Components:      []upstream.ComponentStatus{},
-			BaseImage:       upstream.PinnedAWGBaseImage,
+			BaseImage:       version.PinnedAWGBaseImage,
 		},
 	}
 	h.SetUpstreamService(mockSvc)
@@ -155,7 +156,7 @@ func TestGetUpstreamStatusHandler_DegradedWithUpdateAvailable(t *testing.T) {
 			{
 				Name:            "amneziawg-go",
 				Repo:            "amnezia-vpn/amneziawg-go",
-				PinnedVersion:   upstream.PinnedAWGGoVersion,
+				PinnedVersion:   version.PinnedAWGGoVersion,
 				LatestVersion:   "v3.1.20261201",
 				UpdateAvailable: true,
 				ReleaseURL:      "https://github.com/amnezia-vpn/amneziawg-go/releases/tag/v3.1.20261201",
@@ -163,13 +164,13 @@ func TestGetUpstreamStatusHandler_DegradedWithUpdateAvailable(t *testing.T) {
 			{
 				Name:            "amneziawg-tools",
 				Repo:            "amnezia-vpn/amneziawg-tools",
-				PinnedVersion:   upstream.PinnedAWGToolsVersion,
-				LatestVersion:   upstream.PinnedAWGToolsVersion,
+				PinnedVersion:   version.PinnedAWGToolsVersion,
+				LatestVersion:   version.PinnedAWGToolsVersion,
 				UpdateAvailable: false,
 				Error:           "GitHub API rate limit exceeded",
 			},
 		},
-		BaseImage: upstream.PinnedAWGBaseImage,
+		BaseImage: version.PinnedAWGBaseImage,
 	}
 
 	mockSvc := &mockUpstreamService{status: mockStatus}

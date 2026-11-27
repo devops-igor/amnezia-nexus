@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/version"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -223,8 +225,8 @@ func TestServiceCheck_Success(t *testing.T) {
 		t.Errorf("unexpected error on docker-base-image: %s", dockerComp.Error)
 	}
 
-	if status.BaseImage != PinnedAWGBaseImage {
-		t.Errorf("expected BaseImage %q, got %q", PinnedAWGBaseImage, status.BaseImage)
+	if status.BaseImage != version.PinnedAWGBaseImage {
+		t.Errorf("expected BaseImage %q, got %q", version.PinnedAWGBaseImage, status.BaseImage)
 	}
 }
 
