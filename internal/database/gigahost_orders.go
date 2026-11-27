@@ -157,7 +157,7 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 // this order, so a second reader cannot drift from the first.
 const gigahostOrderSelectColumns = `id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
              created_at, updated_at, price_id, monthly_cap_nok, currency,
-             purchase_origin, purchase_recorded_at, live_repaired_at`
+             purchase_origin, purchase_recorded_at, live_repaired_at, nexus_server_id`
 
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
@@ -201,19 +201,20 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		var createdAt, updatedAt string
 		var assignedIP, currency sql.NullString
 		var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
-		var priceID sql.NullInt64
+		var priceID, nexusServerID sql.NullInt64
 		var monthlyCap sql.NullFloat64
 		if err := rows.Scan(
 			&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 			&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 			&priceID, &monthlyCap, &currency,
-			&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt,
+			&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt, &nexusServerID,
 		); err != nil {
 			return nil, err
 		}
 		o.AssignedIP = assignedIP.String
 		o.Currency = currency.String
 		o.PriceID = int(priceID.Int64)
+		o.NexusServerID = nexusServerID.Int64
 		o.MonthlyCapNOK = monthlyCap.Float64
 		o.PurchaseOrigin = purchaseOrigin.String
 		o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)

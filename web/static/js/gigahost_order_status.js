@@ -708,13 +708,16 @@ function gigahostOrderStatusRow(order, context, classification) {
  * server id feed the status axes, and a failed provider answer makes the row
  * failed. onboarding is recorded separately, so a provider-ready VPS that the
  * panel has not onboarded is not presented as a finished backend. */
-function mergeGigahostOrderDetail(order, deploy) {
+function mergeGigahostOrderDetail(order, deploy, listedAbsence) {
     const merged = Object.assign({}, order);
+    // The list's own durable record of absence. Applied on its own, because the deploy
+    // read below is a second request that can fail without undoing it.
+    if (listedAbsence === true) merged.provider_absent = true;
     if (deploy) {
         if (deploy.step) merged.step = deploy.step;
         if (deploy.error) merged.last_error = deploy.error;
         if (deploy.server_id) merged.nexus_server_id = deploy.server_id;
-        // The deploy read is the one place this view is told that the provider's own
+        // The deploy read is the second place this view is told that the provider's own
         // server inventory no longer lists the server this order registered. Only a
         // true value is carried: an order the panel has no such record for keeps the
         // ordinary treatment rather than reading a missing field as agreement.
@@ -826,10 +829,14 @@ function gigahostOrderStatusNewAbortController() {
 async function gigahostOrderStatusReadOnce(signal) {
     let orders;
     let observations;
+    let absence;
     try {
         const res = await API.get('/api/admin/hosting/gigahost/orders', {signal: signal, silent: true});
         orders = (res && res.orders) ? res.orders : [];
         observations = (res && res.provider_observations) ? res.provider_observations : {};
+        // The list's own durable absence record, so the stage does not depend on the
+        // per-order detail request below, which may fail.
+        absence = (res && res.provider_absent_orders) ? res.provider_absent_orders : {};
     } catch (_) {
         return {ok: false};
     }
@@ -838,7 +845,11 @@ async function gigahostOrderStatusReadOnce(signal) {
     const setupIndex = await readGigahostSetupIntents(signal);
     const backendIndex = await readGigahostBackendIndex(signal);
     const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id, signal)));
-    const merged = orders.map((order, index) => mergeGigahostOrderDetail(order, (details[index] || {}).deploy));
+    const merged = orders.map((order, index) => mergeGigahostOrderDetail(
+        order,
+        (details[index] || {}).deploy,
+        absence[String((order && order.order_id) || '')]
+    ));
     return {
         ok: true,
         merged: merged,

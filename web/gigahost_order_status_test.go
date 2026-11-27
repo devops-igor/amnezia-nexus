@@ -61,7 +61,7 @@ w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
 const actions = [];
 w.triggerGigahostSetup = orderId => actions.push({action:'immediate_setup', orderId});
 
-let orders = [], intents = [], backends = [], deployByOrder = {}, observationByOrder = {};
+let orders = [], intents = [], backends = [], deployByOrder = {}, observationByOrder = {}, absenceByOrder = {};
 let failOrders = false, failIntents = false, failBackends = false, failList = false;
 const calls = [];
 // A prompt or confirmation raised by an accidental action click is answered with a
@@ -73,9 +73,10 @@ w.API = {
     calls.push({method:'GET', url});
     if (url === '/api/admin/hosting/gigahost/orders') {
       if (failOrders) throw new Error('offline');
-      // The real handler answers with the additive per-order provider observation;
-      // a scenario supplies only what it wants to differ from "the provider answered".
-      return {orders: orders, provider_observations: observationByOrder};
+      // The real handler answers with the additive per-order provider observation and
+      // the panel's durable absence record per order; a scenario supplies only what it
+      // wants to differ from "the provider answered" and "nobody was recorded absent".
+      return {orders: orders, provider_observations: observationByOrder, provider_absent_orders: absenceByOrder};
     }
     if (url === '/api/admin/hosting/gigahost/setup-intents') {
       if (failIntents) throw new Error('offline');

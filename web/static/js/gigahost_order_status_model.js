@@ -22,11 +22,15 @@
 const gigahostOrderStatusReadySpellings = ['ready', 'active'];
 const gigahostOrderStatusFailedSpellings = ['failed', 'error'];
 const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled'];
-// gigahostOrderStatusDeletedSpellings is the provider's word for a deployment it no
-// longer has. It is a stage of its own rather than a cancellation, because the fact the
-// operator needs is that the server is gone: a cancelled order was stopped while its
-// VPS could still be running, and a deleted one has no VPS at all.
-const gigahostOrderStatusDeletedSpellings = ['deleted'];
+// gigahostOrderStatusDeletedSpellings is the provider's vocabulary for a deployment it
+// no longer has. Both spellings are one fact, and the backend already treats them as
+// one (`isDeletedStatus` in the order-observation path): a `terminated` order that the
+// client classified as `deploying` would keep the setups and retries that exist to
+// contact a host the panel has evidence is gone. It is a stage of its own rather than a
+// cancellation, because the fact the operator needs is that the server is gone: a
+// cancelled order was stopped while its VPS could still be running, and a deleted one
+// has no VPS at all.
+const gigahostOrderStatusDeletedSpellings = ['deleted', 'terminated'];
 // gigahostOrderStatusRequestedSpellings are the provider and ledger spellings for an
 // order that exists but whose deployment has not started yet. `requested` is a stage in
 // the progression below, so a queued order is not drawn as one already deploying: both
@@ -290,9 +294,12 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal);
 
     // providerAbsent is the panel's durable record that the provider's own server
-    // inventory no longer lists the server this order registered. It is read from the
-    // order's deploy read, never inferred here: this view decides nothing about
-    // existence, it renders the one observation the panel already made.
+    // inventory no longer lists the server this order registered. It arrives from the
+    // order list response (the row itself, read from the column the reconciliation
+    // writes) and, additively, from the order's deploy read. The list's copy is what
+    // makes the stage independent of the deploy read: that request is a second one and
+    // can fail, and a failure must not hand a deleted deployment back to the ordinary
+    // treatment. This view never infers absence; it renders the record the panel made.
     //
     // It decides the stage on its own, and outranks both the provider's order spelling
     // and the ledger copy. These are different questions - whether the order was stopped

@@ -946,6 +946,12 @@ func isTerminalStatus(status string) bool {
 // panel's copy of the last answer and is served whether or not the provider could
 // be reached, so a 200 here does not mean the provider was read. The observation
 // says which it was, per order, without changing the rows themselves.
+//
+// The response also carries the panel's own durable existence record per order
+// (provider_absent_orders). That fact is written by the inventory reconciliation and
+// is served here so a row's deleted presentation does not depend on the per-order
+// deploy read succeeding: an order the panel has recorded as gone keeps its ending
+// even when that second request fails.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {
@@ -960,10 +966,12 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	observations := h.gigahostListObservations(r.Context(), r, orders)
+	absence := h.gigahostOrderAbsenceMarks(r.Context(), orders)
 
 	h.JSONOK(w, map[string]any{
-		"orders":                orders,
-		"count":                 len(orders),
-		"provider_observations": observations,
+		"orders":                 orders,
+		"count":                  len(orders),
+		"provider_observations":  observations,
+		"provider_absent_orders": absence,
 	})
 }
