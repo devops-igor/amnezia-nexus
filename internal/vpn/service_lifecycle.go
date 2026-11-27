@@ -402,16 +402,26 @@ func (s *Service) StartGaugeReconciler(ctx context.Context) {
 		ticker := time.NewTicker(ConnectionGaugeReconcileInterval)
 		defer ticker.Stop()
 		log.Printf("[vpn] periodic connection-gauge reconciler started (interval %s)", ConnectionGaugeReconcileInterval)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.reconcileConnectionCounts(ctx)
-				s.PruneExpiredAffinity()
-			}
-		}
+		s.runMaintenanceLoop(ctx, ticker.C)
 	}()
+}
+
+// runMaintenanceLoop is the body of the periodic maintenance goroutine started
+// by StartGaugeReconciler. Each tick reconciles the active_connections gauge
+// and then prunes expired sticky affinity; a canceled context ends the loop.
+// It takes the tick channel as a parameter so a test can drive one iteration
+// explicitly, while production keeps the hourly ticker created by its caller
+// as the only source of ticks.
+func (s *Service) runMaintenanceLoop(ctx context.Context, ticks <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			s.reconcileConnectionCounts(ctx)
+			s.PruneExpiredAffinity()
+		}
+	}
 }
 
 // Stop gracefully shuts down the VPN subsystem.
