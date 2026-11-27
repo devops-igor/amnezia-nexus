@@ -7,11 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - Sirius - 2026-11-27
+
+A release that gives routing and VPN health their own pages, stops the panel offering a server the provider no longer lists, and retires the last legacy API routes.
+
+### Added
+- Policy routing renders on its own Routing page, carrying the four readouts, the controls that change them and the per-client diagnosis (#990).
+- Each policy readout answers one question and shows one state, replacing five dense blocks and the traffic counters they carried (#985).
+- The VPN page is split into Overview, Backends and Diagnostics, each with its own sidebar entry and loading only its own controllers and data (#988).
+- A server whose provider order is absent from a successful inventory read shows as DELETED in recent deployments, keeps its order identity, offers no retry, setup, resume or approval action, and returns to ordinary treatment if the provider lists it again (#986).
+
+### Changed
+- Pinned versions come from one shared definition: the scheduled upstream monitor, the DEV image parity check and the runtime module version all read it rather than scraping files, and a pin the monitor cannot see now fails instead of defaulting silently (#271).
+- The server page protocol tabs wrap at phone widths instead of scrolling the document sideways (#975).
+- Minor and patch dependency updates across the Go module set (#994).
+
 ### Removed
-- Duplicate legacy route aliases (`/api/my/connections/*` and root server-management routes `POST /add`, `POST /confirm-fingerprint`, `POST/GET /{server_id}/*`) in favor of canonical `/api/connections/*` and `/api/servers/*` routes (#261).
+- The legacy route aliases `/api/my/connections/*` and the root server-management routes (`POST /add`, `POST /confirm-fingerprint`, `POST/GET /{server_id}/*`); the canonical `/api/connections/*` and `/api/servers/*` routes remain (#261).
+- Four diagnosis reason tokens that no production path assigned, the labels two of them would have rendered, and the orphaned `policy_client_reason_*` label family (#982).
 
 ### Fixed
-- Propagate database read and write errors in the `VPNUpdateConfigHandler` fallback branch when `vpnSvc` is nil instead of proceeding to save an unmerged configuration on `GetVPNConfig` failure (#367).
+- AmneziaWG IP allocations are keyed by one explicit identity, so a re-keyed or re-added client is not handed an address another client holds (#177).
+- A server recorded as provider-absent is no longer probed or offered, and an inventory read that failed or omitted the order changes nothing (#986).
+- The VPN update handler propagates a database read or write error instead of saving an unmerged configuration when the configuration read fails (#367).
+- The policy hints describe the address-based routing model the panel implements instead of the retired DNS observation (#983).
 
 ## [3.0.0] - Andromeda - 2026-11-24
 
