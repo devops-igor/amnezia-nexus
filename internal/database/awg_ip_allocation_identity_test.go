@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/config"
 )
 
 // allocationReleaseCapture collects structured records so a test can assert that
@@ -302,6 +304,136 @@ func TestAWGIPAllocations_ReleaseMissVisibleAtErrorLevel(t *testing.T) {
 	}
 }
 
+// TestAWGIPAllocations_ReleaseMissClassifiesReservationsAtPanelLogLevel is the
+// regression for the release diagnostic classifying a zero-row release against
+// the reservations the allocator actually honours -- every status except
+// 'released' -- instead of against an allocated row alone. It runs through the
+// handler and level the panel installs for the documented LOG_LEVEL, so a
+// reservation the operator must see cannot be hidden by that configuration.
+func TestAWGIPAllocations_ReleaseMissClassifiesReservationsAtPanelLogLevel(t *testing.T) {
+	db, cleanup := setupTestDBForAllocations(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const (
+		serverID     = int64(1)
+		peerKey      = "peer-adopted-pubkey"
+		supersededIP = "10.66.66.60"
+		movedKey     = "moved-identity"
+		movedIP      = "10.66.66.61"
+		staleIP      = "10.66.66.62"
+		absentKey    = "absent-identity"
+		absentIP     = "10.66.66.64"
+		releasedIP   = "10.66.66.65"
+	)
+
+	var buf bytes.Buffer
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+	setPanelLogLevel := func(level string) {
+		buf.Reset()
+		slog.SetDefault(slog.New(config.NewLogHandler(&buf, level)))
+	}
+
+	// Shape 1: an ordinary adoption of a peer's changed address superseded its
+	// previous row. The pool still excludes that address, so a release carrying
+	// the stale client/address pair deletes nothing and the diagnostic must
+	// report the surviving reservation, not an absence.
+	seedAllocationRowWithStatus(t, db, serverID, peerKey, supersededIP, "superseded")
+	setPanelLogLevel("ERROR")
+	if err := db.ReleaseAWGClientIP(ctx, serverID, "stale-client", supersededIP); err != nil {
+		t.Fatalf("release over a superseded reservation returned an error: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "still held by another identity") {
+		t.Fatalf("superseded reservation was not reported at LOG_LEVEL=ERROR; output: %q", out)
+	}
+	if !strings.Contains(out, supersededIP) || !strings.Contains(out, peerKey) || !strings.Contains(out, "owner_status=superseded") {
+		t.Fatalf("superseded-reservation report did not name the address, owner and status; output: %q", out)
+	}
+	assertAddressCountedByPool(t, db, serverID, supersededIP)
+
+	// Shape 2: the supplied address is stale and nothing holds it, but the
+	// identity's lease survives at another address. The report must say that
+	// instead of claiming no allocation exists for the requested address.
+	seedAllocationRow(t, db, serverID, movedKey, movedIP)
+	setPanelLogLevel("ERROR")
+	if err := db.ReleaseAWGClientIP(ctx, serverID, movedKey, staleIP); err != nil {
+		t.Fatalf("release over a stale address returned an error: %v", err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "still holds a different address") {
+		t.Fatalf("relocated lease was not reported at LOG_LEVEL=ERROR; output: %q", out)
+	}
+	if !strings.Contains(out, movedKey) || !strings.Contains(out, movedIP) {
+		t.Fatalf("relocated-lease report did not name the identity and the address it still holds; output: %q", out)
+	}
+	assertAddressCountedByPool(t, db, serverID, movedIP)
+
+	// Controls beside the two shapes: a matching release removes the row and stays
+	// silent at ERROR, and a genuinely absent release is an idempotent nil that is
+	// not promoted to an error.
+	for _, release := range []struct{ clientID, ip string }{
+		{peerKey, supersededIP},
+		{movedKey, movedIP},
+		{absentKey, absentIP},
+	} {
+		setPanelLogLevel("ERROR")
+		if err := db.ReleaseAWGClientIP(ctx, serverID, release.clientID, release.ip); err != nil {
+			t.Fatalf("release %s/%s returned an error: %v", release.clientID, release.ip, err)
+		}
+		if out := buf.String(); out != "" {
+			t.Fatalf("matching or absent release %s/%s emitted output at LOG_LEVEL=ERROR: %q", release.clientID, release.ip, out)
+		}
+	}
+	for _, ip := range []string{supersededIP, movedIP} {
+		if owner := allocationOwner(t, db, serverID, ip); owner != "" {
+			t.Fatalf("matching release left %s held by %q", ip, owner)
+		}
+	}
+
+	// A retained 'released' row reserves nothing, so the truthful INFO report is
+	// that the address is not reserved -- never that no allocation exists, which
+	// that retained row would falsify.
+	seedAllocationRowWithStatus(t, db, serverID, "previous-holder", releasedIP, "released")
+	setPanelLogLevel("INFO")
+	if err := db.ReleaseAWGClientIP(ctx, serverID, "another-client", releasedIP); err != nil {
+		t.Fatalf("release over a released row returned an error: %v", err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "no allocation reserves this address") {
+		t.Fatalf("address with only a released row was not described as unreserved at INFO; output: %q", out)
+	}
+	if strings.Contains(out, "level=ERROR") {
+		t.Fatalf("address with only a released row was reported as still held; output: %q", out)
+	}
+
+	// The identity-only release is classified separately: it deletes every row for
+	// the identity whatever its status, so a zero match means it holds nothing.
+	setPanelLogLevel("INFO")
+	if err := db.ReleaseAWGClientIP(ctx, serverID, absentKey, ""); err != nil {
+		t.Fatalf("identity-only release returned an error: %v", err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "no allocation exists for this client identity") {
+		t.Fatalf("identity-only miss was not reported truthfully at INFO; output: %q", out)
+	}
+
+	// A retained row whose stored identity carries surrounding whitespace cannot be
+	// matched by the exact predicate, while the pool still excludes its address. The
+	// report must name it as reserved under that same identity, not as absent.
+	seedAllocationRowWithStatus(t, db, serverID, " padded-identity ", "10.66.66.66", "allocated")
+	setPanelLogLevel("ERROR")
+	if err := db.ReleaseAWGClientIP(ctx, serverID, "padded-identity", "10.66.66.66"); err != nil {
+		t.Fatalf("release over a padded stored identity returned an error: %v", err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "still reserved under the supplied identity") {
+		t.Fatalf("padded stored identity was not reported as reserved under the supplied identity; output: %q", out)
+	}
+	assertAddressCountedByPool(t, db, serverID, "10.66.66.66")
+}
+
 // TestAWGIPAllocations_ReleasePredicateVariants pins the three release
 // predicates against their own lease so a matching release is never reported as
 // a miss, and a release with nothing to look up stays a documented no-op.
@@ -354,13 +486,38 @@ func TestAWGIPAllocations_ReleasePredicateVariants(t *testing.T) {
 // so a release scenario can start from a row it did not have to allocate.
 func seedAllocationRow(t *testing.T, db *DB, serverID int64, clientID, ip string) {
 	t.Helper()
+	seedAllocationRowWithStatus(t, db, serverID, clientID, ip, "allocated")
+}
+
+// seedAllocationRowWithStatus inserts a lease in an explicit status directly, so
+// a release scenario can start from retained state such as the superseded row an
+// ordinary adoption leaves behind.
+func seedAllocationRowWithStatus(t *testing.T, db *DB, serverID int64, clientID, ip, status string) {
+	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339)
 	if _, err := db.SQLDB().ExecContext(context.Background(),
-		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, 'allocated', ?, ?)",
-		serverID, clientID, ip, now, now,
+		"INSERT INTO awg_ip_allocations (server_id, client_id, ip, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+		serverID, clientID, ip, status, now, now,
 	); err != nil {
-		t.Fatalf("failed to seed allocation %s/%s: %v", clientID, ip, err)
+		t.Fatalf("failed to seed %s allocation %s/%s: %v", status, clientID, ip, err)
 	}
+}
+
+// assertAddressCountedByPool asserts the allocator's own used-address set still
+// excludes ip, i.e. the address is still unavailable to the next client. It reads
+// the same query allocation uses, so it cannot disagree with the pool.
+func assertAddressCountedByPool(t *testing.T, db *DB, serverID int64, ip string) {
+	t.Helper()
+	used, err := db.fetchAllocatedIPs(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("failed to read the allocator used-address set: %v", err)
+	}
+	for _, candidate := range used {
+		if candidate == ip {
+			return
+		}
+	}
+	t.Fatalf("address %s is not in the allocator used set %v; the release left it available", ip, used)
 }
 
 // assertAllocationRowCount asserts how many allocation rows exist for a server,

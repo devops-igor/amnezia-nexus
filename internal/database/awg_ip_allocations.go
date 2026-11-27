@@ -228,12 +228,14 @@ func mergeUsedIPs(usedConfigIPs, allocatedIPs []string) []string {
 //
 // clientID is the allocation identity produced by awg.AllocationKey (the public
 // key when one exists), i.e. exactly the identity AllocateAWGClientIP stored. A
-// release that matches no row leaves the address reserved, so it is reported
-// rather than swallowed: a row still held under another identity is logged at
-// ERROR (visible even when LOG_LEVEL=ERROR filters warnings) and an absent row --
-// indistinguishable from an intentional repeat release -- at INFO. It is not an
-// error because a caller releasing an already-released or mismatched pair must
-// not fail the surrounding removal.
+// release that matches no row leaves whatever the allocator still excludes in
+// place, so it is described rather than swallowed: a zero match is classified
+// against the reservations the pool honours (any status except 'released'), and
+// a surviving reservation is logged at ERROR so LOG_LEVEL=ERROR cannot hide it.
+// Only a release that finds no reservation at all is reported, at INFO, where it
+// cannot be mistaken for a still-held address. It is not an error because a
+// caller releasing an already-released or mismatched pair must not fail the
+// surrounding removal.
 func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
@@ -277,25 +279,94 @@ func (d *DB) ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, i
 	return nil
 }
 
+// releaseMiss describes what a zero-row release found still in place. It is read
+// against the reservations the allocator actually honours, not against the exact
+// predicate that failed: fetchAllocatedIPs excludes an address for every status
+// except 'released', so a lease superseded by an ordinary adoption reserves its
+// address exactly like an allocated one.
+type releaseMiss struct {
+	addressReserved  bool
+	addressOwner     string
+	addressStatus    string
+	identityReserved bool
+	identityIP       string
+	identityStatus   string
+	incomplete       error
+}
+
+// reservedAddress returns the lease still reserving ip on this server, if any.
+func (d *DB) reservedAddress(ctx context.Context, serverID int64, ip string) (ownerID, status string, found bool, err error) {
+	err = d.sqlDB.QueryRowContext(ctx,
+		"SELECT client_id, status FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status != 'released' LIMIT 1",
+		serverID, ip,
+	).Scan(&ownerID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return strings.TrimSpace(ownerID), status, true, nil
+}
+
+// reservedLeaseForIdentity returns the lease the identity still holds on this
+// server, if any, with the address it actually occupies.
+func (d *DB) reservedLeaseForIdentity(ctx context.Context, serverID int64, clientID string) (ip, status string, found bool, err error) {
+	err = d.sqlDB.QueryRowContext(ctx,
+		"SELECT ip, status FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND status != 'released' LIMIT 1",
+		serverID, clientID,
+	).Scan(&ip, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return strings.TrimSpace(ip), status, true, nil
+}
+
+// classifyReleaseMiss reads the reservations that make the requested release a
+// genuine miss rather than an intentional repeat.
+func (d *DB) classifyReleaseMiss(ctx context.Context, serverID int64, clientID, ip string) releaseMiss {
+	var miss releaseMiss
+	ownerID, ownerStatus, reserved, err := d.reservedAddress(ctx, serverID, ip)
+	if err != nil {
+		miss.incomplete = err
+		return miss
+	}
+	miss.addressReserved, miss.addressOwner, miss.addressStatus = reserved, ownerID, ownerStatus
+	if clientID == "" {
+		return miss
+	}
+	heldIP, heldStatus, held, err := d.reservedLeaseForIdentity(ctx, serverID, clientID)
+	if err != nil {
+		miss.incomplete = err
+		return miss
+	}
+	miss.identityReserved, miss.identityIP, miss.identityStatus = held, heldIP, heldStatus
+	return miss
+}
+
 // reportReleaseMiss reports a release whose DELETE matched no row.
 //
-// Two different situations produce a zero-row release and they must not be
-// described as the same thing:
-//   - A row for the address still exists under a different identity. That is a
-//     genuine miss: the address is still reserved and the release did nothing.
-//     It is reported at ERROR so it survives the documented LOG_LEVEL=ERROR
-//     configuration, which is exactly the silent-reserved-address failure this
-//     diagnostic exists to surface.
-//   - No row exists at all. That is indistinguishable from an intentional
-//     repeat release (already freed), so it is reported at INFO and never claims
-//     the address is still reserved; the caller still gets the idempotent nil.
+// The situations behind a zero-row release must not be described as the same
+// thing:
+//   - A lease still reserves the requested address under a different identity.
+//     The address stays unavailable to future clients, so this is reported at
+//     ERROR, surviving the documented LOG_LEVEL=ERROR configuration.
+//   - The address is free, but the supplied identity still holds a different
+//     address. The release acted on stale metadata, so the surviving lease is
+//     named at ERROR as well instead of being reported as an absence.
+//   - Nothing is reserved for the address or the identity. That is
+//     indistinguishable from an intentional repeat release (already freed), so it
+//     is reported at INFO and never claims an address is still reserved.
 //
-// The return value stays nil in both cases so a retry is never turned into a
-// failure; observability, not control flow, is what changes with the level.
+// The return value stays nil in every case so a retry is never turned into a
+// failure; observability, not control flow, is what changes.
 func (d *DB) reportReleaseMiss(ctx context.Context, serverID int64, clientID, ip string) {
 	if ip == "" {
-		// Released by identity only and nothing matched: no allocation row exists
-		// for this client. Nothing was found, so nothing is claimed to be held.
+		// Released by identity only and nothing matched: the DELETE covers every
+		// row for that identity whatever its status, so it holds no lease at all.
 		slog.Info("AWG IP release matched no allocation row: no allocation exists for this client identity",
 			"server_id", serverID,
 			"client_id", clientID,
@@ -303,31 +374,43 @@ func (d *DB) reportReleaseMiss(ctx context.Context, serverID int64, clientID, ip
 		return
 	}
 
-	var ownerID string
-	err := d.sqlDB.QueryRowContext(ctx,
-		"SELECT client_id FROM awg_ip_allocations WHERE server_id = ? AND ip = ? AND status = 'allocated' LIMIT 1",
-		serverID, ip,
-	).Scan(&ownerID)
+	miss := d.classifyReleaseMiss(ctx, serverID, clientID, ip)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		slog.Info("AWG IP release matched no allocation row: no allocation exists for this address",
+	case miss.incomplete != nil:
+		slog.Warn("AWG IP release matched no allocation row and the surviving reservations could not be checked",
 			"server_id", serverID,
 			"client_id", clientID,
 			"ip", ip,
+			"error", miss.incomplete,
 		)
-	case err != nil:
-		slog.Warn("AWG IP release matched no allocation row and the surviving holder could not be checked",
-			"server_id", serverID,
-			"client_id", clientID,
-			"ip", ip,
-			"error", err,
-		)
-	default:
+	case miss.addressReserved && miss.addressOwner != clientID:
 		slog.Error("AWG IP release matched no allocation row: the address is still held by another identity",
 			"server_id", serverID,
 			"client_id", clientID,
 			"ip", ip,
-			"owner_id", strings.TrimSpace(ownerID),
+			"owner_id", miss.addressOwner,
+			"owner_status", miss.addressStatus,
+		)
+	case miss.addressReserved:
+		slog.Error("AWG IP release matched no allocation row: the address is still reserved under the supplied identity",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
+			"owner_status", miss.addressStatus,
+		)
+	case miss.identityReserved:
+		slog.Error("AWG IP release matched no allocation row: the address is no longer reserved, but the supplied identity still holds a different address",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
+			"held_ip", miss.identityIP,
+			"held_status", miss.identityStatus,
+		)
+	default:
+		slog.Info("AWG IP release matched no allocation row: no allocation reserves this address",
+			"server_id", serverID,
+			"client_id", clientID,
+			"ip", ip,
 		)
 	}
 }

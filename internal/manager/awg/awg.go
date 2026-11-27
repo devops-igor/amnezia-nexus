@@ -44,25 +44,18 @@ type SSHProvider interface {
 // explicit client_id naming a different client than the public key is refused at
 // the client-add path and again at every persistence entry point (allocate and
 // adopt), so an unequal pair is never stored under one identity and dropped. A
-// release matching a row held under another identity is reported at ERROR; a
-// release that finds no row is reported at INFO and never claims the address is
-// still reserved.
+// release matching no row leaves in place every reservation the pool counts (any
+// status except 'released') and reports it at ERROR, naming whether another
+// identity holds that address or the supplied identity's lease has moved; only a
+// release that finds no reservation at all is reported, at INFO.
 //
 // Contract:
-//   - AllocateAWGClientIP:
-//   - clientID: explicit client identifier supplied by the caller, if any.
-//   - clientPubKey: WireGuard / AmneziaWG public key for the peer.
-//   - The allocation is idempotent: if an allocation already exists for the
-//     resolved identity on serverID, the previously allocated IP is retained and
-//     returned.
-//   - Concurrent allocations on the same server are synchronized and serialized to guarantee
-//     zero IP collisions within the subnet.
-//   - ReleaseAWGClientIP:
-//   - Releases the allocation matching serverID and clientID (and/or ip).
-//   - TransferAWGClientIPLease:
-//   - Transfers allocation lease ownership when an existing client re-keys.
-//   - AdoptAWGClientIPLease:
-//   - Adopts an existing metadata IP for an upgraded client into SQLite if available.
+//   - AllocateAWGClientIP: reserve the next free address for clientID/clientPubKey;
+//     idempotent per resolved identity and serialized per server.
+//   - ReleaseAWGClientIP: release the allocation matching serverID and clientID
+//     (and/or ip).
+//   - TransferAWGClientIPLease: transfer lease ownership when a client re-keys.
+//   - AdoptAWGClientIPLease: adopt an existing metadata IP for an upgraded client.
 type IPAllocator interface {
 	AllocateAWGClientIP(ctx context.Context, serverID int64, clientID, clientPubKey string, usedConfigIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error)
 	ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error
