@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -227,6 +228,110 @@ func TestServiceCheck_Success(t *testing.T) {
 
 	if status.BaseImage != version.PinnedAWGBaseImage {
 		t.Errorf("expected BaseImage %q, got %q", version.PinnedAWGBaseImage, status.BaseImage)
+	}
+}
+
+// TestServiceCheck_ComparesAgainstCompiledModuleVersion is the regression for a
+// loss of the build-metadata wiring. The comparison baseline for amneziawg-go
+// must be the version the binary was compiled against, and only fall back to the
+// pinned constant when no usable record exists. Both halves run the real Service
+// against the same upstream fixture, whose latest tag is above the pinned
+// constant, so the two expectations differ: a fixed pin in Check reports an
+// update for a version that is already compiled in and cannot satisfy the first
+// case, while ignoring the fallback cannot satisfy the second.
+func TestServiceCheck_ComparesAgainstCompiledModuleVersion(t *testing.T) {
+	const recorded = "v3.1.20261201"
+	if recorded == version.PinnedAWGGoVersion {
+		t.Fatalf("fixture version %q must differ from PinnedAWGGoVersion", recorded)
+	}
+
+	tests := []struct {
+		name       string
+		source     func() (*debug.BuildInfo, bool)
+		wantPinned string
+		wantUpdate bool
+	}{
+		{
+			name: "recorded module version is the comparison baseline",
+			source: func() (*debug.BuildInfo, bool) {
+				return &debug.BuildInfo{
+					Deps: []*debug.Module{{Path: version.AWGGoModulePath, Version: recorded}},
+				}, true
+			},
+			wantPinned: recorded,
+			wantUpdate: false,
+		},
+		{
+			name: "no usable record falls back to the pinned constant",
+			source: func() (*debug.BuildInfo, bool) {
+				return nil, false
+			},
+			wantPinned: version.PinnedAWGGoVersion,
+			wantUpdate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ghSrv, dhSrv, ghMux, dhMux := setupMockServers(t)
+			defer ghSrv.Close()
+			defer dhSrv.Close()
+
+			ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-go/tags", func(w http.ResponseWriter, r *http.Request) {
+				tags := []gitHubTag{
+					{Name: recorded},
+					{Name: version.PinnedAWGGoVersion},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(tags)
+			})
+			ghMux.HandleFunc("/repos/amnezia-vpn/amneziawg-tools/tags", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode([]gitHubTag{{Name: version.PinnedAWGToolsVersion}})
+			})
+			dhMux.HandleFunc("/repositories/"+version.DefaultDockerRepo+"/tags", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(dockerHubResponse{
+					Count: 1,
+					Results: []dockerHubTag{
+						{
+							Name:        version.PinnedAWGGoVersion + "-" + version.PinnedAWGImageRevision,
+							LastUpdated: time.Now(),
+						},
+					},
+				})
+			})
+
+			t.Cleanup(version.SetBuildInfoSource(tt.source))
+
+			svc := NewService(
+				WithBaseURL(ghSrv.URL),
+				WithDockerBaseURL(dhSrv.URL),
+			)
+
+			status, err := svc.Check(context.Background(), false)
+			if err != nil {
+				t.Fatalf("Check returned unexpected error: %v", err)
+			}
+
+			goComp := status.Components[0]
+			if goComp.PinnedVersion != tt.wantPinned {
+				t.Errorf("pinned_version for amneziawg-go = %q, want %q", goComp.PinnedVersion, tt.wantPinned)
+			}
+			if goComp.LatestVersion != recorded {
+				t.Errorf("latest_version for amneziawg-go = %q, want the upstream tag %q", goComp.LatestVersion, recorded)
+			}
+			if goComp.UpdateAvailable != tt.wantUpdate {
+				t.Errorf(
+					"update_available for amneziawg-go = %v, want %v (pinned %q vs upstream %q)",
+					goComp.UpdateAvailable,
+					tt.wantUpdate,
+					goComp.PinnedVersion,
+					recorded,
+				)
+			}
+			if status.UpdateAvailable != tt.wantUpdate {
+				t.Errorf("aggregate update_available = %v, want %v", status.UpdateAvailable, tt.wantUpdate)
+			}
+		})
 	}
 }
 

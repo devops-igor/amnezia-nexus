@@ -81,6 +81,69 @@ func TestCompiledAWGGoVersion(t *testing.T) {
 	}
 }
 
+// TestCompiledAWGGoVersionReadsRecordedMetadata fails when the detector stops
+// reading build metadata and always reports the pinned constant. A test binary
+// links no amneziawg-go dependency, so the function's own output in that binary
+// cannot distinguish "the metadata was read" from "the fallback was returned
+// unconditionally"; the metadata source is presented directly instead, with a
+// recorded version that differs from the configured fallback.
+func TestCompiledAWGGoVersionReadsRecordedMetadata(t *testing.T) {
+	const recorded = "v3.1.20261201"
+	if recorded == PinnedAWGGoVersion {
+		t.Fatalf("fixture version %q must differ from PinnedAWGGoVersion", recorded)
+	}
+
+	t.Cleanup(SetBuildInfoSource(func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{
+			Deps: []*debug.Module{{Path: AWGGoModulePath, Version: recorded}},
+		}, true
+	}))
+
+	if got := CompiledAWGGoVersion(); got != recorded {
+		t.Errorf(
+			"CompiledAWGGoVersion() = %q with %s recorded as %q; want the recorded version, not the fallback %q",
+			got,
+			AWGGoModulePath,
+			recorded,
+			PinnedAWGGoVersion,
+		)
+	}
+}
+
+// TestCompiledAWGGoVersionFallsBackWithoutMetadata is the paired expectation for
+// the case the constant exists for: nothing usable is recorded, so the pinned
+// version is reported.
+func TestCompiledAWGGoVersionFallsBackWithoutMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		source func() (*debug.BuildInfo, bool)
+	}{
+		{
+			name: "no build metadata",
+			source: func() (*debug.BuildInfo, bool) {
+				return nil, false
+			},
+		},
+		{
+			name: "no amneziawg-go record",
+			source: func() (*debug.BuildInfo, bool) {
+				return &debug.BuildInfo{
+					Deps: []*debug.Module{{Path: "example.com/other", Version: "v1.0.0"}},
+				}, true
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(SetBuildInfoSource(tt.source))
+			if got := CompiledAWGGoVersion(); got != PinnedAWGGoVersion {
+				t.Errorf("CompiledAWGGoVersion() = %q without a usable record; want the fallback %q", got, PinnedAWGGoVersion)
+			}
+		})
+	}
+}
+
 func TestAWGGoVersionFromModules(t *testing.T) {
 	tests := []struct {
 		name string

@@ -39,12 +39,32 @@ const (
 	PinnedAWGBaseImage = DefaultDockerRepo + ":" + PinnedAWGGoVersion + "-" + PinnedAWGImageRevision
 )
 
+// readBuildInfo is the build-metadata source. It is a variable so a test can
+// present recorded module metadata that a test binary does not carry: go test
+// links only the modules its own packages use, so in a unit test the recorded
+// amneziawg-go version is otherwise absent and "read the metadata" is
+// indistinguishable from "always return the constant". Production code never
+// replaces it.
+var readBuildInfo = debug.ReadBuildInfo
+
+// SetBuildInfoSource installs an alternative build-metadata source and returns
+// a function that restores the previous one. It exists so that the detector and
+// the upstream service that consumes it can be proven to consult recorded
+// metadata that a test binary cannot carry.
+func SetBuildInfoSource(source func() (*debug.BuildInfo, bool)) (restore func()) {
+	previous := readBuildInfo
+	readBuildInfo = source
+	return func() {
+		readBuildInfo = previous
+	}
+}
+
 // CompiledAWGGoVersion returns the amneziawg-go module version recorded in the
 // build metadata of the running binary. It falls back to PinnedAWGGoVersion
 // when build metadata is unavailable, when the module did not contribute code
 // to the binary, or when the build was made from an unversioned replacement.
 func CompiledAWGGoVersion() string {
-	info, ok := debug.ReadBuildInfo()
+	info, ok := readBuildInfo()
 	if !ok || info == nil {
 		return PinnedAWGGoVersion
 	}

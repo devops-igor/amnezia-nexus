@@ -253,15 +253,63 @@ def test_a_present_image_is_not_pulled(docker) -> None:
 
 # -- structural wiring: nothing may drift -------------------------------------------
 
+VERSION_SOURCE = REPO_ROOT / "internal" / "version" / "version.go"
+INSTALLER_SOURCE = REPO_ROOT / "internal" / "manager" / "awg" / "awg_install.go"
+
+
+def _go_string_const(source: str, name: str) -> str:
+    """Return the string literal a Go constant is declared with."""
+    match = re.search(rf'^\s*{name}\s*=\s*"([^"]+)"', source, re.MULTILINE)
+    assert match, (
+        f"constant {name} must be declared as a string literal "
+        "in internal/version/version.go"
+    )
+    return match.group(1)
+
+
+def canonical_base_image() -> str:
+    """The image the panel installs, composed from its single definition.
+
+    The tag is derived there (repository + versioned source + image revision)
+    rather than written out, so the same derivation has to be applied here; a
+    literal to scrape no longer exists, and inventing a second copy of the value
+    is the drift this check exists to catch.
+    """
+    source = VERSION_SOURCE.read_text(encoding="utf-8")
+    repository = _go_string_const(source, "DefaultDockerRepo")
+    version = _go_string_const(source, "PinnedAWGGoVersion")
+    revision = _go_string_const(source, "PinnedAWGImageRevision")
+    return f"{repository}:{version}-{revision}"
+
+
+def assert_client_image_matches_installer(effective_image: str) -> None:
+    """Fail when the image the DEV client runs is not the one the panel installs."""
+    canonical = canonical_base_image()
+    assert effective_image == canonical, (
+        f"DEV client image {effective_image!r} must equal the panel's pinned base image "
+        f"{canonical!r}; both are pinned so a DEV run exercises the shipped datapath"
+    )
+
 
 def test_the_pinned_client_image_equals_the_one_the_panel_installs() -> None:
-    """One definition, two consumers: the Go installer constant and this module."""
-    source = (REPO_ROOT / "internal" / "manager" / "awg" / "awg_install.go").read_text(
-        encoding="utf-8"
+    """One definition, two consumers: the Go installer and this module."""
+    installer = INSTALLER_SOURCE.read_text(encoding="utf-8")
+    assert re.search(r"const awgBaseImage = version\.PinnedAWGBaseImage\b", installer), (
+        "the installer must consume version.PinnedAWGBaseImage rather than "
+        "declaring its own literal"
     )
-    match = re.search(r'const awgBaseImage = "([^"]+)"', source)
-    assert match, "awgBaseImage constant not found"
-    assert dev_host.PRIMARY_CLIENT_IMAGE == match.group(1)
+    assert_client_image_matches_installer(dev_host.PRIMARY_CLIENT_IMAGE)
+
+
+def test_the_parity_check_rejects_a_divergent_effective_image() -> None:
+    """The assertion above must be able to fail, or it protects nothing."""
+    canonical = canonical_base_image()
+    repository, _, tag = canonical.rpartition(":")
+    divergent = f"{repository}:{tag.rsplit('-', 1)[0]}-99"
+    assert divergent != canonical
+
+    with pytest.raises(AssertionError):
+        assert_client_image_matches_installer(divergent)
 
 
 def test_the_traffic_suite_uses_the_shared_probe_and_no_inline_architecture_check() -> None:
