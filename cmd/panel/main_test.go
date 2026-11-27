@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -166,6 +167,37 @@ func TestRunLogLevels(t *testing.T) {
 				t.Fatalf("timed out for log level %s", lvl)
 			}
 		})
+	}
+}
+
+// TestRunInstallsDocumentedLogThreshold proves the panel's own startup path
+// installs the threshold LOG_LEVEL names, rather than a regression choosing one
+// itself: a diagnostic asserted to be visible at ERROR is then visible through the
+// handler this deployment actually installs. Startup stops at the writability
+// preflight, after the logger is installed and before any listener or service.
+func TestRunInstallsDocumentedLogThreshold(t *testing.T) {
+	tempDir := t.TempDir()
+	blocker := filepath.Join(tempDir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("failed to create the preflight blocker: %v", err)
+	}
+	t.Setenv("DATA_DIR", filepath.Join(blocker, "data"))
+	t.Setenv("DB_PATH", filepath.Join(blocker, "data", "panel.db"))
+	t.Setenv("LOG_LEVEL", "ERROR")
+	t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	if err := run(context.Background()); err == nil {
+		t.Fatalf("run with an unusable data dir should stop at the writability preflight")
+	}
+	ctx := context.Background()
+	if slog.Default().Enabled(ctx, slog.LevelInfo) {
+		t.Fatalf("LOG_LEVEL=ERROR installed a handler that still emits INFO")
+	}
+	if !slog.Default().Enabled(ctx, slog.LevelError) {
+		t.Fatalf("LOG_LEVEL=ERROR did not install an ERROR threshold")
 	}
 }
 

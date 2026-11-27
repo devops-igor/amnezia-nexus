@@ -364,3 +364,66 @@ func mustGetConfig(t *testing.T, db *database.DB, withSvc bool, h *Handlers) *mo
 	}
 	return cfg
 }
+
+func (f flagFixture) assertPutInternalError(t *testing.T, body string) {
+	t.Helper()
+	w := f.put(t, body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT /api/vpn/config (%s) status = %d, want 500; body=%s", body, w.Code, w.Body.String())
+	}
+	var errResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errResp["error"] != "internal_error" {
+		t.Errorf("error = %v, want internal_error", errResp["error"])
+	}
+}
+
+// TestVPNUpdateConfigHandler_NilServicePropagatesDatabaseErrors verifies that
+// when h.vpnSvc is nil, VPNUpdateConfigHandler fails closed with HTTP 500
+// internal_error on both GetVPNConfig and SaveVPNConfig failures without
+// invoking SaveVPNConfig when GetVPNConfig fails (issue #367).
+func TestVPNUpdateConfigHandler_NilServicePropagatesDatabaseErrors(t *testing.T) {
+	t.Run("GetVPNConfig error aborts before SaveVPNConfig", func(t *testing.T) {
+		f := newFlagFixture(t, false)
+
+		// Arm a peer-change guard to observe whether SaveVPNConfig is reached.
+		// SaveVPNConfig calls ValidatePortalConfig BEFORE touching SQLite, so if
+		// GetVPNConfig's error is ignored and SaveVPNConfig is invoked on a
+		// closed DB, guard.calls increments to 1 instead of staying 0.
+		guard := &protocolGuardListener{}
+		detach, err := f.db.SubscribePeerChanges(guard)
+		if err != nil {
+			t.Fatalf("SubscribePeerChanges: %v", err)
+		}
+		t.Cleanup(detach)
+
+		if err := f.db.Close(); err != nil {
+			t.Fatalf("db.Close: %v", err)
+		}
+
+		f.assertPutInternalError(t, `{"health_threshold_ms": 750}`)
+		if guard.calls != 0 {
+			t.Fatalf("SaveVPNConfig was invoked (%d guard call(s)) despite GetVPNConfig failing", guard.calls)
+		}
+	})
+
+	t.Run("SaveVPNConfig error returns 500 internal_error", func(t *testing.T) {
+		f := newFlagFixture(t, false)
+		f.setFlags(t, true, true)
+
+		guard := &protocolGuardListener{settings: *mustGetConfig(t, f.db, false, f.h)}
+		detach, err := f.db.SubscribePeerChanges(guard)
+		if err != nil {
+			t.Fatalf("SubscribePeerChanges: %v", err)
+		}
+		t.Cleanup(detach)
+
+		// GetVPNConfig succeeds, but SaveVPNConfig fails ValidatePortalConfig.
+		f.assertPutInternalError(t, `{"random_trailers": false}`)
+		if guard.calls == 0 {
+			t.Fatal("expected SaveVPNConfig to consult ValidatePortalConfig after GetVPNConfig succeeded")
+		}
+	})
+}

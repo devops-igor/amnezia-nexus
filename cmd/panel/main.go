@@ -241,19 +241,7 @@ func run(ctx context.Context) error {
 	}
 
 	// 2. Setup structured logging
-	var level slog.Level
-	switch cfg.LogLevel {
-	case "DEBUG":
-		level = slog.LevelDebug
-	case "WARN":
-		level = slog.LevelWarn
-	case "ERROR":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
-	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(config.NewLogHandler(os.Stdout, cfg.LogLevel)))
 
 	slog.Info("Starting Amnezia Web Panel", "version", cfg.AppVersion, "codename", cfg.AppCodename, "port", cfg.Port)
 

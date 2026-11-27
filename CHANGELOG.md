@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Duplicate legacy route aliases (`/api/my/connections/*` and root server-management routes `POST /add`, `POST /confirm-fingerprint`, `POST/GET /{server_id}/*`) in favor of canonical `/api/connections/*` and `/api/servers/*` routes (#261).
+
+### Fixed
+- Propagate database read and write errors in the `VPNUpdateConfigHandler` fallback branch when `vpnSvc` is nil instead of proceeding to save an unmerged configuration on `GetVPNConfig` failure (#367).
+
 ## [3.0.0] - Andromeda - 2026-11-24
 
 A release that moves policy routing onto the destination address itself, retires the DNS-driven surfaces it replaces, and rebuilds the portal around the operator's first question.

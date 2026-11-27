@@ -446,8 +446,8 @@ func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 		}
 	})
 
-	// 2. Legacy /{server_id}/install receives ~15 minute deadline
-	t.Run("Legacy Install route ~15m", func(t *testing.T) {
+	// 2. Retired legacy /{server_id}/install returns 404 Not Found
+	t.Run("Retired Legacy Install route 404", func(t *testing.T) {
 		mgr.resetDeadline()
 		req := newAuthReq(http.MethodPost, fmt.Sprintf("/%d/install", serverID), models.InstallProtocolRequest{
 			Protocol: "awg",
@@ -456,16 +456,11 @@ func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for retired legacy install route, got %d (body: %s)", rec.Code, rec.Body.String())
 		}
-		dl, found := mgr.getDeadline()
-		if !found {
-			t.Fatal("expected deadline to be set on legacy install context")
-		}
-		remaining := time.Until(dl)
-		if remaining < 14*time.Minute || remaining > 16*time.Minute {
-			t.Fatalf("expected legacy install context deadline ~15m, got remaining %v", remaining)
+		if _, found := mgr.getDeadline(); found {
+			t.Fatal("expected manager not to be invoked on retired legacy install route")
 		}
 	})
 
@@ -491,8 +486,8 @@ func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 		}
 	})
 
-	// 4. Legacy /{server_id}/uninstall receives ~5 minute deadline
-	t.Run("Legacy Uninstall route ~5m", func(t *testing.T) {
+	// 4. Retired legacy /{server_id}/uninstall returns 404 Not Found
+	t.Run("Retired Legacy Uninstall route 404", func(t *testing.T) {
 		mgr.resetDeadline()
 		req := newAuthReq(http.MethodPost, fmt.Sprintf("/%d/uninstall", serverID), models.ProtocolRequest{
 			Protocol: "awg",
@@ -500,16 +495,11 @@ func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for retired legacy uninstall route, got %d (body: %s)", rec.Code, rec.Body.String())
 		}
-		dl, found := mgr.getDeadline()
-		if !found {
-			t.Fatal("expected deadline to be set on legacy uninstall context")
-		}
-		remaining := time.Until(dl)
-		if remaining < 4*time.Minute || remaining > 6*time.Minute {
-			t.Fatalf("expected legacy uninstall context deadline ~5m, got remaining %v", remaining)
+		if _, found := mgr.getDeadline(); found {
+			t.Fatal("expected manager not to be invoked on retired legacy uninstall route")
 		}
 	})
 

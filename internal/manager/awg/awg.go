@@ -38,20 +38,24 @@ type SSHProvider interface {
 
 // IPAllocator defines an interface for managing atomic IP address allocations.
 //
+// Identity contract (see AllocationKey): a row is stored under exactly one
+// identity -- the client public key when supplied, otherwise the explicit client
+// identifier -- and ReleaseAWGClientIP must be called with that same identity. An
+// explicit client_id naming a different client than the public key is refused at
+// the client-add path and again at every persistence entry point (allocate and
+// adopt), so an unequal pair is never stored under one identity and dropped. A
+// release matching no row leaves in place every reservation the pool counts (any
+// status except 'released') and reports it at ERROR, naming whether another
+// identity holds that address or the supplied identity's lease has moved; only a
+// release that finds no reservation at all is reported, at INFO.
+//
 // Contract:
-//   - AllocateAWGClientIP:
-//   - clientID: logical identifier for the client (e.g. user ID or explicit client identifier).
-//   - clientPubKey: WireGuard / AmneziaWG public key for the peer.
-//   - The allocation is idempotent: if an allocation already exists for either clientID or
-//     clientPubKey on serverID, the previously allocated IP is retained and returned.
-//   - Concurrent allocations on the same server are synchronized and serialized to guarantee
-//     zero IP collisions within the subnet.
-//   - ReleaseAWGClientIP:
-//   - Releases the allocation matching serverID and clientID (and/or ip).
-//   - TransferAWGClientIPLease:
-//   - Transfers allocation lease ownership when an existing client re-keys.
-//   - AdoptAWGClientIPLease:
-//   - Adopts an existing metadata IP for an upgraded client into SQLite if available.
+//   - AllocateAWGClientIP: reserve the next free address for clientID/clientPubKey;
+//     idempotent per resolved identity and serialized per server.
+//   - ReleaseAWGClientIP: release the allocation matching serverID and clientID
+//     (and/or ip).
+//   - TransferAWGClientIPLease: transfer lease ownership when a client re-keys.
+//   - AdoptAWGClientIPLease: adopt an existing metadata IP for an upgraded client.
 type IPAllocator interface {
 	AllocateAWGClientIP(ctx context.Context, serverID int64, clientID, clientPubKey string, usedConfigIPs []string, subnetAddr string, subnetCIDR int, gatewayIP string) (string, error)
 	ReleaseAWGClientIP(ctx context.Context, serverID int64, clientID, ip string) error
@@ -597,10 +601,13 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 		previousPeerSection = extractPeerSection(confText, targetKey, targetIP)
 	}
 
-	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
+	effectiveClientID, err := resolveEffectiveClientID(clientParams, clientPubKey)
+	if err != nil {
+		return nil, err
+	}
 
 	clientIP, newlyAllocated, rekeyed, previousOwner, rekeyedIP, err := m.obtainClientIP(
-		ctx, serverID, clientParams, clients, existingIdx, clientPubKey, usedIPs, serverParams, remotePeers,
+		ctx, serverID, effectiveClientID, clientPubKey, clients, existingIdx, usedIPs, serverParams, remotePeers,
 	)
 	if err != nil {
 		return nil, err
@@ -1091,16 +1098,14 @@ func (m *AWGManager) obtainExistingClientIPWithAllocator(
 func (m *AWGManager) obtainClientIP(
 	ctx context.Context,
 	serverID int64,
-	clientParams map[string]any,
+	effectiveClientID, clientPubKey string,
 	clients []AWGClient,
 	existingIdx int,
-	clientPubKey string,
 	usedIPs []string,
 	serverParams map[string]string,
 	remotePeers []AWGPeer,
 ) (string, bool, bool, string, string, error) {
 	subnetAddr, subnetCIDR, gatewayIP := parseServerSubnetParams(serverParams)
-	effectiveClientID := resolveEffectiveClientID(clientParams, clientPubKey)
 
 	if m.ipAllocator != nil {
 		if existingIdx >= 0 && clients[existingIdx].UserData.ClientIP != "" {
@@ -1125,13 +1130,6 @@ func (m *AWGManager) obtainClientIP(
 		return "", false, false, "", "", resErr
 	}
 	return resolvedIP, false, false, "", "", nil
-}
-
-func resolveEffectiveClientID(clientParams map[string]any, clientPubKey string) string {
-	if cid, ok := clientParams["client_id"].(string); ok && strings.TrimSpace(cid) != "" {
-		return strings.TrimSpace(cid)
-	}
-	return clientPubKey
 }
 
 func (m *AWGManager) getServerPublicKeyRequired(ctx context.Context, server *models.Server) (string, error) {

@@ -36,7 +36,7 @@ func TestAllocateAWGClientIP_Sequential(t *testing.T) {
 	gatewayIP := "10.66.66.1"
 
 	// Allocate for client 1
-	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestAllocateAWGClientIP_Sequential(t *testing.T) {
 	}
 
 	// Allocate for client 2
-	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "client2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -74,13 +74,13 @@ func TestAllocateAWGClientIP_Idempotency(t *testing.T) {
 	gatewayIP := "10.66.66.1"
 
 	// First allocation
-	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("first allocation failed: %v", err)
 	}
 
 	// Re-allocation for same clientID
-	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("second allocation failed: %v", err)
 	}
@@ -118,13 +118,13 @@ func TestAllocateAWGClientIP_ReleaseAndReallocation(t *testing.T) {
 	gatewayIP := "10.66.66.1"
 
 	// Allocate client 1 (gets .2)
-	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil || ip1 != "10.66.66.2" {
 		t.Fatalf("unexpected allocation 1: ip=%s, err=%v", ip1, err)
 	}
 
 	// Allocate client 2 (gets .3)
-	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "client2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip2, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil || ip2 != "10.66.66.3" {
 		t.Fatalf("unexpected allocation 2: ip=%s, err=%v", ip2, err)
 	}
@@ -144,7 +144,7 @@ func TestAllocateAWGClientIP_ReleaseAndReallocation(t *testing.T) {
 	}
 
 	// Allocate new client 3 — should get the freed .2
-	ip3, err := db.AllocateAWGClientIP(ctx, serverID, "client3", "pubkey3", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip3, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey3", "pubkey3", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("allocation 3 failed: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestAllocateAWGClientIP_UsedConfigIPs(t *testing.T) {
 	// Suppose remote configuration already has 10.66.66.2 and 10.66.66.3 assigned
 	usedConfigIPs := []string{"10.66.66.2", "10.66.66.3"}
 
-	ip, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", usedConfigIPs, subnetAddr, subnetCIDR, gatewayIP)
+	ip, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", usedConfigIPs, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("allocation failed: %v", err)
 	}
@@ -188,13 +188,13 @@ func TestAllocateAWGClientIP_SubnetExhaustion(t *testing.T) {
 	gatewayIP := "10.66.66.1"
 
 	// 1st allocation: gets .2
-	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "client1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ip1, err := db.AllocateAWGClientIP(ctx, serverID, "pubkey1", "pubkey1", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil || ip1 != "10.66.66.2" {
 		t.Fatalf("unexpected allocation 1: ip=%s, err=%v", ip1, err)
 	}
 
 	// 2nd allocation: subnet is exhausted
-	_, err = db.AllocateAWGClientIP(ctx, serverID, "client2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
+	_, err = db.AllocateAWGClientIP(ctx, serverID, "pubkey2", "pubkey2", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err == nil {
 		t.Fatalf("expected subnet exhaustion error, got nil")
 	}
@@ -220,8 +220,7 @@ func TestAllocateAWGClientIP_ConcurrentAllocations(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			cID := fmt.Sprintf("client-%d", idx)
-			pKey := fmt.Sprintf("pubkey-%d", idx)
-			ip, err := db.AllocateAWGClientIP(ctx, serverID, cID, pKey, nil, subnetAddr, subnetCIDR, gatewayIP)
+			ip, err := db.AllocateAWGClientIP(ctx, serverID, cID, cID, nil, subnetAddr, subnetCIDR, gatewayIP)
 			allocatedIPs[idx] = ip
 			errors[idx] = err
 		}(i)
@@ -316,7 +315,7 @@ func TestAllocateAWGClientIP_OwnershipVerification_ClaimedByOther(t *testing.T) 
 	gatewayIP := "10.66.66.1"
 
 	// Client Alice allocates first IP (10.66.66.2)
-	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice-key", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("alice allocation failed: %v", err)
 	}
@@ -325,7 +324,7 @@ func TestAllocateAWGClientIP_OwnershipVerification_ClaimedByOther(t *testing.T) 
 	}
 
 	// Verify that Bob cannot claim Alice's IP
-	claimed, err := db.isAllocationClaimedByOther(ctx, serverID, ipAlice, "bob", "bob-key")
+	claimed, err := db.isAllocationClaimedByOther(ctx, serverID, ipAlice, "bob-key")
 	if err != nil {
 		t.Fatalf("isAllocationClaimedByOther check failed: %v", err)
 	}
@@ -334,7 +333,7 @@ func TestAllocateAWGClientIP_OwnershipVerification_ClaimedByOther(t *testing.T) 
 	}
 
 	// When Bob allocates, he gets 10.66.66.3, not Alice's IP
-	ipBob, err := db.AllocateAWGClientIP(ctx, serverID, "bob", "bob-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ipBob, err := db.AllocateAWGClientIP(ctx, serverID, "bob-key", "bob-key", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("bob allocation failed: %v", err)
 	}
@@ -356,7 +355,7 @@ func TestTransferAWGClientIPLease_RejectionWhenNotOwned(t *testing.T) {
 	subnetCIDR := 24
 	gatewayIP := "10.66.66.1"
 
-	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	ipAlice, err := db.AllocateAWGClientIP(ctx, serverID, "alice-key", "alice-key", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("alice allocation failed: %v", err)
 	}
@@ -390,7 +389,7 @@ func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
 
 	// 1. Adopt an existing legacy client's IP that has no DB lease row
 	legacyIP := "10.66.66.50"
-	adopted, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-client", "legacy-key", legacyIP)
+	adopted, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-key", "legacy-key", legacyIP)
 	if err != nil {
 		t.Fatalf("adopt legacy IP failed: %v", err)
 	}
@@ -399,7 +398,7 @@ func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
 	}
 
 	// Submitting AllocateAWGClientIP for this client should preserve the adopted IP
-	allocIP, err := db.AllocateAWGClientIP(ctx, serverID, "legacy-client", "legacy-key", nil, subnetAddr, subnetCIDR, gatewayIP)
+	allocIP, err := db.AllocateAWGClientIP(ctx, serverID, "legacy-key", "legacy-key", nil, subnetAddr, subnetCIDR, gatewayIP)
 	if err != nil {
 		t.Fatalf("allocate after adopt failed: %v", err)
 	}
@@ -408,7 +407,7 @@ func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
 	}
 
 	// 2. Attempt to adopt the same IP by another client should be rejected
-	adopted2, err := db.AdoptAWGClientIPLease(ctx, serverID, "attacker", "attacker-key", legacyIP)
+	adopted2, err := db.AdoptAWGClientIPLease(ctx, serverID, "attacker-key", "attacker-key", legacyIP)
 	if err != nil {
 		t.Fatalf("adopt check failed: %v", err)
 	}
@@ -417,7 +416,7 @@ func TestAdoptAWGClientIPLease_Scenarios(t *testing.T) {
 	}
 
 	// 3. Idempotent adoption by the same client should return true
-	adoptedAgain, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-client", "legacy-key", legacyIP)
+	adoptedAgain, err := db.AdoptAWGClientIPLease(ctx, serverID, "legacy-key", "legacy-key", legacyIP)
 	if err != nil {
 		t.Fatalf("idempotent adopt failed: %v", err)
 	}
@@ -445,7 +444,7 @@ func TestAWGIPAllocations_ConcurrentClientIdentity_EnforcesUniqueness(t *testing
 	ctx := context.Background()
 	serverID := int64(1)
 	clientID := "concurrent-client-identity"
-	clientPubKey := "concurrent-pubkey-identity"
+	clientPubKey := clientID
 	subnetAddr := "10.66.66.0"
 	subnetCIDR := 24
 	gatewayIP := "10.66.66.1"
@@ -1020,7 +1019,7 @@ func TestAllocateAWGClientIP_PostMigrationProvisioningRegression(t *testing.T) {
 	}
 
 	// Call db.AllocateAWGClientIP for a brand new client identity on the same server
-	newIP1, err := db.AllocateAWGClientIP(ctx, 1, "new-client-1", "pubkey-1", nil, "10.8.0.0", 24, "10.8.0.1")
+	newIP1, err := db.AllocateAWGClientIP(ctx, 1, "pubkey-1", "pubkey-1", nil, "10.8.0.0", 24, "10.8.0.1")
 	if err != nil {
 		t.Fatalf("AllocateAWGClientIP failed for new-client-1: %v", err)
 	}
@@ -1029,7 +1028,7 @@ func TestAllocateAWGClientIP_PostMigrationProvisioningRegression(t *testing.T) {
 	}
 
 	// Verify subsequent allocation continues cleanly
-	newIP2, err := db.AllocateAWGClientIP(ctx, 1, "new-client-2", "pubkey-2", nil, "10.8.0.0", 24, "10.8.0.1")
+	newIP2, err := db.AllocateAWGClientIP(ctx, 1, "pubkey-2", "pubkey-2", nil, "10.8.0.0", 24, "10.8.0.1")
 	if err != nil {
 		t.Fatalf("AllocateAWGClientIP failed for new-client-2: %v", err)
 	}

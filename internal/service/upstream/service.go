@@ -11,15 +11,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/version"
 )
 
-// Pinned upstream component versions and container base image.
+// Service query defaults and limits. The pinned upstream component identities
+// live in the version package so the installer and the monitor share them.
 const (
-	PinnedAWGGoVersion    = "v3.1.20261116"
-	PinnedAWGToolsVersion = "v3.1.20260812"
-	PinnedAWGBaseImage    = "devopsigor/amneziawg:v3.1.20261116-1"
-
-	DefaultDockerRepo    = "devopsigor/amneziawg"
 	DefaultDockerBaseURL = "https://hub.docker.com/v2"
 
 	DefaultCacheTTL = 1 * time.Hour
@@ -744,9 +742,13 @@ func (s *Service) Check(ctx context.Context, forceRefresh bool) (*UpstreamStatus
 	}
 	s.mu.RUnlock()
 
-	goStatus := s.fetchComponent(ctx, "amneziawg-go", "amnezia-vpn/amneziawg-go", PinnedAWGGoVersion)
-	toolsStatus := s.fetchComponent(ctx, "amneziawg-tools", "amnezia-vpn/amneziawg-tools", PinnedAWGToolsVersion)
-	dockerStatus := s.fetchDockerComponent(ctx, "docker-base-image", DefaultDockerRepo, PinnedAWGBaseImage)
+	// The amneziawg-go comparison baseline is the version the binary was
+	// actually compiled against, so a stale constant cannot report an update
+	// that the running code already contains. The constant remains the
+	// fallback when build metadata is unavailable.
+	goStatus := s.fetchComponent(ctx, "amneziawg-go", "amnezia-vpn/amneziawg-go", version.CompiledAWGGoVersion())
+	toolsStatus := s.fetchComponent(ctx, "amneziawg-tools", "amnezia-vpn/amneziawg-tools", version.PinnedAWGToolsVersion)
+	dockerStatus := s.fetchDockerComponent(ctx, "docker-base-image", version.DefaultDockerRepo, version.PinnedAWGBaseImage)
 
 	components := []ComponentStatus{goStatus, toolsStatus, dockerStatus}
 
@@ -778,7 +780,7 @@ func (s *Service) Check(ctx context.Context, forceRefresh bool) (*UpstreamStatus
 		Status:          status,
 		UpdateAvailable: updateCount > 0,
 		Components:      components,
-		BaseImage:       PinnedAWGBaseImage,
+		BaseImage:       version.PinnedAWGBaseImage,
 	}
 
 	s.mu.Lock()

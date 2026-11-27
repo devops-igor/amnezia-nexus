@@ -27,8 +27,8 @@ import uuid
 import warnings
 from typing import Callable, Optional
 
-# Pinned multiarch AmneziaWG client image; must equal awgBaseImage in
-# internal/manager/awg/awg_install.go (tests/test_e2e_dev_host.py enforces it).
+# Pinned multiarch AmneziaWG client image; must equal the base image the panel
+# derives in internal/version/version.go (tests/test_e2e_dev_host.py enforces it).
 PRIMARY_CLIENT_IMAGE = "devopsigor/amneziawg:v3.1.20261116-1"
 FALLBACK_CLIENT_IMAGE = "devopsigor/amneziawg:ci-test"
 
