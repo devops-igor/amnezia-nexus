@@ -919,10 +919,22 @@ GIGAHOST_PROBE = """() => {
   const panel = orders.querySelector('.gigahost-order-status-details');
   const kids = panel ? [...panel.children] : [];
   const hasText = e => [...e.childNodes].some(n => n.nodeType === 3 && n.textContent.trim());
+  // A job's step is the one span that states it: a bracket while the panel is still
+  // working the job, or the recorded-step label with its value once the row is an
+  // outcome. The label comes from the page's own catalogue and the value after it must
+  // be non-empty, so a lost step still fails here and no other span can stand in.
+  const stepLabel = (typeof window._ === 'function' && window._('gigahost_status_recorded_step')) || '';
+  const isStep = s => {
+    const text = s.textContent.trim();
+    if (text.startsWith('[') && text.endsWith(']') && text.length > 2) return true;
+    if (!stepLabel || stepLabel === 'gigahost_status_recorded_step') return false;
+    const prefix = stepLabel + ':';
+    return text.startsWith(prefix) && text.slice(prefix.length).trim() !== '';
+  };
   return {
     labels: panel ? [...panel.querySelectorAll(':scope > div > span:first-child')].map(read) : [],
     bare: kids.filter(c => c.tagName === 'DIV' && c.children.length === 0).map(read),
-    steps: [...jobs.querySelectorAll('span')].filter(s => /^\\[.+\\]$/.test(s.textContent.trim())).map(read),
+    steps: [...jobs.querySelectorAll('span')].filter(isStep).map(read),
     recovery: [...jobs.querySelectorAll('.btn-primary + span')].map(read),
     empty: [...document.querySelectorAll('#recentOrdersContainer .text-muted, #setupIntentsContainer .text-muted')].map(read),
     everything: [...document.querySelectorAll('#recentOrdersContainer *, #setupIntentsContainer *')]
