@@ -11,6 +11,33 @@ import (
 // code that used to sit in an inline script block at the end of settings.html.
 const settingsScriptPath = "static/js/settings.js"
 
+// templateScriptRefOffsets returns where src loads path as a script, in document
+// order, whatever cache identity the tag declares for it.
+//
+// A shell names a module either literally with the release version or through
+// asset_url when the module's bytes move with a delivery. Both spellings are the
+// same reference to the same module, so a matcher pinned to one of them reports
+// a module that is loaded as absent and an order assertion built on it fails for
+// a reason that has nothing to do with order. Locating the reference through the
+// tag classifier the asset-identity checks already use keeps presence and load
+// order asserted against the reference rather than against one spelling of its
+// query: a module that is absent, or that loads after the page script, still
+// fails. The path must match exactly, so a neighbouring module whose name begins
+// the same way is not mistaken for it.
+func templateScriptRefOffsets(src, path string) []int {
+	var offsets []int
+	for _, loc := range assetTagPattern.FindAllStringIndex(src, -1) {
+		tag := src[loc[0]:loc[1]]
+		if !strings.HasPrefix(tag, "<script") {
+			continue
+		}
+		if named, _, _, ok := classifyAssetTag(tag); ok && named == path {
+			offsets = append(offsets, loc[0])
+		}
+	}
+	return offsets
+}
+
 // settingsTemplateText returns the settings page markup: the page shell followed
 // by every section file under templates/settings/, in name order. Tests that
 // assert on markup read it instead of settings.html alone, because the sections
@@ -116,13 +143,15 @@ func TestSettingsPageSplitContract(t *testing.T) {
 		offset = start + tagEnd
 	}
 
-	// The page script runs after every module whose globals it calls.
-	script := `src="` + "/" + settingsScriptPath
-	scriptAt := strings.Index(shell, script)
-	if scriptAt < 0 {
+	// The page script runs after every module whose globals it calls. Each
+	// reference is located in whichever identity form the shell declares, so a
+	// module this delivery moved onto its own bytes is still found and still has
+	// to load first.
+	pageScriptRefs := templateScriptRefOffsets(shell, "/"+settingsScriptPath)
+	if len(pageScriptRefs) == 0 {
 		t.Fatal("settings shell does not load the page script")
 	}
-	if strings.Count(shell, script) != 1 {
+	if len(pageScriptRefs) != 1 {
 		t.Error("settings shell must load the page script exactly once")
 	}
 	for _, module := range []string{
@@ -130,17 +159,17 @@ func TestSettingsPageSplitContract(t *testing.T) {
 		"gigahost_setup_intents.js", "gigahost_order_status_model.js",
 		"gigahost_order_status.js", "gigahost_placement.js",
 	} {
-		at := strings.Index(shell, `src="/static/js/`+module)
-		if at < 0 || at > scriptAt {
+		refs := templateScriptRefOffsets(shell, "/static/js/"+module)
+		if len(refs) == 0 || refs[0] > pageScriptRefs[0] {
 			t.Errorf("module %s must load before the page script", module)
 		}
 	}
 
 	// The save model's two scripts load before anything that reports through them.
 	for _, module := range []string{"settings_cards.js", "settings_save.js"} {
-		at := strings.Index(shell, `src="/static/js/`+module)
-		first := strings.Index(shell, `src="/static/js/notifications_settings.js`)
-		if at < 0 || at > first {
+		refs := templateScriptRefOffsets(shell, "/static/js/"+module)
+		first := templateScriptRefOffsets(shell, "/static/js/notifications_settings.js")
+		if len(refs) == 0 || len(first) == 0 || refs[0] > first[0] {
 			t.Errorf("module %s must load before the notification controller", module)
 		}
 	}

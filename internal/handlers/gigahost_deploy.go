@@ -113,6 +113,11 @@ type GigahostDeployStatus struct {
 	Error            string    `json:"error,omitempty"`
 	Message          string    `json:"message,omitempty"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	// ProviderAbsent reports that the provider's own server inventory has confirmed
+	// the server this order registered no longer exists. It is the panel's recorded
+	// observation, read from the row - this response performs no provider read to
+	// decide it, and an order that registered no panel server reports false.
+	ProviderAbsent bool `json:"provider_absent,omitempty"`
 }
 
 // SetSSHDialerForTest injects an SSH dialer hook for unit and integration testing.
@@ -807,6 +812,11 @@ func (h *Handlers) GetGigahostDeployStatus(ctx context.Context, orderID string) 
 		}
 	}
 
+	// The absence question is asked about the identity the order registered, which for a
+	// saved setup that paused after registration is journalled on the intent rather than
+	// mirrored onto this ledger row yet.
+	registeredServerID := h.registeredServerIDForOrder(ctx, order.OrderID, nexusServerID)
+
 	return &GigahostDeployStatus{
 		OrderID:          order.OrderID,
 		ProviderServerID: order.ServerID,
@@ -816,7 +826,49 @@ func (h *Handlers) GetGigahostDeployStatus(ctx context.Context, orderID string) 
 		AssignedIP:       order.AssignedIP,
 		Error:            lastError,
 		UpdatedAt:        order.UpdatedAt,
+		ProviderAbsent:   h.deploymentProviderAbsent(ctx, registeredServerID),
 	}, nil
+}
+
+// deploymentProviderAbsent reports whether the provider's own inventory has confirmed
+// that the panel server this order registered no longer exists.
+//
+// The answer is the row's recorded observation, read through the one accessor that
+// already owns that question; this function decides nothing about absence. An order that
+// registered no panel server reports false, and so does a lookup that failed: absence is
+// a positive observation, and an unanswered read is not one. The safe direction is also
+// the ordinary one - a row that cannot be shown to be absent keeps its normal treatment.
+func (h *Handlers) deploymentProviderAbsent(ctx context.Context, nexusServerID int64) bool {
+	if nexusServerID <= 0 || h.db == nil {
+		return false
+	}
+	absent, err := h.db.IsServerProviderAbsent(ctx, nexusServerID)
+	if err != nil {
+		return false
+	}
+	return absent
+}
+
+// registeredServerIDForOrder resolves the panel server an order registered, for a
+// presence question that must not depend on which writer recorded the id.
+//
+// The onboarding journal mirrors the id onto the order ledger when the install
+// completes, while a saved setup journals it on the setup intent at registration and
+// may pause for a long time before that. Reading only the ledger therefore answers
+// "registered no server" for a deployment whose server is registered, which is how a
+// deleted server stayed actionable. The intent is read by the order id the
+// registration was made for - never from an address or the provider's own numeric id -
+// and a failed lookup falls back to the ledger value, so the ordinary treatment is
+// kept rather than an absence invented.
+func (h *Handlers) registeredServerIDForOrder(ctx context.Context, orderID string, ledgerServerID int64) int64 {
+	if ledgerServerID > 0 || h.db == nil || strings.TrimSpace(orderID) == "" {
+		return ledgerServerID
+	}
+	intent, found, err := h.db.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil || !found || intent == nil || intent.NexusServerID <= 0 {
+		return ledgerServerID
+	}
+	return intent.NexusServerID
 }
 
 // GigahostDeployHandler handles POST /api/admin/hosting/gigahost/deploy.

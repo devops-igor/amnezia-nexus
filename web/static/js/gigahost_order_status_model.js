@@ -21,7 +21,16 @@
 // ledger row, which is only the panel's copy of the last answer.
 const gigahostOrderStatusReadySpellings = ['ready', 'active'];
 const gigahostOrderStatusFailedSpellings = ['failed', 'error'];
-const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled', 'deleted'];
+const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled'];
+// gigahostOrderStatusDeletedSpellings is the provider's vocabulary for a deployment it
+// no longer has. Both spellings are one fact, and the backend already treats them as
+// one (`isDeletedStatus` in the order-observation path): a `terminated` order that the
+// client classified as `deploying` would keep the setups and retries that exist to
+// contact a host the panel has evidence is gone. It is a stage of its own rather than a
+// cancellation, because the fact the operator needs is that the server is gone: a
+// cancelled order was stopped while its VPS could still be running, and a deleted one
+// has no VPS at all.
+const gigahostOrderStatusDeletedSpellings = ['deleted', 'terminated'];
 // gigahostOrderStatusRequestedSpellings are the provider and ledger spellings for an
 // order that exists but whose deployment has not started yet. `requested` is a stage in
 // the progression below, so a queued order is not drawn as one already deploying: both
@@ -32,6 +41,10 @@ const gigahostOrderStatusRequestedSpellings = ['pending', 'waiting', 'pending_pa
 // gigahostOrderStatusStages are the provider stages an order passes through, in order.
 // VPN setup and backend health are separate axes, never drawn as stages.
 const gigahostOrderStatusStages = ['requested', 'deploying', 'ready'];
+
+// gigahostOrderStatusTerminalStages name the stages that end the progression: their
+// chain is the request plus the ending, because none of them can claim it ever deployed.
+const gigahostOrderStatusTerminalStages = ['failed', 'cancelled', 'deleted', 'unknown'];
 
 // gigahostOrderStatusSetupStates maps a saved setup-intent state to the setup axis. A
 // state outside this table is reported as unknown rather than guessed into a group:
@@ -92,6 +105,13 @@ function gigahostOrderStatusNow() {
     return new Date();
 }
 
+/* gigahostOrderStatusStageInFlight reports whether a stage is one the deployment can
+ * still be making progress on. A terminal stage is an outcome, not a step in flight:
+ * the attempt is over, so nothing drawn for that row may claim a step is current. */
+function gigahostOrderStatusStageInFlight(stage) {
+    return gigahostOrderStatusStages.indexOf(stage) !== -1;
+}
+
 /* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
  * stage. It reads no address: a VPS is ready only when the provider said so, and an
  * order the provider has accepted without starting is still `requested` rather than
@@ -100,6 +120,7 @@ function gigahostOrderStatusProviderStage(status) {
     const s = String(status || '').trim().toLowerCase();
     if (gigahostOrderStatusReadySpellings.indexOf(s) !== -1) return 'ready';
     if (gigahostOrderStatusFailedSpellings.indexOf(s) !== -1) return 'failed';
+    if (gigahostOrderStatusDeletedSpellings.indexOf(s) !== -1) return 'deleted';
     if (gigahostOrderStatusCancelledSpellings.indexOf(s) !== -1) return 'cancelled';
     if (gigahostOrderStatusRequestedSpellings.indexOf(s) !== -1) return 'requested';
     if (s === 'unknown' || s === '') return 'unknown';
@@ -119,7 +140,7 @@ function gigahostOrderStatusIsPlaceholderID(orderId) {
  * done, current or pending. Steps the current state contradicts are not returned:
  * a failed, cancelled or unknown order does not claim it ever deployed. */
 function gigahostOrderStatusStageChain(stage) {
-    if (stage === 'failed' || stage === 'cancelled' || stage === 'unknown') {
+    if (gigahostOrderStatusTerminalStages.indexOf(stage) !== -1) {
         return [
             {stage: 'requested', state: 'done'},
             {stage: stage, state: 'current'}
@@ -212,7 +233,10 @@ function gigahostOrderStatusHealthState(health) {
  * unreadable setup or health axis yields no advice rather than a guess. */
 function gigahostOrderStatusNextAction(model) {
     if (model.stage === 'unknown') return 'gigahost_status_next_action_check_provider';
-    if (model.stage === 'cancelled') return 'gigahost_status_next_action_none';
+    // A deployment the provider no longer has is over: there is no server to check, to
+    // set up or to retry, and every action the view could name would contact a host the
+    // panel has evidence is not the provider's.
+    if (model.stage === 'cancelled' || model.stage === 'deleted') return 'gigahost_status_next_action_none';
     if (model.stage === 'requested' || model.stage === 'deploying') return 'gigahost_status_next_action_wait';
     if (model.stage === 'failed' || model.setup === 'failed') return 'gigahost_status_next_action_retry';
     return gigahostOrderStatusSettledNextAction(model);
@@ -267,13 +291,30 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     const orderId = String(record.order_id || '');
     const obs = gigahostOrderStatusObservation(observation);
     const journal = gigahostOrderStatusJournalEvidence(detail);
-    const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal);
+    const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal, record.status);
 
+    // providerAbsent is the panel's durable record that the provider's own server
+    // inventory no longer lists the server this order registered. It arrives from the
+    // order list response (the row itself, read from the column the reconciliation
+    // writes) and, additively, from the order's deploy read. The list's copy is what
+    // makes the stage independent of the deploy read: that request is a second one and
+    // can fail, and a failure must not hand a deleted deployment back to the ordinary
+    // treatment. This view never infers absence; it renders the record the panel made.
+    //
+    // It decides the stage on its own, and outranks both the provider's order spelling
+    // and the ledger copy. These are different questions - whether the order was stopped
+    // versus whether the VPS exists - and the operator asked the second one. A provider
+    // that still reports the order as ready while its server inventory no longer lists
+    // the server is exactly the state this exists to present as DELETED.
+    const providerAbsent = record.provider_absent === true;
     const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusProviderStage(claimed.status || record.status);
-    const stage = gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage;
+    const stage = providerAbsent
+        ? 'deleted'
+        : (gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage);
     const assignedIP = gigahostOrderStatusText(detail.assigned_ip, record.assigned_ip);
     return {
         orderId: orderId,
+        providerAbsent: providerAbsent,
         providerStatus: claimed.unknown ? '' : gigahostOrderStatusText(claimed.status, record.status),
         providerSource: claimed.source,
         // The provider was actually read in this response. This is the only thing that
@@ -298,18 +339,31 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
 /* gigahostOrderStatusClaimedProviderStatus decides which status this view may present
  * as the provider's, and where it came from.
  *
- * Only a confirmed observation may become a claimed provider stage. Failing that, the
- * order row is the panel's copy - but the status column is written by two vocabularies,
- * so it may only be read as a provider state when nothing contradicts it. Positive
- * journal evidence means this row's status is onboarding execution (an install that
- * failed after the provider was ready carries "failed" there), so the provider axis
- * becomes an explicit unknown rather than letting the setup outcome wear the provider's
- * name. A view that cannot read the provider says so; it does not inherit somebody
- * else's answer. */
-function gigahostOrderStatusClaimedProviderStatus(obs, journal) {
+ * Only a confirmed observation may become a claimed provider stage. Failing that, a
+ * durably recorded deletion is presented as the stage it is: the panel accepted and
+ * persisted the provider's own ending, and the onboarding journal cannot produce that
+ * spelling. A journal step is history - the immediate setup can journal `deploying`
+ * before the provider finishes, and the status request keeps reporting that step after
+ * the panel recorded the ending - so it must not outrank the record of how the
+ * deployment ended, or an ordinary refresh undoes the ending and re-offers provisioning
+ * for a server the panel has recorded as gone. A fresh affirmative inventory repair still
+ * wins over it, because that repair rewrites the ledger it is read from here.
+ *
+ * For every other recorded status the journal still decides. The status column is written
+ * by two vocabularies, so a non-deletion status may only be read as a provider state when
+ * nothing contradicts it: positive journal evidence means this row's status is onboarding
+ * execution (an install that failed after the provider was ready carries "failed" there),
+ * so the provider axis becomes an explicit unknown rather than letting the setup outcome
+ * wear the provider's name. A view that cannot read the provider says so; it does not
+ * inherit somebody else's answer. */
+function gigahostOrderStatusClaimedProviderStatus(obs, journal, recordedStatus) {
     if (obs.outcome === 'confirmed') {
         const status = gigahostOrderStatusText(obs.status);
         if (status) return {status: status, source: 'provider', unknown: false};
+    }
+    const recorded = gigahostOrderStatusText(recordedStatus).trim().toLowerCase();
+    if (gigahostOrderStatusDeletedSpellings.indexOf(recorded) !== -1) {
+        return {status: recorded, source: 'ledger', unknown: false};
     }
     if (journal.present) return {status: '', source: 'ledger', unknown: true};
     return {status: '', source: 'ledger', unknown: false};
@@ -353,6 +407,23 @@ function gigahostOrderStatusJournalEvidence(deploy) {
 }
 
 
+/* gigahostOrderStatusRecordedOnboarding reports whether the deploy read carries the panel's
+ * own durable evidence that onboarding completed: a registered Nexus server and the
+ * completed step in the install journal.
+ *
+ * It deliberately does not read the provider's status spelling. `ready` and `active` are the
+ * provider's words for a running VPS, and it may use either on identical reads, so a row
+ * recognised by that word switched between "installed" and "not installed" while nothing
+ * about the backend changed - which re-offered Setup Backend and Approve on a backend that
+ * was already installed. The journal's completed step plus the panel server it registered is
+ * the fact, and the provider cannot rename it. */
+function gigahostOrderStatusRecordedOnboarding(deploy) {
+    const detail = deploy || {};
+    if (!(Number(detail.server_id || 0) > 0)) return false;
+    return String(detail.step || '').trim().toLowerCase() === 'ready';
+}
+
+
 /* gigahostOrderStatusModel is the whole classification, and it is pure: the same
  * inputs always produce the same model, so the rendered view can be asserted
  * without a browser. context carries what the page already read:
@@ -367,6 +438,7 @@ function gigahostOrderStatusModel(order, context) {
         orderId: provider.orderId,
         stage: provider.stage,
         chain: gigahostOrderStatusStageChain(provider.stage),
+        providerAbsent: provider.providerAbsent,
         providerStatus: provider.providerStatus,
         providerSource: provider.providerSource,
         providerConfirmed: provider.providerConfirmedRead,

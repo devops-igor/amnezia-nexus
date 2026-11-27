@@ -448,6 +448,73 @@ func TestSettingsControllerURLCarriesTheAssetBytes(t *testing.T) {
 	}
 }
 
+// TestSettingsSavedJobsModuleIsRequestedUnderItsBytes is the delivery regression for
+// the saved-setup module this change rewrote. The release constant did not move, so
+// ?v=<release> is exactly the URL the predecessor served, and a returning browser may
+// still hold the module that never re-read a paused job under it while the page it
+// runs against is the new one.
+//
+// Two directions, because the identity rule and the registration can fail apart:
+//   - the rendered page requests the module at the digest of the bytes this build
+//     ships, not at the release version;
+//   - withdrawing the registration from web.DeliveredAssets is reported by the
+//     delivery rule, so the entry is load-bearing rather than decorative. The
+//     unmutated render is accepted first, so the rejection is attributable to the
+//     withdrawal.
+func TestSettingsSavedJobsModuleIsRequestedUnderItsBytes(t *testing.T) {
+	const module = "/static/js/gigahost_setup_intents.js"
+
+	body := renderSettingsPage(t, models.RoleAdmin)
+
+	emitted := ""
+	for _, src := range collectShellLinks(t, body).scripts {
+		if path, _, _ := strings.Cut(src, "?"); path == module {
+			emitted = src
+		}
+	}
+	want := module + "?v=" + deliveredAssetDigest(t, module)
+	if emitted != want {
+		t.Fatalf("the settings page requests %s at %q, want %q; a browser that cached the "+
+			"previous module under another URL — the release-version URL the predecessor also "+
+			"served, or the bare path — keeps running the module that never re-read a paused job",
+			module, emitted, want)
+	}
+	if !slices.Contains(web.DeliveredAssets, module) {
+		t.Fatalf("%s is requested under its own bytes but is absent from web.DeliveredAssets; "+
+			"the shell enumeration consumes that list, so no check would notice the page losing "+
+			"its identity again", module)
+	}
+
+	// Positive control: the shipped render satisfies the delivery rule, so the
+	// findings below are attributable to the withdrawal.
+	if findings := shellAssetFindings(t, "settings.html", body); len(findings) != 0 {
+		t.Fatalf("the shipped settings page is reported as broken, so the withdrawal control "+
+			"below would prove nothing: %v", findings)
+	}
+
+	saved := web.DeliveredAssets
+	withdrawn := make([]string, 0, len(saved))
+	for _, path := range saved {
+		if path != module {
+			withdrawn = append(withdrawn, path)
+		}
+	}
+	if len(withdrawn) == len(saved) {
+		t.Fatalf("%s was not in web.DeliveredAssets, so removing it changed nothing", module)
+	}
+	web.DeliveredAssets = withdrawn
+	t.Cleanup(func() { web.DeliveredAssets = saved })
+
+	findings := shellAssetFindings(t, "settings.html", body)
+	if len(findings) == 0 {
+		t.Fatalf("withdrawing %s from web.DeliveredAssets was accepted, so the content "+
+			"identity on the page is unchecked", module)
+	}
+	if !strings.Contains(strings.Join(findings, "\n"), module) {
+		t.Fatalf("the finding for the withdrawn registration does not name %s: %v", module, findings)
+	}
+}
+
 // TestSettingsAssetVersionMovesWithTheAssetBytes states the property the cache
 // identity rests on: one identity never covers two different contents, so no
 // cached copy can be served as the other. A test that only compared the URL with

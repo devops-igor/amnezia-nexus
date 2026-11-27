@@ -52,9 +52,16 @@ func TestGigahostSetupIntentsConsumerDOM(t *testing.T) {
 	}
 	templates := settingsTemplateText(t)
 	// The template must load the extracted module: an inline copy would silently
-	// diverge from the file this test exercises.
-	if !strings.Contains(templates, versionedTemplateAsset("/static/js/gigahost_setup_intents.js")) {
-		t.Fatal("settings.html does not load the extracted setup-intents module")
+	// diverge from the file this test exercises. The form is the content-derived one
+	// because this delivery changed the module's bytes without moving the release
+	// version; the assertion below is about the reference, and the identity form it
+	// must carry is proved where the URL is emitted and in the asset-delivery checks.
+	const moduleReference = `<script src="{{ asset_url "/static/js/gigahost_setup_intents.js" }}"></script>`
+	if !strings.Contains(templates, moduleReference) {
+		t.Fatalf("settings.html does not request the saved-setup module through asset_url; "+
+			"the release-version URL is the one its predecessor also served, so a browser "+
+			"holding it keeps running a module that never re-reads a paused job. Want %s",
+			moduleReference)
 	}
 	if !strings.Contains(templates, `id="setupIntentsContainer"`) {
 		t.Fatal("settings.html has no container for saved setup approvals")
@@ -162,6 +169,36 @@ async function render(intents) {
    assert.deepEqual(labels(root), [], 'state ' + state + ' must not offer an action');
  }
 
+ // 7b. Presentation of a terminal saved row. The badge carries the deleted stage as data
+ //     as well as in its label, which is the hook the stylesheet's deleted ink is scoped
+ //     to; the step is named as the last one recorded, because the deployment is gone and
+ //     a bare [installing_protocol] read as work still underway. The control is a row the
+ //     panel is still working on: its step stays the current one.
+ root = await render([{order_id:'ord-absent', protocol:'awg', port:'51820',
+   state:'install_paused', step:'installing_protocol', provider_absent:true}]);
+ const absentRow = root.querySelector('.gigahost-order-row');
+ assert.ok(absentRow, 'a saved row must use the shared reflowing row');
+ assert.ok(absentRow.querySelector('.gigahost-order-identity'), 'the record needs its own side');
+ assert.ok(absentRow.querySelector('.gigahost-order-state'), 'the state and actions need their own side');
+ const absentBadge = absentRow.querySelector('.badge');
+ assert.equal(absentBadge.getAttribute('data-stage'), 'deleted',
+   'the deleted badge must carry its stage as data for the stylesheet');
+ assert.equal(absentBadge.className, 'badge badge-danger');
+ assert.match(absentRow.textContent, /gigahost_status_recorded_step: installing_protocol/,
+   'a terminal row must label its step as the last one recorded');
+ assert.doesNotMatch(absentRow.textContent, /\[installing_protocol\]/,
+   'a terminal row must not present its step as current');
+
+ root = await render([{order_id:'ord-moving', protocol:'awg', state:'installing',
+   step:'installing_protocol'}]);
+ const movingRow = root.querySelector('.gigahost-order-row');
+ assert.match(movingRow.textContent, /\[installing_protocol\]/,
+   'a row the panel is still working on keeps its step as the current one');
+ assert.doesNotMatch(movingRow.textContent, /gigahost_status_recorded_step/,
+   'a moving row must not claim its step is history');
+ assert.equal(movingRow.querySelector('.badge').getAttribute('data-stage'), null,
+   'only the deleted stage carries the deleted ink hook');
+
  // 8. Revoking is that exact order's DELETE, and the view refreshes afterwards.
  calls.length = 0;
  await render([{order_id:'ord-revoke me', protocol:'awg', state:'pending'}]);
@@ -241,10 +278,24 @@ async function render(intents) {
  assert.equal(root.textContent.indexOf('FIXTURE-PRIVATE-MATERIAL'), -1, 'a private key reached the DOM');
  assert.equal(root.textContent.indexOf('fixture-password'), -1, 'a password reached the DOM');
 
- // 14. An unreadable list degrades to the empty state instead of throwing.
+ // 14. A failed read is not an empty list. With a row already on screen the row and its
+ //     action are kept and the container records that its freshness is unproven; with
+ //     nothing on screen the failure is stated as a failed read. Before this change both
+ //     cases rendered "no saved jobs" and stopped the view's refresh altogether, so a
+ //     later observation could not reach the operator without a reload.
  w.API.get = async () => { throw new Error('offline'); };
  await w.loadSetupIntents();
- assert.match(container.textContent, /setup_intents_none/);
+ assert.doesNotMatch(container.textContent, /setup_intents_none/,
+   'a failed read was presented as "no saved jobs"');
+ assert.ok(container.textContent.indexOf('ord-evil') !== -1,
+   'a failed read dropped the row that was on screen');
+ assert.equal(container.getAttribute('data-stale'), 'true',
+   'a failed read was presented as fresh');
+ container.replaceChildren();
+ await w.loadSetupIntents();
+ assert.doesNotMatch(container.textContent, /setup_intents_none/,
+   'a failed read with nothing on screen was presented as "no saved jobs"');
+ assert.match(container.textContent, /gigahost_status_load_failed/);
 
  console.log('SETUP_INTENTS_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});

@@ -24,6 +24,20 @@ type GigahostOrder struct {
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 
+	// LiveRepairedAt is the affirmative inventory observation that contradicted a
+	// recorded deletion, recorded as the instant that observation was requested - never
+	// the moment an answer was processed, which the listing cannot speak for.
+	// Nil means no repair is known, not an inferred repair.
+	// It is internal evidence, independent of the onboarding journal and provider spelling.
+	LiveRepairedAt *time.Time `json:"-"`
+
+	// NexusServerID is the panel server this order registered, as mirrored onto the
+	// ledger by the onboarding journal. A saved setup can journal it on the intent
+	// instead, so zero means "not mirrored here", never "registered nothing".
+	// It is read for identity resolution - an existence question has to name the row
+	// it is about - and is not part of the response shape.
+	NexusServerID int64 `json:"-"`
+
 	// PriceID is the catalog price id the order was placed with. It is the
 	// order-time selection key and is preserved because the provider does not
 	// return it on later reads.

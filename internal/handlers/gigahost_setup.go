@@ -156,6 +156,18 @@ func (h *Handlers) GigahostSetupStatusHandler(w http.ResponseWriter, r *http.Req
 	h.JSONOK(w, map[string]any{"setup": intent})
 }
 
+// gigahostSetupIntentView is one saved job as the list answers it: the durable record
+// plus the presence fact this view offers actions against.
+//
+// The fact is derived per response from the identity the job journaled at registration,
+// through the same predicate the Recent Deployments row reads. It is not stored on the
+// intent: absence is the panel's observation about a server row, and duplicating it into
+// the approval would be a second copy that can disagree.
+type gigahostSetupIntentView struct {
+	*models.GigahostSetupIntent
+	ProviderAbsent bool `json:"provider_absent"`
+}
+
 // GigahostSetupIntentsHandler handles GET /api/admin/hosting/gigahost/setup-intents,
 // the administrator's view of saved setup work without any browser open.
 func (h *Handlers) GigahostSetupIntentsHandler(w http.ResponseWriter, r *http.Request) {
@@ -169,9 +181,16 @@ func (h *Handlers) GigahostSetupIntentsHandler(w http.ResponseWriter, r *http.Re
 		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
+	views := make([]gigahostSetupIntentView, 0, len(intents))
+	for i := range intents {
+		views = append(views, gigahostSetupIntentView{
+			GigahostSetupIntent: &intents[i],
+			ProviderAbsent:      h.deploymentProviderAbsent(r.Context(), intents[i].NexusServerID),
+		})
+	}
 	h.JSONOK(w, map[string]any{
-		"setup_intents": intents,
-		"count":         len(intents),
+		"setup_intents": views,
+		"count":         len(views),
 	})
 }
 

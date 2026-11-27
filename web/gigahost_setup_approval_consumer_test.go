@@ -41,20 +41,26 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	// itself must be the shipped module: an inline copy could diverge from it. The
 	// offer is not conditioned on the provider having assigned an address, because
 	// the provisioning interval before an address exists is what a saved job covers.
-	if !strings.Contains(templateStr, versionedTemplateAsset("/static/js/gigahost_setup_intents.js")) {
+	//
+	// Each reference is located in whichever identity form the shell declares it:
+	// the two order-status modules are requested through asset_url because this
+	// delivery moved their bytes inside a release, while the intent module still
+	// carries the release version. Presence and load order below are asserted on the
+	// reference, so a module that is absent or loads late still fails.
+	if len(templateScriptRefOffsets(templateStr, "/static/js/gigahost_setup_intents.js")) == 0 {
 		t.Fatal("settings.html does not load the module that defines the action")
 	}
-	if !strings.Contains(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status.js")) {
+	rendererRefs := templateScriptRefOffsets(templateStr, "/static/js/gigahost_order_status.js")
+	if len(rendererRefs) == 0 {
 		t.Fatal("settings.html does not load the module that renders the recent orders")
 	}
 	// The classification is a separate shipped module, and it must be loaded before the
 	// renderer that consumes it.
-	modelAt := strings.Index(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status_model.js"))
-	rendererAt := strings.Index(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status.js"))
-	if modelAt < 0 {
+	modelRefs := templateScriptRefOffsets(templateStr, "/static/js/gigahost_order_status_model.js")
+	if len(modelRefs) == 0 {
 		t.Fatal("settings.html does not load the order-status classification module")
 	}
-	if modelAt > rendererAt {
+	if modelRefs[0] > rendererRefs[0] {
 		t.Fatal("the classification module must load before the renderer that uses it")
 	}
 	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
