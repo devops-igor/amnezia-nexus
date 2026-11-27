@@ -34,7 +34,7 @@ import (
 // card by matching nested divs, so the harness loads the markup the page emits.
 func associationSection(t *testing.T) string {
 	t.Helper()
-	card, err := TemplatesFS.ReadFile("templates/settings/gigahost.html")
+	card, err := TemplatesFS.ReadFile("templates/servers_hosting.html")
 	if err != nil {
 		t.Fatalf("read the gigahost settings card: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestGigahostAccountAssociationTemplateWiring(t *testing.T) {
 		t.Fatal("the unlisted choice is not a checkbox, so it cannot be an explicit consent")
 	}
 
-	templates := settingsTemplateText(t)
+	templates := serversHostingTemplateText(t)
 	if !strings.Contains(templates, versionedTemplateAsset("/static/js/gigahost_account_association.js")) {
 		t.Fatal("settings.html does not load the account association controller")
 	}

@@ -79,6 +79,42 @@ func settingsTemplateText(t *testing.T) string {
 	return text.String()
 }
 
+// serversHostingTemplateText returns the markup of the page that hosts the hosting
+// controls: the Servers shell, the hosting card it includes, and the shared save
+// controls that card renders. The controls moved off Settings with the card, so a test
+// about them reads this rather than the Settings surface.
+func serversHostingTemplateText(t *testing.T) string {
+	t.Helper()
+	var text strings.Builder
+	for _, path := range []string{
+		"templates/index.html",
+		"templates/servers_hosting.html",
+		"templates/settings_save_controls.html",
+	} {
+		body, err := TemplatesFS.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		text.Write(body)
+		text.WriteString("\n")
+	}
+	return text.String()
+}
+
+// hostingPageScript returns the hosting card's controller as the browser receives it.
+// It is the half of the Settings page script that moved with the card.
+func hostingPageScript(t *testing.T) string {
+	t.Helper()
+	script, err := StaticFS.ReadFile("static/js/gigahost_hosting.js")
+	if err != nil {
+		t.Fatalf("read the hosting controller: %v", err)
+	}
+	if strings.TrimSpace(string(script)) == "" {
+		t.Fatal("the hosting controller is empty")
+	}
+	return string(script)
+}
+
 // settingsPageScript returns the settings page script as the browser receives it.
 func settingsPageScript(t *testing.T) string {
 	t.Helper()
@@ -90,6 +126,75 @@ func settingsPageScript(t *testing.T) string {
 		t.Fatal("settings page script is empty")
 	}
 	return string(script)
+}
+
+// hostingScriptPath is the controller the Servers shell loads for the hosting card.
+const hostingScriptPath = "static/js/gigahost_hosting.js"
+
+// TestServersShellLoadsHostingModulesBeforeTheHostingController pins the structure of the
+// relocation: the hosting card is included once by the Servers shell, its controller runs
+// after every module whose globals it calls, and the Settings shell loads none of them.
+func TestServersShellLoadsHostingModulesBeforeTheHostingController(t *testing.T) {
+	shellBytes, err := TemplatesFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read the servers shell: %v", err)
+	}
+	shell := string(shellBytes)
+	cardBytes, err := TemplatesFS.ReadFile("templates/servers_hosting.html")
+	if err != nil {
+		t.Fatalf("read the hosting card: %v", err)
+	}
+	card := string(cardBytes)
+	settingsBytes, err := TemplatesFS.ReadFile("templates/settings.html")
+	if err != nil {
+		t.Fatalf("read the settings shell: %v", err)
+	}
+	settingsShell := string(settingsBytes)
+
+	if got := strings.Count(shell, `{{ template "servers_hosting" . }}`); got != 1 {
+		t.Errorf("the servers shell includes the hosting card %d times, want 1", got)
+	}
+	// The credential card keeps the id the settings save model publishes against, so the
+	// relocated form still commits through the shipped save path.
+	if !strings.Contains(card, `id="gigahostCard"`) || !strings.Contains(card, `data-settings-card="gigahost"`) {
+		t.Error("the hosting card lost the id and section the settings save model addresses")
+	}
+
+	controllerRefs := templateScriptRefOffsets(shell, "/"+hostingScriptPath)
+	if len(controllerRefs) == 0 {
+		t.Fatal("the servers shell does not load the hosting controller")
+	}
+	if len(controllerRefs) != 1 {
+		t.Errorf("the servers shell loads the hosting controller %d times, want 1", len(controllerRefs))
+	}
+	modules := []string{
+		"settings_cards.js", "settings_save.js", "gigahost_catalog_status.js",
+		"gigahost_setup.js", "gigahost_setup_intents.js", "gigahost_order_status_model.js",
+		"gigahost_order_status.js", "gigahost_placement.js", "gigahost_account_association.js",
+	}
+	for _, module := range modules {
+		refs := templateScriptRefOffsets(shell, "/static/js/"+module)
+		if len(refs) == 0 || refs[0] > controllerRefs[0] {
+			t.Errorf("module %s must load before the hosting controller", module)
+		}
+	}
+
+	// The block is gone from Settings, controllers included: a module left behind would
+	// keep running against a page whose card it binds no longer exists. The shared save
+	// model stays on Settings, where the other cards still commit through it.
+	hostingModules := []string{"gigahost_hosting.js", "gigahost_catalog_status.js", "gigahost_setup.js",
+		"gigahost_setup_intents.js", "gigahost_order_status_model.js", "gigahost_order_status.js",
+		"gigahost_placement.js", "gigahost_account_association.js"}
+	for _, module := range hostingModules {
+		if refs := templateScriptRefOffsets(settingsShell, "/static/js/"+module); len(refs) != 0 {
+			t.Errorf("the settings shell still loads %s", module)
+		}
+	}
+	for _, action := range []string{`templates/settings/gigahost.html`, `{{ template "settings_gigahost" . }}`} {
+		if strings.Contains(settingsShell, action) {
+			t.Errorf("the settings shell still carries the hosting block: %s", action)
+		}
+	}
 }
 
 // TestSettingsPageSplitContract pins the structure of the split: the shell holds
@@ -155,9 +260,7 @@ func TestSettingsPageSplitContract(t *testing.T) {
 		t.Error("settings shell must load the page script exactly once")
 	}
 	for _, module := range []string{
-		"notifications_settings.js", "gigahost_catalog_status.js", "gigahost_setup.js",
-		"gigahost_setup_intents.js", "gigahost_order_status_model.js",
-		"gigahost_order_status.js", "gigahost_placement.js",
+		"notifications_settings.js",
 	} {
 		refs := templateScriptRefOffsets(shell, "/static/js/"+module)
 		if len(refs) == 0 || refs[0] > pageScriptRefs[0] {

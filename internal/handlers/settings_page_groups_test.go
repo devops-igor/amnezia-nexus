@@ -39,8 +39,9 @@ type settingsGroupSpec struct {
 }
 
 // settingsGroupsForAdmin is the structure an administrator receives: three groups,
-// nine cards. The policy surface is not one of them any more: it is the Routing
-// page (#987), and its two cards left with it.
+// eight cards. The policy surface is not one of them any more: it is the Routing page
+// (#987), and its two cards left with it. The hosting card left with the hosting
+// block, which now renders on the Servers page beside the grid it acts on.
 var settingsGroupsForAdmin = []settingsGroupSpec{
 	{id: "group-portal", nameKey: "settings_group_portal", cards: []string{
 		"appearanceCard", "sslCard", "captchaCard", "limitsCard",
@@ -49,7 +50,7 @@ var settingsGroupsForAdmin = []settingsGroupSpec{
 		"telegramCard", "notificationsCard",
 	}},
 	{id: "group-system", nameKey: "settings_group_system", cards: []string{
-		"upstreamCard", "gigahostCard", "backupCard",
+		"upstreamCard", "backupCard",
 	}},
 }
 
@@ -355,11 +356,11 @@ func TestSettingsPageCardHeadingsSitBelowTheGroupHeading(t *testing.T) {
 				if role == models.RoleAdmin {
 					want = map[string]int{
 						"settings-subheading": 0,
-						// The hosting card carries two named sub-areas inside it: the
-						// deploy area and the one-time account association of servers
-						// registered before the panel recorded their account.
-						"settings-list-title":       3,
-						"settings-subsection-title": 2,
+						// The hosting card's two named sub-areas moved with the card to
+						// the Servers page, so the only heading left in this document
+						// with either class is the notification history's list title.
+						"settings-list-title":       1,
+						"settings-subsection-title": 0,
 					}[class]
 				}
 				if count != want {

@@ -547,7 +547,7 @@ def test_settings_every_staged_card_commits_from_inside_itself(
     assert page.locator(".settings-actions").count() == 0
     cards = [
         "appearanceCard", "sslCard", "captchaCard", "limitsCard", "telegramCard",
-        "notificationsCard", "gigahostCard",
+        "notificationsCard",
     ]
     labels = set()
     for card in cards:
@@ -555,6 +555,14 @@ def test_settings_every_staged_card_commits_from_inside_itself(
         assert commit.count() == 1, card
         labels.add(" ".join(commit.inner_text().split()))
     assert len(labels) == 1, labels
+
+    # The provider credential card moved to the Servers page with the hosting block, and
+    # it commits through the same control the staged Settings cards use.
+    page.goto(f"{base_url}/")
+    page.wait_for_load_state("networkidle")
+    commit = page.locator("#gigahostCard [data-commit]")
+    assert commit.count() == 1, "gigahostCard"
+    assert " ".join(commit.inner_text().split()) in labels
 
 
 @pytest.mark.e2e

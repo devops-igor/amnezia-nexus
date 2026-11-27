@@ -61,7 +61,7 @@ func pageElementIDs(js string) []string {
 func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 	node := requireJSDOM(t)
 
-	templateText := settingsTemplateText(t)
+	templateText := serversHostingTemplateText(t)
 
 	// The page must load the shipped module, not an inline copy.
 	if !strings.Contains(templateText, versionedTemplateAsset("/static/js/gigahost_placement.js")) {
@@ -71,7 +71,7 @@ func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 		t.Fatal("settings.html has no placement selector")
 	}
 
-	pageJS := settingsPageScript(t)
+	pageJS := hostingPageScript(t)
 	// The block this test runs must be the ordering logic, not some other script.
 	for _, token := range []string{"function updateDeploySelections", "function handleDeployVPS", "deployPlacementSelect"} {
 		if !strings.Contains(pageJS, token) {
@@ -120,7 +120,7 @@ w.API = {
   post: async (url, body) => { posts.push({url, body}); return {message:'ok'}; },
   delete: async () => ({status:'ok'}),
 };
-w.UI = {toast: (text, kind) => {(w.__toasts = w.__toasts || []).push({text, kind});}, confirm: async () => true};
+w.UI = {toast: (text, kind) => {(w.__toasts = w.__toasts || []).push({text, kind});}, confirm: async () => true, confirmWith: async (kind, options) => w.UI.confirm(options)};
 w.confirm = () => true;
 // Status polling belongs to the order-status module, which this harness does not
 // load; stub the two entry points the page calls so its boot path can run.

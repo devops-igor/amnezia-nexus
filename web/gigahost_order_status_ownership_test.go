@@ -35,7 +35,7 @@ func gigahostOrderStatusOwnershipHarness(t *testing.T, scenario string) string {
 	}
 	// The listener is taken from the template verbatim, so a change to the shipped wiring
 	// is exercised rather than described.
-	template := settingsPageScript(t)
+	template := hostingPageScript(t)
 	start := strings.Index(template, "    if (btnRefreshCatalog) {")
 	end := strings.Index(template, "    if (btnDeployVPS)")
 	if start < 0 || end <= start {

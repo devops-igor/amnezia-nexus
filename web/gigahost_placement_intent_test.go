@@ -32,7 +32,7 @@ import (
 func TestGigahostPlacementIntentStaysBlockedUntilDeliberateChoice(t *testing.T) {
 	node := requireJSDOM(t)
 
-	pageJS := settingsPageScript(t)
+	pageJS := hostingPageScript(t)
 	moduleJS, err := StaticFS.ReadFile("static/js/gigahost_placement.js")
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)
@@ -92,7 +92,7 @@ w.API = {
   post: async (url, body) => { posts.push({url, body}); return {message:'ok'}; },
   delete: async () => ({status:'ok'}),
 };
-w.UI = {toast: () => {}, confirm: async () => true};
+w.UI = {toast: () => {}, confirm: async () => true, confirmWith: async (kind, options) => w.UI.confirm(options)};
 w.confirm = () => true;
 w.startGigahostOrderStatusRefresh = () => {};
 w.loadRecentOrders = () => {};

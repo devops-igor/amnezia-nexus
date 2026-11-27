@@ -10,7 +10,7 @@
         </button>
     </div>
 
-    {{ if .servers }}
+    {{ if or .servers .deployments }}
     <!-- Search and filtering toolbar -->
     <div class="table-toolbar" style="margin-bottom: var(--space-lg);">
         <div class="table-search-box">
@@ -74,6 +74,49 @@
             </div>
         </div>
         {{ end }}
+        {{/* Deployments this panel has ordered that no panel server represents yet. They
+             are cards in the same grid, with the same anatomy, because the section lists
+             every server this panel has - registered or still awaiting setup - and a
+             second list below it was what made one inventory look like two sections.
+             The state shown is the panel's recorded state; this page reads no provider. */}}
+        {{ range $deployment := .deployments }}
+        <div class="card server-card" id="deployment-{{ $deployment.OrderID }}"
+             data-server-name="{{ $deployment.Name }}" data-server-host="{{ $deployment.Address }}">
+            <div class="server-meta">
+                <div class="server-icon">
+                    <svg class="icon" style="width:24px;height:24px;color:#fff;"><use href="#icon-server"></use></svg>
+                </div>
+                <div>
+                    <div class="server-name">{{ $deployment.Name }}</div>
+                    <div class="server-host">
+                        {{ if $deployment.Address }}<span>{{ $deployment.Address }}</span>{{ else }}{{ _ "gigahost_deployment_no_address" }}{{ end }}
+                    </div>
+                </div>
+            </div>
+
+            <div class="server-protocols">
+                <span class="badge {{ if or $deployment.Deleted $deployment.IsFailed }}badge-danger{{ else if $deployment.IsDeploying }}badge-info{{ else }}badge-secondary{{ end }}">{{ _ $deployment.StageKey }}</span>
+            </div>
+
+            <p class="form-hint">{{ _ "gigahost_deployment_recorded_state" }}: {{ $deployment.Status }}</p>
+
+            {{/* Only what this state allows. A finished order offers nothing: every control
+                 would contact a deployment the order no longer covers. A deployment with no
+                 panel server offers the setup that finishes it, and the handoff sentence
+                 where the reader cannot run it. */}}
+            {{ if $deployment.Deleted }}
+            {{ else if is_admin $.current_user }}
+            <p class="form-hint">{{ _ "gigahost_deployment_no_panel_server" }}</p>
+            <div class="server-actions">
+                <button class="btn btn-primary btn-sm" style="flex:1" onclick="triggerGigahostSetup('{{ $deployment.OrderID }}')">
+                    {{ if $deployment.IsFailed }}{{ _ "deploy_retry_btn" }}{{ else }}{{ _ "deploy_setup_btn" }}{{ end }}
+                </button>
+            </div>
+            {{ else }}
+            <p class="form-hint">{{ _ "gigahost_deployment_not_set_up_admin_handoff" }}</p>
+            {{ end }}
+        </div>
+        {{ end }}
         <div id="serverSearchEmpty" class="empty-state hidden" style="grid-column: 1 / -1; padding: var(--space-xl) 0;">
             <div class="empty-icon"><svg class="icon" style="width:40px;height:40px;"><use href="#icon-search"></use></svg></div>
             <div class="empty-title">{{ _ "no_matching_records" }}</div>
@@ -93,7 +136,14 @@
     </div>
     {{ end }}
 
-    {{ template "servers_deployments" . }}
+    {{/* The controls that act on these deployments stay on this page: they were the
+         Settings hosting block, and they are the reason a card awaiting setup can be
+         finished without leaving the section that shows it. */}}
+    {{ if is_admin .current_user }}
+    <div style="margin-top: var(--space-xl);">
+        {{ template "servers_hosting" . }}
+    </div>
+    {{ end }}
 </section>
 
 <!-- ===== Add Server Modal ===== -->
@@ -216,6 +266,16 @@
 {{ end }}
 
 {{ define "scripts" }}
+<script src="/static/js/settings_cards.js?v={{ .app_version }}"></script>
+<script src="/static/js/settings_save.js?v={{ .app_version }}"></script>
+<script src="/static/js/gigahost_catalog_status.js?v={{ .app_version }}"></script>
+<script src="/static/js/gigahost_setup.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/gigahost_setup_intents.js" }}"></script>
+<script src="{{ asset_url "/static/js/gigahost_order_status_model.js" }}"></script>
+<script src="{{ asset_url "/static/js/gigahost_order_status.js" }}"></script>
+<script src="/static/js/gigahost_placement.js?v={{ .app_version }}"></script>
+<script src="/static/js/gigahost_account_association.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/gigahost_hosting.js" }}"></script>
 <script>
     function filterServers(query) {
         const q = (query || '').trim().toLowerCase();

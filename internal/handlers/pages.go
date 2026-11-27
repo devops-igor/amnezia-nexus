@@ -27,11 +27,23 @@ func (h *Handlers) IndexPageHandler(w http.ResponseWriter, r *http.Request) {
 	// row the grid is hiding.
 	deployments := h.gigahostDeploymentsForServersPage(ctx, allServers)
 
+	// The hosting controls below the grid read the provider credential's presence, so
+	// this page obeys the same secret policy as GET /api/settings: no stored credential
+	// reaches the markup. They are administrator-only controls, so the settings are not
+	// read at all for a role the block does not render for.
+	var settings map[string]any
+	if sess == nil || sess.Role == models.RoleAdmin {
+		settings, _ = h.db.GetAllSettings(ctx)
+		maskSettingsSecrets(settings)
+	}
+
 	// Deployments this panel has ordered but not set up have no servers row, so the
-	// grid alone cannot show them; they are named here and rendered beside it.
+	// grid alone cannot show them; they are cards in that same grid, and the controls
+	// that finish them are the hosting card rendered below it.
 	_ = RenderTemplate(w, r, h.db, "index.html", map[string]any{
 		"servers":     serversListedOnServersPage(allServers),
 		"deployments": deployments,
+		"settings":    settings,
 	})
 }
 

@@ -165,13 +165,14 @@ function wrapperState() { return doc.getElementById('policyAlert').getAttribute(
 // state alone. The save is held at the network so the busy interval is observable.
 func TestSettingsA11y_BusyAndFocusHoldOnAllEightCards(t *testing.T) {
 	// Every card that carries a commit control, on the page that renders it: the
-	// Settings cards and the policy card on Routing.
+	// Settings cards, the policy card on Routing, and the hosting card on Servers.
 	for _, page := range []struct {
 		name string
 		path string
 	}{
 		{"settings", ""},
 		{"routing", "/routing"},
+		{"servers", "/"},
 	} {
 		t.Run(page.name, func(t *testing.T) {
 			h, _, _ := setupTestHandlers(t)

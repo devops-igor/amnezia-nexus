@@ -36,7 +36,7 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read setup intents module: %v", err)
 	}
-	templateStr := settingsTemplateText(t)
+	templateStr := serversHostingTemplateText(t)
 	// The saved action must be offered from the shipped renderer, and the renderer
 	// itself must be the shipped module: an inline copy could diverge from it. The
 	// offer is not conditioned on the provider having assigned an address, because

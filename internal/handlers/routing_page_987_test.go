@@ -423,10 +423,10 @@ func TestSettingsPageKeepsOnlyItsThreeGroups(t *testing.T) {
 	}
 
 	// The cards that stayed are still there, so the move took the policy surface and
-	// nothing else.
+	// the hosting block and nothing else.
 	for _, kept := range []string{
 		"appearanceCard", "sslCard", "captchaCard", "limitsCard",
-		"telegramCard", "notificationsCard", "upstreamCard", "gigahostCard", "backupCard",
+		"telegramCard", "notificationsCard", "upstreamCard", "backupCard",
 	} {
 		if !strings.Contains(body, `id="`+kept+`"`) {
 			t.Errorf("the Settings page lost #%s, which the move should not have touched", kept)

@@ -22,7 +22,7 @@ import (
 func TestGigahostDeploySelectionContract(t *testing.T) {
 	node := requireNode(t)
 	requireJSDOM(t)
-	source := settingsPageScript(t)
+	source := hostingPageScript(t)
 	functions := []string{
 		"function appendDeployOption",
 		"function deployPlanAt",

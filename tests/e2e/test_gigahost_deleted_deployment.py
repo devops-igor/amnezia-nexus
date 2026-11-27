@@ -121,11 +121,10 @@ LISTED_DEPLOYMENT = {
 def _open_gigahost(page: Page, base_url: str, state: dict) -> dict:
     """Render one Recent Deployments state on the real page and read the row back."""
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(f"{base_url}/settings")
+    page.goto(f"{base_url}/")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function(
-        "document.querySelectorAll('.settings-section-card').length >= 9"
-    )
+    # The deployment list is on the Servers page with the hosting card it fills.
+    page.wait_for_function("() => !!document.querySelector('#recentOrdersContainer')")
     # The page starts its own read of this container on load, and the view admits one read
     # at a time: a caller arriving while a chain is running is coalesced into a single
     # follow-up. So the stub is installed and the read requested until the DOM shows the
@@ -311,9 +310,9 @@ def _render_saved_jobs(
 ) -> dict:
     """Render the saved-jobs fixture on the real page and measure its rows."""
     page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
-    page.goto(f"{base_url}/settings")
+    page.goto(f"{base_url}/")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function("document.querySelectorAll('.settings-section-card').length >= 9")
+    page.wait_for_function("() => !!document.querySelector('#setupIntentsContainer')")
     page.add_style_tag(content=NO_TRANSITIONS)
     page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
     # The page starts its own read of these containers on load, and each view admits one
