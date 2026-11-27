@@ -291,7 +291,7 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     const orderId = String(record.order_id || '');
     const obs = gigahostOrderStatusObservation(observation);
     const journal = gigahostOrderStatusJournalEvidence(detail);
-    const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal);
+    const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal, record.status);
 
     // providerAbsent is the panel's durable record that the provider's own server
     // inventory no longer lists the server this order registered. It arrives from the
@@ -339,18 +339,31 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
 /* gigahostOrderStatusClaimedProviderStatus decides which status this view may present
  * as the provider's, and where it came from.
  *
- * Only a confirmed observation may become a claimed provider stage. Failing that, the
- * order row is the panel's copy - but the status column is written by two vocabularies,
- * so it may only be read as a provider state when nothing contradicts it. Positive
- * journal evidence means this row's status is onboarding execution (an install that
- * failed after the provider was ready carries "failed" there), so the provider axis
- * becomes an explicit unknown rather than letting the setup outcome wear the provider's
- * name. A view that cannot read the provider says so; it does not inherit somebody
- * else's answer. */
-function gigahostOrderStatusClaimedProviderStatus(obs, journal) {
+ * Only a confirmed observation may become a claimed provider stage. Failing that, a
+ * durably recorded deletion is presented as the stage it is: the panel accepted and
+ * persisted the provider's own ending, and the onboarding journal cannot produce that
+ * spelling. A journal step is history - the immediate setup can journal `deploying`
+ * before the provider finishes, and the status request keeps reporting that step after
+ * the panel recorded the ending - so it must not outrank the record of how the
+ * deployment ended, or an ordinary refresh undoes the ending and re-offers provisioning
+ * for a server the panel has recorded as gone. A fresh affirmative inventory repair still
+ * wins over it, because that repair rewrites the ledger it is read from here.
+ *
+ * For every other recorded status the journal still decides. The status column is written
+ * by two vocabularies, so a non-deletion status may only be read as a provider state when
+ * nothing contradicts it: positive journal evidence means this row's status is onboarding
+ * execution (an install that failed after the provider was ready carries "failed" there),
+ * so the provider axis becomes an explicit unknown rather than letting the setup outcome
+ * wear the provider's name. A view that cannot read the provider says so; it does not
+ * inherit somebody else's answer. */
+function gigahostOrderStatusClaimedProviderStatus(obs, journal, recordedStatus) {
     if (obs.outcome === 'confirmed') {
         const status = gigahostOrderStatusText(obs.status);
         if (status) return {status: status, source: 'provider', unknown: false};
+    }
+    const recorded = gigahostOrderStatusText(recordedStatus).trim().toLowerCase();
+    if (gigahostOrderStatusDeletedSpellings.indexOf(recorded) !== -1) {
+        return {status: recorded, source: 'ledger', unknown: false};
     }
     if (journal.present) return {status: '', source: 'ledger', unknown: true};
     return {status: '', source: 'ledger', unknown: false};

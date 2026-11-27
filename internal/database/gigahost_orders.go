@@ -187,6 +187,12 @@ func (d *DB) ListGigahostDeployments(ctx context.Context) ([]models.GigahostOrde
 	return list, err
 }
 
+// gigahostOrderRowScanner is what both a single-row read and the list read decode from, so
+// the two readers share one column list and one scan body instead of drifting apart.
+type gigahostOrderRowScanner interface {
+	Scan(dest ...any) error
+}
+
 // scanGigahostOrders runs a query with the canonical column order and scans it.
 func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.GigahostOrder, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, q)
@@ -197,31 +203,11 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 
 	list := []models.GigahostOrder{}
 	for rows.Next() {
-		var o models.GigahostOrder
-		var createdAt, updatedAt string
-		var assignedIP, currency sql.NullString
-		var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
-		var priceID, nexusServerID sql.NullInt64
-		var monthlyCap sql.NullFloat64
-		if err := rows.Scan(
-			&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
-			&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
-			&priceID, &monthlyCap, &currency,
-			&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt, &nexusServerID,
-		); err != nil {
+		order, err := scanGigahostOrder(rows)
+		if err != nil {
 			return nil, err
 		}
-		o.AssignedIP = assignedIP.String
-		o.Currency = currency.String
-		o.PriceID = int(priceID.Int64)
-		o.NexusServerID = nexusServerID.Int64
-		o.MonthlyCapNOK = monthlyCap.Float64
-		o.PurchaseOrigin = purchaseOrigin.String
-		o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
-		o.LiveRepairedAt = parseGigahostRepairTime(liveRepairedAt)
-		o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-		list = append(list, o)
+		list = append(list, *order)
 	}
 	return list, rows.Err()
 }
@@ -430,6 +416,12 @@ func (d *DB) encryptOrderCredential(privateKey string) (string, error) {
 
 // GetGigahostOrder returns one ledger row addressed by its provider order id.
 // found=false means the ledger has no such order.
+//
+// It reads the canonical column list, so a caller that reloads a row after a refused write
+// sees the same record the list read: every column, including the panel server the order
+// registered. A narrower projection here made a reloaded row look as though it had never
+// registered a server, which silently withdrew the durable existence record the caller was
+// about to consult.
 func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.GigahostOrder, bool, error) {
 	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
 		return nil, false, nil
@@ -437,12 +429,10 @@ func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.Giga
 	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
 		return nil, false, err
 	}
-	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	             created_at, updated_at, price_id, monthly_cap_nok, currency,
-	             purchase_origin, purchase_recorded_at, live_repaired_at
+	q := `SELECT ` + gigahostOrderSelectColumns + `
 	      FROM gigahost_orders WHERE order_id = ? ORDER BY id DESC LIMIT 1`
 	row := d.sqlDB.QueryRowContext(ctx, q, orderID)
-	order, err := scanGigahostOrderRow(row)
+	order, err := scanGigahostOrder(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
@@ -452,26 +442,27 @@ func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.Giga
 	return order, true, nil
 }
 
-// scanGigahostOrderRow scans one row in the canonical column order used by
-// readGigahostOrders, so a single-order read cannot drift from the list read.
-func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
+// scanGigahostOrder decodes one row selected with gigahostOrderSelectColumns, so the
+// single-order read and the list read cannot drift from each other.
+func scanGigahostOrder(row gigahostOrderRowScanner) (*models.GigahostOrder, error) {
 	var o models.GigahostOrder
 	var createdAt, updatedAt string
 	var assignedIP, currency sql.NullString
 	var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
-	var priceID sql.NullInt64
+	var priceID, nexusServerID sql.NullInt64
 	var monthlyCap sql.NullFloat64
 	if err := row.Scan(
 		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 		&priceID, &monthlyCap, &currency,
-		&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt,
+		&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt, &nexusServerID,
 	); err != nil {
 		return nil, err
 	}
 	o.AssignedIP = assignedIP.String
 	o.Currency = currency.String
 	o.PriceID = int(priceID.Int64)
+	o.NexusServerID = nexusServerID.Int64
 	o.MonthlyCapNOK = monthlyCap.Float64
 	o.PurchaseOrigin = purchaseOrigin.String
 	o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
