@@ -31,6 +31,10 @@ import (
 // deletedBadgeSelector is the rule scoped to the deleted order-status badge.
 const deletedBadgeSelector = `.settings-section-card .gigahost-order-status[data-stage="deleted"] .gigahost-order-status-toggle`
 
+// savedDeletedBadgeSelector is the same state on the saved-setup-approvals surface,
+// which draws the state as a plain badge rather than as a progression toggle.
+const savedDeletedBadgeSelector = `.settings-section-card .gigahost-order-state .badge[data-stage="deleted"]`
+
 // deletedBadgeInk is the ink role that belongs to the deleted stage alone.
 const deletedBadgeInk = "--text-deleted-badge"
 
@@ -43,36 +47,32 @@ func TestDeletedBadgeMeetsContrastInBothThemes(t *testing.T) {
 	if rule == "" {
 		t.Fatalf("settings.css no longer scopes a rule to %s", deletedBadgeSelector)
 	}
-	if !declaresPropertyValue(rule, "color", "var("+deletedBadgeInk+")") {
-		t.Fatalf("the deleted badge must use its own ink %s:\n%s", deletedBadgeInk, rule)
+	requireInkOnlyBadgeRule(t, rule, deletedBadgeSelector)
+
+	// The saved setup approvals show the same ended deployment on a second surface. The
+	// badge there is the shared .badge-danger, so the fill and the border already come
+	// from the shared danger tokens; only the ink is the state's own, and it is the same
+	// ink the progression badge uses. Without this rule the saved badge painted the
+	// shared danger ink on that fill, which is the pairing measured below.
+	savedRule, _ := cssRule(settingsCSS, savedDeletedBadgeSelector, 0)
+	if savedRule == "" {
+		t.Fatalf("settings.css no longer scopes a rule to %s", savedDeletedBadgeSelector)
 	}
-	if declaresPropertyValue(rule, "color", "var(--text-danger)") {
-		t.Fatalf("the deleted badge reaches for the reserved status ink again:\n%s", rule)
-	}
-	if declaresProperty(rule, "background") || declaresProperty(rule, "background-color") {
-		t.Fatalf("the deleted badge rule must change only the ink, so the shared fill keeps its meaning:\n%s", rule)
-	}
+	requireInkOnlyBadgeRule(t, savedRule, savedDeletedBadgeSelector)
 
 	dark := cssCustomProperties(tokensCSS, ":root")
 	light := cssCustomProperties(tokensCSS, `[data-theme="light"]`)
 
-	for _, theme := range []struct {
-		name  string
-		token map[string]string
-	}{
-		{name: "dark", token: dark},
-		{name: "light", token: light},
-	} {
-		card := requireHexToken(t, theme.name, theme.token, "--bg-card")
-		fillRGB, fillAlpha := requireRGBAToken(t, theme.name, theme.token, "--danger-bg")
-		ink := requireHexToken(t, theme.name, theme.token, deletedBadgeInk)
-		fill := compositeOver(fillRGB, fillAlpha, card)
-		ratio := contrastRatio(ink, fill)
-		if ratio < 4.5 {
-			t.Errorf("the %s DELETED badge measures %.2f:1 (ink %s on fill %s), below the 4.5:1 "+
-				"normal-text minimum", theme.name, ratio, ink, fill)
-		}
+	// The saved badge's fill is the shared danger fill, which is what the ratio below
+	// composites over the card colour. Asserting it here keeps the ratio attached to the
+	// surface it describes rather than to the other badge's rule.
+	savedBadge, _ := cssRule(componentsCSS, ".badge-danger", 0)
+	if !declaresPropertyValue(savedBadge, "background", "var(--danger-bg)") {
+		t.Fatalf("the saved deleted badge's fill is not the danger fill the ratio assumes:\n%s", savedBadge)
 	}
+
+	assertInkMeetsNormalTextMinimum(t, dark, light, deletedBadgeSelector)
+	assertInkMeetsNormalTextMinimum(t, dark, light, savedDeletedBadgeSelector)
 
 	// The shared badge class is untouched: every other consumer still paints --danger
 	// on --danger-bg, so this correction cannot restyle another dialog.
@@ -99,6 +99,44 @@ func readShippedCSS(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(raw)
+}
+
+// requireInkOnlyBadgeRule fails unless the scoped rule paints the state's own ink and
+// leaves the fill alone. Changing the fill would take the state out of the shared danger
+// family, which is what makes the badge mean "this ended badly" in the first place.
+func requireInkOnlyBadgeRule(t *testing.T, rule, selector string) {
+	t.Helper()
+	if !declaresPropertyValue(rule, "color", "var("+deletedBadgeInk+")") {
+		t.Fatalf("%s must use the state's own ink %s:\n%s", selector, deletedBadgeInk, rule)
+	}
+	if declaresPropertyValue(rule, "color", "var(--text-danger)") {
+		t.Fatalf("%s reaches for the reserved status ink again:\n%s", selector, rule)
+	}
+	if declaresProperty(rule, "background") || declaresProperty(rule, "background-color") {
+		t.Fatalf("%s must change only the ink, so the shared fill keeps its meaning:\n%s", selector, rule)
+	}
+}
+
+// assertInkMeetsNormalTextMinimum checks the state's ink against the composited danger
+// fill in both themes, once for each surface that draws it.
+func assertInkMeetsNormalTextMinimum(t *testing.T, dark, light map[string]string, surface string) {
+	t.Helper()
+	for _, theme := range []struct {
+		name  string
+		token map[string]string
+	}{
+		{name: "dark", token: dark},
+		{name: "light", token: light},
+	} {
+		card := requireHexToken(t, theme.name, theme.token, "--bg-card")
+		fillRGB, fillAlpha := requireRGBAToken(t, theme.name, theme.token, "--danger-bg")
+		ink := requireHexToken(t, theme.name, theme.token, deletedBadgeInk)
+		fill := compositeOver(fillRGB, fillAlpha, card)
+		if ratio := contrastRatio(ink, fill); ratio < 4.5 {
+			t.Errorf("the %s badge on %s measures %.2f:1 (ink %s on fill %s), below the 4.5:1 "+
+				"normal-text minimum", theme.name, surface, ratio, ink, fill)
+		}
+	}
 }
 
 // declaresPropertyValue reports whether a declaration block assigns prop exactly value.

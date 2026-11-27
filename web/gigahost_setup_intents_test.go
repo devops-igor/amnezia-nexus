@@ -169,6 +169,36 @@ async function render(intents) {
    assert.deepEqual(labels(root), [], 'state ' + state + ' must not offer an action');
  }
 
+ // 7b. Presentation of a terminal saved row. The badge carries the deleted stage as data
+ //     as well as in its label, which is the hook the stylesheet's deleted ink is scoped
+ //     to; the step is named as the last one recorded, because the deployment is gone and
+ //     a bare [installing_protocol] read as work still underway. The control is a row the
+ //     panel is still working on: its step stays the current one.
+ root = await render([{order_id:'ord-absent', protocol:'awg', port:'51820',
+   state:'install_paused', step:'installing_protocol', provider_absent:true}]);
+ const absentRow = root.querySelector('.gigahost-order-row');
+ assert.ok(absentRow, 'a saved row must use the shared reflowing row');
+ assert.ok(absentRow.querySelector('.gigahost-order-identity'), 'the record needs its own side');
+ assert.ok(absentRow.querySelector('.gigahost-order-state'), 'the state and actions need their own side');
+ const absentBadge = absentRow.querySelector('.badge');
+ assert.equal(absentBadge.getAttribute('data-stage'), 'deleted',
+   'the deleted badge must carry its stage as data for the stylesheet');
+ assert.equal(absentBadge.className, 'badge badge-danger');
+ assert.match(absentRow.textContent, /gigahost_status_recorded_step: installing_protocol/,
+   'a terminal row must label its step as the last one recorded');
+ assert.doesNotMatch(absentRow.textContent, /\[installing_protocol\]/,
+   'a terminal row must not present its step as current');
+
+ root = await render([{order_id:'ord-moving', protocol:'awg', state:'installing',
+   step:'installing_protocol'}]);
+ const movingRow = root.querySelector('.gigahost-order-row');
+ assert.match(movingRow.textContent, /\[installing_protocol\]/,
+   'a row the panel is still working on keeps its step as the current one');
+ assert.doesNotMatch(movingRow.textContent, /gigahost_status_recorded_step/,
+   'a moving row must not claim its step is history');
+ assert.equal(movingRow.querySelector('.badge').getAttribute('data-stage'), null,
+   'only the deleted stage carries the deleted ink hook');
+
  // 8. Revoking is that exact order's DELETE, and the view refreshes afterwards.
  calls.length = 0;
  await render([{order_id:'ord-revoke me', protocol:'awg', state:'pending'}]);

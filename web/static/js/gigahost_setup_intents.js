@@ -32,6 +32,16 @@ const SETUP_INTENTS_PRESENCE_REFRESH_MS = 30000;
 const SETUP_INTENTS_RETRY_MS = 30000;
 const SETUP_INTENTS_RETRY_MAX = 5;
 
+/* setupIntentsMovingStates are the states in which the panel itself is still working
+ * on the job. They are the only ones whose step is a claim about the present: the list
+ * follows them at the moving pace rather than the observation pace, and their row shows
+ * the step as current. Every other state is an outcome the operator reads, so its step
+ * is the last one recorded - the same wording the order disclosure uses for it. The
+ * provider's recorded absence ends a job whatever its stored state says, so it is not
+ * in flight either; that is decided by setupIntentStepInFlight rather than by adding a
+ * second list here. */
+const setupIntentsMovingStates = ['pending', 'installing'];
+
 /* withSetupIntentAction runs one action for one order under that guard.
  *
  * It returns false when an action for the same order was already in flight, so a
@@ -210,16 +220,20 @@ function renderSetupIntentsFailed(container) {
 }
 
 /* setupIntentRow builds one saved job. The left side is the record, the right
- * side is the state and the actions that state makes possible. */
+ * side is the state and the actions that state makes possible.
+ *
+ * Layout is owned by settings.css (.gigahost-order-row and its two sides), the
+ * same rules the recent-orders rows use, so a saved row reflows inside the card
+ * instead of widening it. Both sides wrap and the row stacks below 600 px, which
+ * is what keeps the state and any action in one frame on a phone: with a fixed
+ * flex row the identity pushed the badge and the action past the right edge of
+ * the card, and the document then scrolled sideways to reveal them. */
 function setupIntentRow(i) {
     const row = document.createElement('div');
-    row.style.display = 'flex';
-    row.style.justifyContent = 'space-between';
-    row.style.alignItems = 'center';
-    row.style.padding = '6px 0';
-    row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+    row.className = 'gigahost-order-row';
 
     const left = document.createElement('div');
+    left.className = 'gigahost-order-identity';
     const idSpan = document.createElement('span');
     idSpan.style.fontFamily = 'monospace';
     idSpan.style.fontWeight = '600';
@@ -237,7 +251,13 @@ function setupIntentRow(i) {
         stepSpan.style.fontSize = '0.75rem';
         stepSpan.style.marginLeft = '8px';
         stepSpan.style.color = 'var(--text-secondary)';
-        stepSpan.textContent = '[' + i.step + ']';
+        // A step is a claim about the present only while the panel can still move the
+        // job. Every other state is an outcome whose step is the last one recorded,
+        // and the same wording the order disclosure uses for the same fact - a bare
+        // [installing_protocol] on an ended row read as work still underway.
+        stepSpan.textContent = setupIntentStepInFlight(i)
+            ? '[' + i.step + ']'
+            : _('gigahost_status_recorded_step') + ': ' + i.step;
         left.appendChild(stepSpan);
     }
 
@@ -266,17 +286,21 @@ function setupIntentRow(i) {
     }
 
     const right = document.createElement('div');
-    right.style.display = 'flex';
-    right.style.alignItems = 'center';
-    right.style.gap = '6px';
+    right.className = 'gigahost-order-state';
 
     const badge = document.createElement('span');
     // A job whose registered server the provider's own inventory no longer lists is
     // shown as what it is, rather than as a paused install with nothing to press: the
     // state badge and the action area must not disagree about the same job.
-    badge.className = 'badge ' + (setupIntentProviderAbsent(i) ? 'badge-danger' : setupIntentBadgeClass(i.state));
+    const absent = setupIntentProviderAbsent(i);
+    badge.className = 'badge ' + (absent ? 'badge-danger' : setupIntentBadgeClass(i.state));
+    // The stage is carried as data as well as in the label, so the stylesheet can give
+    // this one state its own ink. The danger fill is the same on both surfaces; the
+    // shared danger ink does not clear 4.5:1 on it in the dark theme, and the recent
+    // deployments badge already has a deleted-stage step of its own.
+    if (absent) badge.setAttribute('data-stage', 'deleted');
     badge.style.fontSize = '0.75rem';
-    badge.textContent = setupIntentProviderAbsent(i)
+    badge.textContent = absent
         ? _('gigahost_status_stage_deleted')
         : (_('setup_state_' + i.state) || (i.state || ''));
     right.appendChild(badge);
@@ -319,6 +343,18 @@ function setupIntentDisplayedIdentity(i) {
  * with no such record keeps its ordinary treatment. */
 function setupIntentProviderAbsent(i) {
     return !!i && i.provider_absent === true;
+}
+
+/* setupIntentStepInFlight reports whether this job's recorded step is still the step it
+ * is on, rather than the last one it reached.
+ *
+ * It is one predicate over the module's own moving-state list, so the pace the list is
+ * followed at and the wording of its step cannot disagree about which jobs are still
+ * running. A provider-confirmed absence ends the job regardless of the recorded state:
+ * the deployment is gone, so nothing about it is in flight. */
+function setupIntentStepInFlight(i) {
+    if (!i || setupIntentProviderAbsent(i)) return false;
+    return setupIntentsMovingStates.indexOf(i.state) !== -1;
 }
 
 /* setupIntentActions returns the buttons a state allows.
@@ -382,7 +418,7 @@ function setupIntentActions(i) {
  * left, so a list with nothing actionable left is not polled at all. */
 function scheduleSetupIntentsPolling(intents) {
     if (window.setupIntentsPollTimer) return;
-    const moving = intents.some(i => i.state === 'pending' || i.state === 'installing');
+    const moving = intents.some(i => setupIntentsMovingStates.indexOf(i.state) !== -1);
     const contactable = intents.some(setupIntentsContactable);
     if (!moving && !contactable) return;
     bindSetupIntentsLifecycle();

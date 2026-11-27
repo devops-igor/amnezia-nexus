@@ -4218,13 +4218,18 @@ td[data-backend-name]:focus-visible {
     }
 }
 
-/* Gigahost recent-orders rows: layout and the progression marker.
+/* Gigahost order rows: layout and the progression marker.
  *
  * These rules belong to this sheet because the widget is part of the Settings surface
  * and is rendered nowhere else, which is the same reason the flows-table cell disclosure
  * is defined here. Card-scoped like its neighbours, and every class they name is listed
  * in the offline guard's Settings surface set, because the frozen reference predates the
  * widget.
+ *
+ * Two lists use this row: the recent orders and the saved setup approvals. Both are the
+ * same thing to read - an order identity on the left, a state and the actions it allows
+ * on the right - so they share one layout rather than each carrying its own, and a fix
+ * to the wrapping reaches both.
  *
  * The row is an identity on the left and the status strip plus its actions on the right.
  * Neither side may widen the card: the ready row's actions used to run past it at
@@ -4289,6 +4294,24 @@ td[data-backend-name]:focus-visible {
    the policy readout answers. */
 .settings-section-card .gigahost-order-status[data-stage="deleted"] .gigahost-order-status-toggle {
     color: var(--text-deleted-badge);
+}
+
+/* The saved setup approvals show the same ended deployment as a plain badge, and the
+   same two facts decide it: the state's own ink is not the shared danger ink. The fill
+   and the border stay the shared danger ones, so the badge keeps meaning "this is the
+   dangerous outcome" while the label stays readable at the 12 px this row sets. Only the
+   deleted state is scoped, and only on this surface: every other danger badge, on this
+   card and elsewhere, keeps the token it had. */
+.settings-section-card .gigahost-order-state .badge[data-stage="deleted"] {
+    color: var(--text-deleted-badge);
+}
+
+/* An action keeps its content width and wraps to the next line instead of being squeezed
+   inside the state group. The button's label does not wrap (the shared .btn rule sets
+   white-space: nowrap), so shrinking it clips the label against the border rather than
+   reflowing it - and the group has a line to give. */
+.settings-section-card .gigahost-order-state .btn {
+    flex: 0 0 auto;
 }
 
 @media (max-width: 600px) {
