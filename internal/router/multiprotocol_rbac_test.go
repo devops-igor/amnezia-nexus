@@ -175,314 +175,119 @@ func TestMultiProtocol_RouterRBAC(t *testing.T) {
 
 	csrfTok := "csrf-token-rbac"
 
-	// 1. Support role MUST be forbidden on VLESS and Naive across both /api/servers/ and legacy / routes
+	// 1. Support role MUST be forbidden on VLESS and Naive on /api/servers/ routes
 	for _, proto := range []string{"vless", "naive"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			for _, action := range []string{"install", "uninstall"} {
-				testName := fmt.Sprintf("Support %s %s%s", proto, prefix, "/"+action)
-				t.Run(testName, func(t *testing.T) {
-					var body string
-					if action == "install" {
-						body = fmt.Sprintf(`{"protocol":%q,"port":"443"}`, proto)
-					} else {
-						body = fmt.Sprintf(`{"protocol":%q}`, proto)
-					}
+		for _, action := range []string{"install", "uninstall"} {
+			testName := fmt.Sprintf("Support %s /api/servers/%s", proto, action)
+			t.Run(testName, func(t *testing.T) {
+				var body string
+				if action == "install" {
+					body = fmt.Sprintf(`{"protocol":%q,"port":"443"}`, proto)
+				} else {
+					body = fmt.Sprintf(`{"protocol":%q}`, proto)
+				}
 
-					vlessMgr.calls = 0
-					naiveMgr.calls = 0
+				vlessMgr.calls = 0
+				naiveMgr.calls = 0
 
-					urlPath := fmt.Sprintf("%s/%d/%s", prefix, serverID, action)
-					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-						UserID:   "support-user-id",
-						Username: "supportuser",
-						Role:     models.RoleSupport,
-					}))
+				urlPath := fmt.Sprintf("/api/servers/%d/%s", serverID, action)
+				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID:   "support-user-id",
+					Username: "supportuser",
+					Role:     models.RoleSupport,
+				}))
 
-					w := httptest.NewRecorder()
-					r.ServeHTTP(w, req)
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
 
-					if w.Code != http.StatusForbidden {
-						t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-					}
-					if vlessMgr.calls != 0 || naiveMgr.calls != 0 {
-						t.Errorf("expected manager not to be called on forbidden request, got vless=%d naive=%d", vlessMgr.calls, naiveMgr.calls)
-					}
-				})
-			}
+				if w.Code != http.StatusForbidden {
+					t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+				}
+				if vlessMgr.calls != 0 || naiveMgr.calls != 0 {
+					t.Errorf("expected manager not to be called on forbidden request, got vless=%d naive=%d", vlessMgr.calls, naiveMgr.calls)
+				}
+			})
 		}
 	}
 
-	// 2. Admin role MUST succeed on VLESS and Naive across both route families
+	// 2. Admin role MUST succeed on VLESS and Naive on /api/servers/ routes
 	for _, proto := range []string{"vless", "naive"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			for _, action := range []string{"install", "uninstall"} {
-				testName := fmt.Sprintf("Admin %s %s%s", proto, prefix, "/"+action)
-				t.Run(testName, func(t *testing.T) {
-					var body string
-					if action == "install" {
-						body = fmt.Sprintf(`{"protocol":%q,"port":"443"}`, proto)
-					} else {
-						body = fmt.Sprintf(`{"protocol":%q}`, proto)
-					}
+		for _, action := range []string{"install", "uninstall"} {
+			testName := fmt.Sprintf("Admin %s /api/servers/%s", proto, action)
+			t.Run(testName, func(t *testing.T) {
+				var body string
+				if action == "install" {
+					body = fmt.Sprintf(`{"protocol":%q,"port":"443"}`, proto)
+				} else {
+					body = fmt.Sprintf(`{"protocol":%q}`, proto)
+				}
 
-					urlPath := fmt.Sprintf("%s/%d/%s", prefix, serverID, action)
-					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-						UserID:   "admin-user-id",
-						Username: "adminuser",
-						Role:     models.RoleAdmin,
-					}))
+				urlPath := fmt.Sprintf("/api/servers/%d/%s", serverID, action)
+				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID:   "admin-user-id",
+					Username: "adminuser",
+					Role:     models.RoleAdmin,
+				}))
 
-					w := httptest.NewRecorder()
-					r.ServeHTTP(w, req)
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
 
-					if w.Code != http.StatusOK {
-						t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-					}
-				})
-			}
+				if w.Code != http.StatusOK {
+					t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+				}
+			})
 		}
 	}
 
 	// 3. Support role CAN still manage legacy protocols like AWG
-	for _, prefix := range []string{"/api/servers", ""} {
-		for _, action := range []string{"install", "uninstall"} {
-			testName := fmt.Sprintf("Support awg %s%s", prefix, "/"+action)
-			t.Run(testName, func(t *testing.T) {
-				var body string
-				if action == "install" {
-					body = `{"protocol":"awg","port":"51820"}`
-				} else {
-					body = `{"protocol":"awg"}`
-				}
+	for _, action := range []string{"install", "uninstall"} {
+		testName := fmt.Sprintf("Support awg /api/servers/%s", action)
+		t.Run(testName, func(t *testing.T) {
+			var body string
+			if action == "install" {
+				body = `{"protocol":"awg","port":"51820"}`
+			} else {
+				body = `{"protocol":"awg"}`
+			}
 
-				urlPath := fmt.Sprintf("%s/%d/%s", prefix, serverID, action)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "support-user-id",
-					Username: "supportuser",
-					Role:     models.RoleSupport,
-				}))
+			urlPath := fmt.Sprintf("/api/servers/%d/%s", serverID, action)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "support-user-id",
+				Username: "supportuser",
+				Role:     models.RoleSupport,
+			}))
 
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
 
-				if w.Code != http.StatusOK {
-					t.Errorf("expected 200 OK for Support role on awg %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
-				}
-			})
-		}
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for Support role on awg %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+			}
+		})
 	}
 
 	// 4. Support role MUST be forbidden from reading and saving VLESS and Naive server configs
 	for _, proto := range []string{"vless", "naive"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			// Read config
-			t.Run(fmt.Sprintf("Support %s %s/server_config", proto, prefix), func(t *testing.T) {
-				body := fmt.Sprintf(`{"protocol":%q}`, proto)
-				urlPath := fmt.Sprintf("%s/%d/server_config", prefix, serverID)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "support-user-id",
-					Username: "supportuser",
-					Role:     models.RoleSupport,
-				}))
-
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
-
-				if w.Code != http.StatusForbidden {
-					t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-				}
-			})
-
-			// Save config
-			t.Run(fmt.Sprintf("Support %s %s/server_config/save", proto, prefix), func(t *testing.T) {
-				body := fmt.Sprintf(`{"protocol":%q,"config":"# test config"}`, proto)
-				urlPath := fmt.Sprintf("%s/%d/server_config/save", prefix, serverID)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "support-user-id",
-					Username: "supportuser",
-					Role:     models.RoleSupport,
-				}))
-
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
-
-				if w.Code != http.StatusForbidden {
-					t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-				}
-			})
-		}
-	}
-
-	// 5. Admin role MUST succeed on reading and saving VLESS and Naive server configs
-	for _, proto := range []string{"vless", "naive"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			// Read config
-			t.Run(fmt.Sprintf("Admin %s %s/server_config", proto, prefix), func(t *testing.T) {
-				body := fmt.Sprintf(`{"protocol":%q}`, proto)
-				urlPath := fmt.Sprintf("%s/%d/server_config", prefix, serverID)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "admin-user-id",
-					Username: "adminuser",
-					Role:     models.RoleAdmin,
-				}))
-
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
-
-				if w.Code != http.StatusOK {
-					t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-				}
-			})
-
-			// Save config
-			t.Run(fmt.Sprintf("Admin %s %s/server_config/save", proto, prefix), func(t *testing.T) {
-				body := fmt.Sprintf(`{"protocol":%q,"config":"# test config"}`, proto)
-				urlPath := fmt.Sprintf("%s/%d/server_config/save", prefix, serverID)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "admin-user-id",
-					Username: "adminuser",
-					Role:     models.RoleAdmin,
-				}))
-
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
-
-				if w.Code != http.StatusOK {
-					t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-				}
-			})
-		}
-	}
-
-	// 6. Support role MUST be forbidden from container toggle on VLESS and Naive (canonical and aliases) across both route families
-	for _, proto := range []string{"vless", "naive", "vless-reality", "naiveproxy"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			for _, action := range []string{"stop", "start", "restart"} {
-				testName := fmt.Sprintf("Support toggle %s %s/%s", proto, prefix, action)
-				t.Run(testName, func(t *testing.T) {
-					body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
-					urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
-					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-						UserID:   "support-user-id",
-						Username: "supportuser",
-						Role:     models.RoleSupport,
-					}))
-
-					w := httptest.NewRecorder()
-					r.ServeHTTP(w, req)
-
-					if w.Code != http.StatusForbidden {
-						t.Errorf("expected 403 Forbidden for Support role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-					}
-				})
-			}
-		}
-	}
-
-	// 7. Admin role MUST succeed on container toggle for VLESS and Naive across both route families
-	for _, proto := range []string{"vless", "naive"} {
-		for _, prefix := range []string{"/api/servers", ""} {
-			for _, action := range []string{"stop", "start", "restart"} {
-				testName := fmt.Sprintf("Admin toggle %s %s/%s", proto, prefix, action)
-				t.Run(testName, func(t *testing.T) {
-					body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
-					urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
-					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-						UserID:   "admin-user-id",
-						Username: "adminuser",
-						Role:     models.RoleAdmin,
-					}))
-
-					w := httptest.NewRecorder()
-					r.ServeHTTP(w, req)
-
-					if w.Code != http.StatusOK {
-						t.Errorf("expected 200 OK for Admin role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
-					}
-				})
-			}
-		}
-	}
-
-	// 8. Support role CAN still toggle legacy protocols like AWG
-	for _, prefix := range []string{"/api/servers", ""} {
-		for _, action := range []string{"stop", "start", "restart"} {
-			testName := fmt.Sprintf("Support toggle awg %s/%s", prefix, action)
-			t.Run(testName, func(t *testing.T) {
-				body := fmt.Sprintf(`{"protocol":"awg","action":%q}`, action)
-				urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
-				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
-				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
-				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
-				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-					UserID:   "support-user-id",
-					Username: "supportuser",
-					Role:     models.RoleSupport,
-				}))
-
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
-
-				if w.Code != http.StatusOK {
-					t.Errorf("expected 200 OK for Support role on awg toggle %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
-				}
-			})
-		}
-	}
-
-	// 9. Clear Server: Support role MUST receive 403 Forbidden across both route families
-	for _, prefix := range []string{"/api/servers", ""} {
-		testName := fmt.Sprintf("Support clear %s/{id}/clear", prefix)
-		t.Run(testName, func(t *testing.T) {
-			urlPath := fmt.Sprintf("%s/%d/clear", prefix, serverID)
-			req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+		// Read config
+		t.Run(fmt.Sprintf("Support %s /api/servers/server_config", proto), func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocol":%q}`, proto)
+			urlPath := fmt.Sprintf("/api/servers/%d/server_config", serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
 			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
@@ -497,17 +302,41 @@ func TestMultiProtocol_RouterRBAC(t *testing.T) {
 			r.ServeHTTP(w, req)
 
 			if w.Code != http.StatusForbidden {
-				t.Errorf("expected 403 Forbidden for Support role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+				t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+			}
+		})
+
+		// Save config
+		t.Run(fmt.Sprintf("Support %s /api/servers/server_config/save", proto), func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocol":%q,"config":"# test config"}`, proto)
+			urlPath := fmt.Sprintf("/api/servers/%d/server_config/save", serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "support-user-id",
+				Username: "supportuser",
+				Role:     models.RoleSupport,
+			}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("expected 403 Forbidden for Support role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
 			}
 		})
 	}
 
-	// 10. Clear Server: Admin role MUST receive 200 OK across both route families
-	for _, prefix := range []string{"/api/servers", ""} {
-		testName := fmt.Sprintf("Admin clear %s/{id}/clear", prefix)
-		t.Run(testName, func(t *testing.T) {
-			urlPath := fmt.Sprintf("%s/%d/clear", prefix, serverID)
-			req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+	// 5. Admin role MUST succeed on reading and saving VLESS and Naive server configs
+	for _, proto := range []string{"vless", "naive"} {
+		// Read config
+		t.Run(fmt.Sprintf("Admin %s /api/servers/server_config", proto), func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocol":%q}`, proto)
+			urlPath := fmt.Sprintf("/api/servers/%d/server_config", serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
 			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
@@ -522,8 +351,157 @@ func TestMultiProtocol_RouterRBAC(t *testing.T) {
 			r.ServeHTTP(w, req)
 
 			if w.Code != http.StatusOK {
-				t.Errorf("expected 200 OK for Admin role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+				t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+			}
+		})
+
+		// Save config
+		t.Run(fmt.Sprintf("Admin %s /api/servers/server_config/save", proto), func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocol":%q,"config":"# test config"}`, proto)
+			urlPath := fmt.Sprintf("/api/servers/%d/server_config/save", serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "admin-user-id",
+				Username: "adminuser",
+				Role:     models.RoleAdmin,
+			}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for Admin role on %s %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
 			}
 		})
 	}
+
+	// 6. Support role MUST be forbidden from container toggle on VLESS and Naive (canonical and aliases)
+	for _, proto := range []string{"vless", "naive", "vless-reality", "naiveproxy"} {
+		for _, action := range []string{"stop", "start", "restart"} {
+			testName := fmt.Sprintf("Support toggle %s /api/servers/%s", proto, action)
+			t.Run(testName, func(t *testing.T) {
+				body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
+				urlPath := fmt.Sprintf("/api/servers/%d/container/toggle", serverID)
+				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID:   "support-user-id",
+					Username: "supportuser",
+					Role:     models.RoleSupport,
+				}))
+
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+
+				if w.Code != http.StatusForbidden {
+					t.Errorf("expected 403 Forbidden for Support role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+				}
+			})
+		}
+	}
+
+	// 7. Admin role MUST succeed on container toggle for VLESS and Naive
+	for _, proto := range []string{"vless", "naive"} {
+		for _, action := range []string{"stop", "start", "restart"} {
+			testName := fmt.Sprintf("Admin toggle %s /api/servers/%s", proto, action)
+			t.Run(testName, func(t *testing.T) {
+				body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
+				urlPath := fmt.Sprintf("/api/servers/%d/container/toggle", serverID)
+				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID:   "admin-user-id",
+					Username: "adminuser",
+					Role:     models.RoleAdmin,
+				}))
+
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+
+				if w.Code != http.StatusOK {
+					t.Errorf("expected 200 OK for Admin role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+				}
+			})
+		}
+	}
+
+	// 8. Support role CAN still toggle legacy protocols like AWG
+	for _, action := range []string{"stop", "start", "restart"} {
+		testName := fmt.Sprintf("Support toggle awg /api/servers/%s", action)
+		t.Run(testName, func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocol":"awg","action":%q}`, action)
+			urlPath := fmt.Sprintf("/api/servers/%d/container/toggle", serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "support-user-id",
+				Username: "supportuser",
+				Role:     models.RoleSupport,
+			}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for Support role on awg toggle %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// 9. Clear Server: Support role MUST receive 403 Forbidden
+	t.Run("Support clear /api/servers/{id}/clear", func(t *testing.T) {
+		urlPath := fmt.Sprintf("/api/servers/%d/clear", serverID)
+		req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+		req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+		req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID:   "support-user-id",
+			Username: "supportuser",
+			Role:     models.RoleSupport,
+		}))
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for Support role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+		}
+	})
+
+	// 10. Clear Server: Admin role MUST receive 200 OK
+	t.Run("Admin clear /api/servers/{id}/clear", func(t *testing.T) {
+		urlPath := fmt.Sprintf("/api/servers/%d/clear", serverID)
+		req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+		req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+		req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID:   "admin-user-id",
+			Username: "adminuser",
+			Role:     models.RoleAdmin,
+		}))
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for Admin role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+		}
+	})
 }

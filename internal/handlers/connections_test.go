@@ -77,7 +77,7 @@ func TestConnectionsHandlers(t *testing.T) {
 			})
 		}()
 
-		req := httptest.NewRequest(http.MethodGet, "/api/my/connections", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
 		reqCtx := middleware.WithSession(req.Context(), sess)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req.WithContext(reqCtx))
@@ -109,7 +109,7 @@ func TestConnectionsHandlers(t *testing.T) {
 			t.Errorf("expected max_connections 15, got %d", resp.Limits.MaxConnections)
 		}
 
-		reqUnauth := httptest.NewRequest(http.MethodGet, "/api/my/connections", nil)
+		reqUnauth := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
 		wUnauth := httptest.NewRecorder()
 		r.ServeHTTP(wUnauth, reqUnauth)
 		if wUnauth.Code != http.StatusUnauthorized {
@@ -190,7 +190,7 @@ func TestConnectionsHandlers(t *testing.T) {
 	})
 
 	t.Run("UserGetMyConnectionsHandler Unauthenticated", func(t *testing.T) {
-		reqUnauth := httptest.NewRequest(http.MethodGet, "/api/my/connections", nil)
+		reqUnauth := httptest.NewRequest(http.MethodGet, "/api/connections", nil)
 		wUnauth := httptest.NewRecorder()
 		r.ServeHTTP(wUnauth, reqUnauth)
 		if wUnauth.Code != http.StatusUnauthorized {

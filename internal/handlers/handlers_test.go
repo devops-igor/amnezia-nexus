@@ -446,7 +446,7 @@ func setupFullUsersRouter(h *Handlers) *chi.Mux {
 
 func setupFullConnectionsRouter(h *Handlers) *chi.Mux {
 	r := chi.NewRouter()
-	r.Get("/api/my/connections", h.UserGetMyConnectionsHandler)
+	r.Get("/api/connections", h.UserGetMyConnectionsHandler)
 	r.Post("/api/connections/add", h.UserAddConnectionHandler)
 	r.Post("/api/connections/{connection_id}/config", h.UserGetConnectionConfigHandler)
 	r.Post("/api/connections/{connection_id}/rename", h.UserRenameConnectionHandler)

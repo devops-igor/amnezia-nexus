@@ -67,8 +67,8 @@ def test_user_login_and_list(page: Page, base_url: str, admin_user: str, admin_p
     page.wait_for_load_state("networkidle")
     assert "/login" not in page.url
 
-    # Validate /api/my/connections response shape
-    my_result = api_get(page, "/api/my/connections")
+    # Validate /api/connections response shape
+    my_result = api_get(page, "/api/connections")
     if isinstance(my_result, dict) and "connections" in my_result:
         assert_response_shape(my_result, {"connections": list, "limits": dict}, "my_connections")
         if isinstance(my_result.get("limits"), dict):

@@ -217,17 +217,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Get("/change-password", h.ChangePasswordPageHandler)
 		r.Get("/my", h.MyConnectionsPageHandler)
 
-		// Legacy route group: /api/my/connections/*
-		r.Route("/api/my/connections", func(r chi.Router) {
-			r.Use(middleware.RateLimit(apiLimiter))
-
-			r.Get("/", h.UserGetMyConnectionsHandler)
-			r.Post("/add", h.UserAddConnectionHandler)
-			r.Post("/{connection_id}/config", h.UserGetConnectionConfigHandler)
-			r.Post("/{connection_id}/rename", h.UserRenameConnectionHandler)
-			r.Post("/{connection_id}/delete", h.UserDeleteConnectionHandler)
-		})
-
 		// Standard route group: /api/connections/*
 		r.Route("/api/connections", func(r chi.Router) {
 			r.Use(middleware.RateLimit(apiLimiter))
@@ -288,7 +277,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	// 7. Admin Protected Pages & APIs
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdmin)
-		r.Post("/{server_id}/clear", h.ClearServerHandler)
 
 		// Settings page and settings API (#909). Admin-only: Support neither
 		// opens the page nor reads or writes settings through the API. The
@@ -370,29 +358,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		// answer the same refusal to the same roles.
 		r.Get("/vpn/backends", h.VPNBackendsPageHandler)
 		r.Get("/vpn/diagnostics", h.VPNDiagnosticsPageHandler)
-
-		// Root server management aliases matching legacy routes
-		r.Post("/add", h.AddServerHandler)
-		r.Post("/confirm-fingerprint", h.ConfirmFingerprintHandler)
-		r.Post("/{server_id}/delete", h.DeleteServerHandler)
-		r.Post("/{server_id}/reboot", h.RebootServerHandler)
-		r.Post("/{server_id}/stats", h.ServerStatsHandler)
-		r.Post("/{server_id}/check", h.ServerCheckHandler)
-		r.Post("/{server_id}/install", h.InstallProtocolHandler)
-		r.Post("/{server_id}/uninstall", h.UninstallProtocolHandler)
-		r.Post("/{server_id}/container/toggle", h.ToggleContainerHandler)
-		r.Post("/{server_id}/server_config", h.GetServerConfigHandler)
-		r.Post("/{server_id}/server_config/save", h.SaveServerConfigHandler)
-		r.Get("/{server_id}/connections", h.GetServerConnectionsHandler)
-		r.Post("/{server_id}/connections/add", h.AddServerConnectionHandler)
-		r.Post("/{server_id}/connections/{client_id}/rotate-mimicry", h.RotateMimicryHandler)
-		r.Get("/{server_id}/reachability", h.GetServerReachabilityHandler)
-		r.Post("/{server_id}/connections/auto-trial", h.AutoTrialHandler)
-		r.Post("/{server_id}/connections/remove", h.RemoveServerConnectionHandler)
-		r.Post("/{server_id}/connections/edit", h.EditServerConnectionHandler)
-		r.Post("/{server_id}/connections/config", h.GetServerConnectionConfigHandler)
-		r.Post("/{server_id}/connections/toggle", h.ToggleServerConnectionHandler)
-		r.Get("/{server_id}/{protocol}/clients", h.GetProtocolClientsHandler)
 
 		// User management API
 		r.Route("/api/users", func(r chi.Router) {
