@@ -12,6 +12,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/version"
 )
 
 func ensureDockerInstalled(ctx context.Context, client ssh.SSHClient) error {
@@ -59,18 +60,17 @@ fi
 }
 
 // awgBaseImage pins the AmneziaWG userspace base image used to build AWG
-// backends. devopsigor/amneziawg:v3.1.20261116-1 is a versioned multiarch
-// (amd64+arm64) tag from the amneziawg-docker repo, built from the
-// AmneziaWG v3.1.20261116 source (devopsigor publishing). Multiarch is
-// required because backends install on both amd64 and arm64 hosts — the
-// upstream amneziavpn/amneziawg-go image publishes amd64 only, which broke
-// ARM64 installs (Issue #225). The versioned tag is chosen over :latest
-// because this image becomes a privileged VPN container on remote hosts:
-// a mutable floating tag is a supply-chain and reproducibility hazard, so
-// installs must pin a pinned, versioned release. The explicit pull
-// before build ensures the tag exists on the host instead of failing
-// mid-build with a stale local cache.
-const awgBaseImage = "devopsigor/amneziawg:v3.1.20261116-1"
+// backends. The value is defined once in the version package; devopsigor/amneziawg
+// is a versioned multiarch (amd64 and arm64) image from the amneziawg-docker
+// repo, built from the pinned AmneziaWG source. Multiarch is required because
+// backends install on both amd64 and arm64 hosts; the upstream
+// amneziavpn/amneziawg-go image publishes amd64 only, which broke ARM64
+// installs (Issue #225). The versioned tag is chosen over :latest because this
+// image becomes a privileged VPN container on remote hosts: a mutable floating
+// tag is a supply-chain and reproducibility hazard, so installs must pin a
+// versioned release. The explicit pull before build ensures the tag exists on
+// the host instead of failing mid-build with a stale local cache.
+const awgBaseImage = version.PinnedAWGBaseImage
 
 func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()

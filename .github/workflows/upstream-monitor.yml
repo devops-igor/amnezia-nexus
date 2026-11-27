@@ -17,9 +17,17 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v7
 
+      # The pins are defined once, in internal/version/version.go, where the base
+      # image is derived from the versioned source. This step fails (no JSON, no
+      # defaults) when that definition cannot be read, so the monitor below can
+      # never compare against a remembered value.
+      - name: Read Pinned Versions From Shared Source
+        run: python3 scripts/upstream_monitor_pins.py > "$RUNNER_TEMP/upstream-pins.json"
+
       - name: Monitor Upstream Tags and Alert
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINS_FILE: ${{ runner.temp }}/upstream-pins.json
         run: |
           python3 - << 'EOF'
           import json
@@ -158,30 +166,49 @@ jobs:
                   return -1
               return 0
 
-          # 1. Extract pinned versions from service.go and validate go.mod
-          with open("internal/service/upstream/service.go", "r", encoding="utf-8") as f:
-              svc_code = f.read()
+          # 1. Load the pinned versions the build ships. They are read from their
+          #    single definition by the previous step; a missing or unreadable
+          #    file fails here instead of comparing against a remembered value.
+          # -- pin loader begin --
+          pins_path = os.environ.get("PINS_FILE", "")
+          if not pins_path or not os.path.exists(pins_path):
+              print(
+                  f"ERROR: pinned-version file {pins_path!r} does not exist; "
+                  "the pin read step produced no output",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
 
-          m_go = re.search(r'PinnedAWGGoVersion\s*=\s*"([^"]+)"', svc_code)
-          m_tools = re.search(r'PinnedAWGToolsVersion\s*=\s*"([^"]+)"', svc_code)
-          m_img = re.search(r'PinnedAWGBaseImage\s*=\s*"([^"]+)"', svc_code)
+          try:
+              with open(pins_path, "r", encoding="utf-8") as pins_file:
+                  pins = json.load(pins_file)
+          except (OSError, ValueError) as exc:
+              print(f"ERROR: cannot read pinned versions from {pins_path}: {exc}", file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(pins, dict):
+              print(f"ERROR: pinned-version file {pins_path} does not hold an object", file=sys.stderr)
+              sys.exit(1)
 
-          pinned_go = m_go.group(1) if m_go else "v3.1.20261116"
-          pinned_tools = m_tools.group(1) if m_tools else "v3.1.20260812"
-          pinned_base_image = m_img.group(1) if m_img else "devopsigor/amneziawg:v3.1.20261116-1"
-          pinned_base_tag = pinned_base_image.split(":")[-1] if ":" in pinned_base_image else pinned_base_image
+          required_pins = ("go_version", "tools_version", "docker_repo", "base_image", "base_tag")
+          missing_pins = [key for key in required_pins if not pins.get(key)]
+          if missing_pins:
+              print(
+                  f"ERROR: pinned-version file {pins_path} is missing {', '.join(missing_pins)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
 
-          go_mod_version = None
-          go_mod_drift = False
-          if os.path.exists("go.mod"):
-              with open("go.mod", "r", encoding="utf-8") as f:
-                  go_mod_content = f.read()
-              m_gomod = re.search(r'github\.com/amnezia-vpn/amneziawg-go/v\d+\s+([^\s]+)', go_mod_content)
-              if m_gomod:
-                  go_mod_version = m_gomod.group(1).strip()
-                  if go_mod_version != pinned_go:
-                      go_mod_drift = True
-                      print(f"WARNING: go.mod amneziawg-go version ({go_mod_version}) drifts from PinnedAWGGoVersion ({pinned_go})!", file=sys.stderr)
+          pinned_go = pins["go_version"]
+          pinned_tools = pins["tools_version"]
+          pinned_repo = pins["docker_repo"]
+          pinned_base_image = pins["base_image"]
+          pinned_base_tag = pins["base_tag"]
+          go_mod_version = pins.get("go_mod_version")
+          go_mod_drift = bool(pins.get("go_mod_drift"))
+          # -- pin loader end --
+
+          if go_mod_drift:
+              print(f"WARNING: go.mod amneziawg-go version ({go_mod_version}) drifts from PinnedAWGGoVersion ({pinned_go})!", file=sys.stderr)
 
           components = [
               {
@@ -198,7 +225,7 @@ jobs:
               },
               {
                   "name": "docker-base-image",
-                  "repo": "devopsigor/amneziawg",
+                  "repo": pinned_repo,
                   "type": "docker",
                   "pinned": pinned_base_tag,
               }
@@ -323,8 +350,8 @@ jobs:
                           f"- **Current Docker Base Image**: `{pinned_base_image}`\n\n"
                           f"### Next Steps\n"
                           f"1. Review changes in upstream {name} {max_tag}.\n"
-                          f"2. Build and publish updated container base image `devopsigor/amneziawg` if needed.\n"
-                          f"3. Update pinned version constant in `internal/service/upstream/service.go` and `go.mod`."
+                          f"2. Build and publish updated container base image `{pinned_repo}` if needed.\n"
+                          f"3. Update pinned version constant in `internal/version/version.go` and `go.mod`."
                           f"{prior_note}"
                       )
 
@@ -362,7 +389,7 @@ jobs:
                       f.write(f"| `{row['name']}` | `{row['pinned']}` | {link} | {row['update']} | [Upstream Link]({row['url']}) |\n")
                   f.write(f"\n**Docker Base Image**: `{pinned_base_image}`\n")
                   if go_mod_drift:
-                      f.write(f"\n> [!CAUTION]\n> **Version Drift Detected**: `go.mod` specifies `{go_mod_version}` for `amneziawg-go`, but `service.go` pins `{pinned_go}`. Please align them.\n")
+                      f.write(f"\n> [!CAUTION]\n> **Version Drift Detected**: `go.mod` specifies `{go_mod_version}` for `amneziawg-go`, but `internal/version/version.go` pins `{pinned_go}`. Please align them.\n")
                   if any_update_found:
                       f.write("\n> [!WARNING]\n> One or more upstream components have newer versions available. Check open issues for details.\n")
                   else:
