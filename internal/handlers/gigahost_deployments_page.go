@@ -49,12 +49,6 @@ const (
 	gigahostDeploymentActionRetry = "retry"
 )
 
-// gigahostDeploymentGoneSpellings are the recorded statuses that mean the deployment no
-// longer exists at the provider.
-//
-//nolint:misspell // "cancelled" is the provider's own spelling, accepted beside "canceled"
-var gigahostDeploymentGoneSpellings = []string{"cancelled", "canceled", "deleted", "terminated"}
-
 // gigahostDeploymentRow is one ledger row prepared for the Servers grid. It carries only
 // what the page displays, so the template cannot accidentally read a field this page has
 // no basis for.
@@ -96,31 +90,54 @@ func (r gigahostDeploymentRow) IsDeploying() bool {
 	return r.Stage == gigahostDeploymentStageDeploying
 }
 
-// GigahostDeploymentStage maps one ledger row to the state the interface presents.
+// gigahostDeploymentStage maps one ledger row to the state the interface presents.
 //
-// A recorded absence is the panel's own existence answer and outranks the status column,
-// which is also written by the onboarding journal: the operator's question is whether the
-// deployment still exists, not which workflow last touched the row. A cancellation is a
-// final decision about the order, so it is presented as the deletion it is - nothing about
-// it is actionable, which is why it must not read as a deployment still waiting for setup.
+// It delegates the "is this order over" question to models.GigahostOrder.Retired, which is
+// the one definition every consumer shares, and only decides the presentation word. The
+// operator's question is whether the deployment still exists, not which workflow last
+// touched the row, so a recorded absence, a cancellation and a provider-final failure all
+// present as the deletion they are: nothing about them is actionable, which is why none of
+// them may read as a deployment still waiting for setup.
+//
+// A failure the panel's own onboarding journal accompanies is deliberately NOT in that
+// class. It is execution the operator ran, so it keeps the retry its state allows.
 func gigahostDeploymentStage(order models.GigahostOrder) string {
-	if order.ProviderAbsent() {
+	if order.Retired() {
 		return gigahostDeploymentStageDeleted
 	}
-	switch status := strings.ToLower(strings.TrimSpace(order.Status)); {
-	case gigahostDeploymentGone(status):
-		return gigahostDeploymentStageDeleted
-	case status == "ready" || status == "active":
-		return gigahostDeploymentStageReady
-	case status == "failed" || status == "error":
-		return gigahostDeploymentStageFailed
-	case status == "pending" || status == "waiting" || status == "pending_payment" || status == "pending_order":
-		return gigahostDeploymentStageRequested
-	case status == "" || status == "unknown":
-		return gigahostDeploymentStageUnknown
-	default:
-		return gigahostDeploymentStageDeploying
+	return gigahostDeploymentStageForStatus(order.Status)
+}
+
+// gigahostDeploymentStageByStatus is the status vocabulary as data: each recorded spelling
+// maps to the state it presents.
+//
+// It is a table rather than an if-chain because the chain had to be re-read to answer "which
+// spellings exist", and a spelling nobody listed fell through to the in-flight state - the
+// one wrong answer for a newly added provider ending. The vocabulary is also read by
+// gigahostDeploymentStageForStatus for the unlisted remainder, so there is one place to
+// extend.
+var gigahostDeploymentStageByStatus = map[string]string{
+	"ready":   gigahostDeploymentStageReady,
+	"active":  gigahostDeploymentStageReady,
+	"failed":  gigahostDeploymentStageFailed,
+	"error":   gigahostDeploymentStageFailed,
+	"pending": gigahostDeploymentStageRequested,
+	"waiting": gigahostDeploymentStageRequested,
+	"":        gigahostDeploymentStageUnknown,
+	"unknown": gigahostDeploymentStageUnknown,
+	// Remaining spellings a provider uses for an accepted, queued order.
+	"pending_payment": gigahostDeploymentStageRequested,
+	"pending_order":   gigahostDeploymentStageRequested,
+}
+
+// gigahostDeploymentStageForStatus presents one recorded status. An unlisted spelling is a
+// deployment the panel has no vocabulary for, which it reports as in flight rather than
+// inventing a state.
+func gigahostDeploymentStageForStatus(status string) string {
+	if stage, known := gigahostDeploymentStageByStatus[strings.ToLower(strings.TrimSpace(status))]; known {
+		return stage
 	}
+	return gigahostDeploymentStageDeploying
 }
 
 // gigahostDeploymentAction names the one control a presented state allows: a finished
@@ -224,17 +241,6 @@ func gigahostServerMatchesProviderID(server models.Server, order models.Gigahost
 		return false
 	}
 	return matchProviderServerID(server.Protocols["provider_server_id"], order.ServerID)
-}
-
-// gigahostDeploymentGone reports a recorded status that means the deployment is over.
-func gigahostDeploymentGone(status string) bool {
-	s := strings.ToLower(strings.TrimSpace(status))
-	for _, gone := range gigahostDeploymentGoneSpellings {
-		if s == gone {
-			return true
-		}
-	}
-	return false
 }
 
 // gigahostDeploymentsForServersPage reads the ledger for the Servers page.

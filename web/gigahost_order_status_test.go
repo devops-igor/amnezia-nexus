@@ -216,7 +216,10 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  // 7. Explicit terminal and unknown states are kept, and obsolete steps are not
  //    drawn for them: a failed order does not claim it ever deployed, and a ledger
  //    placeholder has no confirmed provider state at all.
- orders = [{order_id:'ord-fail', status:'failed'}];
+ // The step rides on the row: the list response serves the panel's own install
+ // journal there, and that column is what marks this as a failure the operator ran
+ // and may retry rather than a provider-final ending.
+ orders = [{order_id:'ord-fail', status:'failed', step:'installing_protocol'}];
  observationByOrder = { 'ord-fail': {outcome:'confirmed', status:'failed'} };
  deployByOrder = { 'ord-fail': {status:'failed', step:'installing_protocol', error:'provider refused'} };
  intents = []; backends = [];

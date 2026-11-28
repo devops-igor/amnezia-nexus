@@ -339,7 +339,10 @@ func TestGigahostOrderStatusRecoveryAfterProviderFailure(t *testing.T) {
  w.API.get = (function(original){
    return async (url, options) => {
      if (url === '/api/admin/hosting/gigahost/orders') {
-       return {orders: [{order_id:'same-order', status:'failed'}],
+       // The row carries the panel's own install journal step, which is what makes this a
+       // failure the operator ran rather than a provider-final ending - so the assertion
+       // below measures the ownership rule, not the failure classification.
+       return {orders: [{order_id:'same-order', status:'failed', step:'installing_protocol'}],
                provider_observations: {'same-order': {outcome:'unavailable', error:'provider down'}}};
      }
      if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents: []};

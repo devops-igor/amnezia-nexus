@@ -94,6 +94,81 @@ func (o GigahostOrder) ProviderAbsent() bool {
 	return strings.TrimSpace(o.ProviderAbsentAt) != ""
 }
 
+// gigahostOrderEndedSpellings are the recorded statuses that end an order's life
+// as an outcome of the order itself. The provider spells a cancellation both ways
+// in different fields, so both are matched literally.
+//
+//nolint:misspell // "cancelled" is the provider's own spelling, accepted beside "canceled"
+var gigahostOrderEndedSpellings = []string{"cancelled", "canceled", "deleted", "terminated"}
+
+// IsGigahostOrderEndedStatus reports a recorded status that ends the order.
+//
+// `failed` is deliberately absent: a failure is only final when nothing local
+// records an install attempt - see FailureIsProviderFinal. Listing it here would
+// make a recoverable setup-journal failure indistinguishable from an order the
+// provider ended.
+func IsGigahostOrderEndedStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	for _, ended := range gigahostOrderEndedSpellings {
+		if s == ended {
+			return true
+		}
+	}
+	return false
+}
+
+// IsGigahostOrderFailedStatus reports the recorded spellings that mean "this order
+// failed" without yet saying whose failure it was.
+func IsGigahostOrderFailedStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+// HasSetupJournalEvidence reports whether the panel's own onboarding journal recorded
+// progress for this order: a recorded step, or the panel server registration it mirrors
+// onto the ledger.
+//
+// Both are written only by the onboarding path, which is what makes them provenance
+// rather than a guess. The status column is shared - the provider refresh writes it too
+// - and ServerID is the provider's numeric id, not the panel's, so neither is evidence
+// that an install was attempted.
+func (o GigahostOrder) HasSetupJournalEvidence() bool {
+	return strings.TrimSpace(o.Step) != "" || o.NexusServerID > 0
+}
+
+// FailureIsProviderFinal reports a recorded failure that no onboarding journal
+// accompanies: the order ended at the provider before any panel setup work began, so
+// there is no recoverable setup outcome behind the word.
+//
+// The distinction decides every downstream affordance. A provider-final failure is over
+// - nothing can be retried onto a deployment that was never provisioned - while a
+// journal-backed failure is execution the operator ran and may retry.
+func (o GigahostOrder) FailureIsProviderFinal() bool {
+	if !IsGigahostOrderFailedStatus(o.Status) {
+		return false
+	}
+	return !o.HasSetupJournalEvidence()
+}
+
+// Retired reports whether the panel's own durable records say this order's life has
+// ended, in either of the two ways it can end:
+//
+//   - a recorded provider absence, which is the inventory answer for this order's own
+//     account saying the deployment is gone;
+//   - a recorded ending: a cancellation, deletion or termination, or a failure no
+//     onboarding journal accompanies.
+//
+// It is the one predicate every consumer of an order's life consults - the grid, the
+// history view, saved setup approvals and the background workers - so an order cannot
+// read as finished on one surface and as actionable on another.
+func (o GigahostOrder) Retired() bool {
+	return o.ProviderAbsent() || IsGigahostOrderEndedStatus(o.Status) || o.FailureIsProviderFinal()
+}
+
 // GigahostOrderCredential is the managed SSH credential attached to one order
 // attempt.
 //

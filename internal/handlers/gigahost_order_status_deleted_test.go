@@ -78,6 +78,12 @@ func TestRecentDeploymentsShowsADeletedDeploymentWithoutContactActions(t *testin
 	// is the state that offers a Retry control, and the control is exactly what the
 	// absence mark has to remove, so the fixture is chosen to make its disappearance
 	// observable rather than trivially absent.
+	//
+	// The step is what makes this a recoverable failure: the order row records that an
+	// install was attempted, so the failure is execution this panel ran rather than a
+	// provider that ended provisioning. Without it the row is provider-final, which this
+	// view already presents as an ending and offers nothing for - and then this test could
+	// not distinguish the absence mark's effect from the state's.
 	if err := h.updateDeployOrderStatus(ctx, orderID, DeployStatusFailed, DeployStatusInstallingProtocol,
 		"controlled install failure", 5104, serverID, "198.51.100.146"); err != nil {
 		t.Fatalf("write the onboarding journal: %v", err)

@@ -580,34 +580,45 @@ func applyDeployIdentity(order *GigahostOrderRecord, statusResp *gigahost.Deploy
 
 // gigahostMissingDetailOutcome answers a provider that has no detail record for the order.
 //
-/* "No such order" only means cancellation when the inventory could corroborate it.
+/* "No such order" is reported as a gap, never as a cancellation.
  *
- * The inventory read is what distinguishes "the provider no longer has this order" from "I
- * could not find out": it either names the order (live, or with the provider's own terminal
- * status), or it answered and named nobody. When the inventory read FAILED, none of those is
- * true, and the terminal value would be sticky here - the next list read skips a terminal row
- * before consulting the inventory again, so an ordinary 503 would strand a live order in the
- * terminal state forever. Report the gap instead and leave the row live, so the next read can
- * repair it. */
+ * The order detail and the panel's existence record answer different questions. The
+ * detail says how the order ended; whether the provider still holds the order is the
+ * inventory's answer, and the inventory is the only read that can be validated for
+ * completeness and for the account it enumerates (gigahost_order_reconcile.go). A 404
+ * carries no such evidence: it is one endpoint declining to describe an order, and it
+ * says the same thing whether the order ended, belongs to another account, or was simply
+ * not found by a partial or unauthorized read.
+ *
+ * Inferring a cancellation from it therefore created a second, weaker writer of the
+ * same durable fact, and one that bypassed every gate the validated record enforces. An
+ * order belonging to another account, an inventory with an unidentifiable entry, or a
+ * refused account read all reached this branch and durably ended a live order. An ending
+ * is not repaired by the inventory either (repairDeletedOrderFromInventory corrects
+ * deletions, not cancellations), so the invented one was permanent.
+ *
+ * What is not lost: a genuinely ended order is recorded by the reconciliation on
+ * the same read that establishes the omission, and an explicit terminal status in a
+ * successful detail answer is still applied by gigahostApplyDeployDetail. Both are
+ * provider statements about this order; this branch never was. So it reports the gap
+ * and leaves the row exactly as it found it. */
 func gigahostMissingDetailOutcome(order *GigahostOrderRecord, deployErr error, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
-	if !errors.Is(deployErr, gigahost.ErrNotFound) || !isGigahostReady(order.Status) {
+	if !errors.Is(deployErr, gigahost.ErrNotFound) {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: deployErr.Error()}
 	}
-	if !inventoryKnown {
+	// The order is still listed by the inventory that was read for this same request.
+	// A missing detail record next to a live listing is a partial read failure, and the
+	// listing is the affirmative answer.
+	if status, ok := gigahostProviderServerStatus(live, order.OrderID); inventoryKnown && ok {
 		return false, GigahostProviderObservation{
-			Outcome: gigahostObservationUnavailable,
-			Error:   "provider inventory could not be read, so a missing deployment record is not evidence of cancellation",
+			Outcome: gigahostObservationConfirmed,
+			Status:  status,
 		}
 	}
-	// Only a cancellation nothing contradicts: live inventory for this order means the missing
-	// detail record is a partial read failure, and the terminal value would be sticky, so later
-	// reads would skip the row and inventory could never repair it.
-	if inventoryListsOrderLive(live, order) || order.LiveRepairedAt != nil {
-		return false, GigahostProviderObservation{
-			Outcome: gigahostObservationUnconfirmed,
-			Error:   "provider has no detail record that contradicts the recorded live observation",
-		}
+	// Anything else: the existence record is the panel's answer, and this read produced
+	// no evidence to add to it. The row keeps the state it had.
+	return false, GigahostProviderObservation{
+		Outcome: gigahostObservationUnavailable,
+		Error:   "provider has no deployment-detail record for this order; existence is decided by the inventory observation",
 	}
-	order.Status = statusCancelled
-	return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
 }

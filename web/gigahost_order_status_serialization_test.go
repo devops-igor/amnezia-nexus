@@ -108,6 +108,11 @@ let holding = true;
 const pending = [];   // {release, reject, phase}
 let announcedStatus = 'deploying';
 let providerOutage = false;
+// sameOrder is the one row this fixture lists. It carries the panel's own install journal
+// step, which is where the list response serves it: that column is what marks a failed row
+// as an install the operator ran rather than a provider-final ending, and these scenarios
+// are about refresh serialization rather than about that classification.
+const sameOrder = () => ({order_id:'same-order', status:'pending', step:'installing_protocol'});
 
 function beginRead() {
   started++;
@@ -147,14 +152,14 @@ w.API = {
     const signal = options && options.signal;
     if (url === '/api/admin/hosting/gigahost/orders') {
       if (holding && holdPhase === 'list') {
-        const p = gate('list', () => ({orders: [{order_id:'same-order', status:'pending'}],
+        const p = gate('list', () => ({orders: [sameOrder()],
           provider_observations: {'same-order': providerOutage
             ? {outcome:'unavailable', error:'controlled provider unavailable'}
             : {outcome:'confirmed', status: announcedStatus}}}));
         pending[pending.length - 1].observeAbort(signal);
         return await p;
       }
-      return {orders: [{order_id:'same-order', status:'pending'}],
+      return {orders: [sameOrder()],
               provider_observations: {'same-order': providerOutage
                 ? {outcome:'unavailable', error:'controlled provider unavailable'}
                 : {outcome:'confirmed', status: announcedStatus}}};
@@ -163,11 +168,11 @@ w.API = {
     if (url === '/api/vpn/backends') return {backends: []};
     if (url.endsWith('/status')) {
       if (holding && holdPhase === 'detail') {
-        const p = gate('detail', () => ({deploy: {status: announcedStatus}}));
+        const p = gate('detail', () => ({deploy: journalDetail()}));
         pending[pending.length - 1].observeAbort(signal);
         return await p;
       }
-      return {deploy: {status: announcedStatus}};
+      return {deploy: journalDetail()};
     }
     throw new Error('unexpected GET ' + url);
   },
@@ -203,6 +208,7 @@ function observeLifetime() {
 // announceReady / announceOutage set the provider answer the fixture will serve, so scenarios read
 // as intent rather than as string literals.
 function announceReady() { announcedStatus = 'ready'; providerOutage = false; }
+const journalDetail = () => ({status: announcedStatus});
 // announceOutage makes the provider read fail: the list still answers, but with no usable
 // provider status, which is the state that must render stale.
 function announceOutage() { announcedStatus = 'failed'; providerOutage = true; }

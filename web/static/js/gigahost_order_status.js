@@ -549,10 +549,11 @@ function gigahostOrderStatusRow(order, context, classification) {
     right.appendChild(gigahostOrderStatusCell(order, context, model));
 
     // A deployment that reads as deleted gets no action, whichever fact produced that
-    // state: the provider's own `deleted` answer, or the panel's durable inventory
-    // mark. Both are combined into the stage already, so the affordances read that one
-    // decision rather than either input. Every action here - retry, immediate setup, a
-    // saved approval - ends in a connection to the deployment's address.
+    // state: the provider's own `deleted` answer, the panel's durable inventory mark, or a
+    // provider-final failure with no setup journal behind it. All are combined into the
+    // stage already, so the affordances read that one decision rather than any input.
+    // Every action here - retry, immediate setup, a saved approval - ends in a connection
+    // to the deployment's address.
     //
     // A cancelled order is deliberately not in this class: cancellation stops the order
     // while its VPS may still be running, which is why it keeps its actions.
@@ -562,7 +563,11 @@ function gigahostOrderStatusRow(order, context, classification) {
         return row;
     }
 
-    if (order.status === 'failed') {
+    // Retry belongs to a failure the panel can actually retry: an install it ran and that
+    // failed. Reading the raw status column here offered Retry for an order the provider
+    // ended before any setup work existed, which is an action that cannot succeed - so the
+    // question is asked of the same classification the status cell uses.
+    if (model.recoverableFailure) {
         const btnRetry = document.createElement('button');
         btnRetry.type = 'button';
         btnRetry.className = 'btn btn-secondary gigahost-order-action';

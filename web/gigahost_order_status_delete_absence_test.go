@@ -23,10 +23,12 @@ func TestRecentDeploymentsKeepsARecordedAbsenceAcrossAFailedDetailRead(t *testin
  // Six orders, newest first, so the recorded deletion is older than the five the list
  // shows by default. Each is a journaled install failure, which is the state that
  // offers a Retry control - so "no action" is measured against a row that would
- // otherwise have one.
- const recent = i => ({order_id:'ord_recent_' + i, status:'failed', assigned_ip:'198.51.100.' + (10 + i)});
+ // otherwise have one. The step is carried on the ROW, which is where the list response
+ // serves it: that column is what distinguishes an install this panel ran from a
+ // provider that ended provisioning, and the retry belongs to the former.
+ const recent = i => ({order_id:'ord_recent_' + i, status:'failed', step:'installing_protocol', assigned_ip:'198.51.100.' + (10 + i)});
  orders = [recent(1), recent(2), recent(3), recent(4), recent(5),
-           {order_id:'ord_gone', status:'failed', assigned_ip:'198.51.100.9'}];
+           {order_id:'ord_gone', status:'failed', step:'installing_protocol', assigned_ip:'198.51.100.9'}];
  // The panel recorded the deletion in the durable record the inventory pass writes,
  // and the list response carries it. Nothing is claimed about the provider here.
  absenceByOrder = {'ord_gone': true};
@@ -103,7 +105,10 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
    {order_id:'ord_term_provider', status:'ready', assigned_ip:'198.51.100.21'},
    {order_id:'ord_term_ledger', status:'terminated', assigned_ip:'198.51.100.22'},
    {order_id:'ord_cancel', status:'cancelled'},
-   {order_id:'ord_fail', status:'failed'}
+   // The step rides on the row, which is where the list response serves the panel's own
+   // install journal. That column is what makes this a recoverable setup failure rather
+   // than a provider-final one, which is the distinction the retry control now follows.
+   {order_id:'ord_fail', status:'failed', step:'installing_protocol'}
  ];
  observationByOrder = {
    'ord_term_provider': {outcome:'confirmed', status:'terminated'},

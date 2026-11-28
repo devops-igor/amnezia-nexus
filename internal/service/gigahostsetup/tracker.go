@@ -49,6 +49,12 @@ type Store interface {
 	HasGigahostOrderCredential(ctx context.Context, orderID string) (bool, error)
 	GetAllServers(ctx context.Context) ([]models.Server, error)
 	GetKnownHostFingerprint(ctx context.Context, serverID int64) (string, error)
+	// IsGigahostOrderRetired reports whether the panel's own records say the order this
+	// job belongs to has ended. It is a read of the ORDER, not of the approval: an
+	// approval's row carries neither the provider's absence observation nor the
+	// onboarding journal, so the tracker cannot answer this question from the row it
+	// already holds.
+	IsGigahostOrderRetired(ctx context.Context, orderID string) (bool, error)
 }
 
 // ErrProviderUnavailable reports that no provider client could be built for this
@@ -310,6 +316,26 @@ func (t *Tracker) observe(ctx context.Context, reader ProviderReader, intent *mo
 	if intent.IsCanceled() {
 		// Revoked approvals must not produce effects. The CAS transition below
 		// is the real guard; this is the cheap early exit.
+		return nil
+	}
+	// The order this job belongs to may have ended since the approval was recorded:
+	// the panel's inventory can record that the provider no longer holds the
+	// deployment, or the provider may have reported a final failure with no journal.
+	// Those facts live on the ORDER ledger, not on the approval, so the tracker reads
+	// them before asking the provider anything. A retired order produces no request:
+	// the job stops here and the operator sees the ending on the surfaces that present
+	// it, rather than a tracker polling a deployment that does not exist.
+	//
+	// A failed read is not a retirement. Absence of an answer leaves the job exactly
+	// where it was, so an unreadable ledger cannot silently stop a live job.
+	retired, err := t.store.IsGigahostOrderRetired(ctx, intent.OrderID)
+	if err != nil {
+		t.recordReadFailure(ctx, intent, providerReadFailure(err))
+		return nil
+	}
+	if retired {
+		slog.Info("Gigahost setup tracking skipped: the order has ended",
+			"order_id", intent.OrderID)
 		return nil
 	}
 	callCtx, cancel := context.WithTimeout(ctx, t.callTimeout)

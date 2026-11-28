@@ -360,7 +360,11 @@ func TestGigahostDeploymentsForServers(t *testing.T) {
 		{OrderID: "ord_registered", Status: "ready", ServerID: 900},
 		{OrderID: "ord_by_address", Status: "ready", AssignedIP: "198.51.100.2"},
 		{OrderID: "ord_cancelled", Status: "cancelled"},
+		// Two failure rows, because the status column alone cannot tell them apart: a
+		// provider that ended before any install is over, while an install the panel ran and
+		// failed keeps the retry its state allows.
 		{OrderID: "ord_failed", Status: "failed"},
+		{OrderID: "ord_setup_failed", Status: "failed", Step: "installing_protocol"},
 		{OrderID: "ord_recorded_absent", Status: "ready", ProviderAbsentAt: absentAt},
 		{OrderID: "ord_blank_state", Status: "   "},
 		{OrderID: "intent_1700000000000", Status: "pending_order"},
@@ -375,7 +379,7 @@ func TestGigahostDeploymentsForServers(t *testing.T) {
 		got = append(got, row.OrderID)
 		stages[row.OrderID] = row.Stage
 	}
-	want := []string{"ord_unregistered", "ord_cancelled", "ord_failed", "ord_recorded_absent", "ord_blank_state"}
+	want := []string{"ord_unregistered", "ord_cancelled", "ord_failed", "ord_setup_failed", "ord_recorded_absent", "ord_blank_state"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("selection mismatch: got %v, want %v", got, want)
 	}
@@ -390,12 +394,27 @@ func TestGigahostDeploymentsForServers(t *testing.T) {
 	if stages["ord_recorded_absent"] != gigahostDeploymentStageDeleted {
 		t.Fatalf("a recorded absence must be presented as deleted, got %q", stages["ord_recorded_absent"])
 	}
-	if stages["ord_failed"] != gigahostDeploymentStageFailed {
-		t.Fatalf("a failed deployment keeps its own state, got %q", stages["ord_failed"])
+	// A provider that ended before any install is over: nothing can be retried onto a
+	// deployment that was never provisioned, so it presents as the deletion it is.
+	if stages["ord_failed"] != gigahostDeploymentStageDeleted {
+		t.Fatalf("a provider-final failure must be presented as deleted, got %q", stages["ord_failed"])
+	}
+	// The paired case: the same status column with the panel's own install journal behind it
+	// is execution the operator ran, so it keeps its own state and its retry.
+	if stages["ord_setup_failed"] != gigahostDeploymentStageFailed {
+		t.Fatalf("a journal-backed failure keeps its own state, got %q", stages["ord_setup_failed"])
 	}
 	// An empty recorded status is not a state: it is shown as unknown, never as blank.
-	if rows[4].Status != "unknown" || stages["ord_blank_state"] != gigahostDeploymentStageUnknown {
-		t.Fatalf("a blank recorded status must read as unknown, got %q / %q", rows[4].Status, stages["ord_blank_state"])
+	if stages["ord_blank_state"] != gigahostDeploymentStageUnknown {
+		t.Fatalf("a blank recorded status must read as unknown, got %q", stages["ord_blank_state"])
+	}
+	for _, row := range rows {
+		if row.OrderID != "ord_blank_state" {
+			continue
+		}
+		if row.Status != "unknown" {
+			t.Fatalf("a blank recorded status must be presented as unknown, got %q", row.Status)
+		}
 	}
 	// Every presented state names a label in the deployment state vocabulary, and the
 	// ones a card can render are the ones the interface has words for.
@@ -409,11 +428,11 @@ func TestGigahostDeploymentsForServers(t *testing.T) {
 	for _, row := range rows {
 		actions[row.OrderID] = row.Action
 	}
-	if actions["ord_cancelled"] != "" || actions["ord_recorded_absent"] != "" {
+	if actions["ord_cancelled"] != "" || actions["ord_recorded_absent"] != "" || actions["ord_failed"] != "" {
 		t.Fatalf("a finished deployment must offer no action: %v", actions)
 	}
-	if actions["ord_failed"] != gigahostDeploymentActionRetry {
-		t.Fatalf("a failed deployment offers the retry its state allows, got %q", actions["ord_failed"])
+	if actions["ord_setup_failed"] != gigahostDeploymentActionRetry {
+		t.Fatalf("a journal-backed failure offers the retry its state allows, got %q", actions["ord_setup_failed"])
 	}
 	if actions["ord_unregistered"] != gigahostDeploymentActionSetup {
 		t.Fatalf("an awaiting deployment offers setup, got %q", actions["ord_unregistered"])

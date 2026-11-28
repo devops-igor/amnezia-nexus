@@ -45,6 +45,10 @@ type InstallStore interface {
 	TakeOverGigahostSetupInstall(ctx context.Context, orderID string, expectGeneration int64) (*models.GigahostSetupIntent, bool, error)
 	UpdateGigahostSetupInstall(ctx context.Context, intent *models.GigahostSetupIntent, expectedGeneration int64) (bool, error)
 	GetGigahostSetupIntent(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error)
+	// IsGigahostOrderRetired reports whether the panel's own records say the order this
+	// attempt would install for has ended. An install is remote work on a specific
+	// deployment, so it must not begin for one the provider no longer holds.
+	IsGigahostOrderRetired(ctx context.Context, orderID string) (bool, error)
 }
 
 // InstallRunner performs the actual steps for one claimed attempt.
@@ -223,6 +227,23 @@ func (i *Installer) RunOnce(ctx context.Context) error {
 
 // runOne claims (or takes over) one intent and runs the install attempt.
 func (i *Installer) runOne(ctx context.Context, candidate *models.GigahostSetupIntent) error {
+	// An install issues remote commands against a specific deployment, so it must not
+	// begin for an order the panel has recorded as ended. The fact lives on the order
+	// ledger, which this row does not carry. Asking before the claim matters: claiming
+	// first would advance the generation and write a step for work that must not happen,
+	// and a paused row would then look like an attempt that had started.
+	//
+	// A failed read is not a retirement. It is reported so the operator sees why nothing
+	// moved, and the row keeps the state it had.
+	retired, err := i.store.IsGigahostOrderRetired(ctx, candidate.OrderID)
+	if err != nil {
+		return fmt.Errorf("failed to read whether order %s has ended: %w", candidate.OrderID, err)
+	}
+	if retired {
+		slog.Info("Gigahost setup install skipped: the order has ended",
+			"order_id", candidate.OrderID, "state", candidate.State)
+		return nil
+	}
 	claimed, gen, ok, err := i.claim(ctx, candidate)
 	if err != nil || !ok {
 		return err

@@ -11,7 +11,7 @@ package handlers
 // The correction must NOT be "ignore 404". These cases pin both sides:
 //
 //	live inventory + 404 detail      -> row keeps its live state, stays refreshable
-//	no inventory + 404 detail        -> genuine absence, still cancels
+//	no inventory + 404 detail        -> genuine absence, durably recorded
 //	inventory listing it terminal    -> not contrary evidence, still cancels
 //	explicit authoritative status    -> keeps today's precedence, both directions
 //
@@ -46,6 +46,12 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 		detailBody   string
 		// wantStatus is the durable row state after the read.
 		wantStatus string
+		// wantAbsent is whether the durable existence record says the order is gone.
+		// It is the fact a genuine absence produces now: the panel records the
+		// observation on its own ledger rather than rewriting the row to a provider
+		// cancellation spelling, because cancellation is not repaired by inventory and an
+		// invented one outlived every later correct read.
+		wantAbsent bool
 		// wantOutcome is the observation the panel reports for the order.
 		wantOutcome string
 		// wantRefreshable says whether a second GET must still attempt the detail read.
@@ -61,12 +67,13 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 			wantRefreshable: true,
 		},
 		{
-			name:            "genuine absence still cancels",
+			name:            "genuine absence still retires",
 			inventory:       `{"meta":{"page":1,"total_pages":1,"total":0},"data":[]}`,
 			detailStatus:    http.StatusNotFound,
 			detailBody:      `{"error":"no such order"}`,
-			wantStatus:      statusCancelled,
-			wantOutcome:     gigahostObservationConfirmed,
+			wantStatus:      gigahost.StatusReady,
+			wantAbsent:      true,
+			wantOutcome:     gigahostObservationNotChecked,
 			wantRefreshable: false,
 		},
 		{
@@ -108,6 +115,15 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 				UpdatedAt:  now,
 			}); err != nil {
 				t.Fatalf("seeding the order: %v", err)
+			}
+			// The order is known to belong to the account this fixture's provider answers
+			// as. That association is what makes a complete listing's omission an
+			// observation ABOUT THIS ORDER; an unattributed listing proves nothing about
+			// anybody's orders and must not retire one. Without it the "genuine absence"
+			// case below would be asserting absence recorded from evidence that does not
+			// support it.
+			if err := h.db.SetGigahostOrderProviderAccount(context.Background(), orderID, "9001"); err != nil {
+				t.Fatalf("record the order's provider account: %v", err)
 			}
 
 			detailCalls := 0
@@ -159,7 +175,14 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 			if stored.Status != tc.wantStatus {
 				t.Errorf("durable status after the read = %q, want %q", stored.Status, tc.wantStatus)
 			}
-			if !strings.Contains(first, `"outcome":"`+tc.wantOutcome+`"`) {
+			if stored.ProviderAbsent() != tc.wantAbsent {
+				t.Errorf("durable absence after the read = %v, want %v: the existence record is %q",
+					stored.ProviderAbsent(), tc.wantAbsent, stored.ProviderAbsentAt)
+			}
+			if tc.wantAbsent && !strings.Contains(first, `"provider_absent_orders":{"`+orderID+`":true}`) {
+				t.Errorf("the list response must carry the recorded absence: %s", first)
+			}
+			if tc.wantOutcome != "" && !strings.Contains(first, `"outcome":"`+tc.wantOutcome+`"`) {
 				t.Errorf("observation = %s, want outcome %q", first, tc.wantOutcome)
 			}
 
@@ -181,6 +204,10 @@ func TestGigahostOrders_ContraryInventoryNotFound(t *testing.T) {
 			if storedAgain.Status != tc.wantStatus {
 				t.Errorf("durable status after the second read = %q, want %q (not repaired, not re-broken)",
 					storedAgain.Status, tc.wantStatus)
+			}
+			if storedAgain.ProviderAbsent() != tc.wantAbsent {
+				t.Errorf("durable absence after the second read = %v, want %v",
+					storedAgain.ProviderAbsent(), tc.wantAbsent)
 			}
 		})
 	}
