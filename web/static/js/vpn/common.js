@@ -1,13 +1,16 @@
-/* Helpers more than one VPN document needs.
+/* Helpers and shared actions the VPN page needs.
  *
- * The VPN subject is three documents (overview, backends, diagnostics). Each one
- * loads only the controllers that own its blocks. The pieces below are used by
- * two or more of them, so they live here rather than being duplicated: a second
- * copy of a formatter or a status label is how the two pages start describing
- * the same value differently.
+ * The VPN subject is one document with three sections, and every section's
+ * controllers load beside this module. The pieces below are used by two or more of
+ * them, so they live here rather than being duplicated: a second copy of a
+ * formatter or a status label is how two sections start describing the same value
+ * differently.
  *
- * Nothing here binds an event, polls an endpoint or touches a page-specific
- * element, so loading it on any page costs no request and starts no controller.
+ * The one delegated action here is the dialog CLOSE control, because on the merged
+ * page both dialogs are in the same document and each section's handler would
+ * otherwise close the same dialog a second time. It is a single listener on the
+ * document, bound once; nothing here polls an endpoint or reads a value a section
+ * owns.
  */
 
 // vpnAssignText writes text only when it actually changes. Several of these
@@ -144,12 +147,23 @@ function vpnFocusIfFocusable(el) {
     return true;
 }
 
-// vpnScrollToTarget positions the intended landing target. The scroll is the
-// default instant behaviour, never a smooth animation, so a reduced-motion
-// visitor gets the same destination without travel.
+// vpnScrollToTarget positions the intended landing target.
+//
+// The scroll is INSTANT, and that is stated rather than inherited. The merged page
+// reuses the Settings sub-navigation, whose stylesheet asks for smooth scrolling on
+// any page that has one - so an unqualified scrollIntoView here would animate. An
+// animated landing is not merely slower: the focus call that follows it interrupts
+// the animation, the page stops part way, and the reader ends up mid-document with
+// the rail naming the wrong section. Instant also gives a reduced-motion visitor the
+// same destination without travel, which is what this helper always promised.
 function vpnScrollToTarget(el) {
     if (el && typeof el.scrollIntoView === 'function') {
-        el.scrollIntoView({ block: 'start' });
+        try {
+            el.scrollIntoView({ block: 'start', behavior: 'instant' });
+        } catch (_) {
+            // A host that rejects the options object still has the CSS path.
+            el.scrollIntoView(true);
+        }
     }
 }
 
@@ -205,7 +219,7 @@ function vpnConsumeBackendHandoff() {
         if (match) {
             // Remove the navigation identity even on a refused/expired arrival. A
             // reload or saved bookmark must not become another Inspect request.
-            window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search + '#vpn-backends-title');
+            window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search + '#backends');
         }
         if (!stored || !match) return null;
         const request = JSON.parse(stored);
@@ -232,7 +246,59 @@ function vpnOwnedAnchorId() {
     return id;
 }
 
+// vpnModuleRegistry names the modules that have been evaluated in this document.
+// The page boot loads a section's controllers on demand and needs to know whether a
+// module is already present - included eagerly by a shell, loaded earlier, or
+// assembled by a test harness - so it does not fetch a second copy. Each module
+// registers ITSELF here at load, so the answer cannot drift from what was actually
+// evaluated: a name is present exactly when its file ran.
+var VPN_REGISTERED_MODULES = {};
+
+function vpnMarkModule(name) {
+    if (!name) return;
+    VPN_REGISTERED_MODULES[String(name)] = true;
+}
+
+function vpnModuleRegistered(name) {
+    return !!name && VPN_REGISTERED_MODULES[String(name)] === true;
+}
+
+// vpnBindSharedActions binds the actions more than one section dispatches. It
+// takes the DOCUMENT, not a section's content root: the control belongs to the page,
+// and a binding that waited for a section's own root would fire twice when two
+// sections share it. It binds at load rather than at readiness so the control works
+// the moment the markup is parsed - a delegated listener on the document does not
+// need the document to be finished.
+function vpnBindSharedActions() {
+    if (typeof document === 'undefined' || !document || document._vpnSharedBound) return false;
+    if (typeof document.addEventListener !== 'function') return false;
+    document._vpnSharedBound = true;
+    document.addEventListener('click', function (event) {
+        const btn = event.target && event.target.closest ? event.target.closest('[data-action="vpn-close-modal"]') : null;
+        if (!btn) return;
+        if (event && typeof event.preventDefault === 'function') event.preventDefault();
+        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
+        if (typeof closeModal === 'function') {
+            closeModal(modalId);
+        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
+            UI.modal.close(modalId);
+        }
+    });
+    return true;
+}
+
+// Bind at load. A harness that assembles a document mock AFTER these modules
+// declares it in the same scope has no document yet, and reading it there is a
+// temporal-dead-zone error rather than a falsy check, so the attempt is guarded:
+// the page boot binds again, and the binding is idempotent.
+try {
+    vpnBindSharedActions();
+} catch (_) { /* the host provides no document yet; the boot binds later */ }
+
 if (typeof window !== 'undefined') {
+    window.vpnBindSharedActions = vpnBindSharedActions;
+    window.vpnMarkModule = vpnMarkModule;
+    window.vpnModuleRegistered = vpnModuleRegistered;
     window.vpnAssignText = vpnAssignText;
     window.vpnDiagText = vpnDiagText;
     window.vpnFormatApiError = vpnFormatApiError;

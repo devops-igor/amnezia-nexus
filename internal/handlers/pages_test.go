@@ -207,18 +207,34 @@ func TestPageHandlers(t *testing.T) {
 			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
 		}
 		body := w.Body.String()
-		// The overview document renders the listener/endpoint configuration and the
-		// four signals. The inventory and the sessions table are other documents now.
-		if !strings.Contains(body, "vpn-listener-badge") {
-			t.Errorf("expected rendered vpn.html to contain 'vpn-listener-badge', got:\n%s", body)
-		}
-		for _, moved := range []string{"vpn-backends-tbody", "vpn-add-backend-btn", "addBackendModal", "vpnServerSelect", "vpnAddBackendSubmitBtn", "vpnSessionsTable"} {
-			if strings.Contains(body, moved) {
-				t.Errorf("the overview document must not render %q; it belongs to a child page", moved)
+		// One document carries all three sections now, so every surface the three
+		// pages had is asserted here rather than per handler.
+		for _, want := range []string{
+			"vpn-listener-badge", "vpn-signal-backends-value", "vpn-forwarder-card",
+			"vpn-backends-tbody", "vpn-add-backend-btn", "addBackendModal",
+			"vpnServerSelect", "vpnAddBackendSubmitBtn", "vpnSessionsTable",
+			"vpn-advanced-entry", "vpn-diagnostics",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("expected rendered vpn.html to contain %q", want)
 			}
 		}
-		if !strings.Contains(body, `/static/js/vpn/overview.js`) {
-			t.Errorf("expected rendered vpn.html to load the overview controller")
+		// One VPN navigation entry, and no link to a retired route.
+		if got := strings.Count(body, `href="/vpn"`); got < 2 {
+			t.Errorf("expected the sidebar entry and the phone shortcut to link /vpn, found %d", got)
+		}
+		for _, retired := range []string{`href="/vpn/backends"`, `href="/vpn/diagnostics"`} {
+			if strings.Contains(body, retired) {
+				t.Errorf("rendered vpn.html must not link the retired route %q", retired)
+			}
+		}
+		// Every module this delivery ships is reachable from the document it serves:
+		// the eager ones as a <script src>, the deferred ones as a data-vpn-modules
+		// declaration on the element that activates them.
+		for _, module := range []string{"common.js", "overview.js", "backends.js", "backends_page.js", "health_problems.js", "health_summary.js", "charts.js", "sessions.js", "diagnostics_page.js", "anchor_handoff.js", "page.js"} {
+			if !strings.Contains(body, "/static/js/vpn/"+module) {
+				t.Errorf("expected rendered vpn.html to load %s", module)
+			}
 		}
 		if strings.Contains(body, "Template Not Found") {
 			t.Fatalf("CRITICAL REGRESSION: /vpn returned 'Template Not Found'")
@@ -231,20 +247,11 @@ func TestPageHandlers(t *testing.T) {
 		w := httptest.NewRecorder()
 		h.VPNBackendsPageHandler(w, req.WithContext(reqCtx))
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		if w.Code != http.StatusFound {
+			t.Fatalf("expected 302, got %d (body: %s)", w.Code, w.Body.String())
 		}
-		body := w.Body.String()
-		for _, want := range []string{"vpn-backends-title", "vpn-backends-tbody", "vpn-add-backend-btn", "addBackendModal", "vpnServerSelect", "vpnAddBackendSubmitBtn", `data-action="vpn-open-add-backend"`} {
-			if !strings.Contains(body, want) {
-				t.Errorf("expected rendered vpn_backends.html to contain %q", want)
-			}
-		}
-		if !strings.Contains(body, `/static/js/vpn/backends.js`) {
-			t.Errorf("expected rendered vpn_backends.html to load '/static/js/vpn/backends.js'")
-		}
-		if strings.Contains(body, "vpn-listener-badge") || strings.Contains(body, "vpnSessionsTable") {
-			t.Errorf("the backends document must not render another page's blocks")
+		if got := w.Header().Get("Location"); got != "/vpn?section=backends" {
+			t.Errorf("expected the retired route to redirect into its section, got %q", got)
 		}
 		backendsJS, err := fs.ReadFile(web.StaticFS, "static/js/vpn/common.js")
 		if err != nil {
@@ -264,19 +271,11 @@ func TestPageHandlers(t *testing.T) {
 		w := httptest.NewRecorder()
 		h.VPNDiagnosticsPageHandler(w, req.WithContext(reqCtx))
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		if w.Code != http.StatusFound {
+			t.Fatalf("expected 302, got %d (body: %s)", w.Code, w.Body.String())
 		}
-		body := w.Body.String()
-		for _, want := range []string{"vpn-forwarder-card", "vpn-diagnostics", "vpnSessionsTable", "vpn-troubleshooting-title"} {
-			if !strings.Contains(body, want) {
-				t.Errorf("expected rendered vpn_diagnostics.html to contain %q", want)
-			}
-		}
-		for _, moved := range []string{"vpn-listener-badge", "vpn-backends-tbody", "addBackendModal"} {
-			if strings.Contains(body, moved) {
-				t.Errorf("the diagnostics document must not render %q", moved)
-			}
+		if got := w.Header().Get("Location"); got != "/vpn?section=diagnostics" {
+			t.Errorf("expected the retired route to redirect into its section, got %q", got)
 		}
 	})
 

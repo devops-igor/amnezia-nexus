@@ -308,27 +308,15 @@
                         <span class="nav-icon"><svg class="icon"><use href="#icon-users"></use></svg></span>
                         <span class="nav-label">{{ _ "nav_users" }}</span>
                     </a>
-                    {{/* The VPN subject is three documents. The group heading uses the
-                         existing section-label appearance, and the three links are
-                         flat siblings beneath it — no new tier, accordion or
-                         indentation. Each link is marked current by the page handler
-                         that rendered it (never by the shell's href matching), so
-                         /vpn does not also light up on /vpn/backends. */}}
-                    <div class="nav-group" role="group" aria-labelledby="nav-vpn-group-label">
-                        <div class="nav-section-label" id="nav-vpn-group-label">{{ _ "nav_vpn" }}</div>
-                        <a href="/vpn" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn" }} aria-current="page"{{ end }}>
-                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-network"></use></svg></span>
-                            <span class="nav-label">{{ _ "nav_vpn_overview" }}</span>
-                        </a>
-                        <a href="/vpn/backends" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn_backends" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn_backends" }} aria-current="page"{{ end }}>
-                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-server"></use></svg></span>
-                            <span class="nav-label">{{ _ "nav_vpn_backends" }}</span>
-                        </a>
-                        <a href="/vpn/diagnostics" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn_diagnostics" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn_diagnostics" }} aria-current="page"{{ end }}>
-                            <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-activity"></use></svg></span>
-                            <span class="nav-label">{{ _ "nav_vpn_diagnostics" }}</span>
-                        </a>
-                    </div>
+                    {{/* The VPN subject is one document with three sections, so it is
+                         one entry. The sections are reached by the page's own jump
+                         rail, not from the shell: a second and third sidebar link
+                         would advertise two routes that no longer exist. The entry is
+                         marked current by the page handler that rendered it. */}}
+                    <a href="/vpn" class="sidebar-nav-link nav-link {{ if eq .active_page "vpn" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn" }} aria-current="page"{{ end }}>
+                        <span class="nav-icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-shield"></use></svg></span>
+                        <span class="nav-label">{{ _ "nav_vpn" }}</span>
+                    </a>
                     {{ end }}
 
                     {{ if has_role .current_user "admin" }}
@@ -428,11 +416,10 @@
                 <svg class="icon"><use href="#icon-users"></use></svg>
                 <span>{{ _ "nav_users" }}</span>
             </a>
-            {{/* The single VPN shortcut keeps its slot and its action. It stands for
-                 the VPN overview only, so it is current on /vpn and merely links
-                 back to it from the two child pages. */}}
+            {{/* The single VPN shortcut keeps its slot, its label and its action; the
+                 three sections are on the page it opens. */}}
             <a href="/vpn" class="bottom-bar-link {{ if eq .active_page "vpn" }}active{{ end }}" data-nav-exact{{ if eq .active_page "vpn" }} aria-current="page"{{ end }}>
-                <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-network"></use></svg>
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-shield"></use></svg>
                 <span>{{ _ "nav_vpn" }}</span>
             </a>
             {{ end }}

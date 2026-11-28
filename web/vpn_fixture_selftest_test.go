@@ -669,6 +669,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/backends_page.js":    &fstest.MapFile{Data: []byte("function vpnLoadBackends() {}")},
 			"static/js/vpn/diagnostics_page.js": &fstest.MapFile{Data: []byte("function vpnLoadDiagnostics() {}")},
 			"static/js/vpn/anchor_handoff.js":   &fstest.MapFile{Data: []byte("function vpnAnchorOwner() {}")},
+			"static/js/vpn/page.js":             &fstest.MapFile{Data: []byte("function vpnBoot() {}")},
 			"static/js/tables.js":               &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
 		switch mode {
@@ -771,6 +772,7 @@ func TestVPNFixtureLoaderSeamAssetFailClosed(t *testing.T) {
 			"static/js/vpn/backends_page.js":    &fstest.MapFile{Data: []byte("function vpnLoadBackends() {}")},
 			"static/js/vpn/diagnostics_page.js": &fstest.MapFile{Data: []byte("function vpnLoadDiagnostics() {}")},
 			"static/js/vpn/anchor_handoff.js":   &fstest.MapFile{Data: []byte("function vpnAnchorOwner() {}")},
+			"static/js/vpn/page.js":             &fstest.MapFile{Data: []byte("function vpnBoot() {}")},
 			"static/js/tables.js":               &fstest.MapFile{Data: []byte("function NexusTable() {}")},
 		}
 		fx := newVPNTestFixtureWithFS(t, validFS, "vpn")
@@ -802,16 +804,25 @@ func TestTemplateMarkerNotFoundFailsClosed(t *testing.T) {
 	}
 }
 
-func TestVPNPageLifecycleDOMContentLoadedMutationFailsClosed(t *testing.T) {
+func TestVPNPageBootDOMContentLoadedMutationFailsClosed(t *testing.T) {
 	fixture := NewVPNTestFixture(t)
 	fixture.RequireJSDOM()
 
-	if !strings.Contains(fixture.PageJS, "DOMContentLoaded") {
-		t.Fatal("expected fixture.PageJS to contain DOMContentLoaded")
+	// The boot is what starts the page's streams, so the mutation targets the boot's
+	// own readiness hook. Mutating a section module would only prove that a section
+	// has a listener; the page's first paint depends on this one.
+	if !strings.Contains(fixture.PageBootJS, "DOMContentLoaded") {
+		t.Fatal("expected fixture.PageBootJS to contain DOMContentLoaded")
 	}
 
 	mutatedFx := *fixture
-	mutatedFx.PageJS = strings.Replace(fixture.PageJS, "DOMContentLoaded", "never-fired-mutant", 1)
+	// Replace EVERY occurrence: the boot names the event once in its readiness hook
+	// and discusses it in a comment, so a first-occurrence replace would land in the
+	// comment and leave the hook intact - a mutant that proves nothing.
+	mutatedFx.PageBootJS = strings.ReplaceAll(fixture.PageBootJS, "DOMContentLoaded", "never-fired-mutant")
+	if mutatedFx.PageBootJS == fixture.PageBootJS {
+		t.Fatal("the mutation did not apply")
+	}
 
 	testScript := mutatedFx.BuildJSDOMHarness(JSDOMHarnessOptions{
 		ExtraJS: `
@@ -831,14 +842,15 @@ w.API = {
 };
 
 (async () => {
-    // Await natural readiness
+    // Await natural readiness. The mutant never starts a stream, so nothing else in
+    // this document is waiting on the page: the assertion below is the whole test.
     await new Promise(resolve => w.document.addEventListener('DOMContentLoaded', resolve, { once: true }));
     for (let i = 0; i < 20; i++) await Promise.resolve();
 
-    // Since DOMContentLoaded was mutated to never-fired-mutant, vpn-status should NOT be registered
     const activeStreams = w.NexusTelemetry.getActiveStreams();
-    assert.ok(activeStreams.includes('vpn-status'), 'vpn-status must be registered in active streams');
+    assert.ok(activeStreams.includes('vpn-overview'), 'vpn-overview must be registered in active streams');
     console.log('MUTATION_UNEXPECTEDLY_PASSED');
+    if (dom && dom.window) dom.window.close();
 })().catch(e => {
     console.error('MUTATION_FAILED_CLOSED: ' + e.message);
     if (dom && dom.window) dom.window.close();
@@ -852,7 +864,7 @@ w.API = {
 		t.Fatalf("expected mutant script to fail, but process succeeded with output:\n%s", string(out))
 	}
 	outStr := string(out)
-	if !strings.Contains(outStr, "MUTATION_FAILED_CLOSED") || !strings.Contains(outStr, "vpn-status must be registered") {
-		t.Fatalf("expected failure output mentioning 'MUTATION_FAILED_CLOSED' and 'vpn-status must be registered', got:\n%s", outStr)
+	if !strings.Contains(outStr, "MUTATION_FAILED_CLOSED") || !strings.Contains(outStr, "vpn-overview must be registered") {
+		t.Fatalf("expected failure output mentioning 'MUTATION_FAILED_CLOSED' and 'vpn-overview must be registered', got:\n%s", outStr)
 	}
 }

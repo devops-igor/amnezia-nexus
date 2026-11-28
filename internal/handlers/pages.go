@@ -106,35 +106,40 @@ func (h *Handlers) SettingsPageHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// VPNPageHandler renders the VPN overview: the four essential signals and the
-// listener/public-endpoint disclosure. Everything it shows is fetched client-side
-// from /api/vpn/status and /api/vpn/config, so the page itself carries no data.
-//
-// The VPN subject is split across three documents (overview, backends,
-// diagnostics) and each one marks its own sidebar entry current here rather than
-// by prefix, because /vpn is a prefix of the other two.
+// VPNPageHandler renders the VPN page: one document with the Overview, Backends
+// and Diagnostics sections in that order. Everything it shows is fetched
+// client-side, so the page itself carries no data and a section's read cannot
+// delay the four signals.
 func (h *Handlers) VPNPageHandler(w http.ResponseWriter, r *http.Request) {
 	_ = RenderTemplate(w, r, h.db, "vpn.html", map[string]any{
 		"active_page": "vpn",
 	})
 }
 
-// VPNBackendsPageHandler renders the VPN backend inventory: the table, its row
-// actions and the add-backend dialog. The inventory, the eligible servers and the
-// enable/disable/delete writes are all /api/vpn/* and /api/servers requests.
+// VPNBackendsPageHandler redirects the retired backend inventory route to the
+// Backends section of the merged page.
+//
+// The redirect names the originating section in a transient query marker and
+// deliberately appends no fragment: a fragment on a redirect target is REPLACED by
+// the one the browser was already carrying, so re-stating it here would discard the
+// legacy deep link the visitor actually followed. The merged page reads the marker,
+// resolves the inherited fragment locally and rewrites the address bar to the
+// canonical /vpn#... URL.
 func (h *Handlers) VPNBackendsPageHandler(w http.ResponseWriter, r *http.Request) {
-	_ = RenderTemplate(w, r, h.db, "vpn_backends.html", map[string]any{
-		"active_page": "vpn_backends",
-	})
+	http.Redirect(w, r, vpnSectionRedirectURL("backends"), http.StatusFound)
 }
 
-// VPNDiagnosticsPageHandler renders forwarder health, the Advanced Diagnostics
-// disclosure and the connection (sessions) table. Health and sessions are read
-// from /api/vpn/status and /api/vpn/sessions after load.
+// VPNDiagnosticsPageHandler redirects the retired diagnostics route to the
+// Diagnostics section. See VPNBackendsPageHandler for why the marker exists and
+// the fragment is not restated.
 func (h *Handlers) VPNDiagnosticsPageHandler(w http.ResponseWriter, r *http.Request) {
-	_ = RenderTemplate(w, r, h.db, "vpn_diagnostics.html", map[string]any{
-		"active_page": "vpn_diagnostics",
-	})
+	http.Redirect(w, r, vpnSectionRedirectURL("diagnostics"), http.StatusFound)
+}
+
+// vpnSectionRedirectURL is the one place a retired VPN child route names the
+// section that now owns it.
+func vpnSectionRedirectURL(section string) string {
+	return "/vpn?section=" + section
 }
 
 // RoutingPageHandler renders the policy routing page: the four readouts, the

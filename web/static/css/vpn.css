@@ -59,7 +59,9 @@
    A fragment landing scrolls its target to the top of the viewport, where the shell's
    fixed header would cover it. The landing targets carry the shell's own chrome height
    as a scroll margin, so the focused element is visible below the bar on a phone as
-   well as on a desktop. */
+   well as on a desktop. The merged VPN page publishes --vpn-landing-offset from its
+   measured top bar plus jump rail, so a landing there clears both; other pages keep
+   the shell height. */
 .vpn-region-target,
 .vpn-diag-entry,
 .vpn-page-title,
@@ -69,7 +71,7 @@
 #vpn-troubleshooting-title,
 #vpn-traffic-performance-title,
 #vpn-diagnostics-title {
-    scroll-margin-top: var(--shell-chrome-height, 88px);
+    scroll-margin-top: var(--vpn-landing-offset, var(--shell-chrome-height, 88px));
 }
 
 /* ===== VPN Link ===== */
@@ -249,6 +251,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
+    min-width: 0;
     gap: var(--space-xs) var(--space-sm);
 }
 
@@ -345,11 +348,7 @@ td[data-backend-name]:focus-visible {
     border-radius: var(--radius-sm);
 }
 
-.vpn-region-target { scroll-margin-block: var(--space-2xl); }
-
 .vpn-diag-entry {
-    grid-column: 2;
-    grid-row: 1;
     min-block-size: 44px;
     justify-content: space-between;
     gap: var(--space-sm);
@@ -552,7 +551,6 @@ td[data-backend-name]:focus-visible {
 
 /* --- Route table region --- */
 
-.vpn-fold-label, .vpn-fold-actions { min-width: 0; gap: var(--space-xs) var(--space-sm); }
 .vpn-fold-actions { justify-content: flex-end; font-weight: 400; font-size: 0.8125rem; }
 
 /* The 540px minimum route table scrolls inside this named region and must never
@@ -607,10 +605,10 @@ td[data-backend-name]:focus-visible {
     border-top: 1px solid var(--border-color);
 }
 
-/* --- Responsive --- */
-
+/* --- Responsive --- (two columns below the sidebar; the rail sticks under the top bar) */
 @media (max-width: 1023px) {
     .vpn-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+    #vpnSubnav { position: sticky; top: var(--topbar-height); z-index: 5; }
 }
 
 @media (max-width: 767px) {
@@ -1014,3 +1012,4 @@ td[data-backend-name]:focus-visible {
 }
 /* Hints take --text-tertiary: AA on every surface, below the label (tokens.css). */
 .portal-page .form-hint { color: var(--text-tertiary); }
+

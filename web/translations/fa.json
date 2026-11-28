@@ -1158,5 +1158,10 @@
   "gigahost_association_reason_provider_unnamed": "ارائه‌دهنده حساب آن‌ها را اعلام نکرد",
   "gigahost_association_reason_write_failed": "پنل نتوانست آن‌ها را ثبت کند",
   "gigahost_association_reason_unlisted_not_confirmed": "حذف تأیید نشده",
-  "gigahost_association_reason_authority_changed": "بررسی پیش از نوشتن این سطر جایگزین شد"
+  "gigahost_association_reason_authority_changed": "بررسی پیش از نوشتن این سطر جایگزین شد",
+  "vpn_page_nav_label": "بخش‌های VPN",
+  "vpn_active_problems": "مشکلات فعال",
+  "vpn_no_active_problems": "هیچ مشکل فعالی وجود ندارد.",
+  "vpn_problems_unavailable": "خواندن مشکلات فعال ممکن نشد.",
+  "vpn_view_active_problems": "مشاهده مشکلات فعال"
 }

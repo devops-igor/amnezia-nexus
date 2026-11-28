@@ -1,15 +1,17 @@
-// VPN Backends page controller.
+// VPN Backends section controller.
 //
-// This document owns the backend inventory: the table, its row actions and the
+// This section owns the backend inventory: the table, its row actions and the
 // add-backend dialog. It reads /api/vpn/backends on each tick and /api/servers
 // once for the display-name enrichment the rows already had (the add dialog
 // refreshes that list itself when it opens, as before). It reads no status,
-// config or session data, so a failure on another VPN page cannot blank it.
+// config or session data, so a failure in another section cannot blank it.
+//
+// The page boot (page.js) starts the tick and reads the server list, because on
+// the merged page the inventory must not start before the reader is near it.
 
 let vpnCachedServers = [];
 let vpnCurrentBackends = [];
 let vpnTableInstance = null;
-var vpnBackendsAnchorApplied = false;
 
 // vpnRenderBackendsError renders the existing error row. It is the read's own
 // failure state: a failed read is never reported as "this backend is gone".
@@ -97,19 +99,23 @@ function vpnRenderBackendsStaleRow() {
     vpnAnnounceBackends(message);
 }
 
-// vpnModalFocusFallback answers where focus goes when the control that opened a
+// vpnModalFocusFallbackFor answers where focus goes when the control that opened a
 // dialog no longer exists: the permanent Add control for the add dialog (the
 // empty-state CTA that may have opened it is replaced by the next render), and the
-// inventory's own heading otherwise.
-function vpnModalFocusFallback(modalId) {
+// inventory's own heading for anything else this section does not own.
+//
+// The page has one window-level handler (page.js), because both dialogs now live in
+// the same document: two modules assigning window.vpnModalFocusFallback would leave
+// whichever loaded last answering for the other section's dialog.
+function vpnModalFocusFallbackFor(modalId) {
     if (modalId === 'addBackendModal') {
-        return document.getElementById('vpn-add-backend-btn') || document.getElementById('vpn-backends-title');
+        return document.getElementById('vpn-add-backend-btn') || document.getElementById('backends');
     }
-    return document.getElementById('vpn-backends-title') || document.getElementById('vpn-add-backend-btn');
+    return null;
 }
 
 if (typeof window !== 'undefined') {
-    window.vpnModalFocusFallback = vpnModalFocusFallback;
+    window.vpnModalFocusFallbackFor = vpnModalFocusFallbackFor;
 }
 
 // Resolve a replaced row control by its action and server identity, never by
@@ -122,10 +128,21 @@ function vpnReplacementBackendFocus(focused, tbody) {
         return candidate.dataset.action === focused.dataset.action && candidate.dataset.serverId === focused.dataset.serverId;
     });
     if (equivalent && equivalent.closest('tr').style.display !== 'none') return equivalent;
-    return document.getElementById('vpn-backends-title');
+    return document.getElementById('backends');
 }
 
 // vpnLoadBackends refreshes the inventory only.
+//
+// Loading data never navigates. It may fill the table, and it may FINISH a landing
+// this arrival already began - a one-shot Inspect whose request arrived before the
+// rows existed can be answered only by a completed read - but it never derives a
+// destination of its own from the fragment.
+//
+// That distinction is the whole point: ordinary navigation (a jump, a cold fragment,
+// Back/Forward) belongs to page.js, which owns the resolver and the reader's
+// position. A read that also landed would reposition the document the moment its
+// response arrived, pulling the reader out of whichever section page.js had landed
+// them in, and a slow inventory was enough to trigger it.
 async function vpnLoadBackends() {
     // The arrival's Inspect request is taken off durable storage before the read, so a
     // failed first read cannot leave it for a later visit to replay.
@@ -167,8 +184,11 @@ async function vpnLoadBackends() {
 
     if (replacingFocus) vpnFocusIfFocusable(vpnReplacementBackendFocus(focused, tbodyBefore));
 
-    if (!vpnBackendsAnchorApplied) {
-        vpnBackendsAnchorApplied = true;
+    if (vpnPendingInspectTunnelId !== null) {
+        // A pending Inspect is the one position a read is allowed to take: it names a
+        // specific row, only a SUCCESSFUL read can say whether that row is there, and
+        // the request is consumed by the render that can answer it. An arrival with no
+        // such request leaves the reader exactly where page.js put them.
         vpnApplyBackendsLanding();
     }
     return backends;
@@ -218,20 +238,40 @@ function vpnAnnounceBackends(message) {
 // vpnFocusBackendsHeading lands on the inventory heading, which is focusable and
 // never destroyed by a re-render.
 function vpnFocusBackendsHeading() {
-    const heading = document.getElementById('vpn-backends-title');
+    const heading = document.getElementById('backends');
     if (heading) {
         vpnScrollToTarget(heading);
         vpnFocusIfFocusable(heading);
     }
 }
 
-// vpnApplyBackendsLanding runs once, after the first successful read.
+// vpnApplyBackendsLanding positions the reader for a landing page.js ASKED for, or
+// finishes a one-shot Inspect request this arrival is carrying.
+//
+// The callers are exactly two, and neither is a data path:
+//
+//   - page.js, when it resolves a fragment, a rail jump or Back/Forward to this
+//     section, passes the canonical target it decided on;
+//   - vpnLoadBackends, and only while a pending Inspect request is held, because
+//     such a request names a row whose existence no read has yet confirmed.
+//
+// Nothing else may call it. In particular a plain successful read must NOT reach
+// this function: an ordinary arrival's position belongs to page.js, and a read that
+// landed here would move the reader to whatever the URL last named, however much
+// later its response arrived.
 //
 // The Inspect handoff wins over a plain fragment: it is a one-shot request that
 // names a specific row. It is consumed here and nowhere else, so an ordinary
 // bookmark or a reload never replays a previous Inspect. A row that is absent
 // after a SUCCESSFUL read is genuinely missing, and the existing missing-entity
 // statement is announced at the destination heading.
+//
+// landingTarget is the id the page's resolver decided on. A legacy inventory id
+// whose node no longer exists (the split's card title is now the section heading)
+// still lands where the id MEANS, instead of being looked up by its removed raw id
+// and silently doing nothing. Called with no argument and no pending request it
+// does nothing at all, so a landing can never be invented from the fragment.
+
 // vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request once the page has
 // taken it off durable tab storage. The request belongs to the navigation that carried
 // it: leaving it in storage let a later ordinary visit replay an arrival whose first
@@ -254,7 +294,7 @@ function vpnTakePendingInspect() {
     return tunnelId;
 }
 
-function vpnApplyBackendsLanding() {
+function vpnApplyBackendsLanding(landingTarget) {
     vpnHoldInspectRequest();
     const tunnelId = vpnTakePendingInspect();
     if (tunnelId) {
@@ -271,7 +311,9 @@ function vpnApplyBackendsLanding() {
         return 'inspect-missing';
     }
 
-    const id = vpnOwnedAnchorId();
+    const id = (typeof landingTarget === 'string' && landingTarget)
+        ? landingTarget
+        : vpnOwnedAnchorId();
     if (!id) return null;
     const el = document.getElementById(id);
     if (!el) return null;
@@ -280,7 +322,7 @@ function vpnApplyBackendsLanding() {
     // converges with legacy links on the permanent opener without opening it.
     const modal = document.getElementById('addBackendModal');
     const target = modal && modal.contains(el) ? document.getElementById('vpn-add-backend-btn') : el;
-    const focusTarget = vpnIsFocusable(target) ? target : vpnNearestHeading(target, 'vpn-backends-title');
+    const focusTarget = vpnIsFocusable(target) ? target : vpnNearestHeading(target, 'backends');
     vpnScrollToTarget(focusTarget);
     vpnFocusIfFocusable(focusTarget);
     return target.id;
@@ -291,14 +333,6 @@ function vpnApplyBackendsLanding() {
 const VPN_BACKENDS_ACTIONS = {
     'vpn-open-add-backend': function () {
         if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
-    },
-    'vpn-close-modal': function (btn) {
-        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
-        if (typeof closeModal === 'function') {
-            closeModal(modalId);
-        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
-            UI.modal.close(modalId);
-        }
     },
     'vpn-trigger-quick-check': function () {
         if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
@@ -348,23 +382,9 @@ if (typeof document !== 'undefined') {
     initVpnBackendsListeners();
 }
 
-document.addEventListener('DOMContentLoaded', function () {
-    initVpnBackendsListeners();
-
-    // Server metadata for the row names: read once, not on every poll. The add
-    // dialog refreshes the same list when it opens.
-    if (typeof API !== 'undefined' && typeof API.get === 'function') {
-        API.get('/api/servers').then(function (servers) {
-            if (Array.isArray(servers)) vpnCachedServers = servers;
-        }).catch(function () {});
-    }
-
-    if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.poll === 'function') {
-        NexusTelemetry.poll('vpn-backends', async function () {
-            await vpnLoadBackends();
-        }, 5000);
-    }
-});
+// The tick and the one-off server read are the page boot's (page.js), which starts
+// them when this section approaches the viewport or is targeted. A module that
+// also polled here would double every inventory request on the merged page.
 
 if (typeof window !== 'undefined') {
     window.vpnLoadBackends = vpnLoadBackends;
@@ -375,3 +395,8 @@ if (typeof window !== 'undefined') {
     window.vpnAnnounceBackends = vpnAnnounceBackends;
     window.initVpnBackendsListeners = initVpnBackendsListeners;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('backends_page');

@@ -1,9 +1,11 @@
 """Read-only E2E checks for the VPN health surface and its diagnostics disclosure.
 
-The problem-first summary and Advanced Diagnostics belong to Diagnostics;
-the four signals stay on Overview. The neighbouring ``test_vpn_diagnostics.py``
-suite keeps the lifecycle, historical-chart and API coverage, and supplies the
-disclosure opener used here.
+#1006 merged the VPN overview, inventory and diagnostics back into one page at
+/vpn, so the health headline and the four signals are two surfaces of one
+document: the headline sits with the operational picture above the fold, and the
+actionable problem rows belong to the Diagnostics section. The neighbouring
+``test_vpn_diagnostics.py`` suite keeps the lifecycle, historical-chart and API
+coverage, and supplies the disclosure opener used here.
 """
 
 import re
@@ -18,15 +20,16 @@ from tests.e2e.test_vpn_diagnostics import _ensure_diagnostics_open
 def test_vpn_dashboard_navigation_and_banner(authenticated_page: Page, base_url: str) -> None:
     """Navigate to Diagnostics -> sees headline forwarder health status banner."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
+    page.goto(f"{base_url}/vpn#diagnostics")
     page.wait_for_load_state("networkidle")
 
-    # Verify not redirected to login
+    # Verify not redirected to login, and that the arrival is the section it named.
     assert "/login" not in page.url
-    assert "/vpn/diagnostics" in page.url
+    assert page.url.endswith("/vpn#diagnostics")
 
-    # One visible health status; Overview signals must not be duplicated here.
-    expect(page.locator("[data-signal]")).to_have_count(0)
+    # One visible health status. The four signals are one row of the same document,
+    # so they are counted once rather than asserted absent.
+    expect(page.locator("[data-signal]")).to_have_count(4)
     for loc in ("#vpn-fwd-status-badge", "#vpn-fwd-status-text", "#vpn-fwd-headline-summary"):
         expect(page.locator(loc)).to_be_visible()
     expect(page.locator("#vpn-forwarder-card #vpn-kpi-throughput")).to_have_count(0)
@@ -44,8 +47,12 @@ def test_vpn_overview_signals(authenticated_page: Page, base_url: str) -> None:
 
     signals = page.locator("[data-signal]")
     expect(signals).to_have_count(4)
-    expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
-    expect(page.locator("#vpn-diagnostics")).to_have_count(0)
+    # The merge puts the health headline and the four signals in one Overview, and
+    # the Advanced Diagnostics panel in Diagnostics: both render exactly once, and the
+    # panel is closed on arrival rather than duplicating the headline.
+    expect(page.locator("#vpn-forwarder-card")).to_have_count(1)
+    expect(page.locator("#vpn-diagnostics")).to_have_count(1)
+    expect(page.locator("#vpn-diagnostics")).to_be_hidden()
     assert ["backends", "sessions", "throughput", "drops"] == [
         signals.nth(i).get_attribute("data-signal") for i in range(4)
     ]
@@ -85,7 +92,7 @@ def test_vpn_overview_signals(authenticated_page: Page, base_url: str) -> None:
 def test_vpn_diagnostic_panels(authenticated_page: Page, base_url: str) -> None:
     """Navigate to Diagnostics -> verifies diagnostic telemetry panel fields."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
+    page.goto(f"{base_url}/vpn#diagnostics")
     page.wait_for_load_state("networkidle")
 
     # Closed by default: nothing opens it for the operator.
