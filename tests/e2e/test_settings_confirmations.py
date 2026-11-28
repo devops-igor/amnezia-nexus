@@ -7,9 +7,12 @@ from playwright.sync_api import Page
 
 from tests.e2e import contrast
 from tests.e2e.conftest import api_post
-# The page probe and the hex reader are the settings suite's own, so the two files
-# cannot disagree about how the page is opened or how a colour is converted.
-from tests.e2e.test_settings import NO_TRANSITIONS, _hex, _open_settings
+# The page probe and the transition switch are the settings suite's own, so the two
+# files cannot disagree about how the page is opened or how a theme is forced. The hex
+# reader moved with the contrast measurements, so it comes from the contrast module:
+# there is still exactly one conversion of a painted colour.
+from tests.e2e.test_settings import NO_TRANSITIONS, _open_settings
+from tests.e2e.test_settings_gigahost_contrast import _hex
 
 
 # --- Deploy VPS confirms before the order leaves the page --------------------
