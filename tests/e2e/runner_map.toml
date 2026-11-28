@@ -26,6 +26,7 @@ paths = [
   "tests/e2e/test_notifications.py",
   "tests/e2e/test_policy_routing_ui.py",
   "tests/e2e/test_routing_page.py",
+  "tests/e2e/test_vpn_merged_page.py",
 ]
 rationale = """
 Login, session, CSRF, captcha, settings, backup and the admin policy routing
@@ -55,6 +56,12 @@ server row, and the suite measures the page the panel renders at three viewports
 in both themes, for each of the three panels. No protocol installation or SSH
 endpoint participates in the measurement, so a local fixture is the whole
 contract rather than a weaker version of it.
+
+The merged VPN page's suite belongs here too: the page, its jump rail, its folds
+and both retired-route redirects are served by the panel binary itself. Its fold
+and landing measurements run against the panel-only deployment, which is exactly
+the configuration where the dataplane is absent - so the not-measured states it
+asserts are real server answers rather than simulated ones.
 """
 
 [[runner]]

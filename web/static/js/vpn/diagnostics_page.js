@@ -1,13 +1,17 @@
-// VPN Diagnostics page controller.
+// VPN Diagnostics section controller.
 //
-// This document owns forwarder health, the Advanced Diagnostics disclosure and
-// the connection (sessions) table. It reads /api/vpn/status and
-// /api/vpn/sessions only: no configuration, no backend inventory and no server
-// list, so the other pages' failures cannot blank this one.
+// This section owns the Advanced Diagnostics disclosure, the connection
+// (sessions) table and the Inspect landings behind the Active problems rows.
 //
-// The Inspect controls that health renders land here for sessions and hand off to
-// the backends page for a backend, carrying one opaque tunnel id in a one-shot
-// slot. They never open Advanced Diagnostics.
+// It reads /api/vpn/sessions only, and it does NOT read /api/vpn/status: the
+// forwarder health it renders comes from the one status sample the page boot takes
+// for the Overview, so the health headline and the four signals are the same
+// measurement and a second status loop cannot exist. It reads no configuration and
+// no backend inventory, so a failure in another section cannot blank this one.
+//
+// The Inspect controls that health renders resolve inside this document now: a
+// session reveals its own drilldown, and a backend hands its tunnel id to the
+// Backends landing through the same one-shot slot it used across documents.
 
 let vpnShowAllRoutes = false;
 
@@ -22,17 +26,11 @@ function vpnToggleShowAllRoutes() {
     }
 }
 
-// vpnLoadDiagnostics refreshes health and sessions. A status failure renders the
-// unavailable state while the sessions list keeps its LAST successful payload with
-// the stale warning; a later success clears the warning.
-async function vpnLoadDiagnostics() {
-    let status = null;
-    try {
-        status = await API.get('/api/vpn/status');
-    } catch (_) {
-        status = null;
-    }
-
+// vpnLoadSessions refreshes the sessions read alone. A failure keeps the LAST
+// successful payload and flags the table as stale; a later success clears the flag.
+// The payload is cached, not rendered here, so the renderer that runs after it sees
+// the same rows whichever order the boot's reads complete in.
+async function vpnLoadSessions() {
     try {
         const sessionsData = await API.get('/api/vpn/sessions');
         vpnLastSessions = sessionsData;
@@ -42,23 +40,56 @@ async function vpnLoadDiagnostics() {
         // stale instead of faking an empty list.
         vpnSessionsStale = true;
     }
+    return vpnLastSessions;
+}
 
-    // Cumulative Rx/Tx live in Advanced Diagnostics as since-reset totals, so
-    // they are written here rather than described as rates.
-    const rxElem = document.getElementById('vpn-rx');
-    if (rxElem && status) rxElem.textContent = Telemetry.formatBytes(status.rx_bytes || 0);
-    const txElem = document.getElementById('vpn-tx');
-    if (txElem && status) txElem.textContent = Telemetry.formatBytes(status.tx_bytes || 0);
+// vpnRenderSessionsFromCache re-renders the table from the payload vpnLoadSessions
+// stored. Splitting the read from the render is what lets the page paint the health
+// headline and the sessions table in one pass without reading the status twice.
+function vpnRenderSessionsFromCache() {
+    if (typeof renderSessions !== 'function') return false;
+    if (vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
+        renderSessions(vpnLastSessions.sessions);
+        return true;
+    }
+    if (typeof vpnRenderSessionsUnavailable === 'function') {
+        // A first read that failed with no earlier snapshot has nothing to show and
+        // must not leave the table on its loading row.
+        vpnRenderSessionsUnavailable();
+    }
+    return false;
+}
 
-    // Renders health, the problem list, the technical panels and the charts, and
-    // re-renders the sessions table from the payload stored above — once.
-    vpnRenderForwarderHealth(status);
+// vpnLoadDiagnostics is kept as the section's own refresh name: it reads the
+// sessions and repaints. The status sample is passed in by the page boot, because
+// this section does not own a status stream of its own.
+async function vpnLoadDiagnostics(status) {
+    // The totals are written through the same function the health renderer uses, so
+    // this entry point and the shared tick cannot describe the same sample
+    // differently. That writer lives in the eager health module because the shared
+    // tick reaches it before this file has been loaded.
+    if (typeof vpnRenderCumulativeTotals === 'function') vpnRenderCumulativeTotals(status);
+    await vpnLoadSessions();
+    vpnRenderSessionsFromCache();
     return status;
 }
 
+// vpnStopPolling stops the streams this page started. They are named explicitly
+// because one document now runs three of them, and a bare stop would leave the
+// others running after the reader has left.
 function vpnStopPolling() {
     if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.stop === 'function') {
-        NexusTelemetry.stop('vpn-diagnostics');
+        NexusTelemetry.stop('vpn-sessions');
+    }
+}
+
+// vpnStopPagePolling tears down every stream the merged page owns. The page boot
+// calls it on departure; no section keeps a timer the others do not know about.
+function vpnStopPagePolling() {
+    if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.stop === 'function') {
+        NexusTelemetry.stop('vpn-overview');
+        NexusTelemetry.stop('vpn-backends');
+        NexusTelemetry.stop('vpn-sessions');
     }
 }
 
@@ -164,17 +195,22 @@ const VPN_BACKEND_CATEGORIES = ['backend'];
 
 function vpnIssueDestinationHeading(category) {
     const c = String(category || '').toLowerCase();
-    if (VPN_BACKEND_CATEGORIES.indexOf(c) !== -1) return 'vpn-backends-title';
+    if (VPN_BACKEND_CATEGORIES.indexOf(c) !== -1) return 'backends';
     return 'vpn-troubleshooting-title';
 }
 
-// vpnNavigateToBackends performs the same-tab navigation to the backend inventory.
+// vpnNavigateToBackends lands on the backend inventory inside this same document.
 // It is a named seam so the handoff can be observed without driving a real
-// navigation.
+// navigation: the section is mounted, the landing runs, and the fragment is the
+// canonical one the rail and a bookmark use.
 function vpnNavigateToBackends(targetId) {
-    const hash = '#' + encodeURIComponent(targetId || 'vpn-backends-title');
-    if (typeof window !== 'undefined' && window.location && typeof window.location.assign === 'function') {
-        window.location.assign('/vpn/backends' + hash);
+    const hash = '#' + encodeURIComponent(targetId || 'backends');
+    if (typeof window === 'undefined' || !window.history) return;
+    if (typeof window.history.pushState === 'function') {
+        window.history.pushState(window.history.state, '', hash);
+    }
+    if (typeof window.vpnLandOnFragment === 'function') {
+        window.vpnLandOnFragment(hash, 'click');
     }
 }
 
@@ -186,7 +222,7 @@ function vpnFocusBackendIssue(row) {
     const nonce = row && row.backendId ? vpnStoreBackendHandoff(row.backendId) : null;
     // The URL carries only a random arrival identity, never an entity id. If
     // storage is unavailable the heading remains a usable destination.
-    vpnNavigateToBackends(nonce ? 'vpn-inspect-' + nonce : 'vpn-backends-title');
+    vpnNavigateToBackends(nonce ? 'vpn-inspect-' + nonce : 'backends');
 }
 
 // vpnFocusIssueTarget moves focus to the existing detail for a problem WITHOUT
@@ -195,7 +231,7 @@ function vpnFocusBackendIssue(row) {
 function vpnFocusIssueTarget(row) {
     if (row.sessionId || row.connectionId) {
         vpnFocusSessionIssue(row);
-    } else if (row.backendId || vpnIssueDestinationHeading(row.category) === 'vpn-backends-title') {
+    } else if (row.backendId || vpnIssueDestinationHeading(row.category) === 'backends') {
         vpnFocusBackendIssue(row);
     } else {
         vpnFocusHeading(vpnIssueDestinationHeading(row.category), null);
@@ -277,8 +313,11 @@ var VPN_DIAGNOSTICS_ANCHOR_FALLBACK = {
 // after the first render. A target inside the disclosure opens it (a deliberate
 // deep link may do that) without toggling it shut, and an invisible chart target
 // falls back to its section heading.
-function vpnApplyDiagnosticsAnchor() {
-    const id = vpnOwnedAnchorId();
+//
+// landingTarget is the id the page's resolver decided on; without it the fragment
+// itself is read, which is what a direct call in this section's own document used.
+function vpnApplyDiagnosticsAnchor(landingTarget) {
+    const id = (typeof landingTarget === 'string' && landingTarget) ? landingTarget : vpnOwnedAnchorId();
     if (!id) return null;
     const fallbackId = VPN_DIAGNOSTICS_ANCHOR_FALLBACK[id] || 'vpn-diagnostics-title';
     const el = document.getElementById(id);
@@ -315,25 +354,16 @@ if (typeof document !== 'undefined') {
     initVpnDiagnosticsListeners();
 }
 
-document.addEventListener('DOMContentLoaded', function () {
-    initVpnDiagnosticsListeners();
-
-    if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.poll === 'function') {
-        NexusTelemetry.poll('vpn-diagnostics', async function () {
-            await vpnLoadDiagnostics();
-            if (!vpnDiagnosticsAnchorApplied) {
-                vpnDiagnosticsAnchorApplied = true;
-                vpnApplyDiagnosticsAnchor();
-            }
-        }, 5000);
-    }
-});
-
-var vpnDiagnosticsAnchorApplied = false;
+// The sessions tick is the page boot's (page.js). Landing is the boot's too: a
+// jump, a cold fragment and a browser Back reach vpnApplyDiagnosticsAnchor through
+// it, and a poll tick never lands.
 
 if (typeof window !== 'undefined') {
     window.vpnLoadDiagnostics = vpnLoadDiagnostics;
+    window.vpnLoadSessions = vpnLoadSessions;
+    window.vpnRenderSessionsFromCache = vpnRenderSessionsFromCache;
     window.vpnStopPolling = vpnStopPolling;
+    window.vpnStopPagePolling = vpnStopPagePolling;
     window.vpnToggleShowAllRoutes = vpnToggleShowAllRoutes;
     window.vpnFindSessionRow = vpnFindSessionRow;
     window.vpnRevealSessionRow = vpnRevealSessionRow;
@@ -342,7 +372,12 @@ if (typeof window !== 'undefined') {
     window.vpnNavigateToBackends = vpnNavigateToBackends;
     window.vpnApplyDiagnosticsAnchor = vpnApplyDiagnosticsAnchor;
     window.initVpnDiagnosticsListeners = initVpnDiagnosticsListeners;
-    // The previous whole-surface loader name is kept as an alias for this page's
-    // own refresh; it no longer touches another document's data.
+    // The previous whole-surface loader name is kept as an alias for this
+    // section's own refresh; it no longer touches another section's data.
     window.vpnLoadData = vpnLoadDiagnostics;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('diagnostics_page');

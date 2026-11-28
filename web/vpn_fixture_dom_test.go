@@ -130,19 +130,19 @@ func countHTMLNodesByID(root *xhtml.Node, id string) int {
 	return count
 }
 
-// validateVPNDashboardDOMOrder validates the diagnostics document's own order.
+// validateVPNDashboardDOMOrder validates the merged page's region order.
 //
-// The VPN subject is three documents now, so there is no single page order to
-// check across the health card, the signals, the inventory and the sessions
-// table. Each document validates its own sequence here, and the page tests
-// assert the other two:
+// #1006 merged the three VPN documents into one page, so there is one order to
+// check across every region the page carries. It is the approved order, and each
+// step of it answers a question the reader arrives with:
 //
-//   - overview: the four-signal grid, then the configuration disclosure;
-//   - backends: one inventory card;
-//   - diagnostics: the health card, then Advanced Diagnostics, then the sessions
-//     table. Health is deliberately ABOVE the disclosure, and the disclosure
-//     above the sessions, so a collapsed panel never sits above the answer it
-//     belongs to.
+//   - Overview carries the four signals and the health headline, so the
+//     operational picture is above the inventory and the diagnostics;
+//   - Backends puts the inventory and its controls next;
+//   - Diagnostics shows the actionable problems, then the connection table, and
+//     the Advanced Diagnostics disclosure last - a collapsed panel never sits
+//     above the answer it belongs to, and diagnostics has no first-screen
+//     entitlement.
 func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 	if doc == nil {
 		return errors.New("nil document")
@@ -155,8 +155,6 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 	if !hasHTMLClass(healthCard, "card") {
 		return errors.New("#vpn-forwarder-card must be a .card")
 	}
-	// The diagnostics document carries no overview signal grid: the signals are the
-	// overview's answer, and a second copy here would duplicate them.
 	if n := findHTMLNodeWithIDPrefix(doc, "vpn-kpi-"); n != nil {
 		return fmt.Errorf("obsolete KPI tile %q must not exist", getHTMLNodeAttr(n, "id"))
 	}
@@ -168,12 +166,21 @@ func validateVPNDashboardDOMOrder(doc *xhtml.Node) error {
 		id   string
 		name string
 	}
+	// One marker per region, chosen so no two are nested: the four-signal grid, the
+	// health headline, the inventory card, the problem rows, the sessions table and
+	// the diagnostics disclosure. A nested pair would make the order below a
+	// statement about a shared ancestor rather than about page order.
 	regions := []region{
-		{"vpn-diagnostics", "#vpn-diagnostics"},
+		{"vpn-signal-backends-value", "#vpn-signal-backends-value"},
+		{"vpn-forwarder-card", "#vpn-forwarder-card"},
+		{"backends", "#backends"},
+		{"active-problems", "#active-problems"},
 		{"vpnSessionsTable", "#vpnSessionsTable"},
+		{"vpn-advanced-entry", "#vpn-advanced-entry"},
+		{"vpn-diagnostics", "#vpn-diagnostics"},
 	}
-	nodes := []*xhtml.Node{healthCard}
-	names := []string{"vpn-forwarder-card"}
+	nodes := make([]*xhtml.Node, 0, len(regions))
+	names := make([]string, 0, len(regions))
 	for _, r := range regions {
 		if count := countHTMLNodesByID(doc, r.id); count != 1 {
 			return fmt.Errorf("expected exactly 1 %s element, found %d", r.name, count)

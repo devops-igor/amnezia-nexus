@@ -151,6 +151,17 @@ func collectShellLinks(t *testing.T, body string) shellLinks {
 				links.scripts = append(links.scripts, attrs["src"])
 			}
 		}
+		// A controller loaded on demand is requested through a data-vpn-modules
+		// attribute on the element that activates it, not through a <script> tag. It is
+		// a reference this shell owns exactly like an eager one, so it is collected
+		// here: a scan that read only script tags would report every deferred module as
+		// unserved and let a bare or release-versioned URL hide behind the same gap.
+		for _, pair := range strings.Fields(attrs["data-vpn-modules"]) {
+			_, url, ok := strings.Cut(pair, "=")
+			if ok && strings.HasPrefix(url, "/static/") {
+				links.scripts = append(links.scripts, url)
+			}
+		}
 	}
 }
 
@@ -217,8 +228,18 @@ func shellDeclaredAssets(t *testing.T, shell string) map[string]shellDeclaredAss
 
 // renderVPNPageFor returns one of the three VPN documents through its production
 // handler, so the render is the application's own path and not a test assembly.
+// renderVPNPageFor returns the VPN page through its production handler, so the
+// render is the application's own path and not a test assembly.
+//
+// #1006 merged the three documents into one, so the page name is kept only to
+// reject a caller that still believes there is more than one: the retired handlers
+// answer a redirect now, and asking one of them for markup would silently assert
+// against a 302 body.
 func renderVPNPageFor(t *testing.T, page string) string {
 	t.Helper()
+	if page != "vpn" {
+		t.Fatalf("renderVPNPageFor(%q): the VPN subject is one page; %q is a retired child route", page, page)
+	}
 	h, _, _ := setupTestHandlers(t)
 	req := httptest.NewRequest(http.MethodGet, "/vpn", nil)
 	ctx := middleware.WithSession(req.Context(), &models.SessionData{
@@ -227,14 +248,7 @@ func renderVPNPageFor(t *testing.T, page string) string {
 	})
 	ctx = middleware.WithCSRFToken(ctx, "csrf-test-token")
 	w := httptest.NewRecorder()
-	switch page {
-	case "vpn_backends":
-		h.VPNBackendsPageHandler(w, req.WithContext(ctx))
-	case "vpn_diagnostics":
-		h.VPNDiagnosticsPageHandler(w, req.WithContext(ctx))
-	default:
-		h.VPNPageHandler(w, req.WithContext(ctx))
-	}
+	h.VPNPageHandler(w, req.WithContext(ctx))
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /vpn (%s) = %d, want 200", page, w.Code)
 	}
@@ -251,23 +265,17 @@ func TestVPNPageServesEveryModuleUnderItsAssetBytes(t *testing.T) {
 		name  string
 		order []string
 	}{
+		// The rendered document's UP-FRONT chain. The section controllers are
+		// declared for deferred loading on the elements that need them, and
+		// TestVPNPageDefersSectionControllers asserts that half of the contract
+		// against the same shipped template.
 		{"vpn", []string{
 			"/static/js/vpn/anchor_handoff.js",
 			"/static/js/vpn/common.js",
 			"/static/js/vpn/overview.js",
-		}},
-		{"vpn_backends", []string{
-			"/static/js/vpn/common.js",
-			"/static/js/vpn/backends.js",
-			"/static/js/vpn/backends_page.js",
-		}},
-		{"vpn_diagnostics", []string{
-			"/static/js/vpn/common.js",
 			"/static/js/vpn/health_problems.js",
 			"/static/js/vpn/health_summary.js",
-			"/static/js/vpn/charts.js",
-			"/static/js/vpn/sessions.js",
-			"/static/js/vpn/diagnostics_page.js",
+			"/static/js/vpn/page.js",
 		}},
 	}
 	for _, page := range pages {

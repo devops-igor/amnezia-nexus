@@ -1157,5 +1157,10 @@
   "gigahost_association_reason_provider_unnamed": "the provider did not name their account",
   "gigahost_association_reason_write_failed": "the panel could not record them",
   "gigahost_association_reason_unlisted_not_confirmed": "deletion not confirmed",
-  "gigahost_association_reason_authority_changed": "the check was replaced before this row was written"
+  "gigahost_association_reason_authority_changed": "the check was replaced before this row was written",
+  "vpn_page_nav_label": "VPN sections",
+  "vpn_active_problems": "Active problems",
+  "vpn_no_active_problems": "No active problems.",
+  "vpn_problems_unavailable": "Active problems could not be read.",
+  "vpn_view_active_problems": "View active problems"
 }

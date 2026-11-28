@@ -1157,5 +1157,10 @@
   "gigahost_association_reason_provider_unnamed": "提供商没有说明其账户",
   "gigahost_association_reason_write_failed": "面板无法记录它们",
   "gigahost_association_reason_unlisted_not_confirmed": "删除未确认",
-  "gigahost_association_reason_authority_changed": "在写入该行之前检查已被替换"
+  "gigahost_association_reason_authority_changed": "在写入该行之前检查已被替换",
+  "vpn_page_nav_label": "VPN 分区",
+  "vpn_active_problems": "当前问题",
+  "vpn_no_active_problems": "没有当前问题。",
+  "vpn_problems_unavailable": "无法读取当前问题。",
+  "vpn_view_active_problems": "查看当前问题"
 }

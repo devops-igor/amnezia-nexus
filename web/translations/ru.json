@@ -1157,5 +1157,10 @@
   "gigahost_association_reason_provider_unnamed": "провайдер не назвал их аккаунт",
   "gigahost_association_reason_write_failed": "панель не смогла их записать",
   "gigahost_association_reason_unlisted_not_confirmed": "удаление не подтверждено",
-  "gigahost_association_reason_authority_changed": "проверка была заменена до записи этой строки"
+  "gigahost_association_reason_authority_changed": "проверка была заменена до записи этой строки",
+  "vpn_page_nav_label": "Разделы VPN",
+  "vpn_active_problems": "Активные проблемы",
+  "vpn_no_active_problems": "Активных проблем нет.",
+  "vpn_problems_unavailable": "Не удалось прочитать активные проблемы.",
+  "vpn_view_active_problems": "Открыть активные проблемы"
 }

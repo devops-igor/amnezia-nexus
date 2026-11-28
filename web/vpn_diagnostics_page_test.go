@@ -62,31 +62,46 @@ func TestVPNPageDiagnosticsSessionsRecovery(t *testing.T) {
         }
     };
 
+    // One pass of the merged page's tick: the boot reads the status ONCE, hands it
+    // to the section (cumulative totals), then paints the health headline from that
+    // same sample. The section itself no longer owns a status read - that is the
+    // property this case proves, not something it works around.
+    const tick = async () => {
+        const status = await w.API.get('/api/vpn/status');
+        await w.vpnLoadDiagnostics(status);
+        w.vpnRenderForwarderHealth(status);
+    };
+
     // Pass 1: Initial success
     sessionResponseMode = 'success1';
-    await w.vpnLoadDiagnostics();
+    await tick();
     assert.strictEqual(w.eval('vpnSessionsStale'), false, 'vpnSessionsStale is false on initial success');
     assert.ok(w.eval('vpnLastSessions'), 'vpnLastSessions is populated');
     assert.strictEqual(w.eval('vpnLastSessions.sessions[0].username'), 'alice', 'vpnLastSessions cached alice');
-    assert.strictEqual(renderedPayloads.length, 1, 'the cached payload was rendered once');
+    // The section's own refresh paints once, and the boot's tick paints the health
+    // headline with the SAME sample; that second paint re-renders the cached rows
+    // rather than reading them again, which is what keeps the two surfaces on one
+    // measurement. So the payload is rendered by the section once and by the
+    // headline once per tick.
+    assert.strictEqual(renderedPayloads.length, 2, 'the cached payload was rendered by the section and the headline');
     assert.strictEqual(renderedPayloads[0][0].username, 'alice', 'rendered alice');
-    assert.strictEqual(healthCalls.length, 1, 'the health renderer ran for the status payload');
+    assert.strictEqual(healthCalls.length, 1, 'the health renderer ran once for the shared status sample');
 
     // Pass 2: Network failure - stale flag set, cached sessions preserved
     sessionResponseMode = 'failure';
-    await w.vpnLoadDiagnostics();
+    await tick();
     assert.strictEqual(w.eval('vpnSessionsStale'), true, 'vpnSessionsStale is true after network failure');
     assert.ok(w.eval('vpnLastSessions'), 'vpnLastSessions still cached');
     assert.strictEqual(w.eval('vpnLastSessions.sessions[0].username'), 'alice', 'vpnLastSessions preserved alice');
-    assert.strictEqual(renderedPayloads.length, 2, 'the cached payload was rendered again on failure');
-    assert.strictEqual(renderedPayloads[1][0].username, 'alice', 'the renderer was handed the preserved payload, not an empty list');
+    assert.strictEqual(renderedPayloads.length, 4, 'the cached payload was rendered again on failure');
+    assert.strictEqual(renderedPayloads[3][0].username, 'alice', 'the renderer was handed the preserved payload, not an empty list');
 
     // Pass 3: Subsequent success - stale flag cleared, new sessions rendered
     sessionResponseMode = 'success2';
-    await w.vpnLoadDiagnostics();
+    await tick();
     assert.strictEqual(w.eval('vpnSessionsStale'), false, 'vpnSessionsStale is cleared to false after recovery');
     assert.strictEqual(w.eval('vpnLastSessions.sessions[0].username'), 'bob', 'vpnLastSessions updated to bob');
-    assert.strictEqual(renderedPayloads[2][0].username, 'bob', 'the renderer was handed bob after recovery');
+    assert.strictEqual(renderedPayloads[5][0].username, 'bob', 'the renderer was handed bob after recovery');
 
     // The payload that is in the module's own state renders into the real table,
     // which is what the operator reads.
@@ -152,18 +167,19 @@ func TestVPNPageDiagnosticsToggleShowAllRoutes(t *testing.T) {
 	}
 }
 
-// TestVPNPageDiagnosticsPollingAndTeardown is the diagnostics half of the retired
-// polling case, and the only half that can keep the teardown assertion: this is the
-// document that exposes vpnStopPolling, and it stops its own stream.
+// TestVPNPageDiagnosticsPollingAndTeardown keeps the diagnostics half of the
+// retired polling case on the merged page: the boot registers one sessions stream
+// (the status stream belongs to the Overview), a tick reads the sessions, and the
+// page's teardown unregisters every stream it started.
 func TestVPNPageDiagnosticsPollingAndTeardown(t *testing.T) {
-	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
 	fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
 		ExtraJS: `
 assert.strictEqual(typeof w.vpnLoadDiagnostics, 'function', 'vpnLoadDiagnostics exported on window');
 assert.strictEqual(typeof w.vpnToggleShowAllRoutes, 'function', 'vpnToggleShowAllRoutes exported on window');
-assert.strictEqual(typeof w.vpnStopPolling, 'function', 'vpnStopPolling exported on window');
+assert.strictEqual(typeof w.vpnStopPagePolling, 'function', 'vpnStopPagePolling exported on window');
 
 const timers = new Map();
 let timerSeq = 0;
@@ -193,6 +209,9 @@ w.API = {
         apiCalls.push(ep);
         if (ep === '/api/vpn/status') return { listener_running: true, connected_sessions: 3, forwarder_available: true };
         if (ep === '/api/vpn/sessions') return { sessions: [] };
+        if (ep === '/api/vpn/config') return {};
+        if (ep === '/api/vpn/backends') return { backends: [] };
+        if (ep === '/api/servers') return [];
         return {};
     }
 };
@@ -201,22 +220,40 @@ w.API = {
     await new Promise(resolve => w.document.addEventListener('DOMContentLoaded', resolve, { once: true }));
     for (let i = 0; i < 20; i++) await Promise.resolve();
 
-    assert.ok(apiCalls.includes('/api/vpn/status'), 'initial vpn-status poll executed on DOMContentLoaded');
-    assert.ok(apiCalls.includes('/api/vpn/sessions'), 'initial sessions read executed on DOMContentLoaded');
-    for (const foreign of ['/api/vpn/config', '/api/vpn/backends', '/api/servers']) {
-        assert.ok(!apiCalls.includes(foreign), 'the diagnostics document must not read ' + foreign);
-    }
+    // The first viewport reads the status and the configuration for the Overview;
+    // the inventory and the sessions belong to sections that are not in view yet,
+    // so an unmounted section costs no request.
+    assert.ok(apiCalls.includes('/api/vpn/status'), 'the first tick reads the status for the Overview');
+    assert.ok(apiCalls.includes('/api/vpn/config'), 'the first tick reads the configuration for the Overview');
+    assert.ok(!apiCalls.includes('/api/vpn/sessions'),
+        'a section that has not been reached must not read its own data: ' + JSON.stringify(apiCalls));
+    assert.ok(!apiCalls.includes('/api/vpn/backends'),
+        'the inventory must not be read before its section is reached: ' + JSON.stringify(apiCalls));
 
     const activeStreams = w.NexusTelemetry.getActiveStreams();
-    assert.ok(activeStreams.includes('vpn-diagnostics'), 'vpn-diagnostics actively registered in NexusTelemetry');
+    assert.ok(activeStreams.includes('vpn-overview'), 'vpn-overview registered in NexusTelemetry');
+    assert.ok(!activeStreams.includes('vpn-sessions'), 'a section that is not mounted starts no stream');
+
+    // Reaching the section starts exactly one sessions stream, and a second
+    // reach does not start another.
+    await w.vpnMountSection('diagnostics');
+    await w.vpnMountSection('diagnostics');
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.ok(w.NexusTelemetry.getActiveStreams().includes('vpn-sessions'), 'reaching the section starts the sessions stream');
+    assert.ok(apiCalls.includes('/api/vpn/sessions'), 'the mounted section read its sessions');
+    const sessionReads = apiCalls.filter(c => c === '/api/vpn/sessions').length;
+    assert.strictEqual(sessionReads, 1, 'a second mount does not start a second read: ' + JSON.stringify(apiCalls));
 
     const scheduledIntervals = Array.from(timers.values()).map(t => t.ms);
     assert.ok(scheduledIntervals.includes(5000), '5000ms polling cadence scheduled: ' + JSON.stringify(scheduledIntervals));
 
-    // Teardown: the document's own stop unregisters its stream and clears timers.
-    w.vpnStopPolling();
-    assert.ok(!w.NexusTelemetry.getActiveStreams().includes('vpn-diagnostics'), 'vpn-diagnostics unregistered after vpnStopPolling');
-    assert.strictEqual(timers.size, 0, 'scheduled timer cleared after vpnStopPolling');
+    // Teardown: the page's own stop unregisters every stream it started.
+    w.vpnStopPagePolling();
+    const afterStop = w.NexusTelemetry.getActiveStreams();
+    for (const stream of ['vpn-overview', 'vpn-backends', 'vpn-sessions']) {
+        assert.ok(!afterStop.includes(stream), stream + ' unregistered after vpnStopPagePolling');
+    }
+    assert.strictEqual(timers.size, 0, 'scheduled timers cleared after vpnStopPagePolling');
 
     const callsBefore = apiCalls.length;
     for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -248,7 +285,7 @@ func TestVPNPageDiagnosticsDelegatedListeners(t *testing.T) {
 
 	for _, attr := range []string{"onclick=", "onchange=", "onsubmit="} {
 		if strings.Contains(fixture.TemplateHTML, attr) {
-			t.Fatalf("expected vpn_diagnostics.html to contain 0 %s attributes, found at least one", attr)
+			t.Fatalf("expected vpn.html to contain 0 %s attributes, found at least one", attr)
 		}
 	}
 

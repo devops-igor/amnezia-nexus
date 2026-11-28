@@ -115,10 +115,11 @@ func TestVPNPageBackendsSecondLoadRefreshesTable(t *testing.T) {
 }
 
 // TestVPNPageBackendsPollingAndServerPrecache is the backends half of the retired
-// polling case: the document precaches the server names its rows need and
-// registers its own inventory poll on the shared engine.
+// polling case on the merged page: reaching the section starts the inventory poll
+// and the one-off server read its rows are named from, and a second reach starts
+// neither again.
 func TestVPNPageBackendsPollingAndServerPrecache(t *testing.T) {
-	fixture := NewVPNTestFixtureForPage(t, "vpn_backends")
+	fixture := NewVPNTestFixtureForPage(t, "vpn")
 	fixture.RequireJSDOM()
 
 	testScript := fixture.BuildJSDOMHarness(JSDOMHarnessOptions{
@@ -152,6 +153,8 @@ w.API = {
         apiCalls.push(ep);
         if (ep === '/api/servers') return [{ server_id: 1, name: 'primary' }];
         if (ep === '/api/vpn/backends') return { backends: [] };
+        if (ep === '/api/vpn/status') return { forwarder_available: true };
+        if (ep === '/api/vpn/config') return {};
         return {};
     }
 };
@@ -160,17 +163,39 @@ w.API = {
     await new Promise(resolve => w.document.addEventListener('DOMContentLoaded', resolve, { once: true }));
     for (let i = 0; i < 20; i++) await Promise.resolve();
 
-    assert.ok(apiCalls.includes('/api/servers'), 'server metadata precache initiated on DOMContentLoaded');
-    assert.ok(apiCalls.includes('/api/vpn/backends'), 'initial backend inventory read executed on DOMContentLoaded');
-    for (const foreign of ['/api/vpn/status', '/api/vpn/config', '/api/vpn/sessions']) {
-        assert.ok(!apiCalls.includes(foreign), 'the backends document must not read ' + foreign);
-    }
+    // The inventory is not in the first viewport, so nothing reads it yet.
+    assert.ok(!apiCalls.includes('/api/vpn/backends'),
+        'an unreached inventory must not be read: ' + JSON.stringify(apiCalls));
+    assert.ok(!apiCalls.includes('/api/servers'),
+        'the row names are not pre-read for a section nobody has reached: ' + JSON.stringify(apiCalls));
+    assert.ok(!w.NexusTelemetry.getActiveStreams().includes('vpn-backends'),
+        'an unreached section starts no stream');
 
-    const activeStreams = w.NexusTelemetry.getActiveStreams();
-    assert.ok(activeStreams.includes('vpn-backends'), 'vpn-backends actively registered in NexusTelemetry');
+    // A jump (or the observer) reaches the section. Activation loads the section's
+    // controllers first, so it returns a promise and the test awaits the work it
+    // asked for instead of guessing at a number of microtask turns.
+    await w.vpnMountSection('backends');
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    assert.ok(apiCalls.includes('/api/servers'), 'the reached section pre-reads the server names');
+    assert.ok(apiCalls.includes('/api/vpn/backends'), 'the reached section reads its inventory');
+    assert.ok(w.NexusTelemetry.getActiveStreams().includes('vpn-backends'),
+        'vpn-backends is registered once the section is reached');
+
+    // Reaching it again (a second jump, a fragment, a Back) starts nothing new.
+    await w.vpnMountSection('backends');
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.strictEqual(apiCalls.filter(c => c === '/api/vpn/backends').length, 1,
+        'a second reach does not start a second inventory read: ' + JSON.stringify(apiCalls));
+    assert.strictEqual(apiCalls.filter(c => c === '/api/servers').length, 1,
+        'the server list is read once, not on every reach: ' + JSON.stringify(apiCalls));
 
     const scheduledIntervals = Array.from(timers.values()).map(t => t.ms);
     assert.ok(scheduledIntervals.includes(5000), '5000ms polling cadence scheduled: ' + JSON.stringify(scheduledIntervals));
+
+    // The inventory section owns no status loop.
+    assert.strictEqual(apiCalls.filter(c => c === '/api/vpn/status').length, 1,
+        'the status is read once per tick by the page boot, not by the section: ' + JSON.stringify(apiCalls));
 
     dom.window.close();
     console.log('PASS_BACKENDS_POLLING');
@@ -198,7 +223,7 @@ func TestVPNPageBackendsDelegatedListeners(t *testing.T) {
 
 	for _, attr := range []string{"onclick=", "onchange=", "onsubmit="} {
 		if strings.Contains(fixture.TemplateHTML, attr) {
-			t.Fatalf("expected vpn_backends.html to contain 0 %s attributes, found at least one", attr)
+			t.Fatalf("expected vpn.html to contain 0 %s attributes, found at least one", attr)
 		}
 	}
 

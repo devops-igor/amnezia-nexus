@@ -28,9 +28,12 @@ const navigationBindingPrelude = `
 assert.strictEqual(typeof w.vpnFocusIssueTarget, 'function',
     'the JSDOM window must bind vpnFocusIssueTarget from the diagnostics controller');
 w.__navDestinations = [];
+// The stub records the FRAGMENT the real seam navigates to. On the merged page the
+// inventory is a section of this document, so the destination is a local hash rather
+// than a path on another document.
 w.vpnNavigateToBackends = function (targetId) {
-    w.__navDestinations.push('/vpn/backends#' + targetId);
-    if (targetId.startsWith('vpn-inspect-')) w.history.replaceState(null, '', '/vpn/backends#' + targetId);
+    w.__navDestinations.push('#' + targetId);
+    if (targetId.startsWith('vpn-inspect-')) w.history.replaceState(null, '', '#vpn-inspect-' + targetId.slice('vpn-inspect-'.length));
 };
 function lastDestination() {
     return w.__navDestinations.length ? w.__navDestinations[w.__navDestinations.length - 1] : null;
@@ -91,7 +94,7 @@ const summaryBefore = summary ? summary.textContent : '';
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
 
 assert.strictEqual(w.vpnConsumeBackendHandoff(), '43', 'the handoff carries tunnel 43, not server 8');
-assert(lastDestination().startsWith('/vpn/backends#vpn-inspect-'), 'and it goes to its identified inventory arrival');
+assert(lastDestination().startsWith('#vpn-inspect-'), 'and it goes to its identified inventory arrival in this document');
 assert.strictEqual(w.vpnConsumeBackendHandoff(), null, 'the one-shot slot is consumed exactly once');
 assert.strictEqual(d.getElementById('vpn-diagnostics').hidden, true, 'Inspect never opens Advanced Diagnostics');
 if (summary) {
@@ -119,7 +122,7 @@ w.vpnRenderForwarderHealth({
 });
 d.getElementById('vpn-fwd-problem-list').children[0].children[1].click();
 assert.strictEqual(w.vpnConsumeBackendHandoff(), '9', 'a backend whose ids are equal still hands off its id');
-assert(lastDestination().startsWith('/vpn/backends#vpn-inspect-'), 'and reaches its identified inventory arrival');
+assert(lastDestination().startsWith('#vpn-inspect-'), 'and reaches its identified inventory arrival');
 console.log('VPN955_R7_BACKEND_EQUAL_IDS_OK');
 })();
 `, "VPN955_R7_BACKEND_EQUAL_IDS_OK")
@@ -178,7 +181,7 @@ const list = d.getElementById('vpn-fwd-problem-list');
 assert.strictEqual(list.children.length, 1, 'the global condition is listed once');
 assert(list.children[0].textContent.includes('No healthy backends available'), 'and it carries the backend explanation');
 list.children[0].children[1].click();
-assert.strictEqual(lastDestination(), '/vpn/backends#vpn-backends-title', 'a backend-scoped global condition goes to the inventory');
+assert.strictEqual(lastDestination(), '#backends', 'a backend-scoped global condition lands on the inventory section in this document');
 assert.strictEqual(w.vpnConsumeBackendHandoff(), null, 'with no entity id there is no one-shot handoff to replay');
 
 // 2. A non-backend global condition: still no entity id, but the condition is
@@ -214,7 +217,7 @@ assert.strictEqual(typeof w.vpnIssueDestinationHeading, 'function', 'the mapping
 // because it arrives as a JSON string, but no trimming is claimed: nothing in the
 // diagnostics payload pads a category.
 ['backend', 'BACKEND'].forEach(function (c) {
-    assert.strictEqual(w.vpnIssueDestinationHeading(c), 'vpn-backends-title',
+    assert.strictEqual(w.vpnIssueDestinationHeading(c), 'backends',
         'category ' + JSON.stringify(c) + ' resolves to the backends surface');
 });
 // Unlisted: everything else keeps the connection destination, including the empty

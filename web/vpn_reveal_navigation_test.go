@@ -159,8 +159,8 @@ assert.strictEqual(target.style.display, 'none', 'the target backend is hidden b
 assert.strictEqual(isVisible(cell), false, 'and its name cell is not painted');
 assert.strictEqual(w.vpnTableInstance.currentPage, 1, 'and the table is on page 1');
 
-d.getElementById('vpn-backends-title').focus();
-assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'focus starts away from the table');
+d.getElementById('backends').focus();
+assert.strictEqual(d.activeElement.id, 'backends', 'focus starts away from the table');
 
 // CONTROL: with no handoff pending, the landing does nothing at all.
 assert.strictEqual(w.vpnApplyBackendsLanding(), null, 'an ordinary visit lands on nothing');
@@ -194,7 +194,7 @@ assert.strictEqual(target.style.display, 'none', 'the target backend is hidden b
 assert.strictEqual(isVisible(cell), false, 'and its name cell is not painted');
 assert.strictEqual(w.vpnTableInstance.searchQuery, 'nothing-matches-this', 'and that search term is what hides it');
 
-d.getElementById('vpn-backends-title').focus();
+d.getElementById('backends').focus();
 storeBackendArrival('60');
 w.vpnApplyBackendsLanding();
 
@@ -222,7 +222,7 @@ assert.strictEqual(target.style.display, 'none', 'the target backend is hidden b
 assert.strictEqual(isVisible(cell), false, 'and its name cell is not painted');
 assert.strictEqual(w.vpnTableInstance.currentStatusFilter, 'degraded', 'and that chip is what hides it');
 
-d.getElementById('vpn-backends-title').focus();
+d.getElementById('backends').focus();
 storeBackendArrival('60');
 w.vpnApplyBackendsLanding();
 
@@ -282,7 +282,7 @@ assert.strictEqual(w.vpnApplyBackendsLanding(), 'inspect-missing', 'the handoff 
 const region = d.getElementById('vpn-backends-announcement');
 assert(region && region.getAttribute('role') === 'status', 'the inventory heading owns a live region');
 assert(region.textContent.includes('no longer'), 'the operator is told the backend is gone: ' + JSON.stringify(region.textContent));
-assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'focus lands on the inventory heading');
+assert.strictEqual(d.activeElement.id, 'backends', 'focus lands on the inventory heading');
 assert.strictEqual(w.vpnConsumeBackendHandoff(), null, 'the one-shot slot is consumed exactly once');
 console.log('VPN955_R9_BACKEND_MISSING_OK');
 })();

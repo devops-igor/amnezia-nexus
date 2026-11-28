@@ -396,6 +396,9 @@ const freshAvailableStatus = {
   ]
  }
 };
+// The charts are drawn only while the disclosure is open, so the recovery the
+// operator actually witnesses is: open Advanced, then a fresh poll repaints it.
+vpnSetDiagnosticsOpen(true);
 vpnRenderForwarderHealth(freshAvailableStatus);
 assert(vpnLastStatus && vpnLastStatus.historical_series, 'fresh poll must cache status');
 assert.strictEqual(document.getElementById('vpn-fwd-status-text').textContent, _('vpn_forwarder_healthy'), 'fresh poll restores Healthy');

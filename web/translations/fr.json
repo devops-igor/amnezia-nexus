@@ -1157,5 +1157,10 @@
   "gigahost_association_reason_provider_unnamed": "le fournisseur n'a pas indiqué leur compte",
   "gigahost_association_reason_write_failed": "le panneau n'a pas pu les enregistrer",
   "gigahost_association_reason_unlisted_not_confirmed": "suppression non confirmée",
-  "gigahost_association_reason_authority_changed": "la vérification a été remplacée avant l’écriture de cette ligne"
+  "gigahost_association_reason_authority_changed": "la vérification a été remplacée avant l’écriture de cette ligne",
+  "vpn_page_nav_label": "Sections VPN",
+  "vpn_active_problems": "Problèmes actifs",
+  "vpn_no_active_problems": "Aucun problème actif.",
+  "vpn_problems_unavailable": "Impossible de lire les problèmes actifs.",
+  "vpn_view_active_problems": "Voir les problèmes actifs"
 }
