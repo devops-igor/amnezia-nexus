@@ -211,24 +211,13 @@
 [data-theme="light"] .badge-danger { color: #be123c; }
 [data-theme="light"] .badge-info { color: #0369a1; }
 
-/* A badge that carries its own state gets that state's readable ink, because the
-   shared danger ink does not clear 4.5:1 on the danger fill it is painted on: it
-   measures 4.42:1 in the dark theme at the 12 px these labels set, under the
-   normal-text minimum. The fill and the border stay the shared danger ones, so the
-   badge still means "this is the dangerous outcome" while the label stays legible.
-
-   This is keyed on the state the badge declares, not on the class alone, so a plain
-   danger control keeps the token it had. DELETED and FAILED are two different facts
-   and keep two different roles: the deletion's own step (--text-deleted-badge) and
-   the status ink a reader must act on (--text-danger). Both measure 6.03:1 dark and
-   5.79:1 light on the composited fill over a card. */
-.badge[data-stage="deleted"] {
-    color: var(--text-deleted-badge);
-}
-
-.badge[data-stage="failed"] {
-    color: var(--text-danger);
-}
+/* An ended-state badge keeps the shared danger fill and border but paints its own
+   readable ink: the shared danger ink measures 4.42:1 on that fill in the dark theme
+   at the 12 px these labels set, under the normal-text minimum. Keyed on the state the
+   badge declares, so a plain danger control keeps the token it had. DELETED and FAILED
+   are different facts and keep a role each; both clear 4.5:1 on the composited fill. */
+.badge[data-stage="deleted"] { color: var(--text-deleted-badge); }
+.badge[data-stage="failed"] { color: var(--text-failed-badge); }
 
 /* ===== Form Elements ===== */
 .form-group {

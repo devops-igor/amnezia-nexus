@@ -20,12 +20,12 @@
     }
 
     /* A card that would sit alone in the last row spans the full width instead of
-       leaving an empty cell half the grid wide: an odd count ends on a lone card
-       (nine for an admin session, seven if the Gigahost card is unavailable), and
-       that card is usually the tallest on the page. An even count ends on a pair
-       and is untouched. Parity is the whole predicate because every grid child is
-       one card and the grid places them in order. Scoped to this block, so the
-       single-column layout below 1024px keeps one track. */
+       leaving an empty cell half the grid wide: an odd count ends on a lone card, and
+       that card is usually the tallest on the page. An even count ends on a pair and is
+       untouched. Parity is the whole predicate because every grid child is one card and
+       the grid places them in order. Scoped to this block, so the single-column layout
+       below 1024px keeps one track. The page is currently even in every group, so the
+       rule applies to no row today and stays correct for the next card that is added. */
     .settings-grid > .settings-section-card:last-child:nth-child(odd) {
         grid-column: 1 / -1;
     }

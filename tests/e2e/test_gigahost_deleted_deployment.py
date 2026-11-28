@@ -19,7 +19,7 @@ the panel's API client in the page, so the renderers run exactly as shipped.
 import pytest
 from playwright.sync_api import Page
 
-from tests.e2e import contrast
+from tests.e2e import contrast, settings_surface
 from tests.e2e.rendered_pixels import dominant_colour, read_png
 
 # The theme is switched by an attribute and the surface colours transition into place.
@@ -230,6 +230,24 @@ SAVED_JOBS = {
     },
 }
 
+# The width of the card a saved-approval row is measured in. Half the Settings grid
+# content box: the hosting card was one of two tracks while it lived in Settings, and the
+# row's reflow contract is about that narrow column. Derived from the tokens rather than
+# pinned, so a retuned spacing scale moves it, and fixed at import so the imposed width and
+# the assertion that checks it cannot disagree.
+def saved_jobs_narrow_card_width(client_width: int = 1440) -> int:
+    """The half-track card width the reflow contract is about, in CSS px.
+
+    Computed by the Settings suite's own geometry, so it is exactly the card the design
+    gives a two-track grid at this viewport, and it cannot drift from the layout the rest
+    of the suite measures.
+    """
+    geometry = settings_surface.geometry(
+        client_width, columns=2, max_width=settings_surface.app_main_max_width()
+    )
+    return int(geometry["track"])
+
+
 # The rows of the saved list, selected by position rather than by a class the row itself
 # carries. A measurement of "does this row fit" must not depend on how the row is built:
 # the same selector has to find the row before and after the layout changed, or the
@@ -343,6 +361,15 @@ def _render_saved_jobs(
         ".getBoundingClientRect(); return r.top >= 0 && r.bottom <= window.innerHeight; }",
         timeout=5000,
     )
+    # Impose the narrow card the reflow contract is about. The hosting card used to sit
+    # in one track of the Settings grid, so it was half-width for free; on the Servers
+    # page it is full-width, and a measurement that read the width from the page would be
+    # measuring the page's layout rather than the row's reflow. The width comes from the
+    # same token-derived geometry the Settings suite uses, so it is the narrow card the
+    # design actually specifies.
+    page.add_style_tag(
+        content=f"#setupIntentsContainer {{ max-width: {saved_jobs_narrow_card_width()}px; }}"
+    )
     return page.evaluate(ROWS_PROBE, SAVED_ROW_SELECTOR)
 
 
@@ -407,9 +434,18 @@ def test_saved_job_control_row_fits_its_row_at_desktop_width(
     than compress it.
     """
     got = _render_saved_jobs(authenticated_page, base_url, viewport=(1440, 900))
+    # The contract is about the row on a NARROW card, so the narrowness is imposed here
+    # rather than read from wherever the card happens to be laid out. It used to be
+    # implied by the hosting card sitting in one track of the Settings grid; the card now
+    # renders on the Servers page at full width, which made the old precondition false and
+    # turned this measurement into an assertion about the page's layout instead of about
+    # the row's reflow. Constraining the inline size keeps the case reproducible wherever
+    # the card lives.
+    narrow = saved_jobs_narrow_card_width()
+    assert narrow < 600, narrow
     row = _row(got, "ord_986_present")
-    assert row["row"]["width"] < 600, (
-        "this case is about the narrow card: the row is no longer half-width", row
+    assert abs(row["row"]["width"] - narrow) <= 1, (
+        f"the row is {row['row']['width']}px wide, want the imposed {narrow}px narrow card", row
     )
     assert row["state"]["right"] <= row["row"]["right"] + 0.5, (
         "the state and action group runs past the row's right edge", row

@@ -319,6 +319,7 @@ func TestRetiredOrderIssuesNoBrowserStatusRequest(t *testing.T) {
 
 	for _, path := range []string{
 		"static/js/gigahost_order_status.js",
+		"static/js/gigahost_order_status_detail.js",
 		"static/js/gigahost_order_status_model.js",
 		"static/js/gigahost_setup_intents.js",
 	} {
@@ -328,10 +329,12 @@ func TestRetiredOrderIssuesNoBrowserStatusRequest(t *testing.T) {
 	}
 	statusModule, _ := web.StaticFS.ReadFile("static/js/gigahost_order_status.js")
 	modelModule, _ := web.StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
+	detailModule, _ := web.StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
 	intentsModule, _ := web.StaticFS.ReadFile("static/js/gigahost_setup_intents.js")
 
 	encodedStatus, _ := json.Marshal(string(statusModule))
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 
 	// The same rows the server half produced: one order the panel recorded absent, and
@@ -377,6 +380,7 @@ w.API = {
 
 w.eval(%s + '\n//# sourceURL=gigahost_setup_intents.js');
 w.eval(%s + '\n//# sourceURL=gigahost_order_status_model.js');
+w.eval(%s + '\n//# sourceURL=gigahost_order_status_detail.js');
 w.eval(%s + '\n//# sourceURL=gigahost_order_status.js');
 
 (async () => {
@@ -390,7 +394,7 @@ w.eval(%s + '\n//# sourceURL=gigahost_order_status.js');
   });
   console.log(JSON.stringify({asked: asked, stages: stages}));
 })().catch(err => { console.error(err && err.stack || String(err)); process.exit(1); });
-`, encodedIntents, encodedModel, encodedStatus)
+`, encodedIntents, encodedModel, encodedDetail, encodedStatus)
 
 	cmd := exec.Command(node, "-")
 	cmd.Stdin = strings.NewReader(script)

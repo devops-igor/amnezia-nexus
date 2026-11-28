@@ -71,6 +71,10 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the recent-orders renderer: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	if !strings.Contains(string(consumer), "appendSetupApprovalAction(right, order.order_id)") {
 		t.Fatal("the shipped renderer does not offer the saved setup approval action")
 	}
@@ -78,6 +82,7 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	encodedModule, _ := json.Marshal(string(module))
 	encodedConsumer, _ := json.Marshal(string(consumer))
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div><div id="setupIntentsContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
@@ -121,6 +126,7 @@ const intentsContainer = w.document.getElementById('setupIntentsContainer');
 const approveBtn = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button:not(.gigahost-order-status-toggle)'))
   .find(b => b.textContent === 'setup_intents_approve');
 
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 w.eval(%s);
@@ -276,7 +282,7 @@ w.eval(%s);
 
  console.log('SETUP_APPROVAL_INITIATION_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedModule), string(encodedModel), string(encodedConsumer))
+`, string(encodedModule), string(encodedModel), string(encodedDetail), string(encodedConsumer))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "SETUP_APPROVAL_INITIATION_DOM_OK") {

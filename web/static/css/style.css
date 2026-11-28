@@ -44,6 +44,9 @@
        separate role rather than a second use of the status ink above, which is the
        notification feedback line's and the policy readout answers'. */
     --text-deleted-badge: #fb7185;
+    /* The same readable step for the failed stage's badge. A separate role from the
+       deletion's and from the reserved status ink: three facts, three names. */
+    --text-failed-badge: #fb7185;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
@@ -127,6 +130,7 @@
     --text-success: #047857;
     --text-danger: #be123c;
     --text-deleted-badge: #be123c;
+    --text-failed-badge: #be123c;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
@@ -1071,24 +1075,13 @@ button:focus-visible,
 [data-theme="light"] .badge-danger { color: #be123c; }
 [data-theme="light"] .badge-info { color: #0369a1; }
 
-/* A badge that carries its own state gets that state's readable ink, because the
-   shared danger ink does not clear 4.5:1 on the danger fill it is painted on: it
-   measures 4.42:1 in the dark theme at the 12 px these labels set, under the
-   normal-text minimum. The fill and the border stay the shared danger ones, so the
-   badge still means "this is the dangerous outcome" while the label stays legible.
-
-   This is keyed on the state the badge declares, not on the class alone, so a plain
-   danger control keeps the token it had. DELETED and FAILED are two different facts
-   and keep two different roles: the deletion's own step (--text-deleted-badge) and
-   the status ink a reader must act on (--text-danger). Both measure 6.03:1 dark and
-   5.79:1 light on the composited fill over a card. */
-.badge[data-stage="deleted"] {
-    color: var(--text-deleted-badge);
-}
-
-.badge[data-stage="failed"] {
-    color: var(--text-danger);
-}
+/* An ended-state badge keeps the shared danger fill and border but paints its own
+   readable ink: the shared danger ink measures 4.42:1 on that fill in the dark theme
+   at the 12 px these labels set, under the normal-text minimum. Keyed on the state the
+   badge declares, so a plain danger control keeps the token it had. DELETED and FAILED
+   are different facts and keep a role each; both clear 4.5:1 on the composited fill. */
+.badge[data-stage="deleted"] { color: var(--text-deleted-badge); }
+.badge[data-stage="failed"] { color: var(--text-failed-badge); }
 
 /* ===== Form Elements ===== */
 .form-group {
@@ -3666,12 +3659,12 @@ td[data-backend-name]:focus-visible {
     }
 
     /* A card that would sit alone in the last row spans the full width instead of
-       leaving an empty cell half the grid wide: an odd count ends on a lone card
-       (nine for an admin session, seven if the Gigahost card is unavailable), and
-       that card is usually the tallest on the page. An even count ends on a pair
-       and is untouched. Parity is the whole predicate because every grid child is
-       one card and the grid places them in order. Scoped to this block, so the
-       single-column layout below 1024px keeps one track. */
+       leaving an empty cell half the grid wide: an odd count ends on a lone card, and
+       that card is usually the tallest on the page. An even count ends on a pair and is
+       untouched. Parity is the whole predicate because every grid child is one card and
+       the grid places them in order. Scoped to this block, so the single-column layout
+       below 1024px keeps one track. The page is currently even in every group, so the
+       rule applies to no row today and stays correct for the next card that is added. */
     .settings-grid > .settings-section-card:last-child:nth-child(odd) {
         grid-column: 1 / -1;
     }

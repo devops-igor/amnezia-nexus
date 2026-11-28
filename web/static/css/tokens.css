@@ -44,6 +44,9 @@
        separate role rather than a second use of the status ink above, which is the
        notification feedback line's and the policy readout answers'. */
     --text-deleted-badge: #fb7185;
+    /* The same readable step for the failed stage's badge. A separate role from the
+       deletion's and from the reserved status ink: three facts, three names. */
+    --text-failed-badge: #fb7185;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;
@@ -127,6 +130,7 @@
     --text-success: #047857;
     --text-danger: #be123c;
     --text-deleted-badge: #be123c;
+    --text-failed-badge: #be123c;
 
     --accent: #6366f1;
     --accent-light: #8b5cf6;

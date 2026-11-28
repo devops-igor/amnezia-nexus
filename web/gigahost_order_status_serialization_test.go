@@ -45,6 +45,10 @@ func gigahostSerializationHarness(t *testing.T, mode, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the status module: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	intentsModule, err := StaticFS.ReadFile("static/js/gigahost_setup_intents.js")
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
@@ -59,6 +63,7 @@ func gigahostSerializationHarness(t *testing.T, mode, scenario string) string {
 
 	encodedModel, _ := json.Marshal(string(modelModule))
 	encodedStatus, _ := json.Marshal(string(statusModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedHandler, _ := json.Marshal(manualHandler)
 	encodedMode, _ := json.Marshal(mode)
@@ -173,6 +178,7 @@ w.API = {
 w.eval(%s);
 w.eval(%s);
 w.eval(%s);
+w.eval(%s);
 (function(){
   const script = new Function('loadRecentOrders','startGigahostOrderStatusRefresh','loadGigahostCatalog','btnRefreshCatalog', %s);
   w.loadGigahostCatalog = () => {};
@@ -219,7 +225,7 @@ const releaseLast = () => { const e = pending[pending.length-1]; if (e) { pendin
 %s
  dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedMode), string(encodedModel), string(encodedIntents), string(encodedStatus), string(encodedHandler), scenario)
+`, string(encodedMode), string(encodedModel), string(encodedDetail), string(encodedIntents), string(encodedStatus), string(encodedHandler), scenario)
 }
 
 func runSerializationScenario(t *testing.T, mode, marker, scenario string) {

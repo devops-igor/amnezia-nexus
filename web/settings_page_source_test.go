@@ -170,7 +170,8 @@ func TestServersShellLoadsHostingModulesBeforeTheHostingController(t *testing.T)
 	modules := []string{
 		"settings_cards.js", "settings_save.js", "gigahost_catalog_status.js",
 		"gigahost_setup.js", "gigahost_setup_intents.js", "gigahost_order_status_model.js",
-		"gigahost_order_status.js", "gigahost_placement.js", "gigahost_account_association.js",
+		"gigahost_order_status_detail.js", "gigahost_order_status.js",
+		"gigahost_placement.js", "gigahost_account_association.js",
 	}
 	for _, module := range modules {
 		refs := templateScriptRefOffsets(shell, "/static/js/"+module)
@@ -183,7 +184,8 @@ func TestServersShellLoadsHostingModulesBeforeTheHostingController(t *testing.T)
 	// keep running against a page whose card it binds no longer exists. The shared save
 	// model stays on Settings, where the other cards still commit through it.
 	hostingModules := []string{"gigahost_hosting.js", "gigahost_catalog_status.js", "gigahost_setup.js",
-		"gigahost_setup_intents.js", "gigahost_order_status_model.js", "gigahost_order_status.js",
+		"gigahost_setup_intents.js", "gigahost_order_status_model.js",
+		"gigahost_order_status_detail.js", "gigahost_order_status.js",
 		"gigahost_placement.js", "gigahost_account_association.js"}
 	for _, module := range hostingModules {
 		if refs := templateScriptRefOffsets(settingsShell, "/static/js/"+module); len(refs) != 0 {

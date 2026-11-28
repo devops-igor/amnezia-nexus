@@ -25,12 +25,17 @@ func TestGigahostSettingsConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 	setup, err := StaticFS.ReadFile("static/js/gigahost_setup.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	encodedStatus, _ := json.Marshal(string(statusModule))
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	encodedSetup, _ := json.Marshal(string(setup))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
@@ -39,6 +44,7 @@ w._ = key => key;
 const toasts = [];
 w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
 w.appendSetupApprovalAction = () => {};
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 let failed = true;
@@ -131,7 +137,7 @@ const actions = root => Array.from(root.querySelectorAll('button:not(.gigahost-o
  assert.equal(toasts.some(t=>t.kind==='success'),false);
  console.log('GIGAHOST_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedModel), string(encodedStatus), string(encodedSetup))
+`, string(encodedModel), string(encodedDetail), string(encodedStatus), string(encodedSetup))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_DOM_OK") {

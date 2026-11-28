@@ -29,6 +29,10 @@ func gigahostOrderStatusOwnershipHarness(t *testing.T, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the status module: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	intentsModule, err := StaticFS.ReadFile("static/js/gigahost_setup_intents.js")
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
@@ -45,6 +49,7 @@ func gigahostOrderStatusOwnershipHarness(t *testing.T, scenario string) string {
 
 	encodedModel, _ := json.Marshal(string(modelModule))
 	encodedStatus, _ := json.Marshal(string(statusModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedHandler, _ := json.Marshal(manualHandler)
 
@@ -139,6 +144,7 @@ w.API = {
 w.eval(%s);
 w.eval(%s);
 w.eval(%s);
+w.eval(%s);
 // Install the shipped manual-refresh listener against this window.
 (function(){
   const handlerSource = %s;
@@ -159,7 +165,7 @@ const release = (index) => held[index].release();
 %s
  dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedModel), string(encodedIntents), string(encodedStatus), string(encodedHandler), scenario)
+`, string(encodedModel), string(encodedDetail), string(encodedIntents), string(encodedStatus), string(encodedHandler), scenario)
 }
 
 func runGigahostOrderStatusOwnership(t *testing.T, marker, scenario string) {

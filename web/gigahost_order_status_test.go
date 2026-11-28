@@ -45,9 +45,14 @@ func gigahostOrderStatusHarness(t *testing.T, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	encodedStatus, _ := json.Marshal(string(statusModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	return jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
@@ -104,6 +109,7 @@ w.eval(%s);
 // instead of to the undifferentiated stdin script, so CRAP is measurable from this
 // test rather than from a parallel harness.
 w.eval(%s + '\n//# sourceURL=gigahost_order_status_model.js');
+w.eval(%s + '\n//# sourceURL=gigahost_order_status_detail.js');
 w.eval(%s + '\n//# sourceURL=gigahost_order_status.js');
 
 const container = () => w.document.getElementById('recentOrdersContainer');
@@ -119,7 +125,7 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(r => s
 (async()=>{
 %s
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedIntents), string(encodedModel), string(encodedStatus), scenario)
+`, string(encodedIntents), string(encodedModel), string(encodedDetail), string(encodedStatus), scenario)
 }
 
 // runGigahostOrderStatusScenario executes one scenario body and requires its own

@@ -48,7 +48,7 @@ func TestBadgeStateInkClearsTheFillItIsPaintedOn(t *testing.T) {
 
 	want := map[string]string{
 		"deleted": "--text-deleted-badge",
-		"failed":  "--text-danger",
+		"failed":  "--text-failed-badge",
 	}
 	for state, token := range want {
 		selector := `.badge[data-stage="` + state + `"]`
@@ -68,7 +68,7 @@ func TestBadgeStateInkClearsTheFillItIsPaintedOn(t *testing.T) {
 	for _, theme := range []string{"dark", "light"} {
 		dark := theme == "dark"
 		fill := compositeOverCard(t, string(tokens), theme)
-		for _, token := range []string{"text-deleted-badge", "text-danger"} {
+		for _, token := range []string{"text-deleted-badge", "text-failed-badge"} {
 			ink := tokenHex(t, string(tokens), theme, token)
 			if ratio := wcagRatio(ink, fill); ratio < 4.5 {
 				t.Errorf("%s theme: %s (%s) on the badge fill (%s) = %.2f:1, under 4.5:1",

@@ -75,16 +75,22 @@ DELIBERATE: dict[tuple[str, str], str] = {}
 
 
 def settings_templates(templates_root: Path | None = None) -> list[Path]:
-    """The templates the settings surface is made of: the layout, both shells, the partials.
+    """The templates whose scripts this scan reads: the layout, the page shells, the partials.
 
     Partials live in two places: templates/settings/ and the settings_*.html files
     beside the page shells (the policy cards). Both load their own scripts. The
     policy cards render on routing.html since #987, so that shell is scanned too:
     a page whose own script builds a coloured node is the same problem as one that
     loads it from a partial.
+
+    index.html (the Servers page) is scanned for the same reason and not as a
+    convenience: the hosting controllers that used to be loaded by settings.html moved
+    to that shell, so a scan that read only the Settings templates would silently stop
+    covering scripts it was written to cover. A module keeps the guard's attention
+    when it changes page.
     """
     root = templates_root or WEB / "templates"
-    files = [root / "base.html", root / "settings.html", root / "routing.html"]
+    files = [root / "base.html", root / "settings.html", root / "routing.html", root / "index.html"]
     files += sorted(root.glob("settings_*.html"))
     files += sorted((root / "settings").glob("*.html"))
     return files

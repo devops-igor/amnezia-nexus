@@ -147,7 +147,12 @@ func runGigahostOrderStatusRendererLoads(t *testing.T, responses gigahostOrderSt
 	}
 
 	encodedStatus, _ := json.Marshal(string(statusModule))
+	detailModule, err := readShippedStatusDetailModule()
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedStatusDetail, _ := json.Marshal(string(detailModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedOrders, _ := json.Marshal(responses.Orders)
 	encodedDetail, _ := json.Marshal(responses.Detail)
@@ -190,6 +195,7 @@ w.API = {
 w.eval(%s);
 w.eval(%s);
 w.eval(%s);
+w.eval(%s);
 const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
 (async () => {
   await w.loadRecentOrders();
@@ -229,7 +235,7 @@ const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
   dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
 `, string(encodedOrders), string(encodedDetail), string(encodedDetails), string(encodedIntentsResp), string(encodedBackends),
-		string(encodedOrderID), string(encodedIntents), string(encodedModel), string(encodedStatus))
+		string(encodedOrderID), string(encodedIntents), string(encodedModel), string(encodedStatusDetail), string(encodedStatus))
 
 	cmd := exec.Command(node)
 	cmd.Stdin = strings.NewReader(script)
@@ -265,6 +271,14 @@ func readShippedOrderStatusModules() (model, renderer []byte, err error) {
 		return nil, nil, err
 	}
 	return model, renderer, nil
+}
+
+// readShippedStatusDetailModule reads the read-only detail panel module, which the page
+// loads between the classification module and the status controller. A harness that
+// evals the controller without it loses gigahostOrderStatusPanel, so every fixture that
+// drives the controller loads it in the template's order.
+func readShippedStatusDetailModule() ([]byte, error) {
+	return web.StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
 }
 
 // gigahostOrderStatusNode discovers node with the repository's CI fail-closed rule: a

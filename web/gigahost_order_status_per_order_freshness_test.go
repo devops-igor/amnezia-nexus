@@ -31,12 +31,17 @@ func runPerOrderFreshnessScenario(t *testing.T, marker, scenario string) {
 	if err != nil {
 		t.Fatalf("read the status module: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	intentsModule, err := StaticFS.ReadFile("static/js/gigahost_setup_intents.js")
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
 	encodedModel, _ := json.Marshal(string(modelModule))
 	encodedStatus, _ := json.Marshal(string(statusModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 
 	node := requireJSDOM(t)
@@ -48,6 +53,7 @@ w.UI = {toast:()=>{}};
 w.triggerGigahostSetup = () => {};
 const flush = async () => { for (let i = 0; i < 16; i++) await new Promise(r => setImmediate(r)); };
 
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 w.eval(%s);
@@ -113,7 +119,7 @@ const flat = (node) => (node ? node.textContent.replace(/\s+/g, ' ') : '');
 %s
  console.log('`+marker+`'); dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedModel), string(encodedIntents), string(encodedStatus), scenario)
+`, string(encodedModel), string(encodedDetail), string(encodedIntents), string(encodedStatus), scenario)
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), marker) {

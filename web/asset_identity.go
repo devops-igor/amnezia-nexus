@@ -72,6 +72,7 @@ var DeliveredAssets = []string{
 	"/static/css/vpn.css",
 	"/static/js/gigahost_hosting.js",
 	"/static/js/gigahost_order_status.js",
+	"/static/js/gigahost_order_status_detail.js",
 	"/static/js/gigahost_order_status_model.js",
 	"/static/js/gigahost_setup_intents.js",
 	"/static/js/policy_panels.js",
