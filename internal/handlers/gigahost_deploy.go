@@ -2,22 +2,16 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
-	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
-	"github.com/go-chi/chi/v5"
 )
 
 // Detailed deployment progression status constants.
@@ -714,21 +708,15 @@ func (h *Handlers) beginGigahostDeploy(
 		release()
 		return nil, nil, 0, nil, fmt.Errorf("failed to load order %s: %w", req.OrderID, err)
 	}
-	return client, order, nexusServerID, release, nil
-}
-
-// deployingStatus is the "provider is still provisioning" answer, which is a
-// normal in-progress state and not a failure.
-func deployingStatus(orderID string, providerServerID, nexusServerID int64) *GigahostDeployStatus {
-	return &GigahostDeployStatus{
-		OrderID:          orderID,
-		ProviderServerID: providerServerID,
-		ServerID:         nexusServerID,
-		Status:           DeployStatusDeploying,
-		Step:             DeployStatusDeploying,
-		Message:          "Gigahost VPS is currently deploying",
-		UpdatedAt:        time.Now().UTC(),
+	// The order may have ended while this dialog was open, so both aliases of this entry
+	// ask before any provider read, SSH dial or registration. The refusal is taken under
+	// the per-order lock, so it cannot be outrun by a concurrent deployment of the same
+	// order and cannot race the write that records the ending.
+	if endErr := h.refuseEndedOrder(ctx, req.OrderID); endErr != nil {
+		release()
+		return nil, nil, 0, nil, endErr
 	}
+	return client, order, nexusServerID, release, nil
 }
 
 // installAndEnableDeploy performs steps 4-6: install the selected protocol, enable
@@ -869,130 +857,4 @@ func (h *Handlers) registeredServerIDForOrder(ctx context.Context, orderID strin
 		return ledgerServerID
 	}
 	return intent.NexusServerID
-}
-
-// GigahostDeployHandler handles POST /api/admin/hosting/gigahost/deploy.
-func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request) {
-	sess := middleware.GetSession(r.Context())
-	if sess == nil || sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
-		return
-	}
-
-	var req GigahostDeployRequest
-	if r.Body != nil && r.Body != http.NoBody {
-		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&req); err != nil {
-			h.JSONError(w, http.StatusBadRequest, "invalid_payload", "Failed to parse request JSON")
-			return
-		}
-	}
-
-	if req.OrderID == "" {
-		req.OrderID = chi.URLParam(r, "order_id")
-	}
-	if req.OrderID == "" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "order_id is required")
-		return
-	}
-
-	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Now().Add(middleware.InstallRequestTimeout))
-
-	status, err := h.DeployGigahostOrder(r.Context(), req)
-	if err != nil {
-		h.writeGigahostDeployFailure(w, status, err)
-		return
-	}
-
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"deploy": status,
-	})
-}
-
-// writeGigahostDeployFailure maps a deployment error to its HTTP response.
-//
-// The two first cases are identity decisions rather than failures: an unnamed
-// host key must be confirmed by the administrator, and a missing managed
-// credential is a pause with instructions. Everything else is a real failure, and
-// the ordering below keeps the most specific cause first.
-func (h *Handlers) writeGigahostDeployFailure(w http.ResponseWriter, status *GigahostDeployStatus, err error) {
-	if errors.Is(err, tunnel.ErrProviderAbsent) {
-		h.serverNotMeasured(w)
-		return
-	}
-	var confirmation *ssh.ErrFingerprintRequired
-	if errors.As(err, &confirmation) {
-		h.JSON(w, http.StatusConflict, map[string]any{
-			"status":      "host_key_confirmation_required",
-			"host":        confirmation.Host,
-			"fingerprint": confirmation.Fingerprint,
-			"deploy":      status,
-		})
-		return
-	}
-	if errors.Is(err, errMissingOrderCredential) {
-		h.JSON(w, http.StatusConflict, map[string]any{
-			"status": DeployStatusFailed,
-			"code":   codeCredentialMissing,
-			"error":  errMissingOrderCredential.Error(),
-			"deploy": status,
-		})
-		return
-	}
-	if errors.Is(err, ErrDuplicateServerID) {
-		h.JSONError(w, http.StatusConflict, "duplicate_server_id", err.Error())
-		return
-	}
-	if strings.Contains(err.Error(), "already in progress") {
-		h.JSONError(w, http.StatusConflict, "in_progress", err.Error())
-		return
-	}
-	if isDeployValidationError(err) {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-		return
-	}
-	h.JSON(w, http.StatusBadGateway, map[string]any{
-		"status": DeployStatusFailed,
-		"error":  err.Error(),
-		"deploy": status,
-	})
-}
-
-// isDeployValidationError reports the request-shape failures that must not be
-// reported as an upstream fault.
-func isDeployValidationError(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "validation") || strings.Contains(msg, "required") ||
-		strings.Contains(msg, "unsupported protocol")
-}
-
-// GigahostDeployStatusHandler handles GET /api/admin/hosting/gigahost/deploy/{order_id}.
-func (h *Handlers) GigahostDeployStatusHandler(w http.ResponseWriter, r *http.Request) {
-	sess := middleware.GetSession(r.Context())
-	if sess == nil || sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
-		return
-	}
-
-	orderID := chi.URLParam(r, "order_id")
-	if orderID == "" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "order_id is required")
-		return
-	}
-
-	status, err := h.GetGigahostDeployStatus(r.Context(), orderID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "not found") {
-			h.JSONError(w, http.StatusNotFound, "not_found", fmt.Sprintf("order %s not found", orderID))
-			return
-		}
-		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
-		return
-	}
-
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"deploy": status,
-	})
 }

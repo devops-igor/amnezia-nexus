@@ -304,3 +304,17 @@ func (h *Handlers) fallbackResolveServerInfo(
 	}
 	return assignedIP, providerServerID
 }
+
+// deployingStatus is the "provider is still provisioning" answer, which is a
+// normal in-progress state and not a failure.
+func deployingStatus(orderID string, providerServerID, nexusServerID int64) *GigahostDeployStatus {
+	return &GigahostDeployStatus{
+		OrderID:          orderID,
+		ProviderServerID: providerServerID,
+		ServerID:         nexusServerID,
+		Status:           DeployStatusDeploying,
+		Step:             DeployStatusDeploying,
+		Message:          "Gigahost VPS is currently deploying",
+		UpdatedAt:        time.Now().UTC(),
+	}
+}

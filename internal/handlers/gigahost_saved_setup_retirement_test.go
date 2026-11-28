@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
@@ -236,7 +237,8 @@ func TestRetiredOrderStopsTheBackgroundTracker(t *testing.T) {
 		t.Fatalf("the fixture did not retire the order through its inventory read")
 	}
 
-	// From here the count must not move, even though the approval is still pending and due.
+	// From here the count must not move, even though the approval was pending and due when
+	// the order ended.
 	clock = clock.Add(gigahostsetup.DefaultInterval + time.Second)
 	before := provider.statusReads
 	if err := tracker.RunOnce(ctx); err != nil {
@@ -245,12 +247,36 @@ func TestRetiredOrderStopsTheBackgroundTracker(t *testing.T) {
 	if provider.statusReads != before {
 		t.Errorf("the background tracker polled a retired order: %d -> %d provider status reads", before, provider.statusReads)
 	}
-	// The row is still pending and due, so the only thing that stopped the read is the
-	// retirement rather than the schedule having run out.
-	if intent, _, err := h.GetGigahostSetupIntent(ctx, retiredID); err == nil && intent != nil {
-		if intent.State != models.SetupStatePending {
-			t.Fatalf("the fixture's approval left the pending state: %+v", intent)
-		}
+	// The stop is durable, not just this pass's decision: the approval is closed with the
+	// same transition a revocation performs, and it records which fact closed it. Asserting
+	// only that the read stopped would pass for a job left pending and due, which is the
+	// state that kept offering Resume and kept being polled on every later pass.
+	intent, _, err := h.GetGigahostSetupIntent(ctx, retiredID)
+	if err != nil || intent == nil {
+		t.Fatalf("reload the approval: intent=%v err=%v", intent, err)
+	}
+	if intent.State != models.SetupStateCanceled {
+		t.Fatalf("the job for a retired order was not closed: state = %q (step %q)", intent.State, intent.Step)
+	}
+	if intent.Step != database.SetupStepOrderEnded {
+		t.Errorf("step = %q, want %q so the surrender is diagnosable", intent.Step, database.SetupStepOrderEnded)
+	}
+	if intent.LastError == "" {
+		t.Error("the closed job records no reason")
+	}
+	// A closed row is not due, so no later pass can be the thing that polls it again.
+	if !intent.NextAttemptAt.IsZero() {
+		t.Errorf("the closed job kept a schedule: next attempt %v", intent.NextAttemptAt)
+	}
+	// The clock has advanced past every due time the row ever had, so the reason it is not
+	// polled is the closure and not the schedule.
+	clock = clock.Add(10 * gigahostsetup.DefaultInterval)
+	settled := provider.statusReads
+	if err := tracker.RunOnce(ctx); err != nil {
+		t.Fatalf("later tracker pass: %v", err)
+	}
+	if provider.statusReads != settled {
+		t.Errorf("a later pass still polled the closed job: %d -> %d reads", settled, provider.statusReads)
 	}
 }
 

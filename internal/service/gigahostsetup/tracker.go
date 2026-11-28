@@ -55,6 +55,12 @@ type Store interface {
 	// onboarding journal, so the tracker cannot answer this question from the row it
 	// already holds.
 	IsGigahostOrderRetired(ctx context.Context, orderID string) (bool, error)
+	// SurrenderGigahostSetupForEndedOrder closes this job when the panel has recorded
+	// that its order ended, and reports whether it has. It is the same durable transition
+	// a revocation performs, so the row leaves every state work may continue from: a pass
+	// that settles the job here means no later pass examines it again, and an attempt
+	// already running is refused by its own generation fence.
+	SurrenderGigahostSetupForEndedOrder(ctx context.Context, orderID string) (bool, error)
 }
 
 // ErrProviderUnavailable reports that no provider client could be built for this
@@ -334,8 +340,20 @@ func (t *Tracker) observe(ctx context.Context, reader ProviderReader, intent *mo
 		return nil
 	}
 	if retired {
-		slog.Info("Gigahost setup tracking skipped: the order has ended",
-			"order_id", intent.OrderID)
+		// Stopping this pass's provider read is not enough on its own: the approval row
+		// stays actionable, so the saved-jobs list keeps offering Resume and a later
+		// confirmation can still hand the job to a worker. The job is therefore closed
+		// with the same durable transition a revocation performs, which is what makes the
+		// ending reach every surface and every worker instead of this one pass.
+		ended, surrenderErr := t.store.SurrenderGigahostSetupForEndedOrder(ctx, intent.OrderID)
+		if surrenderErr != nil {
+			// The row keeps the state it had. Nothing was read from the provider, and the
+			// ledger's answer is unknown rather than negative, so this is reported instead
+			// of settling the job on a guess.
+			return fmt.Errorf("failed to close the setup job for ended order %s: %w", intent.OrderID, surrenderErr)
+		}
+		slog.Info("Gigahost setup tracking stopped: the order has ended",
+			"order_id", intent.OrderID, "closed", ended)
 		return nil
 	}
 	callCtx, cancel := context.WithTimeout(ctx, t.callTimeout)

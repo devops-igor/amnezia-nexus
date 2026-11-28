@@ -49,6 +49,10 @@ type InstallStore interface {
 	// attempt would install for has ended. An install is remote work on a specific
 	// deployment, so it must not begin for one the provider no longer holds.
 	IsGigahostOrderRetired(ctx context.Context, orderID string) (bool, error)
+	// SurrenderGigahostSetupForEndedOrder closes this job when the panel has recorded
+	// that its order ended. It is the same durable transition a revocation performs, so
+	// the row leaves every state work may continue from and says why it stopped.
+	SurrenderGigahostSetupForEndedOrder(ctx context.Context, orderID string) (bool, error)
 }
 
 // InstallRunner performs the actual steps for one claimed attempt.
@@ -240,8 +244,17 @@ func (i *Installer) runOne(ctx context.Context, candidate *models.GigahostSetupI
 		return fmt.Errorf("failed to read whether order %s has ended: %w", candidate.OrderID, err)
 	}
 	if retired {
-		slog.Info("Gigahost setup install skipped: the order has ended",
-			"order_id", candidate.OrderID, "state", candidate.State)
+		// Closing the row is what makes the surrender durable and diagnosable: the
+		// operator sees a job that says the order ended, instead of one that stays at the
+		// handoff point and looks like work nobody has picked up yet. It is also the
+		// only way the attempt that already owns this row learns about the ending - the
+		// fenced journal write it is about to make finds the row no longer installing.
+		ended, surrenderErr := i.store.SurrenderGigahostSetupForEndedOrder(ctx, candidate.OrderID)
+		if surrenderErr != nil {
+			return fmt.Errorf("failed to close the setup job for ended order %s: %w", candidate.OrderID, surrenderErr)
+		}
+		slog.Info("Gigahost setup install stopped: the order has ended",
+			"order_id", candidate.OrderID, "state", candidate.State, "closed", ended)
 		return nil
 	}
 	claimed, gen, ok, err := i.claim(ctx, candidate)

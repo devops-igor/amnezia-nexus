@@ -689,12 +689,21 @@ func (d *DB) TakeOverGigahostSetupInstall(
 }
 
 // UpdateGigahostSetupInstall is the only writer of an in-flight install attempt,
-// and it is fenced by both the installing state and the attempt's generation.
+// and it is fenced by the installing state and the attempt's generation.
 //
 // changed=false means this attempt no longer owns the row - the administrator
-// revoked the approval or a newer attempt took over. The caller must then issue
-// no further remote command: that refusal is the guarantee that a cancellation
-// reaches the install, not just the provider poll.
+// revoked the approval, a newer attempt took over, or the order the job installs
+// for has ended. The caller must then issue no further remote command: that
+// refusal is the guarantee that a cancellation reaches the install, not just the
+// provider poll.
+//
+// The order-retirement question is asked HERE, inside the same critical section as
+// the write, rather than by each phase before it acts. Retirement commits on the
+// order ledger, which this row does not carry, and a pass can take minutes; a
+// check taken when the attempt started cannot speak for the moment its next remote
+// command would run. Because this statement is the authorization for every
+// effect-bearing phase, asking here makes the attempt's own journal the boundary
+// retirement reaches, with no second signal for a runner to forget.
 func (d *DB) UpdateGigahostSetupInstall(
 	ctx context.Context, intent *models.GigahostSetupIntent, expectedGeneration int64,
 ) (bool, error) {
@@ -708,6 +717,28 @@ func (d *DB) UpdateGigahostSetupInstall(
 		return false, err
 	}
 	intent.UpdatedAt = time.Now().UTC()
+
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	// The order's own ending outranks this write. Surrendering the row makes the
+	// statement below match nothing, so the attempt is refused by the fences it
+	// already respects instead of by a second error path a runner would have to
+	// learn. A read failure is returned rather than swallowed: it is reported as a
+	// failure to write, never as a write that happened.
+	if ended, err := d.surrenderSetupForEndedOrderLocked(ctx, intent.OrderID, expectedGeneration); err != nil {
+		return false, err
+	} else if ended {
+		return false, nil
+	}
+	return d.writeInstallJournalLocked(ctx, intent, expectedGeneration)
+}
+
+// writeInstallJournalLocked applies one attempt's journal update under its fences.
+// The caller holds the database write mutex and has already established that the
+// order is live.
+func (d *DB) writeInstallJournalLocked(
+	ctx context.Context, intent *models.GigahostSetupIntent, expectedGeneration int64,
+) (bool, error) {
 	q := `UPDATE gigahost_setup_intents
 	      SET state = ?,
 	          step = ?,
@@ -718,7 +749,6 @@ func (d *DB) UpdateGigahostSetupInstall(
 	          next_attempt_at = ?,
 	          updated_at = ?
 	      WHERE order_id = ? AND state = ? AND install_generation = ?`
-	d.writeMu.Lock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
 		intent.State, intent.Step, intent.LastError,
 		intent.InstallPhase, intent.InstallPhaseDone,
@@ -726,7 +756,6 @@ func (d *DB) UpdateGigahostSetupInstall(
 		formatSetupTimestamp(intent.NextAttemptAt),
 		formatSetupTimestamp(intent.UpdatedAt),
 		intent.OrderID, models.SetupStateInstalling, expectedGeneration)
-	d.writeMu.Unlock()
 	if err != nil {
 		return false, fmt.Errorf("failed to update gigahost setup install: %w", err)
 	}
