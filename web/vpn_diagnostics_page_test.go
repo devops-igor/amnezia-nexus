@@ -236,8 +236,8 @@ w.API = {
 
     // Reaching the section starts exactly one sessions stream, and a second
     // reach does not start another.
-    w.vpnMountSection('diagnostics');
-    w.vpnMountSection('diagnostics');
+    await w.vpnMountSection('diagnostics');
+    await w.vpnMountSection('diagnostics');
     for (let i = 0; i < 20; i++) await Promise.resolve();
     assert.ok(w.NexusTelemetry.getActiveStreams().includes('vpn-sessions'), 'reaching the section starts the sessions stream');
     assert.ok(apiCalls.includes('/api/vpn/sessions'), 'the mounted section read its sessions');

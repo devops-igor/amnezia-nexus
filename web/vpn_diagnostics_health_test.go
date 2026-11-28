@@ -144,8 +144,16 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		if !strings.Contains(entryTag, `aria-controls="vpn-diagnostics"`) {
 			t.Errorf("Advanced Diagnostics entry must control #vpn-diagnostics: %s", entryTag)
 		}
-		if !strings.Contains(vpnStr, `<section class="card vpn-diagnostics" id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden>`) {
+		// The panel is hidden on arrival AND declares the chart module it will need,
+		// so opening it is what loads charts.js. Asserting the hidden default without
+		// the declaration would let a controller drop the declaration and leave the
+		// charts permanently absent.
+		if !strings.Contains(vpnStr, `id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden`) {
 			t.Error("#vpn-diagnostics must be hidden in the template")
+		}
+		panelStart := strings.Index(vpnStr, `id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden`)
+		if panelStart == -1 || !strings.Contains(vpnStr[panelStart:], `data-vpn-modules="charts=`) {
+			t.Error("#vpn-diagnostics must declare the chart module it loads when it is opened")
 		}
 		// The health summary lives inside the single polite live region.
 		if !strings.Contains(vpnStr, `id="vpn-fwd-health-live" role="status" aria-atomic="true"`) {

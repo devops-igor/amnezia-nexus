@@ -129,7 +129,8 @@
      screen does. Add Backend sits at the trailing edge of the same header, outside
      the table's horizontal scroller. The card carries its own region id for the
      card-order check and for the boot's activation observer. */}}
-<section class="card vpn-table-card vpn-section" id="backends-region" aria-labelledby="backends" data-vpn-section="backends">
+<section class="card vpn-table-card vpn-section" id="backends-region" aria-labelledby="backends" data-vpn-section="backends"
+         data-vpn-modules="backends={{ asset_url "/static/js/vpn/backends.js" }} backends_page={{ asset_url "/static/js/vpn/backends_page.js" }} ">
     <div class="flex items-center justify-between vpn-card-head">
         <div class="flex items-center gap-sm">
             <svg class="icon text-muted" aria-hidden="true"><use href="#icon-server"></use></svg>
@@ -169,7 +170,8 @@
 </section>
 
 <!-- ============================= DIAGNOSTICS ============================= -->
-<section class="vpn-section" id="diagnostics-region" aria-labelledby="diagnostics" data-vpn-section="diagnostics">
+<section class="vpn-section" id="diagnostics-region" aria-labelledby="diagnostics" data-vpn-section="diagnostics"
+         data-vpn-modules="sessions={{ asset_url "/static/js/vpn/sessions.js" }} diagnostics_page={{ asset_url "/static/js/vpn/diagnostics_page.js" }} ">
     <h2 class="section-title vpn-region-target" id="diagnostics" tabindex="-1">{{ _ "nav_vpn_diagnostics" }}</h2>
 
     <!-- Active problems first: the actionable rows, without Advanced Diagnostics. -->
@@ -227,7 +229,11 @@
             <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
         </button>
 
-        <section class="card vpn-diagnostics" id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden>
+        {{/* The chart module is declared on the disclosure that needs it, not on the
+             section: it loads only when Advanced Diagnostics is actually opened or
+             a deep link lands inside it, so an unopened panel costs no request. */}}
+        <section class="card vpn-diagnostics" id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden
+                 data-vpn-modules="charts={{ asset_url "/static/js/vpn/charts.js" }} ">
             <header class="vpn-diag-header">
                 <div>
                     <h3 class="card-title vpn-region-target" id="vpn-diagnostics-title" tabindex="-1">{{ _ "vpn_advanced_diagnostics" }}</h3>
@@ -508,19 +514,26 @@
 {{ end }}
 
 {{ define "scripts" }}
-{{/* One document: the fragment resolver runs first, before any section controller
-     starts a read, so an inherited or legacy fragment cannot cost a request it will
-     not use. Then the shared helpers, the section controllers, and the page boot that
-     activates a section when it approaches the viewport or is targeted. */}}
+{{/* Only what the first view needs is loaded up front: the fragment resolver, the
+     shared helpers, the Overview controller, and the health renderers the status
+     tick paints with. Every other controller is declared on the element that needs
+     it (`data-vpn-modules`) and is fetched when that surface is actually activated,
+     so an unopened Backends card or Advanced panel cannot delay the essential read.
+
+     Each module is a classic blocking script with the digest of its own bytes. The
+     boot's loader appends the deferred ones in declaration order for the same
+     reason: backends_page.js drives backends.js, and diagnostics_page.js drives the
+     sessions table.
+
+     health_problems.js and health_summary.js are NOT deferred: they are what
+     vpnRenderForwarderHealth is made of, and refusing to call it while Advanced is
+     closed would delete the active-problem list and every technical value. Splitting
+     the health render into eager and lazy halves is how those two surfaces start
+     describing the same incident differently. */}}
 <script src="{{ asset_url "/static/js/vpn/anchor_handoff.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/common.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/overview.js" }}"></script>
-<script src="{{ asset_url "/static/js/vpn/backends.js" }}"></script>
-<script src="{{ asset_url "/static/js/vpn/backends_page.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/health_problems.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/health_summary.js" }}"></script>
-<script src="{{ asset_url "/static/js/vpn/charts.js" }}"></script>
-<script src="{{ asset_url "/static/js/vpn/sessions.js" }}"></script>
-<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>
 {{ end }}

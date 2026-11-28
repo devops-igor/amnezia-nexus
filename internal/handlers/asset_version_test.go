@@ -254,17 +254,16 @@ func TestVPNPageServesEveryModuleUnderItsAssetBytes(t *testing.T) {
 		name  string
 		order []string
 	}{
+		// The rendered document's UP-FRONT chain. The section controllers are
+		// declared for deferred loading on the elements that need them, and
+		// TestVPNPageDefersSectionControllers asserts that half of the contract
+		// against the same shipped template.
 		{"vpn", []string{
 			"/static/js/vpn/anchor_handoff.js",
 			"/static/js/vpn/common.js",
 			"/static/js/vpn/overview.js",
-			"/static/js/vpn/backends.js",
-			"/static/js/vpn/backends_page.js",
 			"/static/js/vpn/health_problems.js",
 			"/static/js/vpn/health_summary.js",
-			"/static/js/vpn/charts.js",
-			"/static/js/vpn/sessions.js",
-			"/static/js/vpn/diagnostics_page.js",
 			"/static/js/vpn/page.js",
 		}},
 	}

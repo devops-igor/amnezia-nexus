@@ -64,14 +64,11 @@ function vpnRenderSessionsFromCache() {
 // sessions and repaints. The status sample is passed in by the page boot, because
 // this section does not own a status stream of its own.
 async function vpnLoadDiagnostics(status) {
-    // Cumulative Rx/Tx live in Advanced Diagnostics as since-reset totals, so they
-    // are written from the shared sample rather than described as rates.
-    if (status) {
-        const rxElem = document.getElementById('vpn-rx');
-        if (rxElem) rxElem.textContent = Telemetry.formatBytes(status.rx_bytes || 0);
-        const txElem = document.getElementById('vpn-tx');
-        if (txElem) txElem.textContent = Telemetry.formatBytes(status.tx_bytes || 0);
-    }
+    // The totals are written through the same function the health renderer uses, so
+    // this entry point and the shared tick cannot describe the same sample
+    // differently. That writer lives in the eager health module because the shared
+    // tick reaches it before this file has been loaded.
+    if (typeof vpnRenderCumulativeTotals === 'function') vpnRenderCumulativeTotals(status);
     await vpnLoadSessions();
     vpnRenderSessionsFromCache();
     return status;
@@ -316,8 +313,11 @@ var VPN_DIAGNOSTICS_ANCHOR_FALLBACK = {
 // after the first render. A target inside the disclosure opens it (a deliberate
 // deep link may do that) without toggling it shut, and an invisible chart target
 // falls back to its section heading.
-function vpnApplyDiagnosticsAnchor() {
-    const id = vpnOwnedAnchorId();
+//
+// landingTarget is the id the page's resolver decided on; without it the fragment
+// itself is read, which is what a direct call in this section's own document used.
+function vpnApplyDiagnosticsAnchor(landingTarget) {
+    const id = (typeof landingTarget === 'string' && landingTarget) ? landingTarget : vpnOwnedAnchorId();
     if (!id) return null;
     const fallbackId = VPN_DIAGNOSTICS_ANCHOR_FALLBACK[id] || 'vpn-diagnostics-title';
     const el = document.getElementById(id);
@@ -376,3 +376,8 @@ if (typeof window !== 'undefined') {
     // section's own refresh; it no longer touches another section's data.
     window.vpnLoadData = vpnLoadDiagnostics;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('diagnostics_page');

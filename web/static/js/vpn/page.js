@@ -3,22 +3,29 @@
  * /vpn is one document with three sections. This module owns the three things that
  * are only true because the sections share a document:
  *
- *   Activation. A section's controller starts only when its surface approaches the
- *   visible viewport, or when a jump, a fragment or an Inspect target names it. The
- *   Overview controllers start immediately, so the four signals and the health
- *   headline never wait for the inventory or the diagnostics read.
+ *   Activation. A section's controllers are loaded and started only when its surface
+ *   approaches the visible viewport, receives focus, is jumped to, or is named by a
+ *   fragment or an Inspect target. The Overview controllers load with the page, so
+ *   the four signals and the health headline never wait for the inventory, the
+ *   diagnostics read or the chart module. Nothing a section owns is requested on
+ *   ordinary arrival.
  *
  *   One status stream. Overview and the health headline are two renderings of one
  *   measurement, so they read it once per tick: the status sample the Overview load
- *   returns is the same object the health renderer is given. Branding the inventory
- *   traffic or a second diagnostics loop onto the same sample is exactly how the
- *   two surfaces start disagreeing about what the dataplane is doing.
+ *   returns is the same object the health renderer is given. Nothing else is awaited
+ *   on that path - the sessions read belongs to the sessions stream, and a slow or
+ *   failing sessions request must not hold the health sample or the next tick.
+ *   Branding the inventory traffic or a second diagnostics loop onto the same sample
+ *   is exactly how the two surfaces start disagreeing about what the dataplane is
+ *   doing.
  *
  *   Landing. The jump rail, a cold fragment and a browser Back/Forward all end at
  *   the same function: mount the owning section, open only the disclosures the
  *   target needs, scroll it clear of the shell bars and the stuck rail, and put
- *   focus on the heading (or the target when it can take focus). Polling never
- *   lands anywhere, so a tick cannot move the reader.
+ *   focus on the heading (or the target when it can take focus). The landing always
+ *   uses the resolver's CANONICAL target, so a legacy id whose node no longer exists
+ *   still lands where the id means. Polling never lands anywhere, so a tick cannot
+ *   move the reader.
  */
 (function () {
     'use strict';
@@ -29,9 +36,19 @@
         diagnostics: 'diagnostics-region'
     };
 
-    // Which renderer owns a section's first paint. Overview and diagnostics are not
-    // here: the status tick paints both from one sample.
+    // Which sections have been activated. Overview and diagnostics are not here:
+    // the status tick paints the Overview, and the diagnostics section's own
+    // controllers are loaded by name when the section is activated.
     var mounted = { backends: false, diagnostics: false };
+
+    // The in-flight activation of each section. A second jump, a second fragment or
+    // a re-entry returns the same promise instead of loading or starting twice.
+    var mounting = { backends: null, diagnostics: null };
+
+    // Modules this page loaded already, by the name the section declared. A module
+    // registers itself with vpnMarkModule (common.js), so a harness or a shell that
+    // included it up front is not fetched a second time.
+    var moduleLoads = {};
 
     var statusPollStarted = false;
     var sessionPollStarted = false;
@@ -74,6 +91,69 @@
     function sectionElement(section) {
         var id = SECTION_IDS[section];
         return id ? byId(id) : null;
+    }
+
+    // ---- Deferred module loading ---------------------------------------------
+
+    // vpnDeclaredModules reads the "name=url" pairs an element declares in
+    // data-vpn-modules. The URL comes from the template's asset_url, so a deferred
+    // module is requested under the digest of its own bytes exactly like an eager
+    // one; this loader never spells an asset path or a version of its own.
+    function vpnDeclaredModules(el) {
+        var declared = el && el.getAttribute ? el.getAttribute('data-vpn-modules') : null;
+        if (!declared) return [];
+        var parts = String(declared).split(/\s+/);
+        var modules = [];
+        for (var i = 0; i < parts.length; i++) {
+            var pair = parts[i];
+            if (!pair) continue;
+            var cut = pair.indexOf('=');
+            if (cut <= 0) continue;
+            modules.push({ name: pair.slice(0, cut), url: pair.slice(cut + 1) });
+        }
+        return modules;
+    }
+
+    // vpnLoadModules loads each declared module once, in declaration order, and
+    // resolves when they are all present. A module that is already registered - by
+    // an earlier load, or because the shell included it - resolves immediately, so a
+    // repeat activation costs no request and a double include cannot happen.
+    function vpnLoadModules(modules) {
+        var pending = [];
+        for (var i = 0; i < modules.length; i++) {
+            pending.push(vpnLoadModule(modules[i]));
+        }
+        return Promise.all(pending).then(function () { return true; });
+    }
+
+    function vpnLoadModule(module) {
+        if (!module || !module.name) return Promise.resolve(false);
+        if (typeof vpnModuleRegistered === 'function' && vpnModuleRegistered(module.name)) {
+            return Promise.resolve(true);
+        }
+        if (moduleLoads[module.name]) return moduleLoads[module.name];
+        if (!module.url || typeof document === 'undefined' || !document.createElement) {
+            return Promise.resolve(false);
+        }
+        var promise = new Promise(function (resolve) {
+            var script = document.createElement('script');
+            script.src = module.url;
+            // A classic blocking script, like the ones the shell ships: the module
+            // must be evaluated before the controller that uses it, and the order of
+            // the declared pairs is the dependency order.
+            var done = function (ok) {
+                moduleLoads[module.name] = null;
+                resolve(ok);
+            };
+            script.onload = function () { done(true); };
+            script.onerror = function () { done(false); };
+            (document.body || document.documentElement).appendChild(script);
+            // A module that fails to arrive must not strand activation: the section
+            // starts with what it has and its controls state the failure themselves.
+            if (typeof script.addEventListener !== 'function' && typeof script.onload !== 'function') done(false);
+        });
+        moduleLoads[module.name] = promise;
+        return promise;
     }
 
     // ---- Rail geometry -------------------------------------------------------
@@ -190,21 +270,32 @@
 
     // ---- Activation ----------------------------------------------------------
 
-    // vpnMountSection starts a section's controllers once. A second jump, a second
-    // fragment or a re-entry returns the existing work instead of binding a second
-    // listener or starting a second poll over the same elements.
+    // vpnSectionElementFor finds the element that CARRIES a section's activation
+    // metadata. It is the same element whose data-vpn-section names the section, so
+    // an observer, a focus target and a declared module list all read one node. The
+    // heading is a different element: it is the landing destination, not the surface.
+    function vpnSectionElementFor(section) {
+        if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
+        var candidates = document.querySelectorAll('[data-vpn-section]');
+        for (var i = 0; i < candidates.length; i++) {
+            if (candidates[i].getAttribute('data-vpn-section') === section) return candidates[i];
+        }
+        return null;
+    }
+
+    // vpnMountSection loads a section's controllers and starts them once. A second
+    // jump, a second fragment or a re-entry returns the existing work instead of
+    // binding a second listener or starting a second poll over the same elements.
     function vpnMountSection(section) {
-        if (section === 'backends') {
-            if (mounted.backends) return Promise.resolve();
-            mounted.backends = true;
-            return vpnStartBackends();
-        }
-        if (section === 'diagnostics') {
-            if (mounted.diagnostics) return Promise.resolve();
-            mounted.diagnostics = true;
-            return vpnStartDiagnostics();
-        }
-        return Promise.resolve();
+        if (section !== 'backends' && section !== 'diagnostics') return Promise.resolve();
+        if (mounting[section]) return mounting[section];
+        var surface = vpnSectionElementFor(section);
+        var activation = vpnLoadModules(vpnDeclaredModules(surface)).then(function () {
+            mounted[section] = true;
+            return section === 'backends' ? vpnStartBackends() : vpnStartDiagnostics();
+        });
+        mounting[section] = activation;
+        return activation;
     }
 
     function vpnStartBackends() {
@@ -230,7 +321,9 @@
         sessionPollStarted = true;
         if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.poll === 'function') {
             // Sessions are the only read this section adds; the forwarder health it
-            // renders comes from the Overview's status sample.
+            // renders comes from the Overview's status sample. This stream is also
+            // the only sessions consumer, so one request per cadence serves every
+            // surface that shows the table.
             NexusTelemetry.poll('vpn-sessions', async function () {
                 await vpnLoadSessions();
                 vpnRenderSessionsFromCache();
@@ -239,11 +332,24 @@
         return Promise.resolve();
     }
 
+    // vpnActivateAdvanced loads the module the Advanced Diagnostics panel declares
+    // and nothing else. The panel is closed on ordinary arrival, so its chart module
+    // is not requested until the operator (or a deep link) actually opens it.
+    function vpnActivateAdvanced() {
+        var panel = byId('vpn-diagnostics');
+        return vpnLoadModules(vpnDeclaredModules(panel));
+    }
+
     // ---- The single status tick ---------------------------------------------
 
     // vpnTickOnce is one pass of the page's shared measurement: the Overview load
-    // reads the status and the configuration, the same status object paints the
-    // health headline, and only the sections that are mounted add their own reads.
+    // reads the status and the configuration, and the same status object paints the
+    // health headline immediately.
+    //
+    // The sessions read is deliberately NOT awaited here. It belongs to the sessions
+    // stream, which renders its own table when it completes; awaiting it made the
+    // health headline and the whole tick wait on another section's request, so a
+    // slow or failing sessions read froze the essential picture.
     async function vpnTickOnce() {
         var status = null;
         try {
@@ -251,18 +357,8 @@
         } catch (_) {
             status = null;
         }
-        // Diagnostics' sessions are read after the status so the renderer that runs
-        // below finds them cached rather than stating an unavailable read.
-        if (mounted.diagnostics && typeof vpnLoadSessions === 'function') {
-            try {
-                await vpnLoadSessions();
-            } catch (_) {}
-        }
         if (typeof vpnRenderForwarderHealth === 'function') {
             vpnRenderForwarderHealth(status);
-        }
-        if (mounted.diagnostics && typeof vpnRenderSessionsFromCache === 'function') {
-            vpnRenderSessionsFromCache();
         }
         releaseFirstTickWaiters();
         return status;
@@ -282,7 +378,9 @@
             firstTickWaiters.push(resolve);
             // A tick that never completes must not strand the page: the timeout lands
             // anyway, with whatever the document shows.
-            window.setTimeout(resolve, 4000);
+            if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+                window.setTimeout(resolve, 4000);
+            }
         });
     }
 
@@ -331,10 +429,26 @@
         return target;
     }
 
-    // vpnLandOnFragment mounts the owning section, then lands on the canonical
-    // target. A section id (the rail's own href) lands on the section heading even
-    // though the section element itself is not focusable.
+    // vpnLandOnInspect honours a one-shot Inspect arrival. The fragment names a
+    // navigation identity rather than a node, so only a completed successful
+    // inventory read can say whether the named backend is there: the section is
+    // mounted, the inventory is read, and the landing that consumes the request runs
+    // from that read. A fragment whose request is gone (a reload, a bookmark, Back)
+    // leaves the reader on the inventory heading.
+    async function vpnLandOnInspect() {
+        await vpnMountSection('backends');
+        if (typeof vpnLoadBackends !== 'function') return null;
+        await vpnLoadBackends();
+        return 'inspect';
+    }
+
+    // vpnLandOnFragment mounts the owning section, then lands on the resolver's
+    // canonical target. A section id (the rail's own href) lands on the section
+    // heading even though the section element itself is not focusable.
     async function vpnLandOnFragment(hash, source) {
+        if (typeof vpnIsInspectFragment === 'function' && vpnIsInspectFragment(hash)) {
+            return vpnLandOnInspect();
+        }
         if (typeof vpnResolveFragment !== 'function') return null;
         var resolved = vpnResolveFragment(hash);
         if (!resolved) return null;
@@ -343,19 +457,21 @@
         // Each section's own landing function owns the details only it knows: the
         // configuration reveal and the dialog-opener canonicalisation for Overview,
         // the table reveal and Inspect consumption for Backends, the panel and fold
-        // reveal for Diagnostics.
+        // reveal for Diagnostics. The CANONICAL target travels with the call: a
+        // legacy id whose node this document no longer has still lands where the id
+        // means, instead of being looked up by its removed raw id.
         if (resolved.section === 'backends' && typeof vpnApplyBackendsLanding === 'function') {
-            vpnApplyBackendsLanding();
+            vpnApplyBackendsLanding(resolved.target);
             vpnMarkSection();
             return resolved.target;
         }
         if (resolved.section === 'diagnostics' && typeof vpnApplyDiagnosticsAnchor === 'function') {
-            vpnApplyDiagnosticsAnchor();
+            vpnApplyDiagnosticsAnchor(resolved.target);
             vpnMarkSection();
             return resolved.target;
         }
         if (resolved.section === 'overview' && typeof vpnLandOverviewAnchor === 'function') {
-            vpnLandOverviewAnchor();
+            vpnLandOverviewAnchor(resolved.target);
             vpnMarkSection();
             return resolved.target;
         }
@@ -392,7 +508,7 @@
         if (!section) return null;
         var hash = loc.hash || '';
         var resolved = (typeof vpnResolveFragment === 'function') ? vpnResolveFragment(hash) : null;
-        var canonical = '#' + (resolved ? resolved.target : section);
+        var canonical = '#' + (resolved ? resolved.target : (hash.length > 1 ? hash.slice(1) : section));
         var search = loc.search.replace(/[?&]section=[A-Za-z]+/, '').replace(/^&/, '');
         if (search === '?') search = '';
         window.history.replaceState(window.history.state, '', loc.pathname + search + canonical);
@@ -453,9 +569,53 @@
         });
     }
 
+    // vpnActiveSection activates the section a node belongs to. Focus and press
+    // activation go through the SAME idempotent mount a jump uses, so a keyboard
+    // reader tabbing into the inventory gets real rows rather than a control that
+    // answers a press with nothing.
+    function vpnActiveSection(node) {
+        if (!node || typeof node.closest !== 'function') return null;
+        var surface = node.closest('[data-vpn-section]');
+        if (!surface || typeof surface.getAttribute !== 'function') return null;
+        var section = surface.getAttribute('data-vpn-section');
+        if (!section) return null;
+        vpnMountSection(section);
+        return section;
+    }
+
+    // vpnBindEarlyActivation activates a section as soon as the reader reaches it
+    // without scrolling into range: focus or a press that lands inside a section is
+    // an arrival at that section, whether or not the observer has fired yet.
+    //
+    // A press that arrives while its section's controllers are still being fetched
+    // would otherwise be answered by nobody - the control looks live and does
+    // nothing. It is replayed ONCE the module that owns it is present, through the
+    // element's own click, so the action runs exactly as the reader asked.
+    function vpnBindEarlyActivation() {
+        on(document, 'focusin', function (event) {
+            vpnActiveSection(event.target);
+        });
+        on(document, 'click', function (event) {
+            var control = event.target && event.target.closest
+                ? event.target.closest('[data-action]')
+                : null;
+            if (!control) return;
+            var surface = control.closest ? control.closest('[data-vpn-section]') : null;
+            if (!surface || typeof surface.getAttribute !== 'function') return;
+            var section = surface.getAttribute('data-vpn-section');
+            if (!section || mounted[section]) return;
+            vpnMountSection(section).then(function () {
+                if (!control.isConnected) return;
+                if (typeof control.click === 'function') control.click();
+            });
+        }, true);
+    }
+
     // vpnObserveSections starts a section's controllers when its surface comes near
-    // the viewport. The observer never lands or focuses; only a jump, a fragment or
-    // an Inspect does that.
+    // the viewport. It observes the element that CARRIES the section metadata and
+    // reads the section name from that same element: observing a heading that
+    // carries no attribute is how the inventory stayed on its loading row. The
+    // observer never lands or focuses; only a jump, a fragment or an Inspect does.
     function vpnObserveSections() {
         if (typeof IntersectionObserver !== 'function') {
             // Without an observer there is no cheap "is it near" test, so the two
@@ -469,16 +629,15 @@
                 if (!entries[i].isIntersecting) continue;
                 var el = entries[i].target;
                 var section = el.getAttribute ? el.getAttribute('data-vpn-section') : null;
-                if (section) {
-                    vpnMountSection(section);
-                    observer.unobserve(el);
-                }
+                if (!section) continue;
+                vpnMountSection(section);
+                observer.unobserve(el);
             }
         }, { rootMargin: '300px 0px 300px 0px' });
-        var backends = byId('backends');
-        if (backends) observer.observe(backends);
-        var diagnostics = byId('diagnostics-region');
-        if (diagnostics) observer.observe(diagnostics);
+        var surfaces = (typeof document.querySelectorAll === 'function')
+            ? document.querySelectorAll('[data-vpn-section]')
+            : [];
+        for (var i = 0; i < surfaces.length; i++) observer.observe(surfaces[i]);
     }
 
     async function vpnBoot() {
@@ -488,6 +647,7 @@
         vpnBindRail();
         vpnBindScrollMarker();
         vpnBindHashChange();
+        vpnBindEarlyActivation();
 
         // A retired child route's marker is consumed before anything reads the
         // fragment, so this arrival has exactly one destination.
@@ -514,6 +674,10 @@
     if (typeof window !== 'undefined') {
         window.vpnBoot = vpnBoot;
         window.vpnMountSection = vpnMountSection;
+        window.vpnLoadModules = vpnLoadModules;
+        window.vpnDeclaredModules = vpnDeclaredModules;
+        window.vpnActivateAdvanced = vpnActivateAdvanced;
+        window.vpnSectionElementFor = vpnSectionElementFor;
         window.vpnLandOnSection = vpnLandOnSection;
         window.vpnLandOnFragment = vpnLandOnFragment;
         window.vpnMarkSection = vpnMarkSection;

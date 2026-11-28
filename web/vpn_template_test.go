@@ -10,28 +10,53 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"golang.org/x/net/html"
 )
 
-// vpnScriptsByPage is the synchronous chain the VPN page loads, in evaluation
+// vpnScriptsByPage is the script chain the shell loads UP FRONT, in evaluation
 // order. The merged page is one document again, so there is one entry: the resolver,
-// the shared helpers, each section's controllers, and the boot that activates them.
+// the shared helpers, the Overview controller, the health renderers the status tick
+// paints with, and the boot that activates everything else.
+//
+// The section controllers are NOT here. They are declared on the element that needs
+// them (data-vpn-modules) and are fetched when that surface is activated, which is
+// what keeps an unopened Backends card or Advanced panel from blocking the essential
+// read. vpnDeferredModulesBySection is the other half of this contract.
 var vpnScriptsByPage = map[string][]string{
 	"vpn": {
 		"/static/js/vpn/anchor_handoff.js",
 		"/static/js/vpn/common.js",
 		"/static/js/vpn/overview.js",
-		"/static/js/vpn/backends.js",
-		"/static/js/vpn/backends_page.js",
 		"/static/js/vpn/health_problems.js",
 		"/static/js/vpn/health_summary.js",
-		"/static/js/vpn/charts.js",
-		"/static/js/vpn/sessions.js",
-		"/static/js/vpn/diagnostics_page.js",
 		"/static/js/vpn/page.js",
+	},
+}
+
+// vpnDeferredModulesByTarget is every controller the shell does NOT load up front,
+// keyed by the element that declares it. The order inside each entry is the
+// dependency order: backends_page.js drives backends.js, and diagnostics_page.js
+// drives the sessions table. The chart module belongs to the Advanced disclosure
+// alone, so it is not requested until that panel is opened.
+var vpnDeferredModulesByTarget = map[string]struct {
+	element string
+	modules []string
+}{
+	"backends": {
+		element: "backends-region",
+		modules: []string{"/static/js/vpn/backends.js", "/static/js/vpn/backends_page.js"},
+	},
+	"diagnostics": {
+		element: "diagnostics-region",
+		modules: []string{"/static/js/vpn/sessions.js", "/static/js/vpn/diagnostics_page.js"},
+	},
+	"advanced": {
+		element: "vpn-diagnostics",
+		modules: []string{"/static/js/vpn/charts.js"},
 	},
 }
 
@@ -439,7 +464,7 @@ func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 	rendered := renderVPNPage(t, "vpn")
 	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn")
 
-	target := emittedSrcAttr(t, rendered, "/static/js/vpn/backends.js")
+	target := emittedSrcAttr(t, rendered, "/static/js/vpn/health_summary.js")
 	mutated := strings.Replace(rendered, target, withExtraAttribute(target, "async"), 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply async mutation")
@@ -452,7 +477,7 @@ func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 		t.Fatalf("expected error mentioning 'async', got: %v", err)
 	}
 
-	blockTarget := emittedSrcAttr(t, scriptsBlock, "/static/js/vpn/backends.js")
+	blockTarget := emittedSrcAttr(t, scriptsBlock, "/static/js/vpn/health_summary.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blockTarget, withExtraAttribute(blockTarget, "async"), 1)
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply async mutation to scripts block")
@@ -517,11 +542,11 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	rendered := renderVPNPage(t, "vpn")
 
-	// Swap backends.js and backends_page.js on the inventory document, keeping
-	// each element's own identity query with it: the order is what this rejects,
-	// not the URLs. backends_page.js must follow the controller it drives.
-	b1 := emittedScriptTag(t, rendered, "/static/js/vpn/backends.js")
-	b2 := emittedScriptTag(t, rendered, "/static/js/vpn/backends_page.js")
+	// Swap two eager modules, keeping each element's own identity query with it: the
+	// order is what this rejects, not the URLs. overview.js must precede the health
+	// renderers the shared status tick paints with.
+	b1 := emittedScriptTag(t, rendered, "/static/js/vpn/overview.js")
+	b2 := emittedScriptTag(t, rendered, "/static/js/vpn/health_problems.js")
 	mutated := strings.Replace(rendered, b1, "__PLACEHOLDER__", 1)
 	mutated = strings.Replace(mutated, b2, b1, 1)
 	mutated = strings.Replace(mutated, "__PLACEHOLDER__", b2, 1)
@@ -533,8 +558,8 @@ func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	}
 
 	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn")
-	blk1 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends.js")
-	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends_page.js")
+	blk1 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/overview.js")
+	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/health_problems.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blk1, "__PLACEHOLDER__", 1)
 	mutatedBlock = strings.Replace(mutatedBlock, blk2, blk1, 1)
 	mutatedBlock = strings.Replace(mutatedBlock, "__PLACEHOLDER__", blk2, 1)
@@ -555,13 +580,16 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 		targetSrc string
 		attr      string
 	}{
-		{"Defer", `/static/js/vpn/charts.js`, `defer`},
-		{"ModuleLowercase", `/static/js/vpn/sessions.js`, `type="module"`},
-		{"ModuleUppercase", `/static/js/vpn/sessions.js`, `type="MODULE"`},
-		{"ModuleWhitespace", `/static/js/vpn/sessions.js`, `type=" module"`},
-		{"ApplicationJSON", `/static/js/vpn/sessions.js`, `type="application/json"`},
-		{"TextPlain", `/static/js/vpn/sessions.js`, `type="text/plain"`},
-		{"NoModule", `/static/js/vpn/sessions.js`, `nomodule`},
+		// These mutants apply to an EAGER script: a deferred controller is not in
+		// the emitted script block at all, so mutating it here would prove nothing
+		// (and emittedSrcAttr fails loudly rather than passing vacuously).
+		{"Defer", `/static/js/vpn/page.js`, `defer`},
+		{"ModuleLowercase", `/static/js/vpn/health_summary.js`, `type="module"`},
+		{"ModuleUppercase", `/static/js/vpn/health_summary.js`, `type="MODULE"`},
+		{"ModuleWhitespace", `/static/js/vpn/health_summary.js`, `type=" module"`},
+		{"ApplicationJSON", `/static/js/vpn/health_summary.js`, `type="application/json"`},
+		{"TextPlain", `/static/js/vpn/health_summary.js`, `type="text/plain"`},
+		{"NoModule", `/static/js/vpn/health_summary.js`, `nomodule`},
 	}
 
 	for _, tc := range typeMutants {
@@ -834,4 +862,128 @@ func TestStaticVPNScriptHTTPServing(t *testing.T) {
 			t.Errorf("expected HTTP 404 for non-existent asset, got %d", resp.StatusCode)
 		}
 	})
+}
+
+// vpnDeclaredModulePairs reads the "name=url" pairs an element declares for deferred
+// loading, in the declared order. It is the test's own reader of the SHIPPED markup:
+// the boot reads the same attribute, so a declaration that stops being emitted fails
+// here even though the module file still exists.
+func vpnDeclaredModulePairs(t *testing.T, markup, elementID string) []string {
+	t.Helper()
+	doc, err := html.Parse(strings.NewReader(markup))
+	if err != nil {
+		t.Fatalf("parse rendered vpn page: %v", err)
+	}
+	var target *html.Node
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if target != nil {
+			return
+		}
+		if n.Type == html.ElementNode {
+			if id, ok := getAttr(n, "id"); ok && id == elementID {
+				target = n
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	if target == nil {
+		t.Fatalf("the rendered page has no element #%s to declare deferred modules on", elementID)
+	}
+	declared, ok := getAttr(target, "data-vpn-modules")
+	if !ok {
+		t.Fatalf("#%s declares no data-vpn-modules, so nothing would ever load its controller", elementID)
+	}
+	return strings.Fields(declared)
+}
+
+// TestVPNPageDefersSectionControllers is the delivery regression for lazy loading.
+//
+// The shell is rendered and the SCRIPT TAGS it actually emits are read: a controller
+// that returns to a parser-blocking <script> in the head fails here even though every
+// module still exists and every other test still finds it. The opposite error is
+// covered too - a controller that is removed from the head but never declared for
+// loading would leave its section permanently dead, so each deferred module must be
+// declared on the element that needs it, in dependency order.
+//
+// The chart module is held to the same rule and named explicitly: it belongs to the
+// Advanced Diagnostics disclosure, so opening Backends or reaching Diagnostics must
+// not fetch it.
+func TestVPNPageDefersSectionControllers(t *testing.T) {
+	rendered := renderBaseAndVPNTemplate(t)
+	eager := scriptSrcs(t, renderVPNScriptsBlock(t))
+
+	eagerPaths := make([]string, 0, len(eager))
+	for _, src := range eager {
+		path, _, _ := strings.Cut(src, "?")
+		eagerPaths = append(eagerPaths, path)
+	}
+	if !slices.Equal(eagerPaths, vpnScriptsByPage["vpn"]) {
+		t.Fatalf("the shell loads %v up front, want %v", eagerPaths, vpnScriptsByPage["vpn"])
+	}
+
+	for target, declaration := range vpnDeferredModulesByTarget {
+		t.Run(target, func(t *testing.T) {
+			declared := vpnDeclaredModulePairs(t, rendered, declaration.element)
+			var gotPaths []string
+			for _, pair := range declared {
+				name, url, ok := strings.Cut(pair, "=")
+				if !ok || name == "" || url == "" {
+					t.Fatalf("#%s declares %q, which is not a name=url pair", declaration.element, pair)
+				}
+				path, query, hasQuery := strings.Cut(url, "?")
+				if !hasQuery {
+					t.Fatalf("#%s declares %s without a cache identity, so a browser that cached the "+
+						"predecessor keeps running it", declaration.element, path)
+				}
+				want, err := AssetURL(path)
+				if err != nil {
+					t.Fatalf("AssetURL(%s): %v", path, err)
+				}
+				if url != want {
+					t.Fatalf("#%s declares %s at %q, want the digest of its own bytes %q",
+						declaration.element, path, url, want)
+				}
+				if !hasQuery || path == "" {
+					t.Fatalf("unusable declaration %q", pair)
+				}
+				_ = query
+				gotPaths = append(gotPaths, path)
+			}
+			if !slices.Equal(gotPaths, declaration.modules) {
+				t.Fatalf("#%s declares %v; want %v in dependency order",
+					declaration.element, gotPaths, declaration.modules)
+			}
+			// A controller cannot be in both halves: loading it eagerly while also
+			// declaring it deferred would fetch it twice and prove neither rule.
+			for _, path := range declaration.modules {
+				if slices.Contains(vpnScriptsByPage["vpn"], path) {
+					t.Fatalf("%s is loaded up front AND declared deferred on #%s; one of the two is stale",
+						path, declaration.element)
+				}
+			}
+		})
+	}
+
+	// Every module the build ships is in exactly one of the two halves. A file that is
+	// in neither would never load at all.
+	accounted := map[string]bool{}
+	for _, path := range vpnScriptsByPage["vpn"] {
+		accounted[path] = true
+	}
+	for _, declaration := range vpnDeferredModulesByTarget {
+		for _, path := range declaration.modules {
+			accounted[path] = true
+		}
+	}
+	for _, path := range canonicalVPNScripts {
+		if !accounted[path] {
+			t.Errorf("%s is neither loaded up front nor declared for deferred loading, so nothing "+
+				"ever evaluates it", path)
+		}
+	}
 }

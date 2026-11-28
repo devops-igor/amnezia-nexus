@@ -255,6 +255,20 @@
         return id;
     }
 
+    // VPN_INSPECT_FRAGMENT is the arrival identity an Inspect writes. It is not an
+    // element id and it is deliberately NOT in the allowlist above: it names a
+    // one-shot request, which the backends section is the only thing that can honour.
+    // Claiming it here as an id would make the resolver answer for a node that does
+    // not exist, so it is recognised as its own family instead.
+    var VPN_INSPECT_FRAGMENT = /^#vpn-inspect-[a-f0-9]{32}$/;
+
+    // vpnIsInspectFragment reports whether a fragment is an Inspect arrival. Its
+    // caller mounts Backends and lets the completed inventory read consume the
+    // request, because only a SUCCESSFUL read can say whether the row is there.
+    function vpnIsInspectFragment(hash) {
+        return typeof hash === 'string' && VPN_INSPECT_FRAGMENT.test(hash);
+    }
+
     // vpnResolveFragment maps a fragment to the section that owns it and the id the
     // landing should focus. An id this page does not know returns null, and the
     // caller then leaves the page where the browser put it.
@@ -282,6 +296,7 @@
         window.vpnSectionForId = vpnSectionForId;
         window.vpnCanonicalAnchorId = vpnCanonicalAnchorId;
         window.vpnResolveFragment = vpnResolveFragment;
+        window.vpnIsInspectFragment = vpnIsInspectFragment;
         window.vpnSectionFromMarker = vpnSectionFromMarker;
         window.vpnSectionHeadingId = vpnSectionHeadingId;
     }

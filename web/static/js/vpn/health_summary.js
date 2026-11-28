@@ -33,6 +33,74 @@ function vpnFormatHealthTime(val) {
     }
 }
 
+// vpnRenderCumulativeTotals writes the two since-reset aggregate transfer totals
+// that live in Advanced Diagnostics, from the status sample the page already has.
+//
+// It is the ONLY writer of #vpn-rx and #vpn-tx, and the shared status tick reaches
+// it through vpnRenderForwarderHealth. While these were written by the diagnostics
+// loader - which the merged page never calls - both readouts stayed on the "-" the
+// template ships: a permanently blank pair of totals, on the normal production path,
+// for a page whose whole point is that no former readout was lost. One writer, called
+// from the render path every status sample already goes through, is what keeps them
+// connected without adding a second status read.
+//
+// A measured zero is a measurement and renders as one. An unavailable forwarder, or a
+// sample that carries no numeric total, is not a measurement and keeps the "-"
+// placeholder rather than asserting a zero nobody read.
+function vpnRenderCumulativeTotals(status) {
+    const available = !!status && typeof status === 'object' && status.forwarder_available !== false;
+    const rx = available && vpnSignalMeasured(status.rx_bytes) ? status.rx_bytes : null;
+    const tx = available && vpnSignalMeasured(status.tx_bytes) ? status.tx_bytes : null;
+    const format = function (bytes) {
+        return (typeof Telemetry !== 'undefined' && Telemetry && typeof Telemetry.formatBytes === 'function')
+            ? Telemetry.formatBytes(bytes)
+            : String(bytes);
+    };
+    vpnAssignText(document.getElementById('vpn-rx'), rx === null ? '-' : format(rx));
+    vpnAssignText(document.getElementById('vpn-tx'), tx === null ? '-' : format(tx));
+}
+
+// vpnTechnicalVisible reports whether the Advanced Diagnostics disclosure is open.
+// The disclosure is the one owner of that state (vpnSetDiagnosticsOpen), so it is
+// read from the panel rather than tracked a second time: a second copy of the flag
+// is how a closed panel keeps costing work, or an open one stops painting.
+function vpnTechnicalVisible() {
+    const panel = document.getElementById('vpn-diagnostics');
+    return !!panel && panel.hidden === false;
+}
+
+// vpnRenderTechnicalDetail paints the technical rows and, while the disclosure is
+// open, the historical charts from the sample the page already holds.
+//
+// The rows are plain text assignments into markup that already exists; they are
+// written from the shared sample so an opened panel is never stale, and they are what
+// the operator reads the moment it opens. The CHARTS are the expensive part - they
+// synthesise SVG, attach hover overlays and dispose chart interactions - so they are
+// drawn only while the panel is visible. That is the work the finding measured:
+// before this guard, every successful tick built chart SVG for a panel nobody had
+// opened, on an ordinary arrival.
+function vpnRenderTechnicalDetail(status) {
+    if (!status || typeof status !== 'object') return;
+    const cap = Number(status.forwarder_queue_capacity || 0);
+    const occ = Number(status.forwarder_queue_occupancy || 0);
+    const peak = Number(status.forwarder_queue_high_water || 0);
+    if (typeof vpnRenderTechDiagnosticCards === 'function') {
+        vpnRenderTechDiagnosticCards(status, {
+            cap: cap,
+            occ: occ,
+            peak: peak,
+            dropsQueueFull: Number(status.forwarder_drops_queue_full || 0),
+            dropsNoRoute: Number(status.forwarder_drops_no_route || 0),
+            dropsOversize: Number(status.forwarder_drops_packet_too_large || 0),
+            fmtBps: vpnFormatHealthBps,
+            fmtPps: vpnFormatHealthPps
+        });
+    }
+    if (vpnTechnicalVisible() && typeof vpnRenderHistoryCharts === 'function' && status.historical_series) {
+        vpnRenderHistoryCharts(status.historical_series);
+    }
+}
+
 // vpnRenderRestoredAggregates restores the four aggregate diagnostics that #955
 // left without any UI consumer. Each one lived in a retired KPI tile; every
 // surviving read of the same field is per-backend or per-route, which does not
@@ -90,6 +158,12 @@ function vpnRenderStallsTotal(latency) {
 
 // vpnSetDiagnosticsOpen is the ONLY writer of #vpn-diagnostics visibility. It is
 // called from explicit operator controls, so polling cannot change it.
+//
+// Opening it is also the moment the deferred chart module becomes legitimate: the
+// panel declares it in data-vpn-modules, so it is requested on open (and only then),
+// and the technical detail is painted from the status sample the page already holds.
+// Closing it disposes the chart interactions, so a closed panel keeps no hover
+// handlers alive; it never stops the Overview.
 function vpnSetDiagnosticsOpen(open, focusTarget) {
     const panel = document.getElementById('vpn-diagnostics');
     const entry = document.getElementById('vpn-advanced-entry');
@@ -97,12 +171,36 @@ function vpnSetDiagnosticsOpen(open, focusTarget) {
     vpnDiagnosticsOpen = !!open;
     panel.hidden = !vpnDiagnosticsOpen;
     entry.setAttribute('aria-expanded', String(vpnDiagnosticsOpen));
+    if (vpnDiagnosticsOpen) {
+        // Paint from the sample already held, then again once the deferred module has
+        // arrived. A host without the page boot (this section rendered on its own)
+        // has no loader, and simply paints immediately with whatever module set it has.
+        if (typeof vpnRenderTechnicalDetail === 'function') vpnRenderTechnicalDetail(vpnCurrentStatusSample());
+        if (typeof vpnActivateAdvanced === 'function') {
+            vpnActivateAdvanced().then(function () {
+                if (!vpnDiagnosticsOpen) return;
+                if (typeof vpnRenderTechnicalDetail === 'function') vpnRenderTechnicalDetail(vpnCurrentStatusSample());
+            });
+        }
+    } else if (typeof vpnDisposeChartInteractions === 'function') {
+        vpnDisposeChartInteractions(true);
+    }
     if (focusTarget === 'panel') {
         const title = document.getElementById('vpn-diagnostics-title');
         if (title && typeof title.focus === 'function') title.focus();
     } else if (focusTarget === 'entry' && typeof entry.focus === 'function') {
         entry.focus();
     }
+}
+
+// vpnCurrentStatusSample returns the last successful status payload this page
+// rendered, which is what a disclosure opened between two ticks paints from. It
+// reads the same variable the health renderer assigns, so an open panel and a fresh
+// poll can never describe different samples.
+function vpnCurrentStatusSample() {
+    if (typeof vpnLastStatus !== 'undefined' && vpnLastStatus) return vpnLastStatus;
+    if (typeof window !== 'undefined' && window.vpnLastStatus) return window.vpnLastStatus;
+    return null;
 }
 
 function vpnToggleDiagnostics() {
@@ -526,23 +624,18 @@ function vpnRenderForwarderHealth(status) {
 
     vpnRenderRestoredAggregates(status);
 
-    // Delegate the technical detail panels and the historical charts. They live
-    // inside the Advanced Diagnostics disclosure, whose open state is never
-    // touched here.
-    vpnRenderTechDiagnosticCards(status, {
-        cap: cap,
-        occ: occ,
-        peak: peak,
-        dropsQueueFull: dropsQueueFull,
-        dropsNoRoute: dropsNoRoute,
-        dropsOversize: dropsOversize,
-        fmtBps: vpnFormatHealthBps,
-        fmtPps: vpnFormatHealthPps
-    });
+    // The since-reset transfer totals live in Advanced Diagnostics but they are
+    // painted from THIS sample, not from a diagnostics-only load: the shared tick is
+    // the only path production takes, so a writer it never reaches is a blank
+    // readout. It runs whether or not the disclosure is open, because the value
+    // belongs to the sample rather than to the panel's visibility.
+    vpnRenderCumulativeTotals(status);
 
-    if (typeof vpnRenderHistoryCharts === 'function' && status.historical_series) {
-        vpnRenderHistoryCharts(status.historical_series);
-    }
+    // Technical detail is painted from this sample. The rows are text assignments into
+    // markup that already exists, so an opened panel is never stale; the charts are
+    // drawn only while the panel is actually open, which is the work an unopened
+    // disclosure used to cost on every tick.
+    vpnRenderTechnicalDetail(status);
 
     if (typeof vpnLastSessions !== 'undefined' && vpnLastSessions && Array.isArray(vpnLastSessions.sessions)) {
         if (typeof renderSessions === 'function') {
@@ -563,6 +656,10 @@ function vpnRenderForwarderHealth(status) {
 
 if (typeof window !== 'undefined') {
     window.vpnRenderForwarderHealth = vpnRenderForwarderHealth;
+    window.vpnRenderCumulativeTotals = vpnRenderCumulativeTotals;
+    window.vpnRenderTechnicalDetail = vpnRenderTechnicalDetail;
+    window.vpnTechnicalVisible = vpnTechnicalVisible;
+    window.vpnCurrentStatusSample = vpnCurrentStatusSample;
     window.vpnSetDiagnosticsOpen = vpnSetDiagnosticsOpen;
     window.vpnToggleDiagnostics = vpnToggleDiagnostics;
     window.vpnCloseDiagnostics = vpnCloseDiagnostics;
@@ -572,3 +669,8 @@ if (typeof window !== 'undefined') {
     window.vpnRenderQueueDwell = vpnRenderQueueDwell;
     window.vpnRenderStallsTotal = vpnRenderStallsTotal;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('health_summary');

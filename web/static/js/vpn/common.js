@@ -246,6 +246,23 @@ function vpnOwnedAnchorId() {
     return id;
 }
 
+// vpnModuleRegistry names the modules that have been evaluated in this document.
+// The page boot loads a section's controllers on demand and needs to know whether a
+// module is already present - included eagerly by a shell, loaded earlier, or
+// assembled by a test harness - so it does not fetch a second copy. Each module
+// registers ITSELF here at load, so the answer cannot drift from what was actually
+// evaluated: a name is present exactly when its file ran.
+var VPN_REGISTERED_MODULES = {};
+
+function vpnMarkModule(name) {
+    if (!name) return;
+    VPN_REGISTERED_MODULES[String(name)] = true;
+}
+
+function vpnModuleRegistered(name) {
+    return !!name && VPN_REGISTERED_MODULES[String(name)] === true;
+}
+
 // vpnBindSharedActions binds the actions more than one section dispatches. It
 // takes the DOCUMENT, not a section's content root: the control belongs to the page,
 // and a binding that waited for a section's own root would fire twice when two
@@ -280,6 +297,8 @@ try {
 
 if (typeof window !== 'undefined') {
     window.vpnBindSharedActions = vpnBindSharedActions;
+    window.vpnMarkModule = vpnMarkModule;
+    window.vpnModuleRegistered = vpnModuleRegistered;
     window.vpnAssignText = vpnAssignText;
     window.vpnDiagText = vpnDiagText;
     window.vpnFormatApiError = vpnFormatApiError;

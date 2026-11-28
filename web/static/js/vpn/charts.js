@@ -646,3 +646,18 @@ if (typeof window !== 'undefined') {
     window.vpnRenderHistoryCharts = vpnRenderHistoryCharts;
     window.vpnSetHistoryWindow = vpnSetHistoryWindow;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('charts');
+
+// A module loaded on demand arrives AFTER the status sample that justified loading
+// it, so the panel it was fetched for is painted from the sample already held. This
+// is the deferred half of "opening Advanced renders its charts": the disclosure's
+// setter paints immediately with whatever it has and then again here, so the charts
+// appear once the bytes are there instead of waiting for the next poll.
+if (typeof window !== 'undefined' && typeof vpnTechnicalVisible === 'function' && vpnTechnicalVisible()) {
+    const held = (typeof vpnCurrentStatusSample === 'function') ? vpnCurrentStatusSample() : null;
+    if (held && typeof vpnRenderTechnicalDetail === 'function') vpnRenderTechnicalDetail(held);
+}

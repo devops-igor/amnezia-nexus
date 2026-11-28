@@ -455,6 +455,9 @@ vpnLastStatus = { forwarder_available: true, historical_series: series };
 const seen = [];
 const original = vpnGenerateSparklineSVG;
 vpnGenerateSparklineSVG = (values, ...rest) => { seen.push(values); return original(values, ...rest); };
+// Ranges belong to the open panel: a closed disclosure draws no chart, so the
+// operator opens Advanced first and then switches range.
+vpnSetDiagnosticsOpen(true);
 for (const [win, expected] of [['1h', 2], ['24h', 3], ['15m', 1]]) {
     seen.length = 0;
     vpnSetHistoryWindow(win);
@@ -494,6 +497,7 @@ vpnRenderForwarderHealth({
 assert(el('vpn-diag-drop-reasons').children.length > 0, 'drop reasons render');
 assert(el('vpn-diag-routing-counts').textContent.includes('3'), 'route integrity renders');
 assert(el('vpn-diag-engine-status').textContent.includes('VirtualTUN'), 'engine state renders');
+vpnSetDiagnosticsOpen(true);
 const reasonHistory = el('vpn-chart-reasons');
 assert(reasonHistory.children.length > 0, 'reason history renders one series per reported reason');
 assert(reasonHistory.textContent.includes('drops/s'), 'the reason series is labelled as a rate: ' + reasonHistory.textContent);

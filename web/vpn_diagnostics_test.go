@@ -134,7 +134,14 @@ func TestVPNDiagnosticsTemplateDOMOracle(t *testing.T) {
 	fixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
 	source := []byte(fixture.CombinedSource())
 	mutated := strings.Replace(string(source), `id="vpn-diag-throughput"`, `id="vpn-diag-throughput-typo"`, 1)
-	script := vpnDiagnosticsHealthScript(t, mutated, `vpnRenderForwarderHealth({forwarder_available:true});`)
+	// The technical rows are painted only while Advanced Diagnostics is open, so the
+	// mutation is applied to the state that writes them. Asserting against the closed
+	// panel would pass for the mutation without the renderer ever reaching the id.
+	script := vpnDiagnosticsHealthScript(t, mutated, `
+vpnRenderForwarderHealth({forwarder_available:true});
+vpnSetDiagnosticsOpen(true);
+vpnRenderTechnicalDetail(vpnCurrentStatusSample());
+`)
 	if out, err := execNodeScript(node, script); err == nil ||
 		!strings.Contains(string(out), "DOM id missing from actual template: vpn-diag-throughput") {
 		t.Fatalf("template ID mutation escaped DOM oracle: %v", err)
@@ -182,9 +189,17 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 	// did not move in this change, so a bare path or ?v=<release> is the URL the
 	// predecessor served and a returning browser keeps running that controller
 	// against this markup.
-	if !strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`) {
-		t.Errorf("expected templates/vpn.html to request the VPN diagnostics controller through its asset bytes: %s",
-			`<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`)
+	//
+	// It is requested as a DEFERRED module (data-vpn-modules on the section that
+	// activates it), not as a parser-blocking script: an unopened Diagnostics section
+	// must not delay the essential read. Both facts are asserted, so moving it back
+	// into the head fails here.
+	deferred := `data-vpn-modules="sessions={{ asset_url "/static/js/vpn/sessions.js" }} diagnostics_page={{ asset_url "/static/js/vpn/diagnostics_page.js" }} ">`
+	if !strings.Contains(tmplStr, deferred) {
+		t.Errorf("expected templates/vpn.html to declare the VPN diagnostics controller for deferred load through its asset bytes: %s", deferred)
+	}
+	if strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`) {
+		t.Errorf("templates/vpn.html loads diagnostics_page.js eagerly again; the section must activate it")
 	}
 	if strings.Contains(tmplStr, `<script src="/static/js/vpn/diagnostics_page.js"></script>`) {
 		t.Errorf("templates/vpn.html still requests /static/js/vpn/diagnostics_page.js bare, which is the URL the " +

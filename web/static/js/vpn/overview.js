@@ -300,8 +300,12 @@ function initVpnOverviewListeners() {
 // once after the first render: a later poll must not move focus under the
 // operator. Configuration is revealed when the target is one of its fields, and
 // a target that cannot take focus lands on its summary or the page heading.
-function vpnLandOverviewAnchor() {
-    const rawId = vpnOwnedAnchorId();
+//
+// landingTarget is the id the page's resolver decided on. The resolver owns the
+// legacy-id mapping, so a bookmark naming a dialog field still lands on the control
+// that opens it even though this function never sees the raw fragment.
+function vpnLandOverviewAnchor(landingTarget) {
+    const rawId = (typeof landingTarget === 'string' && landingTarget) ? landingTarget : vpnOwnedAnchorId();
     if (!rawId) return null;
     // An id inside the endpoint dialog canonicalises to the control that opens it:
     // a fragment never opens a dialog by itself.

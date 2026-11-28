@@ -433,11 +433,23 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 // vpnCompanionBoundaryMarker separates template HTML from companion JS modules in CombinedSource.
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
-// CompanionScripts returns the JS modules the harness evaluates, in order. A page
-// named "vpn" gets the whole shipped chain, boot included; a section-named page gets
-// its own controllers WITHOUT the boot, so a case that drives one controller is not
-// running the other sections' polls underneath its assertion. The asset-identity
-// checks derive the real chain from the template, so drift is caught there.
+// CompanionScripts returns the JS modules the harness evaluates, in order.
+//
+// The assembled page mirrors what the shell SHIPS: the eager chain runs for every
+// case, and the deferred controllers are appended as well, because a harness has no
+// network and nothing to fetch them from. Two consequences are stated rather than
+// hidden:
+//
+//   - the page boot's loader sees each deferred module already registered in
+//     common.js's registry, so a case that drives activation performs no injection and
+//     its assertions are about behaviour, not about script injection;
+//   - a case whose subject IS the injection asserts the REQUEST, by replacing
+//     vpnLoadModule for the duration of that case.
+//
+// A section-named page gets its own controllers without the boot, so a case that
+// drives one controller is not running the other sections' polls underneath its
+// assertion. The asset-identity and template checks derive the real split from the
+// shipped template, so drift between this order and the shell is caught there.
 func (f *VPNTestFixture) CompanionScripts() string {
 	switch f.OwnerPage {
 	case "vpn_backends":
@@ -445,7 +457,7 @@ func (f *VPNTestFixture) CompanionScripts() string {
 	case "vpn_diagnostics":
 		return f.CommonJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.SessionsJS + "\n" + f.PageJS
 	default:
-		// The whole page, in load order, ending with the boot that activates it.
+		// The whole page, in dependency order, ending with the boot that activates it.
 		return f.AnchorHandoffJS + "\n" + f.CommonJS + "\n" +
 			f.OverviewJS + "\n" + f.BackendsJS + "\n" + f.BackendsPageJS + "\n" +
 			f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" +

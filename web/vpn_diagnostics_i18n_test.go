@@ -61,6 +61,11 @@ assert(!backendRows[0].textContent.includes('Server Disabled'),'disabled backend
 // The visible percentile is the recent forward-write reservoir, gated on its own
 // sample count; the fixture carries p95_health_samples:0, so it is NOT measured.
 assert.strictEqual(text('vpn-diag-lat-percentiles'),E('vpn_diag_not_measured'),'unsampled percentile is not measured');
+// The historical charts are drawn only while Advanced Diagnostics is open, so the
+// panel is opened through its own setter - the trigger the operator uses - before the
+// series are asserted. The rows above are read from the closed panel deliberately:
+// they are text into existing markup, not chart work.
+vpnSetDiagnosticsOpen(true);
 function seriesLabel(id,label) {
  return document.getElementById(id).children.some(child=>child.textContent===label+' ('+vpnHistoryWindow+')');
 }

@@ -228,7 +228,10 @@ func TestPageHandlers(t *testing.T) {
 				t.Errorf("rendered vpn.html must not link the retired route %q", retired)
 			}
 		}
-		for _, module := range []string{"overview.js", "backends.js", "backends_page.js", "health_problems.js", "health_summary.js", "charts.js", "sessions.js", "diagnostics_page.js", "page.js"} {
+		// Every module this delivery ships is reachable from the document it serves:
+		// the eager ones as a <script src>, the deferred ones as a data-vpn-modules
+		// declaration on the element that activates them.
+		for _, module := range []string{"common.js", "overview.js", "backends.js", "backends_page.js", "health_problems.js", "health_summary.js", "charts.js", "sessions.js", "diagnostics_page.js", "anchor_handoff.js", "page.js"} {
 			if !strings.Contains(body, "/static/js/vpn/"+module) {
 				t.Errorf("expected rendered vpn.html to load %s", module)
 			}

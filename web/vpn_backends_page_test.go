@@ -171,8 +171,10 @@ w.API = {
     assert.ok(!w.NexusTelemetry.getActiveStreams().includes('vpn-backends'),
         'an unreached section starts no stream');
 
-    // A jump (or the observer) reaches the section.
-    w.vpnMountSection('backends');
+    // A jump (or the observer) reaches the section. Activation loads the section's
+    // controllers first, so it returns a promise and the test awaits the work it
+    // asked for instead of guessing at a number of microtask turns.
+    await w.vpnMountSection('backends');
     for (let i = 0; i < 20; i++) await Promise.resolve();
 
     assert.ok(apiCalls.includes('/api/servers'), 'the reached section pre-reads the server names');
@@ -181,7 +183,7 @@ w.API = {
         'vpn-backends is registered once the section is reached');
 
     // Reaching it again (a second jump, a fragment, a Back) starts nothing new.
-    w.vpnMountSection('backends');
+    await w.vpnMountSection('backends');
     for (let i = 0; i < 20; i++) await Promise.resolve();
     assert.strictEqual(apiCalls.filter(c => c === '/api/vpn/backends').length, 1,
         'a second reach does not start a second inventory read: ' + JSON.stringify(apiCalls));

@@ -174,7 +174,12 @@ async function vpnLoadBackends() {
 
     if (replacingFocus) vpnFocusIfFocusable(vpnReplacementBackendFocus(focused, tbodyBefore));
 
-    if (!vpnBackendsAnchorApplied) {
+    if (!vpnBackendsAnchorApplied || vpnPendingInspectTunnelId !== null) {
+        // The ordinary anchor landing runs once. A pending Inspect is a request that
+        // names a specific row, so the read that follows it must honour it even when
+        // an earlier ordinary visit already consumed the anchor rule: otherwise an
+        // Inspect issued from the Diagnostics section - after this inventory had
+        // loaded - could never be rescued by the one-time flag.
         vpnBackendsAnchorApplied = true;
         vpnApplyBackendsLanding();
     }
@@ -232,13 +237,19 @@ function vpnFocusBackendsHeading() {
     }
 }
 
-// vpnApplyBackendsLanding runs once, after the first successful read.
+// vpnApplyBackendsLanding runs its rules once per arrival, and again whenever a
+// one-shot Inspect request is pending.
 //
 // The Inspect handoff wins over a plain fragment: it is a one-shot request that
 // names a specific row. It is consumed here and nowhere else, so an ordinary
 // bookmark or a reload never replays a previous Inspect. A row that is absent
 // after a SUCCESSFUL read is genuinely missing, and the existing missing-entity
 // statement is announced at the destination heading.
+//
+// landingTarget is the id the page's resolver decided on. A legacy inventory id
+// whose node no longer exists (the split's card title is now the section heading)
+// still lands where the id MEANS, instead of being looked up by its removed raw id
+// and silently doing nothing.
 // vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request once the page has
 // taken it off durable tab storage. The request belongs to the navigation that carried
 // it: leaving it in storage let a later ordinary visit replay an arrival whose first
@@ -261,7 +272,7 @@ function vpnTakePendingInspect() {
     return tunnelId;
 }
 
-function vpnApplyBackendsLanding() {
+function vpnApplyBackendsLanding(landingTarget) {
     vpnHoldInspectRequest();
     const tunnelId = vpnTakePendingInspect();
     if (tunnelId) {
@@ -278,7 +289,9 @@ function vpnApplyBackendsLanding() {
         return 'inspect-missing';
     }
 
-    const id = vpnOwnedAnchorId();
+    const id = (typeof landingTarget === 'string' && landingTarget)
+        ? landingTarget
+        : vpnOwnedAnchorId();
     if (!id) return null;
     const el = document.getElementById(id);
     if (!el) return null;
@@ -360,3 +373,8 @@ if (typeof window !== 'undefined') {
     window.vpnAnnounceBackends = vpnAnnounceBackends;
     window.initVpnBackendsListeners = initVpnBackendsListeners;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('backends_page');

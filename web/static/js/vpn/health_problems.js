@@ -884,3 +884,8 @@ if (typeof window !== 'undefined') {
     window.vpnResetHealthProblems = vpnResetHealthProblems;
     window.vpnResetTechDiagnosticCards = vpnResetTechDiagnosticCards;
 }
+
+// This file has been evaluated: the page boot asks this registry before it
+// requests a module, so the answer is recorded by the module itself rather than
+// by the loader that hopes it arrived.
+if (typeof vpnMarkModule === 'function') vpnMarkModule('health_problems');

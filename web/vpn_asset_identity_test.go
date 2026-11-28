@@ -57,13 +57,8 @@ var vpnScriptDependencyOrderByPage = map[string][]string{
 		"/static/js/vpn/anchor_handoff.js",
 		"/static/js/vpn/common.js",
 		"/static/js/vpn/overview.js",
-		"/static/js/vpn/backends.js",
-		"/static/js/vpn/backends_page.js",
 		"/static/js/vpn/health_problems.js",
 		"/static/js/vpn/health_summary.js",
-		"/static/js/vpn/charts.js",
-		"/static/js/vpn/sessions.js",
-		"/static/js/vpn/diagnostics_page.js",
 		"/static/js/vpn/page.js",
 	},
 }
@@ -239,7 +234,9 @@ func TestVPNScriptsCarryTheAssetBytes(t *testing.T) {
 // current query would pass for both contents; varying the bytes is what shows
 // the query is an identity rather than a constant.
 func TestVPNScriptURLMovesWithTheAssetBytes(t *testing.T) {
-	const changed = "/static/js/vpn/charts.js"
+	// An EAGER module: the deferred ones are not in this block, so varying one of
+	// them would compare a URL this check never emits.
+	const changed = "/static/js/vpn/health_summary.js"
 	const page = "vpn"
 	order := vpnScriptDependencyOrderByPage[page]
 
@@ -378,6 +375,13 @@ var (
 	// assetURLActionPattern is the content-derived form a template may use; its
 	// argument is the asset path.
 	assetURLActionPattern = regexp.MustCompile(`\{\{\s*asset_url\s+"(/static/[^"]+)"\s*\}\}`)
+	// deferredModulesAttrPattern matches a data-vpn-modules attribute VALUE. Its pairs
+	// use the same content-derived action as every other asset reference, which means
+	// the value itself contains a quoted "…" argument - so the delimiter is matched
+	// lazily up to the enclosing tag rather than up to the first inner quote.
+	deferredModulesAttrPattern = regexp.MustCompile(`data-vpn-modules="([^<]*?)"\s*/?>`)
+	// deferredModulePairPattern finds one name={{ asset_url "…" }} pair.
+	deferredModulePairPattern = regexp.MustCompile(`(\w+)=(\{\{\s*asset_url\s+"(/static/[^"]+)"\s*\}\}|/static/[^\s"]+)`)
 	releaseVersionQuery   = regexp.MustCompile(`^\?v=\{\{\s*\.app_version\s*\}\}$`)
 )
 
@@ -394,6 +398,28 @@ const contentIdentitySentinel = "?v=@content-identity@"
 // to path+sentinel, so attribute-level parsers can read the tag.
 func normalizeAssetActions(src string) string {
 	return assetURLActionPattern.ReplaceAllString(src, "${1}"+contentIdentitySentinel)
+}
+
+// deferredModulePair is one "name=url" entry of a data-vpn-modules attribute.
+type deferredModulePair struct {
+	name string
+	url  string
+	path string
+	raw  string
+}
+
+// deferredModulePairs reads every deferred module declaration in template source.
+// Each pair names its asset through the same content-derived action every other
+// reference uses, so the URL is captured with the action intact and classified
+// exactly like a script tag's.
+func deferredModulePairs(src string) []deferredModulePair {
+	var pairs []deferredModulePair
+	for _, attr := range deferredModulesAttrPattern.FindAllStringSubmatch(src, -1) {
+		for _, m := range deferredModulePairPattern.FindAllStringSubmatch(attr[1], -1) {
+			pairs = append(pairs, deferredModulePair{name: m[1], url: m[2], path: m[3], raw: m[0]})
+		}
+	}
+	return pairs
 }
 
 // tagAssetValue returns the attribute value a script or stylesheet tag names,
@@ -421,6 +447,12 @@ func tagAssetValue(tag string) string {
 // rather than an attribute value, so it must be read from the whole tag before
 // the plain attribute forms, and both callers below would otherwise repeat that
 // order and drift.
+//
+// A deferred declaration counts too, and it lives on a <section>, not a <script>:
+// the tag patterns above would never see it, so the scan below reads those
+// declarations explicitly. A controller loaded through data-vpn-modules is a
+// reference this shell owns exactly like a <script src>, and it carries the same
+// content-derived identity.
 func classifyAssetTag(tag string) (path string, form assetReferenceForm, declared string, ok bool) {
 	if m := assetURLActionPattern.FindStringSubmatch(tag); m != nil {
 		return m[1], refAssetBytes, m[0], true
@@ -510,12 +542,43 @@ func scanVPNAssetReferences(t *testing.T) []vpnAssetReference {
 			return readErr
 		}
 		scanned++
-		for _, tag := range assetTagPattern.FindAllString(string(body), -1) {
+		// The RAW source: an emitted tag still spells `{{ asset_url "…" }}` inside a
+		// (template-invalid but scannable) attribute, and classifyAssetTag reads that
+		// action as the content-derived form. Normalizing first would turn every one
+		// of them into an unversioned URL and report the whole repository as broken.
+		source := string(body)
+		for _, tag := range assetTagPattern.FindAllString(source, -1) {
 			path, form, declared, ok := classifyAssetTag(tag)
 			if !ok || !slices.Contains(vpnDeliveredAssets, path) {
 				continue
 			}
 			refs = append(refs, vpnAssetReference{template: p, path: path, form: form, declared: declared})
+		}
+		// A deferred controller is named on the element that needs it, not in a
+		// <script> tag, so those declarations are read from the raw source: the
+		// action is still there and every pair is enumerated, not only the first.
+		// A bare or release-versioned URL in data-vpn-modules is the same cache
+		// defect as one in a script src.
+		for _, pair := range deferredModulePairs(source) {
+			// A pair names its asset either through the content-derived action (which
+			// carries no literal "?" at all) or as a plain path, which then has to be
+			// bare or release-versioned - both of which are findings.
+			if assetURLActionPattern.MatchString(pair.url) {
+				refs = append(refs, vpnAssetReference{template: p, path: pair.path, form: refAssetBytes, declared: pair.raw})
+				continue
+			}
+			path, query, hasQuery := strings.Cut(pair.url, "?")
+			if pair.path == "" {
+				pair.path = path
+			}
+			if !slices.Contains(vpnDeliveredAssets, path) {
+				continue
+			}
+			form := refBare
+			if hasQuery && releaseVersionQuery.MatchString("?"+query) {
+				form = refReleaseVersion
+			}
+			refs = append(refs, vpnAssetReference{template: p, path: path, form: form, declared: pair.raw})
 		}
 		return nil
 	})
@@ -561,6 +624,15 @@ func TestEveryShellLoadsDeliveredAssetsUnderTheirBytes(t *testing.T) {
 	for _, page := range vpnPagesInOrder {
 		for _, path := range vpnScriptDependencyOrderByPage[page] {
 			wantShells[path] = append(wantShells[path], page+".html")
+		}
+	}
+	// The deferred controllers are declared in the same template, so the enumeration
+	// must cover them too: a section whose controller is only referenced through
+	// data-vpn-modules is still a reference this shell owns, and a scan that walked
+	// only <script> tags would report it missing while the attribute named it.
+	for _, declaration := range vpnDeferredModulesByTarget {
+		for _, path := range declaration.modules {
+			wantShells[path] = append(wantShells[path], "vpn.html")
 		}
 	}
 
