@@ -86,6 +86,11 @@ func (p *Pool) observedGenerationLocked(observed *models.BackendTunnel) (*models
 // "the tunnel state moved".
 var ErrSetupApprovalRevoked = database.ErrSetupApprovalRevoked
 
+// ErrOrderEndedBeforeAdmission reports that the order the backend is being admitted
+// for has ended, so the promotion was refused. It is a refusal, not a tunnel-state
+// error: the generation is intact and the backend is simply not admitted.
+var ErrOrderEndedBeforeAdmission = database.ErrOrderEndedBeforeAdmission
+
 // PromoteTunnelWithEnrollmentRelease commits a qualified backend's runtime health
 // and releases its durable enrollment quarantine in one transaction.
 //

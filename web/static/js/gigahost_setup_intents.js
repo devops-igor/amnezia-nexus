@@ -292,7 +292,7 @@ function setupIntentRow(i) {
     // A job whose registered server the provider's own inventory no longer lists is
     // shown as what it is, rather than as a paused install with nothing to press: the
     // state badge and the action area must not disagree about the same job.
-    const absent = setupIntentProviderAbsent(i);
+    const absent = setupIntentEnded(i);
     badge.className = 'badge ' + (absent ? 'badge-danger' : setupIntentBadgeClass(i.state));
     // The stage is carried as data as well as in the label, so the stylesheet can give
     // this one state its own ink. The danger fill is the same on both surfaces; the
@@ -345,6 +345,29 @@ function setupIntentProviderAbsent(i) {
     return !!i && i.provider_absent === true;
 }
 
+/* setupIntentOrderRetired reports the panel's durable record that the ORDER this job
+ * belongs to has ended.
+ *
+ * It is a different fact from provider_absent above and neither implies the other: an
+ * order can be cancelled, or fail at the provider before any panel server was ever
+ * registered, so there is no server-row observation to carry. The list computes it from
+ * the order ledger through the same predicate the grid and the history view present from,
+ * and it is reported per response rather than stored on the approval, so the two surfaces
+ * cannot disagree about the same order.
+ *
+ * Only an explicit true counts. A list that does not carry the field - an older panel, or
+ * a read that failed - keeps every row's ordinary treatment, because a missing key is not
+ * an observation that the order is gone. */
+function setupIntentOrderRetired(i) {
+    return !!i && i.order_retired === true;
+}
+
+/* setupIntentEnded reports whether this job's deployment is over for either durable
+ * reason. Both suppress every action that would contact the deployment. */
+function setupIntentEnded(i) {
+    return setupIntentProviderAbsent(i) || setupIntentOrderRetired(i);
+}
+
 /* setupIntentStepInFlight reports whether this job's recorded step is still the step it
  * is on, rather than the last one it reached.
  *
@@ -353,7 +376,7 @@ function setupIntentProviderAbsent(i) {
  * running. A provider-confirmed absence ends the job regardless of the recorded state:
  * the deployment is gone, so nothing about it is in flight. */
 function setupIntentStepInFlight(i) {
-    if (!i || setupIntentProviderAbsent(i)) return false;
+    if (!i || setupIntentEnded(i)) return false;
     return setupIntentsMovingStates.indexOf(i.state) !== -1;
 }
 
@@ -386,7 +409,7 @@ function setupIntentActions(i) {
     if (i.state === 'pending') {
         add(_('setup_intents_cancel'), 'secondary', () => cancelSetupIntent(i.order_id));
     }
-    if (setupIntentProviderAbsent(i)) return buttons;
+    if (setupIntentEnded(i)) return buttons;
     const displayed = setupIntentDisplayedIdentity(i);
     if (i.state === 'install_paused' || i.state === 'awaiting_credentials') {
         add(_('setup_intents_resume'), 'primary', () => resumeSetupIntent(i.order_id));
@@ -453,7 +476,7 @@ function scheduleSetupIntentsRetry() {
  * observation can change. Revocation is deliberately not one of them: it is a
  * local decision about the panel's own approval and contacts nothing. */
 function setupIntentsContactable(i) {
-    if (!i || setupIntentProviderAbsent(i)) return false;
+    if (!i || setupIntentEnded(i)) return false;
     if (i.state === 'install_paused' || i.state === 'awaiting_credentials') return true;
     return i.state === 'awaiting_host_confirmation' && !!setupIntentDisplayedIdentity(i);
 }

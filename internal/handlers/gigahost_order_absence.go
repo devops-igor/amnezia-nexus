@@ -22,14 +22,24 @@ import (
 )
 
 // gigahostOrderAbsenceMarks reports, per order id, whether the panel's durable record
-// marks the server this order registered as gone.
+// marks this order gone.
 //
-// Only orders the record marks appear in the result. A missing key and a false value
-// are the same answer - the ordinary treatment - because absence is a positive
-// observation: a failed read of the column, an order that registered no panel server
-// and a server nobody marked absent all mean "not absent", never a guess.
+// Two records can say it, and they are independent facts about the same order: the
+// ledger's own order-level observation (written when a successful inventory read omitted
+// the order) and the observation on the server row the order registered. Either is
+// enough. Only orders a record marks appear in the result. A missing key and a false
+// value are the same answer - the ordinary treatment - because absence is a positive
+// observation: a failed read, an order that registered no panel server and a server
+// nobody marked absent all mean "not absent", never a guess.
 func (h *Handlers) gigahostOrderAbsenceMarks(ctx context.Context, orders []GigahostOrderRecord) map[string]bool {
 	marks := make(map[string]bool, len(orders))
+	// The ledger's own record needs no second read, so it is collected before the
+	// server-side read and survives that read failing.
+	for i := range orders {
+		if orders[i].ProviderAbsent() {
+			marks[orders[i].OrderID] = true
+		}
+	}
 	absent, err := h.providerAbsentServerIDs(ctx)
 	if err != nil {
 		// An unanswered read is not an absence observation.

@@ -57,7 +57,7 @@ func deployConfirmationTranslations(t *testing.T) map[string]string {
 func TestGigahostDeployVPSConfirmsBeforeOrdering(t *testing.T) {
 	node := requireJSDOM(t)
 
-	pageJS := settingsPageScript(t)
+	pageJS := hostingPageScript(t)
 	moduleJS, err := StaticFS.ReadFile("static/js/gigahost_placement.js")
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)
@@ -135,6 +135,9 @@ w.UI = {
     asked.push(options);
     return new Promise(resolve => { decide = resolve; });
   },
+  // The kind marking the shipped ui.js adds around one confirm is that module's own
+  // concern; this harness stubs the dialog itself, so the marking is a pass-through.
+  confirmWith: (kind, options) => w.UI.confirm(options),
 };
 w.API = {
   get: async url => (url.indexOf('/catalog') !== -1) ? catalogResponse : {orders:[], setup_intents:[]},

@@ -19,7 +19,7 @@ the panel's API client in the page, so the renderers run exactly as shipped.
 import pytest
 from playwright.sync_api import Page
 
-from tests.e2e import contrast
+from tests.e2e import contrast, settings_surface
 from tests.e2e.rendered_pixels import dominant_colour, read_png
 
 # The theme is switched by an attribute and the surface colours transition into place.
@@ -31,13 +31,14 @@ NO_TRANSITIONS = (
 )
 
 
-GIGAHOST_DELETED_RENDER = """({orders, intents, observations, deploys}) => {
+GIGAHOST_DELETED_RENDER = """({orders, intents, observations, deploys, absence}) => {
   stopGigahostOrderStatusRefresh();
   const detail = id => (deploys || {})[id] || {};
   window.API = {
     get: async url => {
       if (url === '/api/admin/hosting/gigahost/orders')
-        return {orders, provider_observations: observations};
+        return {orders, provider_observations: observations,
+                provider_absent_orders: absence || {}};
       if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents: intents};
       if (url === '/api/vpn/backends') return {backends: []};
       const m = String(url).match(/\\/orders\\/(.+)\\/status$/);
@@ -84,10 +85,20 @@ DELETED_DEPLOYMENT = {
             "order_id": "ord-deleted",
             "status": "failed",
             "assigned_ip": "198.51.100.9",
+            # The ledger row really does carry the journal step: the column is on the
+            # same row the list serves (see gigahostOrderSelectColumns), and the setup
+            # path writes it. It is load-bearing here, not decoration - the refresh asks
+            # it before deciding whether a status request is worth issuing, so a fixture
+            # without it makes the row retired for a reason this state does not have.
+            "step": "installing_protocol",
         }
     ],
     "intents": [],
     "observations": {"ord-deleted": {"outcome": "confirmed", "status": "failed"}},
+    # The durable absence record the list carries for this order. It is the panel's own
+    # written answer that the provider no longer lists the server, which is a different
+    # fact from the deploy read's copy and survives that read failing.
+    "absence": {"ord-deleted": True},
     # The failed journal is what offers a Retry control on an ordinary row, so the
     # fixture makes the absence of that control observable rather than trivially true.
     "deploys": {
@@ -102,11 +113,14 @@ DELETED_DEPLOYMENT = {
 }
 
 # The same order as though the provider still had it. It is the control: the row is
-# classified normally, keeps its status and offers the action its state allows.
+# classified normally, keeps its status and offers the action its state allows. Only the
+# absence record differs from the fixture above, which is what makes the pair a control
+# rather than two unrelated states.
 LISTED_DEPLOYMENT = {
     "orders": DELETED_DEPLOYMENT["orders"],
     "intents": [],
     "observations": DELETED_DEPLOYMENT["observations"],
+    "absence": {},
     "deploys": {
         "ord-deleted": {
             "status": "failed",
@@ -121,11 +135,10 @@ LISTED_DEPLOYMENT = {
 def _open_gigahost(page: Page, base_url: str, state: dict) -> dict:
     """Render one Recent Deployments state on the real page and read the row back."""
     page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(f"{base_url}/settings")
+    page.goto(f"{base_url}/")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function(
-        "document.querySelectorAll('.settings-section-card').length >= 9"
-    )
+    # The deployment list is on the Servers page with the hosting card it fills.
+    page.wait_for_function("() => !!document.querySelector('#recentOrdersContainer')")
     # The page starts its own read of this container on load, and the view admits one read
     # at a time: a caller arriving while a chain is running is coalesced into a single
     # follow-up. So the stub is installed and the read requested until the DOM shows the
@@ -231,6 +244,24 @@ SAVED_JOBS = {
     },
 }
 
+# The width of the card a saved-approval row is measured in. Half the Settings grid
+# content box: the hosting card was one of two tracks while it lived in Settings, and the
+# row's reflow contract is about that narrow column. Derived from the tokens rather than
+# pinned, so a retuned spacing scale moves it, and fixed at import so the imposed width and
+# the assertion that checks it cannot disagree.
+def saved_jobs_narrow_card_width(client_width: int = 1440) -> int:
+    """The half-track card width the reflow contract is about, in CSS px.
+
+    Computed by the Settings suite's own geometry, so it is exactly the card the design
+    gives a two-track grid at this viewport, and it cannot drift from the layout the rest
+    of the suite measures.
+    """
+    geometry = settings_surface.geometry(
+        client_width, columns=2, max_width=settings_surface.app_main_max_width()
+    )
+    return int(geometry["track"])
+
+
 # The rows of the saved list, selected by position rather than by a class the row itself
 # carries. A measurement of "does this row fit" must not depend on how the row is built:
 # the same selector has to find the row before and after the layout changed, or the
@@ -311,9 +342,9 @@ def _render_saved_jobs(
 ) -> dict:
     """Render the saved-jobs fixture on the real page and measure its rows."""
     page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
-    page.goto(f"{base_url}/settings")
+    page.goto(f"{base_url}/")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function("document.querySelectorAll('.settings-section-card').length >= 9")
+    page.wait_for_function("() => !!document.querySelector('#setupIntentsContainer')")
     page.add_style_tag(content=NO_TRANSITIONS)
     page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
     # The page starts its own read of these containers on load, and each view admits one
@@ -343,6 +374,15 @@ def _render_saved_jobs(
         "() => { const r = document.getElementById('setupIntentsContainer')"
         ".getBoundingClientRect(); return r.top >= 0 && r.bottom <= window.innerHeight; }",
         timeout=5000,
+    )
+    # Impose the narrow card the reflow contract is about. The hosting card used to sit
+    # in one track of the Settings grid, so it was half-width for free; on the Servers
+    # page it is full-width, and a measurement that read the width from the page would be
+    # measuring the page's layout rather than the row's reflow. The width comes from the
+    # same token-derived geometry the Settings suite uses, so it is the narrow card the
+    # design actually specifies.
+    page.add_style_tag(
+        content=f"#setupIntentsContainer {{ max-width: {saved_jobs_narrow_card_width()}px; }}"
     )
     return page.evaluate(ROWS_PROBE, SAVED_ROW_SELECTOR)
 
@@ -408,9 +448,18 @@ def test_saved_job_control_row_fits_its_row_at_desktop_width(
     than compress it.
     """
     got = _render_saved_jobs(authenticated_page, base_url, viewport=(1440, 900))
+    # The contract is about the row on a NARROW card, so the narrowness is imposed here
+    # rather than read from wherever the card happens to be laid out. It used to be
+    # implied by the hosting card sitting in one track of the Settings grid; the card now
+    # renders on the Servers page at full width, which made the old precondition false and
+    # turned this measurement into an assertion about the page's layout instead of about
+    # the row's reflow. Constraining the inline size keeps the case reproducible wherever
+    # the card lives.
+    narrow = saved_jobs_narrow_card_width()
+    assert narrow < 600, narrow
     row = _row(got, "ord_986_present")
-    assert row["row"]["width"] < 600, (
-        "this case is about the narrow card: the row is no longer half-width", row
+    assert abs(row["row"]["width"] - narrow) <= 1, (
+        f"the row is {row['row']['width']}px wide, want the imposed {narrow}px narrow card", row
     )
     assert row["state"]["right"] <= row["row"]["right"] + 0.5, (
         "the state and action group runs past the row's right edge", row

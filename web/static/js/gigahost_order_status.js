@@ -78,120 +78,6 @@ function gigahostOrderStatusTime(isoValue, absentKey) {
     return el;
 }
 
-/* gigahostOrderStatusDetail puts one labelled fact in the panel. Every value is
- * written with textContent: a provider diagnostic is untrusted input and must not
- * become markup. */
-function gigahostOrderStatusDetail(container, labelKey, valueNode) {
-    const row = document.createElement('div');
-    row.style.display = 'flex';
-    row.style.justifyContent = 'space-between';
-    row.style.gap = 'var(--space-sm)';
-    row.style.padding = '2px 0';
-
-    const label = document.createElement('span');
-    // Labels name the fact beside them, so they are informative text: --text-muted
-    // measures 2.95:1 (dark) and 2.56:1 (light) on a card, under the 4.5:1 minimum.
-    label.style.color = 'var(--text-secondary)';
-    label.textContent = _(labelKey);
-    row.appendChild(label);
-
-    const value = document.createElement('span');
-    value.style.textAlign = 'right';
-    value.style.wordBreak = 'break-word';
-    if (typeof valueNode === 'string') value.textContent = valueNode;
-    else if (valueNode) value.appendChild(valueNode);
-    row.appendChild(value);
-
-    container.appendChild(row);
-}
-
-/* gigahostOrderStatusPanel builds the read-only details for one order. It reads
- * the model only and makes no request. */
-function gigahostOrderStatusPanel(model) {
-    const panel = document.createElement('div');
-    panel.className = 'gigahost-order-status-details';
-    panel.style.maxWidth = '340px';
-    panel.style.fontSize = '0.78rem';
-    panel.style.lineHeight = '1.45';
-
-    const note = document.createElement('div');
-    note.style.color = 'var(--text-secondary)';
-    note.style.marginBottom = '4px';
-    note.textContent = _('gigahost_status_read_only');
-    panel.appendChild(note);
-
-    gigahostOrderStatusDetail(panel, 'gigahost_status_provider',
-        _('gigahost_status_stage_' + model.stage) + (model.providerStatus ? ' (' + model.providerStatus + ')' : ''));
-    gigahostOrderStatusDetail(panel, 'gigahost_status_vpn_setup', _('gigahost_status_setup_' + model.setup));
-    gigahostOrderStatusDetail(panel, 'gigahost_status_backend_health', _('gigahost_status_health_' + model.health));
-    gigahostOrderStatusAddressDetail(panel, model);
-    gigahostOrderStatusDetail(panel, 'gigahost_status_last_check',
-        gigahostOrderStatusTime(model.lastCheckedAt, 'gigahost_status_not_checked'));
-    gigahostOrderStatusDetail(panel, 'gigahost_status_last_change',
-        gigahostOrderStatusTime(model.lastChangeAt, 'gigahost_status_never'));
-
-    gigahostOrderStatusStepDetail(panel, model);
-    gigahostOrderStatusFailureDetail(panel, model);
-    gigahostOrderStatusDetail(panel, 'gigahost_status_next_action', _(model.nextActionKey));
-    return panel;
-}
-
-/* gigahostOrderStatusStepDetail shows the recorded step. A terminal order is not in
- * flight, so its step is the last one that was attempted: the fact is kept and the
- * claim changes, because "Current step" beside "Next action: Nothing to do" reads as
- * progress on a finished attempt. */
-function gigahostOrderStatusStepDetail(panel, model) {
-    const step = model.step || (model.setupIntent && model.setupIntent.step) || '';
-    if (!step) return;
-    gigahostOrderStatusDetail(panel,
-        gigahostOrderStatusStageInFlight(model.stage) ? 'gigahost_status_step' : 'gigahost_status_recorded_step',
-        step);
-}
-
-/* gigahostOrderStatusFailureDetail shows the reported reason as text: a provider
- * diagnostic is untrusted input and must never become markup.
- *
- * A row whose provider read failed shows that read's own diagnostic here, because that is
- * this order's known failure. Without it the failure would only exist in an aggregate notice
- * that a different order's success can hide. */
-function gigahostOrderStatusFailureDetail(panel, model) {
-    const failure = model.failure
-        || (model.setupIntent && model.setupIntent.last_error)
-        || (model.providerReadFailed ? model.providerError : '')
-        || '';
-    if (!failure) return;
-    const node = document.createElement('span');
-    node.style.color = 'var(--danger-color, #e53e3e)';
-    node.textContent = failure;
-    if (model.providerReadFailed) node.setAttribute('data-provider-error', 'true');
-    gigahostOrderStatusDetail(panel, model.providerReadFailed ? 'gigahost_status_provider_error' : 'gigahost_status_failure', node);
-}
-
-/* gigahostOrderStatusAddressDetail shows the address when there is one, and says
- * what it does and does not prove: an address on an unready server is not a usable VPN
- * endpoint, and an address on a deleted server may already belong to somebody else. */
-function gigahostOrderStatusAddressDetail(panel, model) {
-    if (!model.assignedIP) return;
-    gigahostOrderStatusDetail(panel, 'gigahost_status_address', model.assignedIP);
-    // A deleted deployment keeps its last recorded address as a fact about the past. The
-    // provisioning explanation would be false for it - the provider is not deploying
-    // anything - and the honest warning is that the address is no longer reserved for
-    // this panel, which is exactly why nothing here may dial it.
-    if (model.stage === 'deleted') {
-        const stale = document.createElement('div');
-        stale.style.color = 'var(--text-secondary)';
-        stale.textContent = _('gigahost_status_ip_deleted');
-        panel.appendChild(stale);
-        return;
-    }
-    // An address proves nothing about readiness when the provider state is unknown, so
-    // the explanation is due in that case too, not only while actively deploying.
-    if (!model.addressWhileProvisioning && !model.providerUnknown) return;
-    const hint = document.createElement('div');
-    hint.style.color = 'var(--text-secondary)';
-    hint.textContent = _('gigahost_status_ip_while_provisioning');
-    panel.appendChild(hint);
-}
 
 /* gigahostOrderStatusCell builds one interactive status: a button carrying the
  * stage progression, plus a panel of read-only details.
@@ -219,6 +105,10 @@ function gigahostOrderStatusCell(order, context, classification) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'badge gigahost-order-status-toggle ' + gigahostOrderStatusBadgeClass(model.stage);
+    // The state is carried on the badge itself, not only on its wrapper, because the
+    // ink is the badge's: the shared danger ink does not clear 4.5:1 on the danger fill
+    // it is painted on at the 12 px this label sets, so the state decides the colour.
+    toggle.setAttribute('data-stage', model.stage);
     toggle.setAttribute('aria-expanded', 'false');
     toggle.setAttribute('aria-controls', detailsID);
     model.chain.forEach((entry, index) => {
@@ -659,10 +549,11 @@ function gigahostOrderStatusRow(order, context, classification) {
     right.appendChild(gigahostOrderStatusCell(order, context, model));
 
     // A deployment that reads as deleted gets no action, whichever fact produced that
-    // state: the provider's own `deleted` answer, or the panel's durable inventory
-    // mark. Both are combined into the stage already, so the affordances read that one
-    // decision rather than either input. Every action here - retry, immediate setup, a
-    // saved approval - ends in a connection to the deployment's address.
+    // state: the provider's own `deleted` answer, the panel's durable inventory mark, or a
+    // provider-final failure with no setup journal behind it. All are combined into the
+    // stage already, so the affordances read that one decision rather than any input.
+    // Every action here - retry, immediate setup, a saved approval - ends in a connection
+    // to the deployment's address.
     //
     // A cancelled order is deliberately not in this class: cancellation stops the order
     // while its VPS may still be running, which is why it keeps its actions.
@@ -672,7 +563,11 @@ function gigahostOrderStatusRow(order, context, classification) {
         return row;
     }
 
-    if (order.status === 'failed') {
+    // Retry belongs to a failure the panel can actually retry: an install it ran and that
+    // failed. Reading the raw status column here offered Retry for an order the provider
+    // ended before any setup work existed, which is an action that cannot succeed - so the
+    // question is asked of the same classification the status cell uses.
+    if (model.recoverableFailure) {
         const btnRetry = document.createElement('button');
         btnRetry.type = 'button';
         btnRetry.className = 'btn btn-secondary gigahost-order-action';
@@ -844,7 +739,18 @@ async function gigahostOrderStatusReadOnce(signal) {
     const checkedAt = gigahostOrderStatusNow().toISOString();
     const setupIndex = await readGigahostSetupIntents(signal);
     const backendIndex = await readGigahostBackendIndex(signal);
-    const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id, signal)));
+    // Only an order the provider can still say something about is asked about. A row
+    // the panel has recorded as gone, and a cancelled one, are both finished, so the
+    // status request is not issued for them at all - the decision the panel already
+    // holds is the answer. The classification is the same one the row renders, taken
+    // from the recorded row and the list's own absence record.
+    const details = await Promise.all(orders.map((order) => {
+        const orderID = order && order.order_id;
+        if (!gigahostOrderStatusPollable(order, absence[String(orderID || '')])) {
+            return {deploy: null, detailOK: true, skipped: true};
+        }
+        return readGigahostOrderDeploy(orderID, signal);
+    }));
     const merged = orders.map((order, index) => mergeGigahostOrderDetail(
         order,
         (details[index] || {}).deploy,

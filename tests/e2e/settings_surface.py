@@ -67,6 +67,35 @@ SETTINGS_PROBE = """() => {
   };
 }"""
 
+# The card ids the Settings page renders, in DOM order, grouped as the page groups
+# them. These are the ids the templates give their `.settings-section-card` elements.
+#
+# The count is not a constant to wait for. It used to be stated as "at least 9 cards",
+# and when the hosting card moved out of Settings to the Servers page that number
+# described a page that no longer exists: every test that waited on it timed out
+# against a page that had rendered completely, which reads as a missing page rather
+# than as a stale expectation. The list below is the page's own content, so a card that
+# leaves or arrives is a visible edit here instead of a silent timeout, and the two
+# assertions built on it fail with the card named.
+SETTINGS_CARD_IDS = [
+    "appearanceCard", "sslCard", "captchaCard", "limitsCard",
+    "telegramCard", "notificationsCard", "upstreamCard", "backupCard",
+]
+
+# The readiness predicate every Settings measurement waits on. It is one definition
+# because the wait was previously copied at three call sites and each copy is a place
+# the condition can drift from the page.
+SETTINGS_READY_JS = (
+    "() => [" + ", ".join(f'"{card}"' for card in SETTINGS_CARD_IDS) + "]"
+    ".every(id => document.getElementById(id))"
+)
+
+
+def wait_for_settings(page) -> None:
+    """Wait until every Settings card the page is made of is in the DOM."""
+    page.wait_for_function(SETTINGS_READY_JS)
+
+
 # The three groups the accepted information architecture leaves on the page, in DOM
 # order. The enumeration reads them from the page and compares, so a group that
 # loses its grid fails here instead of reducing what is checked. The Network policy
@@ -74,9 +103,28 @@ SETTINGS_PROBE = """() => {
 SETTINGS_GROUP_IDS = ["group-portal", "group-notifications", "group-system"]
 
 
-# The groups whose last row holds one card, which is what the span rule exists for:
-# System ends on the backup card after one pair. The other two groups end on a pair.
-LONE_LAST_CARD_GROUPS = ["group-system"]
+# The groups whose last row holds one card, which is what the span rule exists for.
+#
+# Empty, and that is a fact about the page rather than a disabled check: every group now
+# holds an even number of cards (Portal 4, Notifications 2, System 2), so no grid ends on
+# a lone card. It held System while Settings carried a ninth card; when the hosting card
+# moved to the Servers page the page became even and this list described a page that no
+# longer exists. The span rule itself is still exercised, from the other direction: the
+# paired-last-row branch asserts the rule does not misfire, and the rule's own odd-count
+# case is covered by the CSS contract test that reads the parity predicate.
+LONE_LAST_CARD_GROUPS: list[str] = []
+
+
+def app_main_max_width(fallback: float = 1300.0) -> float:
+    """The app shell's max content width, read from the stylesheet that declares it.
+
+    The browser reports the same value in SETTINGS_PROBE, but a caller that needs the
+    geometry without a page (a fixture imposing a card width) reads it here instead of
+    pinning a number that would then be independent of the layout.
+    """
+    layout = (REPO_ROOT / "web" / "static" / "css" / "layout.css").read_text(encoding="utf-8")
+    match = re.search(r"\.app-main\s*\{[^}]*max-width:\s*([\d.]+)px", layout, re.S)
+    return float(match.group(1)) if match else fallback
 
 
 def rows(cards: list[dict]) -> list[list[dict]]:

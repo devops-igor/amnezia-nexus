@@ -227,10 +227,18 @@ func TestGigahostOrderInventoryOutageKeepsOrderRefreshable(t *testing.T) {
 	}
 }
 
-// TestGigahostOrderSuccessfulEmptyInventoryStillCancels is the control that keeps this correction
-// from swallowing real absence: an inventory that answered and named nobody, with a 404 detail, is
-// still a cancellation.
-func TestGigahostOrderSuccessfulEmptyInventoryStillCancels(t *testing.T) {
+// TestGigahostOrderSuccessfulEmptyInventoryStillRetires is the control that keeps this
+// correction from swallowing real absence: an inventory that answered completely, for the
+// account this order is known to belong to, and named nobody, still retires the order.
+//
+// The order's account has to be known for the answer to be about it - that is the
+// reconciliation's account gate, and it is what a genuine observation carries. An
+// unattributed inventory says nothing about anybody's orders, so it cannot retire one; the
+// paired test for that direction is TestDetail404CannotRetireAnOrderTheInventoryDidNotJudge.
+//
+// What this test now asserts is therefore provenance rather than a single writer: the ending
+// is recorded from the validated existence observation, which the row presents as DELETED.
+func TestGigahostOrderSuccessfulEmptyInventoryStillRetires(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -242,6 +250,11 @@ func TestGigahostOrderSuccessfulEmptyInventoryStillCancels(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// The order is known to belong to the account that answers, so an omission from that
+	// account's complete listing is an observation about this order.
+	if err := h.db.SetGigahostOrderProviderAccount(ctx, orderID, existenceAccount); err != nil {
+		t.Fatalf("record the order's account: %v", err)
+	}
 
 	client, err := gigahost.NewClient(gigahost.Config{
 		BaseURL: "https://provider.invalid",
@@ -249,6 +262,8 @@ func TestGigahostOrderSuccessfulEmptyInventoryStillCancels(t *testing.T) {
 		Transport: durableRoundTripper(func(r *http.Request) (*http.Response, error) {
 			code, body := http.StatusOK, ""
 			switch {
+			case strings.HasSuffix(r.URL.Path, "/account"):
+				body = `{"data":{"cust_id":1111,"cust_name":"Fixture"}}`
 			case strings.HasSuffix(r.URL.Path, "/servers"):
 				body = `[]` // answered, and named nobody
 			case strings.Contains(r.URL.Path, "deploy/status"):
@@ -266,16 +281,22 @@ func TestGigahostOrderSuccessfulEmptyInventoryStillCancels(t *testing.T) {
 	h.SetGigahostClient(client)
 
 	read := gigahostOrderStatusRead(t, h, orderID)
-	rows, err := h.getGigahostOrders(ctx)
-	if err != nil {
-		t.Fatalf("reload: %v", err)
+	stored := storedOrder(t, h, orderID)
+	if !stored.ProviderAbsent() {
+		t.Fatalf("a complete inventory that names nobody must record absence for the account that answered: %+v", stored)
 	}
-	if rows[0].Status != statusCancelled {
-		t.Fatalf("a successfully read inventory that names nobody is genuine absence and must "+
-			"still cancel, got %q", rows[0].Status)
+	// The row is not rewritten to a provider spelling by the detail read; the existence
+	// record is the panel's answer, and the row keeps its own recorded status.
+	if stored.Status != "ready" {
+		t.Errorf("the existence observation must not rewrite the recorded status, got %q", stored.Status)
 	}
-	if got := gigahostOrderStatusProviderObservation(t, read.Orders, orderID)["outcome"]; got != gigahostObservationConfirmed {
-		t.Fatalf("that cancellation is a provider answer and must be confirmed, got %v", got)
+	if !absenceMark(t, read.Orders, orderID) {
+		t.Fatalf("the list response must carry the recorded absence: %s", read.Orders)
+	}
+	// The ending reaches the interface from that record.
+	rendered := renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, orderID))
+	if len(rendered.Rows) != 1 || rendered.Rows[0].Stage != "deleted" || len(rendered.Rows[0].Actions) != 0 {
+		t.Fatalf("a genuinely retired order must render as deleted with no action: %+v", rendered.Rows)
 	}
 }
 

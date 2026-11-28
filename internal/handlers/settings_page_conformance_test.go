@@ -249,6 +249,7 @@ func TestSettingsStylesheetIsRegistered(t *testing.T) {
 }
 
 func TestSettingsPageControlsHaveAccessibleNames(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 	doc := parseSettingsDocument(t, renderSettingsPage(t, models.RoleAdmin))
 
 	wantCategories := []string{"server_health", "backend_health", "provisioning", "updates", "failover"}
@@ -293,7 +294,10 @@ func TestSettingsPageControlsHaveAccessibleNames(t *testing.T) {
 		t.Errorf("category group aria-labelledby = %q, want notificationCategoriesLabel", by)
 	}
 
-	refresh := elementByID(doc, "btnRefreshCatalog")
+	// The icon-only catalog refresh button lives on the page the hosting card renders
+	// on, so its accessible name is asserted where the control is.
+	hostingDoc := parseSettingsDocument(t, renderServersPage(t, h))
+	refresh := elementByID(hostingDoc, "btnRefreshCatalog")
 	if refresh == nil {
 		t.Fatal("catalog refresh button is missing")
 	}
@@ -345,12 +349,30 @@ func enclosingLabel(n *html.Node) *html.Node {
 }
 
 func TestSettingsPageCollapsedFieldsUseHiddenAttribute(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 	doc := parseSettingsDocument(t, renderSettingsPage(t, models.RoleAdmin))
 	for _, id := range []string{
 		"sslFields", "telegramFields", "upstreamUpdateBanner",
-		"deployCatalogStale", "deployCatalogLoading", "deployPlacementHint",
 	} {
 		n := elementByID(doc, id)
+		if n == nil {
+			t.Errorf("#%s is missing", id)
+			continue
+		}
+		if _, ok := attr(n, "hidden"); !ok {
+			t.Errorf("#%s does not start hidden", id)
+		}
+		if style, ok := attr(n, "style"); ok {
+			t.Errorf("#%s carries an inline style %q", id, style)
+		}
+	}
+	// The hosting card's collapsed regions moved with the card, so the same rule is
+	// asserted on the page that renders them.
+	hostingDoc := parseSettingsDocument(t, renderServersPage(t, h))
+	for _, id := range []string{
+		"deployCatalogStale", "deployCatalogLoading", "deployPlacementHint",
+	} {
+		n := elementByID(hostingDoc, id)
 		if n == nil {
 			t.Errorf("#%s is missing", id)
 			continue

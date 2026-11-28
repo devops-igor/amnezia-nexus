@@ -211,6 +211,14 @@
 [data-theme="light"] .badge-danger { color: #be123c; }
 [data-theme="light"] .badge-info { color: #0369a1; }
 
+/* An ended-state badge keeps the shared danger fill and border but paints its own
+   readable ink: the shared danger ink measures 4.42:1 on that fill in the dark theme
+   at the 12 px these labels set, under the normal-text minimum. Keyed on the state the
+   badge declares, so a plain danger control keeps the token it had. DELETED and FAILED
+   are different facts and keep a role each; both clear 4.5:1 on the composited fill. */
+.badge[data-stage="deleted"] { color: var(--text-deleted-badge); }
+.badge[data-stage="failed"] { color: var(--text-failed-badge); }
+
 /* ===== Form Elements ===== */
 .form-group {
     margin-bottom: var(--space-md);

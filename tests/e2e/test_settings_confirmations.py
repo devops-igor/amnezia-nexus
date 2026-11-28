@@ -7,9 +7,12 @@ from playwright.sync_api import Page
 
 from tests.e2e import contrast
 from tests.e2e.conftest import api_post
-# The page probe and the hex reader are the settings suite's own, so the two files
-# cannot disagree about how the page is opened or how a colour is converted.
-from tests.e2e.test_settings import NO_TRANSITIONS, _hex, _open_settings
+# The page probe and the transition switch are the settings suite's own, so the two
+# files cannot disagree about how the page is opened or how a theme is forced. The hex
+# reader moved with the contrast measurements, so it comes from the contrast module:
+# there is still exactly one conversion of a painted colour.
+from tests.e2e.test_settings import NO_TRANSITIONS, _open_settings
+from tests.e2e.test_settings_gigahost_contrast import _hex
 
 
 # --- Deploy VPS confirms before the order leaves the page --------------------
@@ -53,9 +56,42 @@ DEPLOY_SELECTIONS = (
     ".map(id => document.getElementById(id).value)"
 )
 
+# The card that carries the ordering form. It is the same card id the hosting block
+# had in Settings, and the template that renders it is the Servers page's.
+DEPLOY_FORM_CARD = "gigahostCard"
+
+
+def _open_hosting_page(page: Page, base_url: str) -> None:
+    """Open the Servers page, which is where the ordering form lives.
+
+    The ordering form was the Settings hosting card. It moved beside the server grid
+    with the rest of the hosting controls, so the page that owns it is the Servers
+    page and Settings no longer carries the card at all. Opening Settings here left
+    every wait below describing a control on a page that does not render it.
+
+    This is deliberately not `_open_settings`: that helper waits for the Settings
+    cards, which are the one thing this page does not have, so reusing it would wait
+    on the wrong page for the same reason. The viewport, the disabled transitions and
+    the theme switch are applied the way that helper applies them, because the
+    measurements here assume the same settled appearance. The theme is the dark one
+    the ordering form is measured against; a case that measures another theme sets it
+    after this returns, as it did before.
+    """
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(f"#{DEPLOY_FORM_CARD}")
+    page.add_style_tag(content=NO_TRANSITIONS)
+    page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", "dark")
+
 
 def _deploy_form(page: Page, base_url: str, orders: list) -> None:
-    """Open Settings with a local test catalog, recording the order request."""
+    """Open the page that hosts the ordering form with a local test catalog.
+
+    The catalog is stubbed before the page loads, because the controller requests it
+    while the page initialises: a route registered after the navigation would arrive
+    too late and the selectors would be populated from the real provider answer.
+    """
     page.route(
         "**/api/admin/hosting/gigahost/catalog**",
         lambda route: route.fulfill(
@@ -70,7 +106,7 @@ def _deploy_form(page: Page, base_url: str, orders: list) -> None:
         )
 
     page.route("**/api/admin/hosting/gigahost/order", record_order)
-    _open_settings(page, base_url, "dark")
+    _open_hosting_page(page, base_url)
     page.wait_for_function(
         "() => { const s = document.getElementById('deployPlanSelect');"
         " return !!s && s.options.length > 0 && !s.disabled; }"

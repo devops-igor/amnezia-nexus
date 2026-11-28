@@ -47,20 +47,15 @@ import (
 // settingsSurfaceControllers are the controllers the Settings page loads. The
 // policy surface is the Routing page since #987, so its controllers are listed
 // apart: the identity of each is pinned on the page that actually loads it, and a
-// controller that moved without its tag is reported on the page that lost it.
+// controller that moved without its tag is reported on the page that lost it. The
+// hosting card's controllers are the Servers page's since the hosting block moved
+// there, and that page's shell check pins them.
 var settingsSurfaceControllers = []string{
 	"/static/js/settings_nav.js",
 	"/static/js/settings_cards.js",
 	"/static/js/settings_save.js",
 	"/static/js/notifications_settings.js",
 	"/static/js/settings.js",
-	"/static/js/gigahost_catalog_status.js",
-	"/static/js/gigahost_setup.js",
-	"/static/js/gigahost_setup_intents.js",
-	"/static/js/gigahost_order_status_model.js",
-	"/static/js/gigahost_order_status.js",
-	"/static/js/gigahost_placement.js",
-	"/static/js/gigahost_account_association.js",
 }
 
 // routingSurfaceControllers are the controllers the Routing page loads: the shared
@@ -464,7 +459,9 @@ func TestSettingsControllerURLCarriesTheAssetBytes(t *testing.T) {
 func TestSettingsSavedJobsModuleIsRequestedUnderItsBytes(t *testing.T) {
 	const module = "/static/js/gigahost_setup_intents.js"
 
-	body := renderSettingsPage(t, models.RoleAdmin)
+	// The saved-setup list is on the Servers page with the hosting card it fills.
+	h, _, _ := setupTestHandlers(t)
+	body := renderServersPage(t, h)
 
 	emitted := ""
 	for _, src := range collectShellLinks(t, body).scripts {

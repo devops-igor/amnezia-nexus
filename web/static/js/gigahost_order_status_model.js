@@ -112,6 +112,51 @@ function gigahostOrderStatusStageInFlight(stage) {
     return gigahostOrderStatusStages.indexOf(stage) !== -1;
 }
 
+/* gigahostOrderStatusPresentedStage maps a provider stage to the stage this view
+ * presents. One mapping exists, and it is about a finished order:
+ *
+ * A cancellation is the final decision about an order, so it is presented as the
+ * deletion it is rather than as a state that still awaits an operator. Nothing about a
+ * cancelled order is actionable - every control this view could offer would contact a
+ * deployment the order no longer covers - and presenting it as "not usable yet" was how
+ * a cancelled order came to look like one still waiting for setup.
+ *
+ * The provider/ledger spelling stays available through gigahostOrderStatusProviderStage;
+ * this function decides only what the interface claims. */
+function gigahostOrderStatusPresentedStage(stage) {
+    if (stage === 'cancelled') return 'deleted';
+    return stage;
+}
+
+/* gigahostOrderStatusLedgerStage classifies one order from its recorded row and the
+ * list's durable absence record, without any per-order provider read. It answers the
+ * question a read has to ask before it asks anything: is there still an order at the
+ * provider that this read could learn something about?
+ *
+ * It exists so the refresh performs no status request for a retired order, and so the
+ * decision to skip that request is made from the same vocabulary the rendered row uses.
+ * A provider-final failure is included: the order ended before any setup work, so there is
+ * no deployment a status request could describe. The row's own step column is what keeps a
+ * recoverable setup failure out of that class; it is present on the row the list returned,
+ * so this question does not depend on the detail read succeeding. */
+function gigahostOrderStatusLedgerStage(order, providerAbsent) {
+    if (providerAbsent === true) return 'deleted';
+    const id = String((order && order.order_id) || '');
+    if (gigahostOrderStatusIsPlaceholderID(id)) return 'unknown';
+    const stage = gigahostOrderStatusPresentedStage(gigahostOrderStatusProviderStage(order && order.status));
+    const journal = gigahostOrderStatusRowJournalEvidence(order, null);
+    if (gigahostOrderStatusProviderFinalFailure(order && order.status, journal)) return 'deleted';
+    return stage;
+}
+
+/* gigahostOrderStatusPollable reports whether a per-order status request may be issued
+ * for this order at all. A deleted or cancelled order is finished: the panel holds the
+ * decision already, and a status request could only re-ask a provider that has nothing
+ * left to say about it. */
+function gigahostOrderStatusPollable(order, providerAbsent) {
+    return gigahostOrderStatusLedgerStage(order, providerAbsent) !== 'deleted';
+}
+
 /* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
  * stage. It reads no address: a VPS is ready only when the provider said so, and an
  * order the provider has accepted without starting is still `requested` rather than
@@ -291,6 +336,12 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     const orderId = String(record.order_id || '');
     const obs = gigahostOrderStatusObservation(observation);
     const journal = gigahostOrderStatusJournalEvidence(detail);
+    // The row's own recorded step is journal evidence too, and it survives a failed detail
+    // read. It is deliberately NOT folded into `journal` above: that value also decides
+    // whether the provider axis is claimable at all, and a completed `ready` row carries a
+    // step, so feeding it there would make a finished install read as unknown whenever the
+    // second request failed. It is used only to answer the narrower failure question.
+    const journalForFailure = gigahostOrderStatusRowJournalEvidence(record, detail);
     const claimed = gigahostOrderStatusClaimedProviderStatus(obs, journal, record.status);
 
     // providerAbsent is the panel's durable record that the provider's own server
@@ -307,14 +358,37 @@ function gigahostOrderStatusProviderFacts(order, deploy, observation) {
     // that still reports the order as ready while its server inventory no longer lists
     // the server is exactly the state this exists to present as DELETED.
     const providerAbsent = record.provider_absent === true;
-    const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusProviderStage(claimed.status || record.status);
-    const stage = providerAbsent
-        ? 'deleted'
-        : (gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage);
+    // Two separate questions about a recorded failure, and answering them together is what
+    // made an ended order actionable:
+    //
+    //   providerFinalFailure  the order ended at the provider before any panel setup work,
+    //                         so there is no deployment to act on. Only the RECORDED
+    //                         failure and the panel's own journal decide it - a provider
+    //                         answer cannot invent an install that never ran. A confirmed
+    //                         live answer does supersede it, because that is positive
+    //                         evidence the deployment exists.
+    //   recoverableFailure    the panel ran an install and it failed, so the operator has an
+    //                         action that can succeed. Deriving this from the presented
+    //                         stage was wrong: a provider that answers `ready` for a failed
+    //                         install moves the stage to ready, and the Retry the operator
+    //                         needs disappeared with it.
+    const recordedFailure = gigahostOrderStatusProviderFinalFailure(record.status, journalForFailure);
+    const providerConfirmsAlive = claimed.source === 'provider' &&
+        gigahostOrderStatusFailedSpellings.indexOf(
+            String(claimed.status || '').trim().toLowerCase()) === -1;
+    const providerFinalFailure = recordedFailure && !providerConfirmsAlive;
+    const recoverableFailure = gigahostOrderStatusFailedSpellings.indexOf(
+        String(record.status || '').trim().toLowerCase()) !== -1 && !providerFinalFailure;
+    const orderStage = claimed.unknown ? 'unknown' : gigahostOrderStatusPresentedStage(
+        gigahostOrderStatusProviderStage(claimed.status || record.status));
+    let stage = providerAbsent ? 'deleted' : (gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage);
+    if (providerFinalFailure) stage = 'deleted';
     const assignedIP = gigahostOrderStatusText(detail.assigned_ip, record.assigned_ip);
     return {
         orderId: orderId,
         providerAbsent: providerAbsent,
+        providerFinalFailure: providerFinalFailure,
+        recoverableFailure: recoverableFailure,
         providerStatus: claimed.unknown ? '' : gigahostOrderStatusText(claimed.status, record.status),
         providerSource: claimed.source,
         // The provider was actually read in this response. This is the only thing that
@@ -406,6 +480,48 @@ function gigahostOrderStatusJournalEvidence(deploy) {
     };
 }
 
+/* gigahostOrderStatusRowJournalEvidence builds the onboarding-journal evidence for one
+ * order from both places it can be recorded: the deploy DTO (the panel server id and step
+ * the journal writes) and the order row the list already returned, whose own step column
+ * survives a failed detail read.
+ *
+ * Reading only the DTO made a recoverable setup failure look provider-final whenever that
+ * second request failed: the row still recorded `installing_protocol`, but the evidence
+ * was gone, so the failure was classified as ended and its Retry disappeared for a job the
+ * operator had run and could retry. */
+function gigahostOrderStatusRowJournalEvidence(order, deploy) {
+    const evidence = gigahostOrderStatusJournalEvidence(deploy);
+    const rowStep = String((order || {}).step || '').trim().toLowerCase();
+    if (!evidence.present && rowStep !== '') {
+        return {
+            present: true,
+            status: evidence.status,
+            step: rowStep,
+            serverID: evidence.serverID
+        };
+    }
+    return evidence;
+}
+
+/* gigahostOrderStatusProviderFinalFailure reports a recorded failure that no onboarding
+ * journal accompanies: the provider ended provisioning before the panel did any setup
+ * work, so there is no recoverable execution behind the word and nothing an operator
+ * could retry onto it.
+ *
+ * It is the browser half of models.GigahostOrder.FailureIsProviderFinal, and it exists so
+ * the classification does not depend on which surface is asking. The row's own status
+ * column carries `failed` in two situations that look identical there - a provider that
+ * never provisioned the VPS, and an install this panel ran and failed - and only the
+ * journal distinguishes them. Treating both as recoverable was how an ended order kept
+ * offering Retry and kept being polled for a deployment that was never created.
+ *
+ * `journal` is the evidence gigahostOrderStatusJournalEvidence returned for this row. */
+function gigahostOrderStatusProviderFinalFailure(status, journal) {
+    const s = String(status || '').trim().toLowerCase();
+    if (gigahostOrderStatusFailedSpellings.indexOf(s) === -1) return false;
+    return !(journal && journal.present);
+}
+
 
 /* gigahostOrderStatusRecordedOnboarding reports whether the deploy read carries the panel's
  * own durable evidence that onboarding completed: a registered Nexus server and the
@@ -440,6 +556,8 @@ function gigahostOrderStatusModel(order, context) {
         chain: gigahostOrderStatusStageChain(provider.stage),
         providerAbsent: provider.providerAbsent,
         providerStatus: provider.providerStatus,
+        providerFinalFailure: provider.providerFinalFailure,
+        recoverableFailure: provider.recoverableFailure,
         providerSource: provider.providerSource,
         providerConfirmed: provider.providerConfirmedRead,
         providerReadFailed: provider.providerReadFailed,

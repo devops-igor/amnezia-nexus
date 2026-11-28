@@ -192,6 +192,11 @@ func (h *Handlers) registerServerForInstall(
 	if client, clientErr := h.getGigahostClient(ctx, nil); clientErr == nil {
 		accountID = h.gigahostServerAccount(ctx, client, req.ProviderServerID)
 	}
+	// The shared registration writer asks the order's ending inside the insert's own
+	// transaction. The account read above is network work, and the journal write that
+	// opened this phase does not speak for what the ledger holds now: a complete
+	// inventory omission committed during that read retires the order, and no row may
+	// be created for a deployment the panel already records as gone.
 	server, err := h.registerDeployServer(ctx, req, order, 0, req.ProviderServerID, req.AssignedIP, fingerprint, accountID)
 	if err != nil {
 		return nil, err

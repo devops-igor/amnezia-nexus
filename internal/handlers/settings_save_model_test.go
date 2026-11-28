@@ -65,7 +65,7 @@ commitOf('appearanceCard').click();
 await until(() => shown(statusOf('appearanceCard')), 'the appearance card to report success');
 assert.equal(statusOf('appearanceCard').textContent.trim(), CFG.dict.settings_saved);
 
-for (const id of ['sslCard', 'limitsCard', 'telegramCard', 'captchaCard', 'notificationsCard', 'gigahostCard']) {
+for (const id of ['sslCard', 'limitsCard', 'telegramCard', 'captchaCard', 'notificationsCard']) {
   assert.equal(shown(statusOf(id)), false, id + ' must not report the appearance save');
   assert.equal(shown(errorOf(id)), false, id + ' must not show an error for the appearance save');
 }
@@ -120,13 +120,24 @@ assert.equal(doc.querySelectorAll('.toast').length, 0, 'a page-level toast is on
 assert.equal(toasts.length, 0, 'toasts raised during load and save: ' + JSON.stringify(toasts));
 assert.equal(shown(errorOf('appearanceCard')), false);
 
-// The failures are real, so they must still be visible - but in their own cards.
+// The notification failure is real, so it must still be visible - in its own card.
+assert.ok(card('notificationsCard').textContent.indexOf(CFG.dict.notifications_load_failed) !== -1,
+  'the notification card must say its own settings could not be read');
+`)
+}
+
+// TestSettingsSaveModel_ProviderCatalogErrorStaysInItsOwnCard is the other half of the
+// scoping rule, on the page the credentials card moved to: an unconfigured provider is the
+// hosting card's own failure, shown inside it, and it never becomes a page-level toast.
+func TestSettingsSaveModel_ProviderCatalogErrorStaysInItsOwnCard(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runHostingScenario(t, h, `
 const catalog = doc.getElementById('deployPlanSelect');
+assert.ok(catalog, 'the hosting card has no order selector');
 assert.ok(catalog.textContent.indexOf(CFG.dict.deploy_vps_catalog_unavailable) !== -1,
   'the hosting card must say its own catalog is unavailable');
 assert.ok(card('gigahostCard').contains(catalog));
-assert.ok(card('notificationsCard').textContent.indexOf(CFG.dict.notifications_load_failed) !== -1,
-  'the notification card must say its own settings could not be read');
+assert.equal(toasts.length, 0, 'a provider configuration error must not raise a page toast: ' + JSON.stringify(toasts));
 `)
 }
 
@@ -142,7 +153,7 @@ failSave = true;
 commitOf('limitsCard').click();
 await until(() => shown(errorOf('limitsCard')), 'the limits card to report the failure');
 assert.equal(shown(statusOf('limitsCard')), false);
-for (const id of ['appearanceCard', 'sslCard', 'captchaCard', 'telegramCard', 'gigahostCard']) {
+for (const id of ['appearanceCard', 'sslCard', 'captchaCard', 'telegramCard']) {
   assert.equal(shown(errorOf(id)), false, id + ' must not show the limits failure');
 }
 assert.equal(toasts.length, 0, 'a card failure must not also raise a page toast: ' + JSON.stringify(toasts));
@@ -300,12 +311,12 @@ assert.equal((await stored()).appearance.language, 'fr');
 }
 
 // TestSettingsSaveModel_ProviderCredentialCommitsFromItsOwnCard: the Gigahost key
-// is committed by the credentials card, stored, and shown masked afterwards. The
-// ordering workflow beside it is a set of immediate actions and never makes the
-// card look edited.
+// is committed by the credentials card on the page it now lives on, stored, and shown
+// masked afterwards. The ordering workflow beside it is a set of immediate actions and
+// never makes the card look edited.
 func TestSettingsSaveModel_ProviderCredentialCommitsFromItsOwnCard(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
-	runSettingsScenario(t, h, `
+	runHostingScenario(t, h, `
 assert.ok(commitOf('gigahostCard'), 'the provider credentials card has no commit control of its own');
 assert.equal(shown(badgeOf('gigahostCard')), false, 'the order selectors are immediate actions, not staged settings');
 const plan = doc.getElementById('deployPlanSelect');

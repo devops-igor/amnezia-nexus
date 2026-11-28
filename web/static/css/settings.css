@@ -20,12 +20,12 @@
     }
 
     /* A card that would sit alone in the last row spans the full width instead of
-       leaving an empty cell half the grid wide: an odd count ends on a lone card
-       (nine for an admin session, seven if the Gigahost card is unavailable), and
-       that card is usually the tallest on the page. An even count ends on a pair
-       and is untouched. Parity is the whole predicate because every grid child is
-       one card and the grid places them in order. Scoped to this block, so the
-       single-column layout below 1024px keeps one track. */
+       leaving an empty cell half the grid wide: an odd count ends on a lone card, and
+       that card is usually the tallest on the page. An even count ends on a pair and is
+       untouched. Parity is the whole predicate because every grid child is one card and
+       the grid places them in order. Scoped to this block, so the single-column layout
+       below 1024px keeps one track. The page is currently even in every group, so the
+       rule applies to no row today and stays correct for the next card that is added. */
     .settings-grid > .settings-section-card:last-child:nth-child(odd) {
         grid-column: 1 / -1;
     }
@@ -697,3 +697,42 @@
         justify-content: flex-start;
     }
 }
+
+/* The association controls' labels are whole sentences in some locales, and the shared
+   .btn rule sets white-space: nowrap, so a sentence-sized label could not wrap: it ran
+   past the Hosting card and widened the document instead. Measured on the Russian
+   preview at the 320 CSS px review floor, its right edge was 7.9px past the viewport
+   while English, French, Chinese and Persian all fitted.
+
+   The fix is the wrap, not the size: the font-size the card's button scale gives these
+   controls and the touch height it gives them are unchanged, and nothing is hidden.
+   Only the label may take a second line and the control may shrink to the card rather
+   than past it. Scoped to this one section so no other button's single-line treatment
+   moves. overflow stays hidden because it is what clips the shared .btn gradient to the
+   rounded border; the wrap happens inside that box. */
+.settings-section-card #gigahostAssociationSection .btn {
+    max-width: 100%;
+    white-space: normal;
+    text-align: start;
+}
+
+/* A flex item's automatic minimum size is its content width, which keeps a long label
+   on one line and overflows anyway. The min-content floor of wrapping text is its
+   longest word, so the item can shrink to the line and wrap within it. */
+.settings-section-card #gigahostAssociationSection .btn > span {
+    min-width: 0;
+}
+
+/* The optional unlisted-servers choice is the other sentence-sized label in this
+   section: a bare inline-flex row cannot break its text either, so it would widen the
+   card the same way once the preview reveals it. */
+.settings-section-card #gigahostAssociationSection .switch-container {
+    max-width: 100%;
+    align-items: flex-start;
+}
+
+.settings-section-card #gigahostAssociationSection .switch-label-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+

@@ -34,14 +34,20 @@ var settingsMatrixOutcomes = []string{
 
 // settingsMatrixCards are the cards the Settings page renders. The policy card is
 // not one of them since #987: it is the Routing page's card, and it keeps the same
-// matrix there (routingMatrixCards) rather than losing the coverage it had here.
+// matrix there (routingMatrixCards) rather than losing the coverage it had here. The
+// provider credential card is not one of them either: the hosting card moved to the
+// Servers page, and it keeps the same matrix there (hostingMatrixCards).
 var settingsMatrixCards = []string{
 	"appearanceCard", "captchaCard", "sslCard", "limitsCard", "telegramCard",
-	"gigahostCard", "notificationsCard",
+	"notificationsCard",
 }
 
 // routingMatrixCards are the cards the Routing page renders.
 var routingMatrixCards = []string{"policyRoutingCard"}
+
+// hostingMatrixCards are the cards the Servers page renders through the shared save
+// model: the relocated provider credential card.
+var hostingMatrixCards = []string{"gigahostCard"}
 
 // matrixCell is one result row the scenario prints.
 type matrixCell struct {
@@ -173,9 +179,14 @@ async function mxCell(cardId, outcome) {
     const before = await mxStored(cfg);
     // The cross-card focus case needs an editable field in a DIFFERENT card on the
     // page under test. The policy card lives on /routing, where the appearance card
-    // is not rendered, so its neighbour is the override textarea beside it.
+    // is not rendered, so its neighbour is the override textarea beside it. The
+    // hosting card lives on the Servers page with no other settings card, so its
+    // neighbour is the add-server form's name field: a field outside the card is what
+    // the case needs, and what it establishes is that focus elsewhere does not clear
+    // this card's state.
     const other = p.doc.getElementById(cfg.other) ? p.doc.getElementById(cfg.other)
-        : p.doc.getElementById('policy_inventory_override');
+        : p.doc.getElementById('policy_inventory_override') ? p.doc.getElementById('policy_inventory_override')
+        : p.doc.getElementById('serverName');
     if (!other) throw new Error('no field in another card to move to on this page');
     const draft = mxEdit(p, cfg, ++mxN);
     ok(mxDirty(p) !== '', 'editing marks the card unsaved');
@@ -342,8 +353,8 @@ func runMatrix(t *testing.T, path string, outcomes, cards []string) []matrixCell
 
 // TestSettingsSaveModel_Matrix is the class-level oracle. Each cell is a subtest,
 // so a broken cell names its card and its outcome. It runs on every page that holds
-// a card with a commit control: the cards that stayed in Settings and the policy
-// card that moved to Routing.
+// a card with a commit control: the cards that stayed in Settings, the policy card that
+// moved to Routing, and the provider credential card that moved to Servers.
 func TestSettingsSaveModel_Matrix(t *testing.T) {
 	pages := []struct {
 		path  string
@@ -351,6 +362,7 @@ func TestSettingsSaveModel_Matrix(t *testing.T) {
 	}{
 		{"/settings", settingsMatrixCards},
 		{"/routing", routingMatrixCards},
+		{"/", hostingMatrixCards},
 	}
 	var cells []matrixCell
 	want := 0

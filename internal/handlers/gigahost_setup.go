@@ -157,15 +157,22 @@ func (h *Handlers) GigahostSetupStatusHandler(w http.ResponseWriter, r *http.Req
 }
 
 // gigahostSetupIntentView is one saved job as the list answers it: the durable record
-// plus the presence fact this view offers actions against.
+// plus the two presence facts this view offers actions against.
 //
-// The fact is derived per response from the identity the job journaled at registration,
-// through the same predicate the Recent Deployments row reads. It is not stored on the
-// intent: absence is the panel's observation about a server row, and duplicating it into
-// the approval would be a second copy that can disagree.
+// ProviderAbsent is the pre-existing server-row observation, resolved from the identity
+// the job journaled at registration. OrderRetired is the order-level answer, which is a
+// different fact: an order can end without ever registering a panel server, and a job
+// paused before registration still has an order whose life the panel has recorded as over.
+// Without it, a job for a retired order kept offering Resume and kept being polled, because
+// its own row carries neither the provider absence observation nor the onboarding journal.
+//
+// Both are derived per response through the same predicates the Recent Deployments row
+// reads, and neither is stored on the intent: duplicating either into the approval would be
+// a second copy that can disagree.
 type gigahostSetupIntentView struct {
 	*models.GigahostSetupIntent
 	ProviderAbsent bool `json:"provider_absent"`
+	OrderRetired   bool `json:"order_retired"`
 }
 
 // GigahostSetupIntentsHandler handles GET /api/admin/hosting/gigahost/setup-intents,
@@ -181,17 +188,34 @@ func (h *Handlers) GigahostSetupIntentsHandler(w http.ResponseWriter, r *http.Re
 		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
+	orderIDs := make([]string, 0, len(intents))
+	for i := range intents {
+		orderIDs = append(orderIDs, intents[i].OrderID)
+	}
+	retired := h.gigahostOrderRetirement(r.Context(), orderIDs)
 	views := make([]gigahostSetupIntentView, 0, len(intents))
 	for i := range intents {
 		views = append(views, gigahostSetupIntentView{
 			GigahostSetupIntent: &intents[i],
 			ProviderAbsent:      h.deploymentProviderAbsent(r.Context(), intents[i].NexusServerID),
+			OrderRetired:        retired[intents[i].OrderID],
 		})
 	}
 	h.JSONOK(w, map[string]any{
 		"setup_intents": views,
 		"count":         len(views),
 	})
+}
+
+// gigahostOrderRetirement answers, per order id, whether the panel's own records say the
+// order is over. A panel with no database, and a failed read, answer that nothing is
+// retired: absence of a record is not an observation, and this read must never be the
+// reason an action disappears.
+func (h *Handlers) gigahostOrderRetirement(ctx context.Context, orderIDs []string) map[string]bool {
+	if h == nil || h.db == nil {
+		return map[string]bool{}
+	}
+	return h.db.GigahostOrderRetirementByOrderID(ctx, orderIDs)
 }
 
 // ApproveGigahostSetup records the administrator's setup approval for an order.
@@ -241,9 +265,14 @@ func (h *Handlers) ApproveGigahostSetup(
 
 // loadApprovableOrder resolves the placed order an approval may reference.
 //
-// Both refusals here exist so no job can be created whose provider side nobody
-// placed: an unknown id has no order, and a placeholder id (an unresolved intent
-// or an unknown purchase outcome) has no confirmed provider order.
+// Three refusals exist so no job can be created whose provider side nobody placed or
+// whose deployment the panel has recorded as over: an unknown id has no order, a
+// placeholder id (an unresolved intent or an unknown purchase outcome) has no confirmed
+// provider order, and a retired order has no deployment left to set up.
+//
+// The retirement refusal is the order-level gate. Approving setup for an order the panel
+// has recorded as gone created a job that would be polled and offered for action while
+// both the grid and the history view called the same order DELETED.
 func (h *Handlers) loadApprovableOrder(ctx context.Context, orderID string) (*models.GigahostOrder, error) {
 	if strings.TrimSpace(orderID) == "" {
 		return nil, newSetupValidationError("order_id is required")
@@ -259,6 +288,10 @@ func (h *Handlers) loadApprovableOrder(ctx context.Context, orderID string) (*mo
 	if !found {
 		return nil, newSetupValidationError(fmt.Sprintf(
 			"order %s is not recorded; setup can only be approved for a placed order", orderID))
+	}
+	if order.Retired() {
+		return nil, newSetupValidationError(fmt.Sprintf(
+			"order %s has ended; its deployment no longer exists at the provider, so setup cannot be approved for it", orderID))
 	}
 	return order, nil
 }
@@ -489,6 +522,12 @@ func (h *Handlers) GigahostSetupConfirmHostHandler(w http.ResponseWriter, r *htt
 //     would be the defect: its trust precheck pauses before any discovery call, so
 //     the operator's retry could never produce an identity. It is instead re-armed
 //     for tracking, which is the state machine that owns discovery.
+//
+// Before either, the order itself is asked whether it still exists. A resume is an
+// instruction to contact a deployment, and the panel may already have recorded that
+// deployment as gone through the inventory - a fact the approval's own row does not
+// carry. Admitting the resume would have the worker retry against a server the provider
+// no longer lists.
 func (h *Handlers) ResumeGigahostSetup(
 	ctx context.Context, orderID string,
 ) (*models.GigahostSetupIntent, bool, error) {
@@ -504,6 +543,13 @@ func (h *Handlers) ResumeGigahostSetup(
 	}
 	if !found {
 		return nil, false, nil
+	}
+	if retired, err := h.db.IsGigahostOrderRetired(ctx, orderID); err != nil {
+		return nil, false, err
+	} else if retired {
+		// The stored row is returned unchanged: a resume that did not happen must not be
+		// reported as one, and the caller explains the real state.
+		return current, false, nil
 	}
 	if isDiscoveryRetryState(current) {
 		return h.reArmSetupDiscovery(ctx, orderID)
@@ -533,6 +579,11 @@ func (h *Handlers) reArmSetupDiscovery(
 
 // ConfirmGigahostSetupHost records the exact host identity an administrator
 // confirmed and re-arms provider tracking.
+//
+// It is refused for a retired order for the same reason a resume is: the confirmation's
+// only effect is to send the job on to contact a deployment, and the panel may already
+// have recorded that deployment as gone. A confirmation recorded against nothing would
+// also misreport the operator's decision as accepted.
 func (h *Handlers) ConfirmGigahostSetupHost(
 	ctx context.Context, orderID, fingerprint string,
 ) (*models.GigahostSetupIntent, bool, error) {
@@ -541,6 +592,15 @@ func (h *Handlers) ConfirmGigahostSetupHost(
 	}
 	if h.db == nil {
 		return nil, false, errors.New("database not available")
+	}
+	if retired, err := h.db.IsGigahostOrderRetired(ctx, orderID); err != nil {
+		return nil, false, err
+	} else if retired {
+		current, found, err := h.db.GetGigahostSetupIntent(ctx, orderID)
+		if err != nil || !found {
+			return nil, false, err
+		}
+		return current, false, nil
 	}
 	return h.db.ConfirmGigahostSetupHostFingerprint(ctx, orderID, fingerprint)
 }

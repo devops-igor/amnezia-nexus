@@ -394,13 +394,14 @@ func TestGenuineCancellationSurvivesAnInventoryThatDoesNotListIt(t *testing.T) {
 		t.Fatalf("a cancellation the inventory does not contradict must survive, got %v", got)
 	}
 	row := renderDeletedDeployment(t, runGigahostOrderStatusRendererLoads(t, read, orderID))
-	if row.Stage != "cancelled" {
-		t.Fatalf("a cancelled deployment must render cancelled, got %q", row.Stage)
+	if row.Stage != "deleted" {
+		t.Fatalf("a cancelled deployment must render as the deletion it is, got %q", row.Stage)
 	}
-	// A cancelled order is not a deleted one: cancellation stops the order while its VPS
-	// may still be running, so its actions are deliberately untouched by this change.
-	if slices.Contains(row.Actions, "deploy_retry_btn") {
-		t.Fatalf("a cancelled order is not retried through the deleted rule, got %v", row.Actions)
+	// The ending is presented from the recorded status, so nothing about the row is
+	// offered: every control would contact a deployment the cancelled order no longer
+	// covers, and asking the provider about it again is the polling that stops here.
+	if len(row.Actions) != 0 {
+		t.Fatalf("a cancelled order offers no action, got %v", row.Actions)
 	}
 	if !strings.Contains(row.Identity, "#"+orderID) {
 		t.Fatalf("the cancelled deployment lost its order identity: %q", row.Identity)

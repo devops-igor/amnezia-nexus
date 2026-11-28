@@ -134,7 +134,17 @@ SETTINGS_SCOPED_OVERRIDES = frozenset({
     ".settings-section-card .text-muted",
     ".settings-section-card .data-table th",
     ".settings-section-card .form-input::placeholder",
+    # The Hosting card's one-time association controls carry sentence-sized labels in
+    # several locales, and the shared .btn and .switch-container rules cannot break
+    # their text. Allowing the label to wrap inside the existing control is a rule
+    # about that section's own buttons and switch row, named exactly as the other
+    # scoped overrides are.
+    ".settings-section-card #gigahostAssociationSection .btn",
+    ".settings-section-card #gigahostAssociationSection .btn > span",
+    ".settings-section-card #gigahostAssociationSection .switch-container",
+    ".settings-section-card #gigahostAssociationSection .switch-label-text",
 })
+
 
 # The three spacing utilities the Settings templates use. They live in vpn.css,
 # next to the legacy utilities. Kept as exact selectors so a regression that

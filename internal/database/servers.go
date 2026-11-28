@@ -360,6 +360,99 @@ func (d *DB) SetServerProviderAbsence(ctx context.Context, id int64, observedAt 
 	return nil
 }
 
+// The ledger's own existence record.
+//
+// The two methods below are the ledger siblings of SetServerProviderAbsence and live
+// beside it, because they are one writer family: the same observation about the same
+// provider inventory, kept on the row that owns it. The server-row record covers a
+// deployment that registered a panel server. An order the provider no longer lists that
+// never became a server has no such row to mark, so its observation is kept on the ledger
+// entry itself and that order can be retired rather than refreshed and offered for setup
+// forever.
+//
+// This is the only writer of the ledger's absence columns. The single-writer rule the
+// absence guard states is satisfied structurally: the columns are written in this file,
+// which the guard names as the store, and the gated DECISION stays in one place - the
+// inventory reconciliation decides, these methods only record - so the one entry point
+// for "something concluded a server is gone" does not depend on where the statement lives.
+//
+// Both are addressed by the provider order id, which is the ledger's identity for an
+// order, and both refuse an update that matched no row: an observation about an order the
+// ledger does not hold is a caller defect, not a silent no-op.
+
+// SetGigahostOrderProviderAccount records the provider account an order was
+// observed under.
+//
+// The association is what makes absence decidable: one account's inventory answer
+// says nothing about another account's orders, so an order whose account is
+// unknown is never judged. It is written only from a provider answer that named
+// this order or the server it registered, never inferred from whichever
+// credential happens to be configured.
+func (d *DB) SetGigahostOrderProviderAccount(ctx context.Context, orderID, accountID string) error {
+	orderID = strings.TrimSpace(orderID)
+	accountID = strings.TrimSpace(accountID)
+	if d == nil || d.sqlDB == nil || orderID == "" || accountID == "" {
+		return nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return err
+	}
+	q := `UPDATE gigahost_orders
+	      SET provider_account_id = ?, updated_at = ?
+	      WHERE order_id = ? AND provider_account_id != ?`
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	res, err := d.sqlDB.ExecContext(ctx, q, accountID, time.Now().UTC().Format(time.RFC3339), orderID, accountID)
+	if err != nil {
+		return fmt.Errorf("failed to record the provider account of order %q: %w", orderID, err)
+	}
+	if _, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("failed to confirm the provider account write for order %q: %w", orderID, err)
+	}
+	return nil
+}
+
+// SetGigahostOrderAbsence records one order's existence observation: absentAt is
+// the instant the successful listing that omitted the order was requested, and a
+// zero time clears the observation.
+//
+// Clearing is written together with the observation, so a row can never carry an
+// absence stamp that belongs to a different account than the one currently
+// recorded.
+func (d *DB) SetGigahostOrderAbsence(ctx context.Context, orderID string, absentAt time.Time, accountID string) error {
+	orderID = strings.TrimSpace(orderID)
+	if d == nil || d.sqlDB == nil || orderID == "" {
+		return nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return err
+	}
+	stamp := ""
+	if !absentAt.IsZero() {
+		stamp = absentAt.UTC().Format(time.RFC3339)
+	}
+	if stamp == "" {
+		accountID = ""
+	}
+	q := `UPDATE gigahost_orders
+	      SET provider_absent_at = ?, provider_absent_account_id = ?, updated_at = ?
+	      WHERE order_id = ?
+	        AND (provider_absent_at != ? OR provider_absent_account_id != ?)`
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	res, err := d.sqlDB.ExecContext(ctx, q,
+		stamp, strings.TrimSpace(accountID), time.Now().UTC().Format(time.RFC3339),
+		orderID, stamp, strings.TrimSpace(accountID),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record the existence state of order %q: %w", orderID, err)
+	}
+	if _, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("failed to confirm the existence state write for order %q: %w", orderID, err)
+	}
+	return nil
+}
+
 // UpdateServerCredentials updates and encrypts SSH password and private key.
 func (d *DB) UpdateServerCredentials(ctx context.Context, id int64, sshPass, sshKey string) error {
 	return d.UpdateServer(ctx, id, map[string]any{

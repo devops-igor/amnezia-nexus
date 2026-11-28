@@ -56,22 +56,30 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 // one, and the previous controller cannot write aria-current, so the programmatic
 // current tab would stay on the first panel after a switch.
 //
+// The Gigahost hosting controller is a new file: the Settings hosting card moved to
+// the Servers page and its workflow half left settings.js, so both files changed and
+// both are requested through AssetURL on the page that loads them.
+//
 // This is the only place that set is spelled. A check that kept its own copy
 // could answer "every asset is identified" while the copy was missing the asset
 // whose bytes moved, which is how the table engine stayed bare behind a green
 // VPN-only guard. A delivery that changes another shipped asset adds it here and
 // the checks that consume this list cover it without further edits.
 var DeliveredAssets = []string{
+	"/static/css/components.css",
 	"/static/css/layout.css",
 	"/static/css/settings.css",
 	"/static/css/vpn.css",
+	"/static/js/gigahost_hosting.js",
 	"/static/js/gigahost_order_status.js",
+	"/static/js/gigahost_order_status_detail.js",
 	"/static/js/gigahost_order_status_model.js",
 	"/static/js/gigahost_setup_intents.js",
 	"/static/js/policy_panels.js",
 	"/static/js/policy_routing.js",
 	"/static/js/server_actions.js",
 	"/static/js/server_telemetry.js",
+	"/static/js/settings.js",
 	"/static/js/settings_nav.js",
 	"/static/js/tables.js",
 	"/static/js/ui.js",

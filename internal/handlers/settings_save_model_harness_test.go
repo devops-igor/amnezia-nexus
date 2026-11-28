@@ -274,6 +274,13 @@ func runRoutingScenario(t *testing.T, h *Handlers, scenario string) string {
 	return runSettingsScenarioWith(t, h, settingsHarnessOptions{path: "/routing"}, scenario)
 }
 
+// runHostingScenario is runSettingsScenario against the Servers page: the page the
+// hosting card and the credential commit it owns now render on.
+func runHostingScenario(t *testing.T, h *Handlers, scenario string) string {
+	t.Helper()
+	return runSettingsScenarioWith(t, h, settingsHarnessOptions{path: "/"}, scenario)
+}
+
 // runSettingsScenarioWith is runSettingsScenario with the harness server options.
 func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOptions, scenario string) string {
 	t.Helper()
@@ -288,6 +295,8 @@ func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOpti
 	switch opts.pagePath() {
 	case "/routing":
 		page = renderRoutingPageFor(t, h, models.RoleAdmin)
+	case "/":
+		page = renderServersPageAs(t, h, models.RoleAdmin)
 	default:
 		page = renderSettingsPageFor(t, h, models.RoleAdmin)
 	}

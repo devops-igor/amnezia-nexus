@@ -23,10 +23,12 @@ func TestRecentDeploymentsKeepsARecordedAbsenceAcrossAFailedDetailRead(t *testin
  // Six orders, newest first, so the recorded deletion is older than the five the list
  // shows by default. Each is a journaled install failure, which is the state that
  // offers a Retry control - so "no action" is measured against a row that would
- // otherwise have one.
- const recent = i => ({order_id:'ord_recent_' + i, status:'failed', assigned_ip:'198.51.100.' + (10 + i)});
+ // otherwise have one. The step is carried on the ROW, which is where the list response
+ // serves it: that column is what distinguishes an install this panel ran from a
+ // provider that ended provisioning, and the retry belongs to the former.
+ const recent = i => ({order_id:'ord_recent_' + i, status:'failed', step:'installing_protocol', assigned_ip:'198.51.100.' + (10 + i)});
  orders = [recent(1), recent(2), recent(3), recent(4), recent(5),
-           {order_id:'ord_gone', status:'failed', assigned_ip:'198.51.100.9'}];
+           {order_id:'ord_gone', status:'failed', step:'installing_protocol', assigned_ip:'198.51.100.9'}];
  // The panel recorded the deletion in the durable record the inventory pass writes,
  // and the list response carries it. Nothing is claimed about the provider here.
  absenceByOrder = {'ord_gone': true};
@@ -37,8 +39,12 @@ func TestRecentDeploymentsKeepsARecordedAbsenceAcrossAFailedDetailRead(t *testin
  // PHASE 1 - the per-order status request fails for every row.
  failList = true;
  await w.loadRecentOrders();
- assert.deepEqual(calls.filter(c => /\/status$/.test(c.url)).map(c => c.url).length, orders.length,
-   'the fixture must actually request a detail per order, got ' + JSON.stringify(calls.map(c => c.url)));
+ // The recorded deletion is not asked about at all, so the fixture requests one detail
+ // for each of the five rows the panel still holds an open question about.
+ assert.deepEqual(calls.filter(c => /\/status$/.test(c.url)).map(c => c.url).length, orders.length - 1,
+   'the fixture must actually request a detail per live order, got ' + JSON.stringify(calls.map(c => c.url)));
+ assert.deepEqual(calls.map(c => c.url).filter(u => u.indexOf('ord_gone') !== -1 && /\/status$/.test(u)), [],
+   'a recorded deletion must not be asked about at the provider');
  const failedRows = Array.from(container().querySelectorAll('.gigahost-order-row'));
  assert.equal(failedRows.length, 6,
    'a recorded deletion older than the five shown must still be listed while the detail read fails, got ' +
@@ -99,7 +105,10 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
    {order_id:'ord_term_provider', status:'ready', assigned_ip:'198.51.100.21'},
    {order_id:'ord_term_ledger', status:'terminated', assigned_ip:'198.51.100.22'},
    {order_id:'ord_cancel', status:'cancelled'},
-   {order_id:'ord_fail', status:'failed'}
+   // The step rides on the row, which is where the list response serves the panel's own
+   // install journal. That column is what makes this a recoverable setup failure rather
+   // than a provider-final one, which is the distinction the retry control now follows.
+   {order_id:'ord_fail', status:'failed', step:'installing_protocol'}
  ];
  observationByOrder = {
    'ord_term_provider': {outcome:'confirmed', status:'terminated'},
@@ -122,14 +131,14 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
  await w.loadRecentOrders();
 
  const stages = cells().map(c => c.getAttribute('data-stage'));
- assert.deepEqual(stages, ['deleted','deleted','cancelled','failed'],
-   'both terminal provider spellings are deletions, and cancelled and failed stay distinct, got ' +
+ assert.deepEqual(stages, ['deleted','deleted','deleted','failed'],
+   'both terminal provider spellings and a cancellation are deletions, and a failure stays the distinct outcome it was, got ' +
    JSON.stringify(stages));
 
- cells().slice(0, 2).forEach((cell, index) => {
+ cells().slice(0, 3).forEach((cell, index) => {
    const actions = Array.from(cell.parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
    assert.deepEqual(actions, [],
-     'a ' + (index === 0 ? 'provider-terminated' : 'ledger-terminated') + ' order must offer no contact action, got ' +
+     'a ' + ['provider-terminated','ledger-terminated','cancelled'][index] + ' order must offer no contact action, got ' +
      JSON.stringify(actions));
    const chain = Array.from(cell.querySelectorAll('.gigahost-order-status-stage'))
      .map(s => s.getAttribute('data-stage') + ':' + s.getAttribute('data-state'));
@@ -139,10 +148,8 @@ func TestTerminatedOrdersReachTheDeletedStage(t *testing.T) {
      /gigahost_status_stage_deleted/, 'the row must name the deleted stage');
  });
 
- // The two non-deletion outcomes are unchanged: a cancellation keeps its affordance and
- // a failed order keeps the retry that its state allows.
- const cancelActions = Array.from(cells()[2].parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
- assert.ok(cancelActions.length > 0, 'a cancelled order keeps the setup affordance it had');
+ // The failure that is not a recorded ending keeps the retry its state allows, so the
+ // assertion above is about the ending rather than about every terminal outcome.
  assert.deepEqual(
    Array.from(cells()[3].parentNode.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent),
    ['deploy_retry_btn'], 'a failed order keeps its retry control');

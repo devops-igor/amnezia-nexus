@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
@@ -114,7 +115,7 @@ func isRefreshableOrderID(orderID string) bool {
 // one actually answered, per order. The rows are modified in place exactly as before;
 // the returned map is the only new fact.
 func (h *Handlers) gigahostOrderObservations(
-	ctx context.Context, client gigahost.Client, orders []GigahostOrderRecord,
+	ctx context.Context, client gigahost.Client, orders []GigahostOrderRecord, panelServers []models.Server,
 ) map[string]GigahostProviderObservation {
 	// Every order starts at "no read was attempted", which is the truth for a terminal
 	// row and the base each successful read below overwrites.
@@ -131,6 +132,7 @@ func (h *Handlers) gigahostOrderObservations(
 	inventoryObservedAt := time.Now().UTC()
 	servers, serversErr := client.GetServers(ctx)
 	inventoryKnown := serversErr == nil
+	h.gigahostReconcileOrderExistence(ctx, client, orders, panelServers, servers, inventoryKnown, inventoryObservedAt)
 	if !inventoryKnown {
 		// An inventory that could not be read answers for nobody. Every non-terminal
 		// order it would have covered is reported unavailable, which is the one thing
@@ -154,6 +156,14 @@ func (h *Handlers) gigahostOrderObservations(
 			}
 			continue
 		}
+		// A recorded absence is the panel's own existence answer: the provider has
+		// already been asked, in a read that succeeded, and answered that it does not
+		// hold this order. Asking again every list read is the polling this record
+		// exists to stop, and no answer could change a durable observation except a
+		// listing that names the order, which the reconciliation above already reads.
+		if orders[i].ProviderAbsent() {
+			continue
+		}
 		observedRepair := orders[i].LiveRepairedAt
 		updated := false
 		if inventoryKnown && h.refreshOrderFromServers(servers, &orders[i], inventoryObservedAt) {
@@ -174,22 +184,9 @@ func (h *Handlers) gigahostOrderObservations(
 				if rowUpdated {
 					updated = true
 				}
-				// The order detail is the more specific read, so a confirmed answer from
-				// it outranks the inventory answer for the same order. A failed or silent
-				// detail read does not: the inventory already established a real provider
-				// status for this order, and overwriting it with "unavailable" would mark
-				// a confirmed order stale and refuse to advance its confirmed check time.
-				//
-				// The exception is when the inventory itself could not be read: then the
-				// provenance of this whole read is "the provider was not fully reachable",
-				// and a confirmation from the detail alone must not erase that, because the
-				// view has to stay visibly stale and keep its last confirmed time.
-				if inventoryKnown && (obs.confirmed() || !observations[orders[i].OrderID].confirmed()) {
-					observations[orders[i].OrderID] = obs
-				} else if !inventoryKnown && obs.authoritativeTerminal() {
-					// An explicit terminal status is a real provider answer about the order
-					// itself, so it still applies even while the inventory read failed.
-					observations[orders[i].OrderID] = obs
+				if merged, keep := gigahostDetailObservationPrecedence(
+					observations[orders[i].OrderID], obs, inventoryKnown); keep {
+					observations[orders[i].OrderID] = merged
 				}
 			}
 		}
@@ -202,6 +199,35 @@ func (h *Handlers) gigahostOrderObservations(
 	return observations
 }
 
+// gigahostDetailObservationPrecedence decides whether one order's detail read replaces the
+// observation already recorded for it, and returns the value to keep.
+//
+// The order detail is the more specific read, so a confirmed answer from it outranks the
+// inventory answer for the same order. A failed or silent detail read does not: the
+// inventory already established a real provider status for this order, and overwriting it
+// with "unavailable" would mark a confirmed order stale and refuse to advance its confirmed
+// check time.
+//
+// The exception is when the inventory itself could not be read: then the provenance of this
+// whole read is "the provider was not fully reachable", and a confirmation from the detail
+// alone must not erase that, because the view has to stay visibly stale and keep its last
+// confirmed time. An explicit terminal status is still a real provider answer about the
+// order itself, so it applies even then.
+//
+// It is one function rather than a branch inside the loop because it is the whole
+// precedence rule, and the rule is what a reader comes to this file to find.
+func gigahostDetailObservationPrecedence(
+	current, detail GigahostProviderObservation, inventoryKnown bool,
+) (GigahostProviderObservation, bool) {
+	if inventoryKnown && (detail.confirmed() || !current.confirmed()) {
+		return detail, true
+	}
+	if !inventoryKnown && detail.authoritativeTerminal() {
+		return detail, true
+	}
+	return GigahostProviderObservation{}, false
+}
+
 // gigahostListObservations answers, per order, what the list request could prove about the
 // provider. Every order starts at "no read was attempted", which is the truth for a terminal
 // row; a resolution failure or the real reads then overwrite that where they can say more.
@@ -212,7 +238,7 @@ func (h *Handlers) gigahostOrderObservations(
 // could not be reached - and leaving it at not_checked would let a stale ledger row display
 // with no warning. Terminal rows keep not_checked, since re-reading them changes nothing.
 func (h *Handlers) gigahostListObservations(
-	ctx context.Context, r *http.Request, orders []GigahostOrderRecord,
+	ctx context.Context, r *http.Request, orders []GigahostOrderRecord, panelServers []models.Server,
 ) map[string]GigahostProviderObservation {
 	observations := make(map[string]GigahostProviderObservation, len(orders))
 	for i := range orders {
@@ -235,7 +261,7 @@ func (h *Handlers) gigahostListObservations(
 	if len(orders) == 0 {
 		return observations
 	}
-	return h.gigahostOrderObservations(ctx, client, orders)
+	return h.gigahostOrderObservations(ctx, client, orders, panelServers)
 }
 
 // isDeletedStatus reports the one terminal vocabulary that claims the *server* is gone,
@@ -554,34 +580,45 @@ func applyDeployIdentity(order *GigahostOrderRecord, statusResp *gigahost.Deploy
 
 // gigahostMissingDetailOutcome answers a provider that has no detail record for the order.
 //
-/* "No such order" only means cancellation when the inventory could corroborate it.
+/* "No such order" is reported as a gap, never as a cancellation.
  *
- * The inventory read is what distinguishes "the provider no longer has this order" from "I
- * could not find out": it either names the order (live, or with the provider's own terminal
- * status), or it answered and named nobody. When the inventory read FAILED, none of those is
- * true, and the terminal value would be sticky here - the next list read skips a terminal row
- * before consulting the inventory again, so an ordinary 503 would strand a live order in the
- * terminal state forever. Report the gap instead and leave the row live, so the next read can
- * repair it. */
+ * The order detail and the panel's existence record answer different questions. The
+ * detail says how the order ended; whether the provider still holds the order is the
+ * inventory's answer, and the inventory is the only read that can be validated for
+ * completeness and for the account it enumerates (gigahost_order_reconcile.go). A 404
+ * carries no such evidence: it is one endpoint declining to describe an order, and it
+ * says the same thing whether the order ended, belongs to another account, or was simply
+ * not found by a partial or unauthorized read.
+ *
+ * Inferring a cancellation from it therefore created a second, weaker writer of the
+ * same durable fact, and one that bypassed every gate the validated record enforces. An
+ * order belonging to another account, an inventory with an unidentifiable entry, or a
+ * refused account read all reached this branch and durably ended a live order. An ending
+ * is not repaired by the inventory either (repairDeletedOrderFromInventory corrects
+ * deletions, not cancellations), so the invented one was permanent.
+ *
+ * What is not lost: a genuinely ended order is recorded by the reconciliation on
+ * the same read that establishes the omission, and an explicit terminal status in a
+ * successful detail answer is still applied by gigahostApplyDeployDetail. Both are
+ * provider statements about this order; this branch never was. So it reports the gap
+ * and leaves the row exactly as it found it. */
 func gigahostMissingDetailOutcome(order *GigahostOrderRecord, deployErr error, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
-	if !errors.Is(deployErr, gigahost.ErrNotFound) || !isGigahostReady(order.Status) {
+	if !errors.Is(deployErr, gigahost.ErrNotFound) {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: deployErr.Error()}
 	}
-	if !inventoryKnown {
+	// The order is still listed by the inventory that was read for this same request.
+	// A missing detail record next to a live listing is a partial read failure, and the
+	// listing is the affirmative answer.
+	if status, ok := gigahostProviderServerStatus(live, order.OrderID); inventoryKnown && ok {
 		return false, GigahostProviderObservation{
-			Outcome: gigahostObservationUnavailable,
-			Error:   "provider inventory could not be read, so a missing deployment record is not evidence of cancellation",
+			Outcome: gigahostObservationConfirmed,
+			Status:  status,
 		}
 	}
-	// Only a cancellation nothing contradicts: live inventory for this order means the missing
-	// detail record is a partial read failure, and the terminal value would be sticky, so later
-	// reads would skip the row and inventory could never repair it.
-	if inventoryListsOrderLive(live, order) || order.LiveRepairedAt != nil {
-		return false, GigahostProviderObservation{
-			Outcome: gigahostObservationUnconfirmed,
-			Error:   "provider has no detail record that contradicts the recorded live observation",
-		}
+	// Anything else: the existence record is the panel's answer, and this read produced
+	// no evidence to add to it. The row keeps the state it had.
+	return false, GigahostProviderObservation{
+		Outcome: gigahostObservationUnavailable,
+		Error:   "provider has no deployment-detail record for this order; existence is decided by the inventory observation",
 	}
-	order.Status = statusCancelled
-	return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
 }

@@ -304,6 +304,26 @@
 
     /* ===== Reusable Async Confirmation Modal ===== */
     /**
+     * confirmWith marks the shared dialog for the length of one confirmation, so a
+     * confirmation that needs its own layout can be told apart from every other use of
+     * the same modal. The mark is removed in finally: whether the operator answered, and
+     * whichever answer they gave, the next confirmation starts unmarked.
+     *
+     * @param {string} kind the marking this confirmation needs
+     * @param {Object} options the same options confirm accepts
+     * @returns {Promise<boolean>}
+     */
+    async function confirmWith(kind, options) {
+        const modal = typeof document !== 'undefined' ? document.getElementById('nexusConfirmModal') : null;
+        if (modal) modal.dataset.confirmKind = kind;
+        try {
+            return await confirm(options);
+        } finally {
+            if (modal) delete modal.dataset.confirmKind;
+        }
+    }
+
+    /**
      * Reusable async confirmation modal
      * @param {Object} options
      * @param {string} [options.title='Confirm Action']
@@ -524,6 +544,7 @@
         },
         copy: copy,
         confirm: confirm,
+        confirmWith: confirmWith,
         formatBytes: formatBytes,
         downloadFile: downloadFile,
         downloadQRCode: downloadQRCode,

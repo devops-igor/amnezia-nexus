@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // GigahostOrder is one persisted Gigahost hourly order attempt.
 //
@@ -48,6 +51,11 @@ type GigahostOrder struct {
 	// Currency is the order's billing currency. Empty means "not recorded"
 	// and is treated as NOK, the pre-existing assumption.
 	Currency string `json:"currency"`
+	// Step is the onboarding journal's last recorded step for this order, as the
+	// journal writer stored it. It is the panel's own execution record, never a
+	// provider observation, and it is served so a row whose status is no longer
+	// asked about still shows the step that was reached.
+	Step string `json:"step,omitempty"`
 
 	// PurchaseOrigin records who created this row, and is the only evidence the
 	// setup pipeline accepts that this panel actually purchased the order. See
@@ -58,6 +66,107 @@ type GigahostOrder struct {
 	// PurchaseRecordedAt is when the purchase intent was committed. It is recorded
 	// with the stamp in the same INSERT so the two cannot disagree.
 	PurchaseRecordedAt time.Time `json:"purchase_recorded_at,omitempty"`
+
+	// ProviderAccountID is the provider account the order was observed under: the
+	// account whose own answer named this order or the server it registered. Empty
+	// means unknown, and an unknown association may never justify a durable absence,
+	// because one account's listing says nothing about another account's orders.
+	ProviderAccountID string `json:"-"`
+
+	// ProviderAbsentAt records when a successful, complete provider inventory read
+	// omitted this order, as an RFC3339 UTC timestamp. Empty means no such
+	// observation: the provider still lists it, or no successful read has judged it.
+	// It is an observation about the provider's view of one order, never a deletion
+	// of the ledger row, and it is what lets an order that never registered a panel
+	// server be retired rather than polled forever.
+	ProviderAbsentAt string `json:"-"`
+
+	// ProviderAbsentAccountID records which provider account the listing that
+	// produced the absence observation answered for. It is written and cleared with
+	// the observation, so a later credential change is visible rather than silent.
+	ProviderAbsentAccountID string `json:"-"`
+}
+
+// ProviderAbsent reports whether a successful provider inventory read has
+// recorded that this order is gone. A failed or unanswered read never writes the
+// column, so an empty value is the only "not absent" answer the panel holds.
+func (o GigahostOrder) ProviderAbsent() bool {
+	return strings.TrimSpace(o.ProviderAbsentAt) != ""
+}
+
+// gigahostOrderEndedSpellings are the recorded statuses that end an order's life
+// as an outcome of the order itself. The provider spells a cancellation both ways
+// in different fields, so both are matched literally.
+//
+//nolint:misspell // "cancelled" is the provider's own spelling, accepted beside "canceled"
+var gigahostOrderEndedSpellings = []string{"cancelled", "canceled", "deleted", "terminated"}
+
+// IsGigahostOrderEndedStatus reports a recorded status that ends the order.
+//
+// `failed` is deliberately absent: a failure is only final when nothing local
+// records an install attempt - see FailureIsProviderFinal. Listing it here would
+// make a recoverable setup-journal failure indistinguishable from an order the
+// provider ended.
+func IsGigahostOrderEndedStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	for _, ended := range gigahostOrderEndedSpellings {
+		if s == ended {
+			return true
+		}
+	}
+	return false
+}
+
+// IsGigahostOrderFailedStatus reports the recorded spellings that mean "this order
+// failed" without yet saying whose failure it was.
+func IsGigahostOrderFailedStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+// HasSetupJournalEvidence reports whether the panel's own onboarding journal recorded
+// progress for this order: a recorded step, or the panel server registration it mirrors
+// onto the ledger.
+//
+// Both are written only by the onboarding path, which is what makes them provenance
+// rather than a guess. The status column is shared - the provider refresh writes it too
+// - and ServerID is the provider's numeric id, not the panel's, so neither is evidence
+// that an install was attempted.
+func (o GigahostOrder) HasSetupJournalEvidence() bool {
+	return strings.TrimSpace(o.Step) != "" || o.NexusServerID > 0
+}
+
+// FailureIsProviderFinal reports a recorded failure that no onboarding journal
+// accompanies: the order ended at the provider before any panel setup work began, so
+// there is no recoverable setup outcome behind the word.
+//
+// The distinction decides every downstream affordance. A provider-final failure is over
+// - nothing can be retried onto a deployment that was never provisioned - while a
+// journal-backed failure is execution the operator ran and may retry.
+func (o GigahostOrder) FailureIsProviderFinal() bool {
+	if !IsGigahostOrderFailedStatus(o.Status) {
+		return false
+	}
+	return !o.HasSetupJournalEvidence()
+}
+
+// Retired reports whether the panel's own durable records say this order's life has
+// ended, in either of the two ways it can end:
+//
+//   - a recorded provider absence, which is the inventory answer for this order's own
+//     account saying the deployment is gone;
+//   - a recorded ending: a cancellation, deletion or termination, or a failure no
+//     onboarding journal accompanies.
+//
+// It is the one predicate every consumer of an order's life consults - the grid, the
+// history view, saved setup approvals and the background workers - so an order cannot
+// read as finished on one surface and as actionable on another.
+func (o GigahostOrder) Retired() bool {
+	return o.ProviderAbsent() || IsGigahostOrderEndedStatus(o.Status) || o.FailureIsProviderFinal()
 }
 
 // GigahostOrderCredential is the managed SSH credential attached to one order

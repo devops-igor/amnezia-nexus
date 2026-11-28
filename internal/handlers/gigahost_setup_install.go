@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -387,6 +388,12 @@ func (h *Handlers) resumeInstallAction(
 // the existing deploy status endpoint agrees with the setup intent. A failure here
 // is ignored: the durable intent is already the authority and the ledger row is a
 // progress view.
+//
+// The mirror is the last thing an attempt writes, and enablement's traffic
+// qualification can take a while, so the order is asked again before reporting it.
+// A ledger row that says a retired order reached ready is exactly the dishonest
+// surface this path must not produce: the job's own journal is fenced, but this
+// write is a plain status update and would otherwise outlive that fence.
 func (h *Handlers) completeOrderDeployStatus(
 	ctx context.Context, req GigahostDeployRequest, server *models.Server,
 ) {
@@ -395,6 +402,17 @@ func (h *Handlers) completeOrderDeployStatus(
 	}
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
+	// The mirror is a success claim about a deployment, so it is written only when the order is
+	// known to be live: an ended order gets no ready row, and an unreadable ledger is not
+	// permission to write one. In both other cases the durable intent already holds what the
+	// attempt actually established, and this row keeps its last known value.
+	if ended, known := h.retirementQuestion(persistCtx, req.OrderID); !known || ended {
+		if ended {
+			slog.Info("Gigahost setup did not record the order as ready: the order ended",
+				"order_id", req.OrderID, "server_id", server.ID)
+		}
+		return
+	}
 	_ = h.updateDeployOrderStatus(persistCtx, req.OrderID, DeployStatusReady, DeployStatusReady, "",
 		req.ProviderServerID, server.ID, server.Host)
 }

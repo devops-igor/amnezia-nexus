@@ -50,9 +50,6 @@
     <p class="card-subtitle">{{ _ "settings_group_system_desc" }}</p>
     <div class="settings-grid">
         {{ template "settings_upstream_components" . }}
-        {{ if is_admin .current_user }}
-        {{ template "settings_gigahost" . }}
-        {{ end }}
         {{ template "settings_backup" . }}
     </div>
 </section>
@@ -61,12 +58,5 @@
 <script src="/static/js/settings_cards.js?v={{ .app_version }}"></script>
 <script src="/static/js/settings_save.js?v={{ .app_version }}"></script>
 <script src="/static/js/notifications_settings.js?v={{ .app_version }}"></script>
-<script src="/static/js/gigahost_catalog_status.js?v={{ .app_version }}"></script>
-<script src="/static/js/gigahost_setup.js?v={{ .app_version }}"></script>
-<script src="{{ asset_url "/static/js/gigahost_setup_intents.js" }}"></script>
-<script src="{{ asset_url "/static/js/gigahost_order_status_model.js" }}"></script>
-<script src="{{ asset_url "/static/js/gigahost_order_status.js" }}"></script>
-<script src="/static/js/gigahost_placement.js?v={{ .app_version }}"></script>
-<script src="/static/js/gigahost_account_association.js?v={{ .app_version }}"></script>
-<script src="/static/js/settings.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/settings.js" }}"></script>
 {{ end }}

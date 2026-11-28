@@ -45,9 +45,14 @@ func gigahostOrderStatusHarness(t *testing.T, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
+	detailModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_detail.js")
+	if err != nil {
+		t.Fatalf("read the status detail module: %v", err)
+	}
 	encodedStatus, _ := json.Marshal(string(statusModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
 	encodedModel, _ := json.Marshal(string(modelModule))
+	encodedDetail, _ := json.Marshal(string(detailModule))
 	return jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
@@ -104,6 +109,7 @@ w.eval(%s);
 // instead of to the undifferentiated stdin script, so CRAP is measurable from this
 // test rather than from a parallel harness.
 w.eval(%s + '\n//# sourceURL=gigahost_order_status_model.js');
+w.eval(%s + '\n//# sourceURL=gigahost_order_status_detail.js');
 w.eval(%s + '\n//# sourceURL=gigahost_order_status.js');
 
 const container = () => w.document.getElementById('recentOrdersContainer');
@@ -119,7 +125,7 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(r => s
 (async()=>{
 %s
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedIntents), string(encodedModel), string(encodedStatus), scenario)
+`, string(encodedIntents), string(encodedModel), string(encodedDetail), string(encodedStatus), scenario)
 }
 
 // runGigahostOrderStatusScenario executes one scenario body and requires its own
@@ -210,7 +216,10 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  // 7. Explicit terminal and unknown states are kept, and obsolete steps are not
  //    drawn for them: a failed order does not claim it ever deployed, and a ledger
  //    placeholder has no confirmed provider state at all.
- orders = [{order_id:'ord-fail', status:'failed'}];
+ // The step rides on the row: the list response serves the panel's own install
+ // journal there, and that column is what marks this as a failure the operator ran
+ // and may retry rather than a provider-final ending.
+ orders = [{order_id:'ord-fail', status:'failed', step:'installing_protocol'}];
  observationByOrder = { 'ord-fail': {outcome:'confirmed', status:'failed'} };
  deployByOrder = { 'ord-fail': {status:'failed', step:'installing_protocol', error:'provider refused'} };
  intents = []; backends = [];
@@ -230,17 +239,22 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  assert.match(flat(panel()), /gigahost_status_next_action_check_provider/);
  assert.match(flat(panel()), /gigahost_status_ip_while_provisioning/);
 
- // 8. A cancelled order is terminal: it reports nothing to do, and the stepper does
- //    not claim it ever deployed. The setup affordance itself is the pre-existing
- //    one and is preserved, because revoking an approval never cancelled the VPS.
+ // 8. A cancelled order is a final decision, so it is presented as the deletion it is:
+ //    it reports nothing to do, the stepper does not claim it ever deployed, and no
+ //    status request is issued for it at all. It is not presented as a deployment that
+ //    still awaits an operator, which is what made a cancelled order read like one.
  orders = [{order_id:'ord-cancel', status:'cancelled'}];
  observationByOrder = { 'ord-cancel': {outcome:'confirmed', status:'cancelled'} };
  deployByOrder = { 'ord-cancel': {} };
+ const beforeCancel = calls.length;
  await w.loadRecentOrders();
- assert.equal(cell().getAttribute('data-stage'), 'cancelled');
+ assert.equal(cell().getAttribute('data-stage'), 'deleted');
  assert.match(flat(panel()), /gigahost_status_next_action_none/);
  const cancelChain = Array.from(toggle().querySelectorAll('.gigahost-order-status-stage')).map(s => s.getAttribute('data-stage'));
- assert.deepEqual(cancelChain, ['requested','cancelled'], 'a cancelled order must not claim the deploying step');
+ assert.deepEqual(cancelChain, ['requested','deleted'], 'a cancelled order must not claim the deploying step');
+ assert.deepEqual(calls.slice(beforeCancel).filter(c => /\/status$/.test(c.url)), [],
+   'a cancelled order must not be asked about at the provider, got ' +
+   JSON.stringify(calls.slice(beforeCancel).map(c => c.url)));
 `)
 }
 

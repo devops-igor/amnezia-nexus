@@ -30,8 +30,8 @@ func GetTemplatesSubFS() (fs.FS, error) {
 }
 
 // LayoutPartials are the template files that only define sections included by a layout
-// page: settings_policy.html is rendered by settings.html, settings/gigahost.html by the
-// Settings group, servers_deployments.html by the Servers page, and so on.
+// page: settings_policy.html is rendered by settings.html, servers_hosting.html by the
+// Servers page, and so on.
 //
 // A Go template resolves its includes when it executes, not when it parses, so anything
 // that renders a page has to parse these files beside base.html and the page itself. The
@@ -40,7 +40,7 @@ func GetTemplatesSubFS() (fs.FS, error) {
 // templates, is what stops the two from disagreeing about which files make up a page. A
 // page that includes a section this list omits cannot execute at all, in either consumer.
 var LayoutPartials = []string{
-	"servers_deployments.html",
+	"servers_hosting.html",
 	"settings_policy.html",
 	"settings_policy_client.html",
 	"settings_notifications.html",
@@ -52,5 +52,4 @@ var LayoutPartials = []string{
 	"settings/limits.html",
 	"settings/backup.html",
 	"settings/upstream_components.html",
-	"settings/gigahost.html",
 }

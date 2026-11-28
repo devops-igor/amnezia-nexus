@@ -39,7 +39,10 @@ var gigahostOrdersSchema = `CREATE TABLE IF NOT EXISTS gigahost_orders (
 	updated_at TEXT NOT NULL,
 	price_id INTEGER DEFAULT 0,
 	monthly_cap_nok REAL DEFAULT 0.0,
-	currency TEXT DEFAULT ''
+	currency TEXT DEFAULT '',
+	provider_account_id TEXT NOT NULL DEFAULT '',
+	provider_absent_at TEXT NOT NULL DEFAULT '',
+	provider_absent_account_id TEXT NOT NULL DEFAULT ''
 )`
 
 // gigahostOrderColumns lists every optional column added after the original
@@ -65,6 +68,13 @@ var gigahostOrderColumns = []struct {
 	{"purchase_recorded_at", `ALTER TABLE gigahost_orders ADD COLUMN purchase_recorded_at TEXT NOT NULL DEFAULT ''`},
 	// Unknown historical rows remain NULL: neither identity nor registration proves repair.
 	{"live_repaired_at", `ALTER TABLE gigahost_orders ADD COLUMN live_repaired_at TEXT`},
+	// The order-level existence record. Absence used to be recordable only on the
+	// server row an order registered, so an order that never registered one could not
+	// be retired at all. Every existing row starts with an empty observation, which is
+	// exactly "nothing has been observed", never an inferred deletion.
+	{"provider_account_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_account_id TEXT NOT NULL DEFAULT ''`},
+	{"provider_absent_at", `ALTER TABLE gigahost_orders ADD COLUMN provider_absent_at TEXT NOT NULL DEFAULT ''`},
+	{"provider_absent_account_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_absent_account_id TEXT NOT NULL DEFAULT ''`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -157,7 +167,8 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 // this order, so a second reader cannot drift from the first.
 const gigahostOrderSelectColumns = `id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
              created_at, updated_at, price_id, monthly_cap_nok, currency,
-             purchase_origin, purchase_recorded_at, live_repaired_at, nexus_server_id`
+             purchase_origin, purchase_recorded_at, live_repaired_at, nexus_server_id,
+             provider_account_id, provider_absent_at, provider_absent_account_id, step`
 
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
@@ -232,18 +243,23 @@ func (d *DB) InsertGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 		}
 		recordedAt = o.PurchaseRecordedAt.UTC().Format(time.RFC3339Nano)
 	}
+	// The panel's own registration is part of the row's provenance: a deployment records the
+	// server it created on the order it was created for. Without this the ledger holds no
+	// attribution between an order and the backend it admitted, so the one durable fact that
+	// answers "may this backend be admitted?" cannot be asked for an immediate setup at all -
+	// only a saved job carried it, on the intent row.
 	q := `INSERT INTO gigahost_orders
 	      (order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
 	       created_at, updated_at, price_id, monthly_cap_nok, currency,
-	       purchase_origin, purchase_recorded_at)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	       purchase_origin, purchase_recorded_at, nexus_server_id)
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
 		o.OrderID, o.ServerID, o.Status, o.PlanID, o.RegionID, o.HourlyPriceNOK, o.AssignedIP,
 		o.CreatedAt.Format(time.RFC3339), o.UpdatedAt.Format(time.RFC3339),
 		o.PriceID, o.MonthlyCapNOK, o.Currency,
-		origin, recordedAt,
+		origin, recordedAt, o.NexusServerID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert gigahost order: %w", err)
@@ -414,6 +430,95 @@ func (d *DB) encryptOrderCredential(privateKey string) (string, error) {
 	return enc, nil
 }
 
+// IsGigahostOrderRetired reports whether the panel's own durable records say this
+// order's life has ended, through the one predicate every consumer shares
+// (models.GigahostOrder.Retired).
+//
+// It is the question a saved setup approval and a background worker must ask before
+// producing an effect for an order: an approval is addressed by an order id, and its own
+// row carries neither the provider absence observation nor the onboarding journal, so
+// without this read a job could work on a deployment the panel has already recorded as
+// gone. A missing row is not a retirement: found=false means the ledger never recorded
+// this order, which is a different fact and must not silently remove an action.
+func (d *DB) IsGigahostOrderRetired(ctx context.Context, orderID string) (bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return false, nil
+	}
+	order, found, err := d.GetGigahostOrder(ctx, orderID)
+	if err != nil || !found || order == nil {
+		return false, err
+	}
+	return order.Retired(), nil
+}
+
+// GigahostOrderRetirementByOrderID answers, per order id, whether the panel's own
+// durable records say that order's life has ended.
+//
+// It exists because saved setup work is not the order list. The list computes a row's
+// ending from the row it already holds, but a saved approval is addressed by its own
+// order id and its row is read from a different query, so a surface that only knows the
+// approval had no way to ask the question at all. Without this join, an order the panel
+// has recorded as gone stayed offered for setup, and its background tracker kept
+// polling a provider that no longer held the deployment.
+//
+// One decision produces every answer: models.GigahostOrder.Retired is the same predicate
+// the grid and the history view present from, so no two surfaces can disagree about the
+// same order. A missing row and a failed read both answer "not retired": absence of a
+// record is not an observation, and this read must never be the reason an action
+// disappears.
+func (d *DB) GigahostOrderRetirementByOrderID(ctx context.Context, orderIDs []string) map[string]bool {
+	retired := make(map[string]bool, len(orderIDs))
+	if d == nil || d.sqlDB == nil || len(orderIDs) == 0 {
+		return retired
+	}
+	wanted := make([]string, 0, len(orderIDs))
+	seen := make(map[string]struct{}, len(orderIDs))
+	for _, orderID := range orderIDs {
+		id := strings.TrimSpace(orderID)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		wanted = append(wanted, id)
+	}
+	if len(wanted) == 0 {
+		return retired
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return retired
+	}
+	// The order id is bound, never interpolated; only the marker count is rendered.
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(wanted)), ",")
+	args := make([]any, 0, len(wanted))
+	for _, id := range wanted {
+		args = append(args, id)
+	}
+	q := `SELECT ` + gigahostOrderSelectColumns + `
+	      FROM gigahost_orders
+	      WHERE order_id IN (` + placeholders + `)` // #nosec G202 -- placeholder count only; all values are bound arguments
+	rows, err := d.sqlDB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return retired
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		order, scanErr := scanGigahostOrder(rows)
+		if scanErr != nil {
+			return retired
+		}
+		if order.Retired() {
+			retired[order.OrderID] = true
+		}
+	}
+	if rows.Err() != nil {
+		return retired
+	}
+	return retired
+}
+
 // GetGigahostOrder returns one ledger row addressed by its provider order id.
 // found=false means the ledger has no such order.
 //
@@ -451,11 +556,13 @@ func scanGigahostOrder(row gigahostOrderRowScanner) (*models.GigahostOrder, erro
 	var purchaseOrigin, purchaseRecordedAt, liveRepairedAt sql.NullString
 	var priceID, nexusServerID sql.NullInt64
 	var monthlyCap sql.NullFloat64
+	var providerAccountID, providerAbsentAt, providerAbsentAccountID, step sql.NullString
 	if err := row.Scan(
 		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 		&priceID, &monthlyCap, &currency,
 		&purchaseOrigin, &purchaseRecordedAt, &liveRepairedAt, &nexusServerID,
+		&providerAccountID, &providerAbsentAt, &providerAbsentAccountID, &step,
 	); err != nil {
 		return nil, err
 	}
@@ -467,6 +574,10 @@ func scanGigahostOrder(row gigahostOrderRowScanner) (*models.GigahostOrder, erro
 	o.PurchaseOrigin = purchaseOrigin.String
 	o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
 	o.LiveRepairedAt = parseGigahostRepairTime(liveRepairedAt)
+	o.ProviderAccountID = strings.TrimSpace(providerAccountID.String)
+	o.ProviderAbsentAt = strings.TrimSpace(providerAbsentAt.String)
+	o.ProviderAbsentAccountID = strings.TrimSpace(providerAbsentAccountID.String)
+	o.Step = strings.TrimSpace(step.String)
 	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return &o, nil

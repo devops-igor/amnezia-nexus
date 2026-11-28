@@ -751,3 +751,220 @@ def test_server_tab_icons_are_decorative_in_the_accessibility_tree(
         assert not graphics, (
             f"{label}: the decorative icon is still in the accessibility tree: {graphics}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The Hosting card's association controls at the 320 CSS px review floor.
+#
+# The verdict measured the Russian preview control running past its card: at 320 the
+# document widened to 328 px, the card ended at 304 and the button at 327.94, so its right
+# edge was 7.94 px past the viewport. English, French, Chinese and Persian all fitted at 320,
+# and every locale fitted at 343. The cause is the shared .btn rule's white-space: nowrap on
+# a label that is a whole sentence in some locales, so the control grew past the card rather
+# than letting the label take a second line.
+#
+# The fix is that wrap, scoped to this one section: nothing is hidden, and the label's size
+# is still the card's button scale.
+# ---------------------------------------------------------------------------
+
+HOSTING_CARD = "#gigahostCard"
+ASSOCIATION_SECTION = "#gigahostAssociationSection"
+
+# Every control in the section whose label is a phrase rather than a word. All three are
+# measured, because the revealed ones are as likely to overflow as the always-visible one
+# and a test that only measured the preview would miss them.
+ASSOCIATION_CONTROLS = (
+    "btnGigahostAssociationPreview",
+    "gigahostAssociationUnlistedChoice",
+    "btnGigahostAssociationConfirm",
+)
+
+# The floor this case holds, and the width the defect was measured at.
+REFLOW_FLOOR = 320
+# A width at which no association label is constrained, used as the size reference: the
+# contract is that a narrow viewport reflows this text and does not shrink it.
+REFERENCE_WIDTH = 1440
+
+ASSOCIATION_PROBE = """() => {
+  const box = el => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return {left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+            width: r.width, height: r.height};
+  };
+  const section = document.querySelector('#gigahostAssociationSection');
+  const card = document.querySelector('#gigahostCard');
+  const control = (id) => {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    const style = getComputedStyle(el);
+    const b = box(el);
+    return {
+      box: b,
+      whiteSpace: style.whiteSpace,
+      fontSize: style.fontSize,
+      // How many line boxes the control's own text occupies.
+      lines: (() => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        return new Set([...range.getClientRects()].filter(r => r.width || r.height)
+          .map(r => Math.round(r.top))).size;
+      })(),
+      label: (el.textContent || '').trim(),
+    };
+  };
+  const label = document.querySelector('#btnGigahostAssociationPreview > span');
+  const labelRects = [];
+  if (label) {
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    for (const r of range.getClientRects()) {
+      if (r.width || r.height) labelRects.push({top: r.top, bottom: r.bottom, right: r.right});
+    }
+  }
+  return {
+    docScroll: document.documentElement.scrollWidth,
+    docClient: document.documentElement.clientWidth,
+    bodyScroll: document.body.scrollWidth,
+    card: box(card),
+    section: box(section),
+    previewLabelRects: labelRects,
+    controls: Object.fromEntries(
+      ['btnGigahostAssociationPreview','gigahostAssociationUnlistedChoice','btnGigahostAssociationConfirm']
+        .map(id => [id, control(id)])),
+  };
+}"""
+
+
+def open_servers_page(page: Page, base_url: str, lang: str, width: int) -> None:
+    """Load the Servers page at one width and locale, with the Hosting card present."""
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(f"{base_url}/?lang={lang}")
+    page.wait_for_selector(HOSTING_CARD)
+    page.wait_for_function("() => document.styleSheets.length >= 8")
+    # The association card is administrator-only, so its absence here would make every
+    # measurement below vacuous rather than failing.
+    assert page.locator(ASSOCIATION_SECTION).count() == 1, (
+        "the association section is not on the page; this case would measure nothing"
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("locale", LOCALES)
+def test_hosting_association_controls_fit_the_reflow_floor(
+    authenticated_page: Page, base_url: str, locale: str
+) -> None:
+    """Every locale's association controls fit inside the card at 320 CSS px.
+
+    The controls are measured with the optional choice and the confirm control revealed,
+    because those are the states the preview step puts the operator in and they carry the
+    longest labels in the section.
+    """
+    page = authenticated_page
+    open_servers_page(page, base_url, locale, REFLOW_FLOOR)
+    # Reveal the two post-preview controls through their own class, which is the state the
+    # preview step produces; the reveal behaviour itself is covered elsewhere.
+    page.evaluate(
+        "() => { for (const id of ['gigahostAssociationUnlistedChoice', 'btnGigahostAssociationConfirm']) {"
+        " const el = document.getElementById(id); if (el) el.classList.remove('hidden'); } }"
+    )
+    m = page.evaluate(ASSOCIATION_PROBE)
+
+    # The same controls at a width where no label was ever constrained, which is the size
+    # reference: a narrow viewport may reflow this text, it may not shrink it.
+    page.set_viewport_size({"width": REFERENCE_WIDTH, "height": 1000})
+    page.wait_for_function("() => document.getAnimations().every(a => a.playState !== 'running')")
+    page.evaluate(
+        "() => { for (const id of ['gigahostAssociationUnlistedChoice', 'btnGigahostAssociationConfirm']) {"
+        " const el = document.getElementById(id); if (el) el.classList.remove('hidden'); } }"
+    )
+    reference = page.evaluate(ASSOCIATION_PROBE)
+    page.set_viewport_size({"width": REFLOW_FLOOR, "height": 1000})
+    page.wait_for_function("() => document.getAnimations().every(a => a.playState !== 'running')")
+
+    # No horizontal document scroll: the defect widened the document to 328 for Russian.
+    assert m["docScroll"] <= m["docClient"] + RECT_TOLERANCE, (
+        f"{locale}: the document scrolls sideways at {REFLOW_FLOOR}: "
+        f"{m['docScroll']} > {m['docClient']}"
+    )
+    assert m["bodyScroll"] <= m["docClient"] + RECT_TOLERANCE, (
+        f"{locale}: the body scrolls sideways at {REFLOW_FLOOR}: "
+        f"{m['bodyScroll']} > {m['docClient']}"
+    )
+
+    card, section = m["card"], m["section"]
+    assert card and section, f"{locale}: the Hosting card or its section is missing"
+    for control_id in ASSOCIATION_CONTROLS:
+        got = m["controls"].get(control_id)
+        assert got and got["box"], f"{locale}/{control_id}: the control is not on the page"
+        label = f"{locale}/{control_id}"
+        # Inside the card it belongs to, measured with a sub-pixel tolerance.
+        assert got["box"]["left"] >= card["left"] - RECT_TOLERANCE, f"{label}: starts left of the card"
+        assert got["box"]["right"] <= card["right"] + RECT_TOLERANCE, (
+            f"{label}: ends {got['box']['right'] - card['right']:.2f} px past the card"
+        )
+        # And on screen, which is the defect the verdict measured.
+        assert got["box"]["right"] <= m["docClient"] + RECT_TOLERANCE, (
+            f"{label}: ends {got['box']['right'] - m['docClient']:.2f} px past the viewport"
+        )
+        assert got["box"]["left"] >= -RECT_TOLERANCE, f"{label}: starts off screen"
+        # The wrap is allowed but nothing is shrunk to make it fit. The size is compared
+        # with the size this control has at a width where it was never constrained, which
+        # is the contract: a narrower viewport may reflow text, it may not shrink it.
+        reference_control = reference["controls"].get(control_id)
+        assert reference_control, f"{label}: the reference width did not render this control"
+        assert got["fontSize"] == reference_control["fontSize"], (
+            f"{label}: the label was resized from {reference_control['fontSize']} to "
+            f"{got['fontSize']} to make it fit, which the reflow contract forbids"
+        )
+        # A control that wraps grows taller; one that fits keeps its single-line height.
+        # Neither may collapse, which is what a squeezed control does.
+        assert got["box"]["height"] >= reference_control["box"]["height"] - RECT_TOLERANCE, (
+            f"{label}: the control shrank from {reference_control['box']['height']:.1f} px to "
+            f"{got['box']['height']:.1f} px"
+        )
+
+    # A wrapped label must be painted inside its own control, not clipped by it.
+    preview = m["controls"]["btnGigahostAssociationPreview"]["box"]
+    for rect in m["previewLabelRects"]:
+        assert rect["right"] <= preview["right"] + RECT_TOLERANCE, (
+            f"{locale}: the preview label is clipped at its right edge: {rect} vs {preview}"
+        )
+        assert rect["top"] >= preview["top"] - RECT_TOLERANCE, (
+            f"{locale}: the preview label is clipped at the top: {rect} vs {preview}"
+        )
+        assert rect["bottom"] <= preview["bottom"] + RECT_TOLERANCE, (
+            f"{locale}: the preview label is clipped at the bottom: {rect} vs {preview}"
+        )
+
+
+@pytest.mark.e2e
+def test_russian_hosting_fits_at_the_floor_it_used_to_need_343_for(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """The measured comparison for this fix, on the locale that failed.
+
+    Russian required 343 px before this change and fitted at nothing narrower. This case
+    asserts the two facts that make the fix real rather than a tolerance change: at 320 the
+    document does not scroll, and every control stays inside the card - and the label really
+    did wrap, so the fit did not come from hiding or shrinking text.
+    """
+    page = authenticated_page
+    open_servers_page(page, base_url, "ru", REFLOW_FLOOR)
+    m = page.evaluate(ASSOCIATION_PROBE)
+
+    assert m["docScroll"] <= m["docClient"] + RECT_TOLERANCE, (
+        f"ru at {REFLOW_FLOOR} still scrolls sideways: {m['docScroll']} > {m['docClient']}"
+    )
+    preview = m["controls"]["btnGigahostAssociationPreview"]
+    assert preview["box"]["right"] <= m["card"]["right"] + RECT_TOLERANCE, (
+        f"ru: the preview ends {preview['box']['right'] - m['card']['right']:.2f} px past the card"
+    )
+    assert preview["whiteSpace"] == "normal", (
+        f"ru: the preview keeps the shared nowrap rule ({preview['whiteSpace']}), "
+        "so a sentence-sized label cannot wrap"
+    )
+    assert preview["lines"] >= 2, (
+        f"ru: this locale's label fits one line at {REFLOW_FLOOR} ({preview['label']!r}), "
+        "so the measurement is no longer exercising the wrap"
+    )

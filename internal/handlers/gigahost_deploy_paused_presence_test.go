@@ -32,6 +32,32 @@ type savedSetupView struct {
 	Text    string   `json:"text"`
 	Buttons []string `json:"buttons"`
 	Badges  []string `json:"badges"`
+	// Rows is every rendered row, in order, with the actions and state badge that row
+	// itself carries. A surface that lists several jobs cannot be asserted from the
+	// container-wide slices above: "this action is absent" is a different claim from "no row
+	// offers it", and only the per-row view can tell a suppressed row from a missing one.
+	Rows []savedSetupRow `json:"rows"`
+}
+
+// savedSetupRow is one rendered saved job.
+type savedSetupRow struct {
+	OrderID string   `json:"orderId"`
+	Stage   string   `json:"stage"`
+	Text    string   `json:"text"`
+	Buttons []string `json:"buttons"`
+}
+
+// savedSetupRowForOrder returns one rendered saved-job row by order id, failing when the
+// view did not render it at all.
+func (v savedSetupView) savedSetupRowForOrder(t *testing.T, orderID string) savedSetupRow {
+	t.Helper()
+	for _, row := range v.Rows {
+		if row.OrderID == orderID {
+			return row
+		}
+	}
+	t.Fatalf("the saved-jobs view did not render order %s: %+v", orderID, v.Rows)
+	return savedSetupRow{}
 }
 
 // runGigahostSetupIntentsRendererLoads executes the shipped saved-jobs module against
@@ -72,7 +98,18 @@ const flat = node => (node ? node.textContent.replace(/\s+/g, ' ') : '');
   process.stdout.write('INTENTS_RESULT=' + JSON.stringify({
     text: flat(container),
     buttons: Array.from(container.querySelectorAll('button')).map(flat),
-    badges: Array.from(container.querySelectorAll('.badge')).map(flat)
+    badges: Array.from(container.querySelectorAll('.badge')).map(flat),
+    rows: Array.from(container.querySelectorAll('.gigahost-order-row')).map(row => {
+      const badge = row.querySelector('.badge');
+      const idSpan = row.querySelector('.gigahost-order-identity span');
+      const identity = idSpan ? flat(idSpan) : '';
+      return {
+        orderId: identity.charAt(0) === '#' ? identity.slice(1) : identity,
+        stage: badge ? badge.getAttribute('data-stage') : null,
+        text: flat(row),
+        buttons: Array.from(row.querySelectorAll('button')).map(flat)
+      };
+    })
   }) + '\n');
   dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });

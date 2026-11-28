@@ -50,7 +50,7 @@ func TestGigahostSetupIntentsConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read setup intents module: %v", err)
 	}
-	templates := settingsTemplateText(t)
+	templates := serversHostingTemplateText(t)
 	// The template must load the extracted module: an inline copy would silently
 	// diverge from the file this test exercises. The form is the content-derived one
 	// because this delivery changed the module's bytes without moving the release
