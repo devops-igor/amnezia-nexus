@@ -532,6 +532,9 @@ function vpnRenderForwarderHealth(status) {
         vpnResetTechDiagnosticCards();
         vpnRenderRestoredAggregates(null);
         vpnRenderRoutePressure(null, []);
+        // The cumulative totals are cleared by the same writer that fills them, so an
+        // unavailable sample cannot leave a stale figure from a previous tick standing.
+        vpnRenderCumulativeTotals(null);
 
         const countersSinceElem = document.getElementById('vpn-fwd-counters-since');
         if (countersSinceElem) countersSinceElem.textContent = '-';

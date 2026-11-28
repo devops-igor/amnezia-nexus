@@ -15,6 +15,7 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 	pageStr := fixture.PageJS
 	backendsPageStr := fixture.BackendsPageJS
 	diagnosticsPageStr := fixture.DiagnosticsPageJS
+	summaryStr := fixture.HealthSummaryJS
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -64,8 +65,16 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 			t.Errorf("backends_page.js missing required modernized token %q", token)
 		}
 	}
-	if !strings.Contains(diagnosticsPageStr, "Telemetry.formatBytes") {
-		t.Errorf("diagnostics_page.js missing required modernized token %q", "Telemetry.formatBytes")
+	// The cumulative Rx/Tx writer moved to the eager health renderer, because the shared
+	// status tick is the only path production takes: a writer the tick never reaches left
+	// both readouts permanently blank. The formatting it depends on still has to come
+	// from the shared Telemetry formatter, so the token is asserted where the writer
+	// actually lives.
+	if !strings.Contains(summaryStr, "Telemetry.formatBytes") {
+		t.Errorf("health_summary.js missing required modernized token %q", "Telemetry.formatBytes")
+	}
+	if !strings.Contains(diagnosticsPageStr, "vpnRenderCumulativeTotals") {
+		t.Errorf("diagnostics_page.js must reuse the shared cumulative-total writer, not keep a second copy")
 	}
 
 	requiredBackendTokens := []string{

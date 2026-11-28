@@ -50,6 +50,10 @@
     // included it up front is not fetched a second time.
     var moduleLoads = {};
 
+    // The surfaces this boot observed, so activation can read the section metadata from
+    // the element it watches instead of searching the document again.
+    var observedSurfaces = [];
+
     var statusPollStarted = false;
     var sessionPollStarted = false;
     var backendPollStarted = false;
@@ -126,16 +130,31 @@
         return Promise.all(pending).then(function () { return true; });
     }
 
+    // vpnLoadModule loads one declared module and resolves when it is present.
+    //
+    // The DECISION lives here - already registered, already in flight, otherwise fetch -
+    // and only the fetch is behind the seam. A case can then hold the fetch open and
+    // still see the same idempotency the page relies on: a module that is present is
+    // never requested again, whoever performs the request.
     function vpnLoadModule(module) {
         if (!module || !module.name) return Promise.resolve(false);
         if (typeof vpnModuleRegistered === 'function' && vpnModuleRegistered(module.name)) {
             return Promise.resolve(true);
         }
         if (moduleLoads[module.name]) return moduleLoads[module.name];
-        if (!module.url || typeof document === 'undefined' || !document.createElement) {
+        var impl = (typeof window !== 'undefined' && typeof window.vpnLoadModuleImpl === 'function')
+            ? window.vpnLoadModuleImpl
+            : vpnLoadScriptModule;
+        var promise = Promise.resolve(impl(module));
+        moduleLoads[module.name] = promise;
+        return promise;
+    }
+
+    function vpnLoadScriptModule(module) {
+        if (!module || !module.url || typeof document === 'undefined' || !document.createElement) {
             return Promise.resolve(false);
         }
-        var promise = new Promise(function (resolve) {
+        return new Promise(function (resolve) {
             var script = document.createElement('script');
             script.src = module.url;
             // A classic blocking script, like the ones the shell ships: the module
@@ -148,12 +167,18 @@
             script.onload = function () { done(true); };
             script.onerror = function () { done(false); };
             (document.body || document.documentElement).appendChild(script);
-            // A module that fails to arrive must not strand activation: the section
-            // starts with what it has and its controls state the failure themselves.
-            if (typeof script.addEventListener !== 'function' && typeof script.onload !== 'function') done(false);
         });
-        moduleLoads[module.name] = promise;
-        return promise;
+    }
+
+    // vpnModulesReady reports whether every module a section declares is already
+    // evaluated. It is the difference between "this press landed on a live control"
+    // and "this press landed on markup whose controller has not arrived": only the
+    // second one needs replaying, and replaying the first would run the action twice.
+    function vpnModulesReady(modules) {
+        for (var i = 0; i < modules.length; i++) {
+            if (typeof vpnModuleRegistered !== 'function' || !vpnModuleRegistered(modules[i].name)) return false;
+        }
+        return true;
     }
 
     // ---- Rail geometry -------------------------------------------------------
@@ -275,10 +300,19 @@
     // an observer, a focus target and a declared module list all read one node. The
     // heading is a different element: it is the landing destination, not the surface.
     function vpnSectionElementFor(section) {
-        if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
+        if (typeof document === 'undefined') return null;
+        // The boot already knows the surfaces it observes; falling back to a query keeps
+        // this usable when a section is mounted without having been observed.
+        for (var i = 0; i < observedSurfaces.length; i++) {
+            var candidate = observedSurfaces[i].el;
+            if (candidate && candidate.getAttribute && candidate.getAttribute('data-vpn-section') === section) {
+                return candidate;
+            }
+        }
+        if (typeof document.querySelectorAll !== 'function') return null;
         var candidates = document.querySelectorAll('[data-vpn-section]');
-        for (var i = 0; i < candidates.length; i++) {
-            if (candidates[i].getAttribute('data-vpn-section') === section) return candidates[i];
+        for (var j = 0; j < candidates.length; j++) {
+            if (candidates[j].getAttribute('data-vpn-section') === section) return candidates[j];
         }
         return null;
     }
@@ -290,7 +324,16 @@
         if (section !== 'backends' && section !== 'diagnostics') return Promise.resolve();
         if (mounting[section]) return mounting[section];
         var surface = vpnSectionElementFor(section);
-        var activation = vpnLoadModules(vpnDeclaredModules(surface)).then(function () {
+        var modules = vpnDeclaredModules(surface);
+        var activation = vpnLoadModules(modules).then(function () {
+            if (modules.length && !vpnModulesReady(modules)) {
+                // The controllers never arrived, so nothing can be started: the stream
+                // would poll an endpoint no renderer consumes. The activation is
+                // released so a later arrival retries instead of finding the section
+                // permanently (and silently) marked active.
+                mounting[section] = null;
+                return false;
+            }
             mounted[section] = true;
             return section === 'backends' ? vpnStartBackends() : vpnStartDiagnostics();
         });
@@ -604,7 +647,12 @@
             if (!surface || typeof surface.getAttribute !== 'function') return;
             var section = surface.getAttribute('data-vpn-section');
             if (!section || mounted[section]) return;
+            // Only a press whose handler is genuinely ABSENT is replayed. A section whose
+            // controllers are already evaluated handles the press itself, and replaying
+            // would run its action twice.
+            var replay = !vpnModulesReady(vpnDeclaredModules(surface));
             vpnMountSection(section).then(function () {
+                if (!replay) return;
                 if (!control.isConnected) return;
                 if (typeof control.click === 'function') control.click();
             });
@@ -637,7 +685,10 @@
         var surfaces = (typeof document.querySelectorAll === 'function')
             ? document.querySelectorAll('[data-vpn-section]')
             : [];
-        for (var i = 0; i < surfaces.length; i++) observer.observe(surfaces[i]);
+        for (var i = 0; i < surfaces.length; i++) {
+            observedSurfaces.push({ el: surfaces[i] });
+            observer.observe(surfaces[i]);
+        }
     }
 
     async function vpnBoot() {
@@ -675,6 +726,8 @@
         window.vpnBoot = vpnBoot;
         window.vpnMountSection = vpnMountSection;
         window.vpnLoadModules = vpnLoadModules;
+        window.vpnLoadModule = vpnLoadModule;
+        window.vpnModulesReady = vpnModulesReady;
         window.vpnDeclaredModules = vpnDeclaredModules;
         window.vpnActivateAdvanced = vpnActivateAdvanced;
         window.vpnSectionElementFor = vpnSectionElementFor;

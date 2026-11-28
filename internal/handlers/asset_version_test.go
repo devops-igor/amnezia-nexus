@@ -151,6 +151,17 @@ func collectShellLinks(t *testing.T, body string) shellLinks {
 				links.scripts = append(links.scripts, attrs["src"])
 			}
 		}
+		// A controller loaded on demand is requested through a data-vpn-modules
+		// attribute on the element that activates it, not through a <script> tag. It is
+		// a reference this shell owns exactly like an eager one, so it is collected
+		// here: a scan that read only script tags would report every deferred module as
+		// unserved and let a bare or release-versioned URL hide behind the same gap.
+		for _, pair := range strings.Fields(attrs["data-vpn-modules"]) {
+			_, url, ok := strings.Cut(pair, "=")
+			if ok && strings.HasPrefix(url, "/static/") {
+				links.scripts = append(links.scripts, url)
+			}
+		}
 	}
 }
 

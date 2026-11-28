@@ -382,7 +382,7 @@ var (
 	deferredModulesAttrPattern = regexp.MustCompile(`data-vpn-modules="([^<]*?)"\s*/?>`)
 	// deferredModulePairPattern finds one name={{ asset_url "…" }} pair.
 	deferredModulePairPattern = regexp.MustCompile(`(\w+)=(\{\{\s*asset_url\s+"(/static/[^"]+)"\s*\}\}|/static/[^\s"]+)`)
-	releaseVersionQuery   = regexp.MustCompile(`^\?v=\{\{\s*\.app_version\s*\}\}$`)
+	releaseVersionQuery       = regexp.MustCompile(`^\?v=\{\{\s*\.app_version\s*\}\}$`)
 )
 
 // contentIdentitySentinel stands in for a content-derived query when a test
