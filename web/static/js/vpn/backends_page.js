@@ -12,7 +12,6 @@
 let vpnCachedServers = [];
 let vpnCurrentBackends = [];
 let vpnTableInstance = null;
-var vpnBackendsAnchorApplied = false;
 
 // vpnRenderBackendsError renders the existing error row. It is the read's own
 // failure state: a failed read is never reported as "this backend is gone".
@@ -133,6 +132,17 @@ function vpnReplacementBackendFocus(focused, tbody) {
 }
 
 // vpnLoadBackends refreshes the inventory only.
+//
+// Loading data never navigates. It may fill the table, and it may FINISH a landing
+// this arrival already began - a one-shot Inspect whose request arrived before the
+// rows existed can be answered only by a completed read - but it never derives a
+// destination of its own from the fragment.
+//
+// That distinction is the whole point: ordinary navigation (a jump, a cold fragment,
+// Back/Forward) belongs to page.js, which owns the resolver and the reader's
+// position. A read that also landed would reposition the document the moment its
+// response arrived, pulling the reader out of whichever section page.js had landed
+// them in, and a slow inventory was enough to trigger it.
 async function vpnLoadBackends() {
     // The arrival's Inspect request is taken off durable storage before the read, so a
     // failed first read cannot leave it for a later visit to replay.
@@ -174,13 +184,11 @@ async function vpnLoadBackends() {
 
     if (replacingFocus) vpnFocusIfFocusable(vpnReplacementBackendFocus(focused, tbodyBefore));
 
-    if (!vpnBackendsAnchorApplied || vpnPendingInspectTunnelId !== null) {
-        // The ordinary anchor landing runs once. A pending Inspect is a request that
-        // names a specific row, so the read that follows it must honour it even when
-        // an earlier ordinary visit already consumed the anchor rule: otherwise an
-        // Inspect issued from the Diagnostics section - after this inventory had
-        // loaded - could never be rescued by the one-time flag.
-        vpnBackendsAnchorApplied = true;
+    if (vpnPendingInspectTunnelId !== null) {
+        // A pending Inspect is the one position a read is allowed to take: it names a
+        // specific row, only a SUCCESSFUL read can say whether that row is there, and
+        // the request is consumed by the render that can answer it. An arrival with no
+        // such request leaves the reader exactly where page.js put them.
         vpnApplyBackendsLanding();
     }
     return backends;
@@ -237,8 +245,20 @@ function vpnFocusBackendsHeading() {
     }
 }
 
-// vpnApplyBackendsLanding runs its rules once per arrival, and again whenever a
-// one-shot Inspect request is pending.
+// vpnApplyBackendsLanding positions the reader for a landing page.js ASKED for, or
+// finishes a one-shot Inspect request this arrival is carrying.
+//
+// The callers are exactly two, and neither is a data path:
+//
+//   - page.js, when it resolves a fragment, a rail jump or Back/Forward to this
+//     section, passes the canonical target it decided on;
+//   - vpnLoadBackends, and only while a pending Inspect request is held, because
+//     such a request names a row whose existence no read has yet confirmed.
+//
+// Nothing else may call it. In particular a plain successful read must NOT reach
+// this function: an ordinary arrival's position belongs to page.js, and a read that
+// landed here would move the reader to whatever the URL last named, however much
+// later its response arrived.
 //
 // The Inspect handoff wins over a plain fragment: it is a one-shot request that
 // names a specific row. It is consumed here and nowhere else, so an ordinary
@@ -249,7 +269,9 @@ function vpnFocusBackendsHeading() {
 // landingTarget is the id the page's resolver decided on. A legacy inventory id
 // whose node no longer exists (the split's card title is now the section heading)
 // still lands where the id MEANS, instead of being looked up by its removed raw id
-// and silently doing nothing.
+// and silently doing nothing. Called with no argument and no pending request it
+// does nothing at all, so a landing can never be invented from the fragment.
+
 // vpnPendingInspectTunnelId holds this ARRIVAL's Inspect request once the page has
 // taken it off durable tab storage. The request belongs to the navigation that carried
 // it: leaving it in storage let a later ordinary visit replay an arrival whose first

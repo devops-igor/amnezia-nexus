@@ -160,10 +160,11 @@ func TestVPNPageBackendsInspectArrivalIsScopedToOneNavigation(t *testing.T) {
     assert.strictEqual(announcement.textContent, '', 'a revealed row announces nothing');
 
     // 3. An ordinary later visit is a fresh document: nothing page-local survives, and
-    //    storage holds nothing to replay.
+    //    storage holds nothing to replay. The read has no one-time landing of its own
+    //    to reset - filling the table is all it does, so there is nothing here that
+    //    could reposition an ordinary visit.
     w.history.replaceState(null, '', '/vpn/backends');
     w.eval('vpnPendingInspectTunnelId = null');
-    w.eval('vpnBackendsAnchorApplied = false');
     w.document.activeElement.blur();
     await w.vpnLoadBackends();
     assert.strictEqual(rowCount(), 2, 'the inventory is still rendered');
