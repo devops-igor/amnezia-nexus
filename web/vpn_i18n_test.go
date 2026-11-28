@@ -38,20 +38,19 @@ func extractVPNTranslationKeys(t *testing.T) (keys []string, staticCount int) {
 
 	keySet := make(map[string]bool)
 
-	// 1. Parse the three VPN documents. Every user-visible string a document
-	// renders has to exist in all five bundles, so all three are scanned.
-	for _, page := range []string{"vpn", "vpn_backends", "vpn_diagnostics"} {
-		tmplData, err := fs.ReadFile(TemplatesFS, "templates/"+page+".html")
-		if err != nil {
-			t.Fatalf("failed to read templates/%s.html: %v", page, err)
-		}
-		tmplMatches := tmplI18nRegex.FindAllStringSubmatch(string(tmplData), -1)
-		if len(tmplMatches) == 0 {
-			t.Fatalf("expected to find translation keys in templates/%s.html, found none", page)
-		}
-		for _, m := range tmplMatches {
-			keySet[m[1]] = true
-		}
+	// 1. Parse the VPN page. Every user-visible string it renders has to exist in
+	// all five bundles; the page is one document, so it is one scan and no section
+	// can be missed by a loop over names that no longer exist.
+	tmplData, err := fs.ReadFile(TemplatesFS, "templates/vpn.html")
+	if err != nil {
+		t.Fatalf("failed to read templates/vpn.html: %v", err)
+	}
+	tmplMatches := tmplI18nRegex.FindAllStringSubmatch(string(tmplData), -1)
+	if len(tmplMatches) == 0 {
+		t.Fatal("expected to find translation keys in templates/vpn.html, found none")
+	}
+	for _, m := range tmplMatches {
+		keySet[m[1]] = true
 	}
 
 	// 2. Parse the VPN modules each document loads.

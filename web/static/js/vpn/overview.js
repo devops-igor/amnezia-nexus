@@ -1,11 +1,12 @@
-// VPN Overview page controller: the four essential signals and the
+// VPN Overview controller: the four essential signals and the
 // listener/public-endpoint configuration.
 //
-// This document owns exactly two reads — /api/vpn/status and /api/vpn/config —
-// plus the endpoint write they feed. It loads none of the diagnostics, chart,
-// session or backend-table controllers and prefetches none of their data, so a
-// failure on another page cannot blank this one. The formatters and label
-// helpers it shares with the other VPN documents come from common.js.
+// This section owns exactly two reads — /api/vpn/status and /api/vpn/config —
+// plus the endpoint write they feed, and loads none of the diagnostics, chart,
+// session or backend-table data. The status sample it returns is also what paints
+// the VPN Health headline, so the two surfaces are one measurement rather than two
+// reads that can disagree. The formatters and label helpers it shares with the
+// other sections come from common.js.
 
 // vpnConfiguredPublicEndpoint holds the configured value (never the detected
 // fallback), so the endpoint dialog starts from what the operator saved.
@@ -262,16 +263,12 @@ if (typeof window !== 'undefined') {
 const VPN_OVERVIEW_ACTIONS = {
     'vpn-open-edit-endpoint': function () {
         vpnOpenEditEndpointModal();
-    },
-    'vpn-close-modal': function (btn) {
-        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
-        if (typeof closeModal === 'function') {
-            closeModal(modalId);
-        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
-            UI.modal.close(modalId);
-        }
     }
 };
+
+// The dialog close control is NOT in this map: on the merged page both dialogs are
+// in the same document, so common.js owns one listener for it. Two sections
+// handling the same action would close the same dialog twice.
 
 function initVpnOverviewListeners() {
     if (typeof document === 'undefined') return;
@@ -330,26 +327,11 @@ if (typeof document !== 'undefined') {
     initVpnOverviewListeners();
 }
 
-document.addEventListener('DOMContentLoaded', function () {
-    initVpnOverviewListeners();
-
-    // A recognised legacy fragment is already navigating to its owner; starting
-    // the poll here would ask for Overview data the visitor never sees.
-    if (window.vpnHandoffPending === true) return;
-
-    if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.poll === 'function') {
-        NexusTelemetry.poll('vpn-overview', async function () {
-            await vpnLoadOverview();
-            // After the first tick only: a bare re-poll never re-jumps.
-            if (!vpnOverviewAnchorLanded) {
-                vpnOverviewAnchorLanded = true;
-                vpnLandOverviewAnchor();
-            }
-        }, 5000);
-    }
-});
-
-var vpnOverviewAnchorLanded = false;
+// The poll is started by the page boot (page.js), not here: Overview and the VPN
+// Health headline read the SAME status sample on one tick, so the stream cannot be
+// opened twice. Landing is the page boot's too - a jump, a cold fragment and a
+// browser Back all reach vpnLandOverviewAnchor through it, and a poll tick never
+// moves focus.
 
 if (typeof window !== 'undefined') {
     window.vpnLoadOverview = vpnLoadOverview;

@@ -408,8 +408,6 @@ func TestTemplateEngineAndHelpers(t *testing.T) {
 		"leaderboard.html",
 		"user_share.html",
 		"vpn.html",
-		"vpn_backends.html",
-		"vpn_diagnostics.html",
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -599,8 +597,6 @@ func TestAdversarialTemplateSecurityAndResilience(t *testing.T) {
 		"leaderboard.html",
 		"user_share.html",
 		"vpn.html",
-		"vpn_backends.html",
-		"vpn_diagnostics.html",
 	}
 
 	t.Run("Zero Panic On Nil Data", func(t *testing.T) {

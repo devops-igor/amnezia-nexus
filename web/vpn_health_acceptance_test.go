@@ -85,28 +85,27 @@ func TestVPN955Acceptance01HealthyIsCompactAndUnduplicated(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse vpn.html: %v", err)
 		}
+		// One page holds both surfaces now, so "exactly four signals" is asserted on
+		// the whole document rather than per document: a second copy of the grid, or a
+		// grid nested inside the health card, is the duplication that matters.
 		if got := len(findHTMLNodesByAttr(doc, "data-signal")); got != 4 {
 			t.Errorf("expected exactly 4 [data-signal] entries, got %d", got)
 		}
-		// The overview carries the signals and none of the health card.
-		if findHTMLNodeByID(doc, "vpn-forwarder-card") != nil {
-			t.Error("the overview document must not render the health card")
-		}
-
-		diagFixture := NewVPNTestFixtureForPage(t, "vpn_diagnostics")
-		diagDoc, err := xhtml.Parse(strings.NewReader(diagFixture.TemplateHTML))
-		if err != nil {
-			t.Fatalf("parse vpn_diagnostics.html: %v", err)
-		}
-		healthCard := findHTMLNodeByID(diagDoc, "vpn-forwarder-card")
+		healthCard := findHTMLNodeByID(doc, "vpn-forwarder-card")
 		if healthCard == nil {
 			t.Fatal("#vpn-forwarder-card not found")
 		}
 		if nested := findHTMLElementByClassWithin(healthCard, "stats-grid"); nested != nil {
 			t.Error("#vpn-forwarder-card must not contain a nested .stats-grid")
 		}
-		if got := len(findHTMLNodesByAttr(diagDoc, "data-signal")); got != 0 {
-			t.Errorf("the diagnostics document must not render the overview signals, got %d", got)
+		// The headline sits with the signals rather than in Diagnostics, and the
+		// problem rows live in Diagnostics, so the essentials are never behind them.
+		problemList := findHTMLNodeByID(doc, "vpn-fwd-problem-list")
+		if problemList == nil {
+			t.Fatal("#vpn-fwd-problem-list not found")
+		}
+		if isHTMLDescendant(problemList, healthCard) {
+			t.Error("the problem rows must not be inside the health headline card")
 		}
 	})
 

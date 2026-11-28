@@ -146,38 +146,34 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for token, want := range map[string]int{
-		"NexusTelemetry.poll('vpn-diagnostics'": 1,
-		"API.get('/api/vpn/status')":            1,
-		"API.get('/api/vpn/sessions')":          1,
-	} {
-		if got := strings.Count(string(pageSource), token); got != want {
-			t.Errorf("%s count=%d, want%d", token, got, want)
-		}
+	source := string(pageSource)
+	// The section reads the sessions and nothing else. It does NOT read the status:
+	// the boot takes one status sample for the whole page and hands it to this
+	// section, so a second status loop - the thing that would let the headline and
+	// the four signals disagree about the dataplane - cannot exist here.
+	if got := strings.Count(source, "API.get('/api/vpn/sessions')"); got != 1 {
+		t.Errorf("diagnostics controller must read the sessions exactly once, got %d", got)
 	}
-	// The diagnostics document reads none of the configuration, backend
-	// inventory or server list: those belong to the other two pages.
 	for _, foreign := range []string{
+		"API.get('/api/vpn/status')",
 		"API.get('/api/vpn/config')",
 		"API.get('/api/vpn/backends')",
 		"API.get('/api/servers')",
+		"NexusTelemetry.poll(",
 	} {
-		if strings.Contains(string(pageSource), foreign) {
-			t.Errorf("diagnostics controller must not request %s", foreign)
+		if strings.Contains(source, foreign) {
+			t.Errorf("diagnostics controller must not own %s", foreign)
 		}
 	}
-	for _, token := range []string{"vpnRenderForwarderHealth(status)"} {
-		if !strings.Contains(string(pageSource), token) {
-			t.Errorf("polling must handle %s", token)
+	// A failed sessions read keeps the last successful payload and says the table is
+	// stale; the read itself is a named seam the boot can await.
+	for _, token := range []string{"function vpnLoadSessions(", "vpnSessionsStale = true"} {
+		if !strings.Contains(source, token) {
+			t.Errorf("the sessions read must keep %s", token)
 		}
-	}
-	// A failed status read renders the unavailable state instead of aborting the
-	// tick: the loader keeps its last value as null and renders that.
-	if !strings.Contains(string(pageSource), "status = null") {
-		t.Error("polling must render the unavailable state when the status read fails")
 	}
 
-	tmplSource, err := TemplatesFS.ReadFile("templates/vpn_diagnostics.html")
+	tmplSource, err := TemplatesFS.ReadFile("templates/vpn.html")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,17 +183,17 @@ func TestVPNDiagnosticsPollingContract(t *testing.T) {
 	// predecessor served and a returning browser keeps running that controller
 	// against this markup.
 	if !strings.Contains(tmplStr, `<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`) {
-		t.Errorf("expected templates/vpn_diagnostics.html to request the VPN diagnostics controller through its asset bytes: %s",
+		t.Errorf("expected templates/vpn.html to request the VPN diagnostics controller through its asset bytes: %s",
 			`<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>`)
 	}
 	if strings.Contains(tmplStr, `<script src="/static/js/vpn/diagnostics_page.js"></script>`) {
-		t.Errorf("templates/vpn_diagnostics.html still requests /static/js/vpn/diagnostics_page.js bare, which is the URL the " +
+		t.Errorf("templates/vpn.html still requests /static/js/vpn/diagnostics_page.js bare, which is the URL the " +
 			"predecessor served and a warm cache still holds")
 	}
 
 	inlineScriptRegex := regexp.MustCompile(`(?s)<script(?:\s+type="[^"]*")?>\s*[^<]`)
 	if inlineScriptRegex.MatchString(tmplStr) {
-		t.Errorf("templates/vpn_diagnostics.html must not contain inline <script> blocks")
+		t.Errorf("templates/vpn.html must not contain inline <script> blocks")
 	}
 }
 
@@ -206,14 +202,14 @@ func TestVPNDashboardSectionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
 	if err != nil {
-		t.Fatalf("failed to parse vpn_diagnostics.html: %v", err)
+		t.Fatalf("failed to parse vpn.html: %v", err)
 	}
 
 	if err := validateVPNDashboardDOMOrder(doc); err != nil {
@@ -336,13 +332,13 @@ func TestVPNHistoricalChartsContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
 	doc, err := xhtml.Parse(strings.NewReader(string(vpnData)))
 	if err != nil {
-		t.Fatalf("failed to parse vpn_diagnostics.html: %v", err)
+		t.Fatalf("failed to parse vpn.html: %v", err)
 	}
 
 	chartIDs := []string{

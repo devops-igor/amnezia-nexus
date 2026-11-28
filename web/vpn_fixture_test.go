@@ -178,6 +178,9 @@ type VPNTestFixture struct {
 	BackendsPageJS    string
 	DiagnosticsPageJS string
 	AnchorHandoffJS   string
+	// PageBootJS is the merged page's boot: the jump rail, section activation and the
+	// local fragment landing.
+	PageBootJS string
 	// PageJS is the concatenation of this delivery's page controllers. The single
 	// page controller was split into one per document; the field remains so that
 	// tests which scan "the page's own controller" see all three.
@@ -213,11 +216,22 @@ func NewVPNTestFixture(t *testing.T) *VPNTestFixture {
 	return newVPNTestFixtureWithFS(t, StaticFS, "vpn")
 }
 
-// NewVPNTestFixtureForPage builds the fixture around one VPN document. page is
-// the template base name ("vpn", "vpn_backends" or "vpn_diagnostics").
+// NewVPNTestFixtureForPage builds the fixture around one VPN page name. #1006 merged
+// the three documents into one, so every name renders the SAME template; the names
+// survive because they also select which section's controllers the harness loads.
 func NewVPNTestFixtureForPage(t *testing.T, page string) *VPNTestFixture {
 	t.Helper()
 	return newVPNTestFixtureWithFS(t, StaticFS, page)
+}
+
+// vpnTemplateNameForPage is the one place a fixture page name maps to a file.
+func vpnTemplateNameForPage(page string) string {
+	switch page {
+	case "vpn", "vpn_backends", "vpn_diagnostics":
+		return "vpn.html"
+	default:
+		return page + ".html"
+	}
 }
 
 func readFixtureStaticAsset(staticFS fs.FS, path string) ([]byte, error) {
@@ -236,7 +250,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS, page string) *VPNTest
 	if err != nil {
 		t.Fatalf("filesystem sub-FS initialization failed: %v", err)
 	}
-	templateName := page + ".html"
+	templateName := vpnTemplateNameForPage(page)
 	vpnBytes, err := fs.ReadFile(tmplFS, templateName)
 	if err != nil {
 		t.Fatalf("failed reading fixture files: %v", err)
@@ -319,6 +333,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS, page string) *VPNTest
 	backendsPageJS := readModule("backends_page.js")
 	diagnosticsPageJS := readModule("diagnostics_page.js")
 	anchorHandoffJS := readModule("anchor_handoff.js")
+	pageBootJS := readModule("page.js")
 	pageJS := overviewJS
 	switch page {
 	case "vpn_backends":
@@ -352,6 +367,7 @@ func newVPNTestFixtureWithFS(t *testing.T, staticFS fs.FS, page string) *VPNTest
 		BackendsPageJS:    backendsPageJS,
 		DiagnosticsPageJS: diagnosticsPageJS,
 		AnchorHandoffJS:   anchorHandoffJS,
+		PageBootJS:        pageBootJS,
 		PageJS:            pageJS,
 		TablesJS:          tablesJS,
 		ParsedDOM:         doc,
@@ -417,10 +433,11 @@ func (f *VPNTestFixture) RenderedHTML(lang string) string {
 // vpnCompanionBoundaryMarker separates template HTML from companion JS modules in CombinedSource.
 const vpnCompanionBoundaryMarker = "\n/* --- VPN COMPANION MODULES BOUNDARY --- */\n"
 
-// CompanionScripts returns the JS modules the owner document ships, in
-// evaluation order. Deriving it from the owner page is what makes an asset
-// boundary assertion meaningful: the overview never carries the diagnostics
-// controllers, and diagnostics never carries backend management.
+// CompanionScripts returns the JS modules the harness evaluates, in order. A page
+// named "vpn" gets the whole shipped chain, boot included; a section-named page gets
+// its own controllers WITHOUT the boot, so a case that drives one controller is not
+// running the other sections' polls underneath its assertion. The asset-identity
+// checks derive the real chain from the template, so drift is caught there.
 func (f *VPNTestFixture) CompanionScripts() string {
 	switch f.OwnerPage {
 	case "vpn_backends":
@@ -428,7 +445,11 @@ func (f *VPNTestFixture) CompanionScripts() string {
 	case "vpn_diagnostics":
 		return f.CommonJS + "\n" + f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" + f.SessionsJS + "\n" + f.PageJS
 	default:
-		return f.AnchorHandoffJS + "\n" + f.CommonJS + "\n" + f.PageJS
+		// The whole page, in load order, ending with the boot that activates it.
+		return f.AnchorHandoffJS + "\n" + f.CommonJS + "\n" +
+			f.OverviewJS + "\n" + f.BackendsJS + "\n" + f.BackendsPageJS + "\n" +
+			f.HealthProblemsJS + "\n" + f.HealthSummaryJS + "\n" + f.ChartsJS + "\n" +
+			f.SessionsJS + "\n" + f.DiagnosticsPageJS + "\n" + f.PageBootJS
 	}
 }
 
@@ -488,6 +509,7 @@ func (f *VPNTestFixture) BuildJSDOMHarness(opts JSDOMHarnessOptions) string {
 		{"static/js/vpn/health_problems.js", "health problems", f.HealthProblemsJS},
 		{"static/js/vpn/health_summary.js", "health summary", f.HealthSummaryJS},
 		{"static/js/vpn/overview.js", "page", f.PageJS},
+		{"static/js/vpn/page.js", "page boot", f.PageBootJS},
 		{"static/js/vpn/sessions.js", "sessions", f.SessionsJS},
 	} {
 		if len(strings.TrimSpace(module.body)) == 0 {
@@ -507,6 +529,16 @@ virtualConsole.on('jsdomError', (err) => {
 });
 const dom = new JSDOM(%q, { virtualConsole, pretendToBeVisual: true, runScripts: 'dangerously', url: 'https://review.invalid' });
 const w = dom.window;
+// JSDOM has no layout, so every observed element would report as not intersecting.
+// This stub records the targets and never fires: the honest model of a section that
+// is out of view. A case that wants one mounted calls vpnMountSection, as a jump does.
+w.__vpnObserved = [];
+w.IntersectionObserver = class {
+    constructor(cb) { this.cb = cb; this.targets = []; }
+    observe(el) { this.targets.push(el); w.__vpnObserved.push(el); }
+    unobserve(el) { this.targets = this.targets.filter(t => t !== el); }
+    disconnect() { this.targets = []; }
+};
 w.API = {
     get: async () => ({}),
     post: async () => ({}),

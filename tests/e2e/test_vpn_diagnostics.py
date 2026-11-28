@@ -23,6 +23,20 @@ def _ensure_diagnostics_open(page: Page) -> None:
     expect(page.locator("#vpn-diagnostics")).to_be_visible()
 
 
+def _goto_section(page: Page, base_url: str, section: str) -> None:
+    """Open the VPN page at one of its sections.
+
+    #1006 merged the three VPN documents into one page at /vpn, so every check
+    that used to navigate to /vpn/diagnostics or /vpn/backends now names the
+    section's fragment on the single document. The retired routes still redirect
+    into the matching section; that redirect is asserted where it is the subject
+    (see the redirect case below), not relied on for ordinary navigation.
+    """
+    page.goto(f"{base_url}/vpn#{section}")
+    page.wait_for_load_state("networkidle")
+    expect(page.locator(f"#{section}")).to_be_visible()
+
+
 def _open_details(page: Page, selector: str) -> None:
     """Open one native <details> fold, only when it is actually closed.
 
@@ -89,8 +103,7 @@ _CHART_BADGE_PATTERNS = {
 def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to Diagnostics -> interactive time window toggle (15m, 1h, 24h)."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
     _ensure_diagnostics_open(page)
@@ -136,8 +149,7 @@ def test_vpn_historical_charts_interaction_and_kpis(
 ) -> None:
     """Verify consolidated historical charts, KPI badges, time axes, and hover tooltips."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
     _ensure_diagnostics_open(page)
@@ -182,8 +194,7 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
 ) -> None:
     """Verify chart availability transition from unavailable to recovered and empty clearing."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     # Open technical details disclosure if collapsed
     _ensure_diagnostics_open(page)
@@ -233,8 +244,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
 ) -> None:
     """Verify active chart tooltip and hover are preserved across live polling."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     _ensure_diagnostics_open(page)
 
@@ -270,8 +280,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
 def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> None:
     """Navigate to Diagnostics -> Problem Routes details and 'Show all routes' toggle."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     _ensure_diagnostics_open(page)
 
@@ -297,8 +306,7 @@ def test_vpn_problem_routes_toggle(authenticated_page: Page, base_url: str) -> N
 def test_vpn_sessions_problems_toggle(authenticated_page: Page, base_url: str) -> None:
     """Verify Connection Troubleshooting problems filter toggle button."""
     page = authenticated_page
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     toggle_btn = page.locator("#vpn-sessions-toggle-problems-btn")
     expect(toggle_btn).to_be_visible()
@@ -317,8 +325,7 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     """Verify forwarder routes table mobile containment, horizontal scrolling, and RTL behavior."""
     page = authenticated_page
     page.set_viewport_size({"width": 375, "height": 667})
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    _goto_section(page, base_url, "diagnostics")
 
     # #955 removed every auto-expand: neither Advanced Diagnostics nor the route
     # fold opens itself. Open both explicitly, and only when closed, so this check
@@ -861,80 +868,63 @@ def test_vpn_metrics_requires_authentication(page: Page, base_url: str) -> None:
 def test_vpn_dashboard_sections_visual_order_and_vertical_layout(
     authenticated_page: Page, base_url: str
 ) -> None:
-    """Per-page visual order and exclusivity across the three VPN documents.
+    """One page, three sections, in the approved order and with the approved folds.
 
-    The single VPN page became three documents, so a cross-block y-order check no
-    longer describes any page. Each owner's order is asserted on its own document,
-    and the blocks belonging to the other two are asserted absent.
+    #1006 merged the three VPN documents back into one page, so this is now a
+    single-document order check across every region: Overview (signals, then the
+    health headline, then the closed endpoint disclosure), then Backends (the
+    inventory card), then Diagnostics (the problem rows, then the sessions table,
+    then the Advanced Diagnostics trigger and its panel). It replaces the
+    per-document exclusivity assertions, which described a split this delivery
+    reverses.
     """
     page = authenticated_page
+    _goto_section(page, base_url, "overview")
 
-    # Diagnostics: health (the answer) before the disclosure, which is before the
-    # sessions table.
-    page.goto(f"{base_url}/vpn/diagnostics")
-    page.wait_for_load_state("networkidle")
+    # Every region is present once. A second copy of any of them is the duplication
+    # the merge has to avoid.
+    for anchor in ("#overview", "#backends", "#diagnostics"):
+        expect(page.locator(anchor)).to_have_count(1)
+    expect(page.locator(".stats-grid.vpn-overview")).to_have_count(1)
+    expect(page.locator("#vpn-forwarder-card")).to_have_count(1)
+    expect(page.locator("#vpnBackendsTable")).to_have_count(1)
+    expect(page.locator("#vpnSessionsTable")).to_have_count(1)
 
-    # Health and sessions remain visible while Advanced Diagnostics starts closed.
-    expect(page.locator("#vpn-forwarder-card")).to_be_visible()
-    expect(page.locator("#vpnSessionsTable")).to_be_visible()
+    # Both disclosures start closed on ordinary arrival.
     expect(page.locator("#vpn-diagnostics")).to_be_hidden()
+    expect(page.locator("#vpn-advanced-entry")).to_have_attribute("aria-expanded", "false")
+    assert page.locator("#vpn-configuration").evaluate("el => el.open") is False
+
     _ensure_diagnostics_open(page)
 
-    diagnostics_card = page.locator("#vpn-diagnostics")
-    forwarder_card = page.locator("#vpn-forwarder-card")
-    sessions_card = page.locator("#vpnSessionsTable").locator(
-        "xpath=ancestor::div[contains(@class, 'card')][1]"
-    )
-    sections = [
-        ("forwarder-card", forwarder_card),
-        ("diagnostics-card", diagnostics_card),
-        ("sessions-card", sessions_card),
+    ordered = [
+        ("overview-heading", page.locator("#overview")),
+        ("signals", page.locator(".stats-grid.vpn-overview")),
+        ("health", page.locator("#vpn-forwarder-card")),
+        ("endpoint", page.locator("#vpn-configuration")),
+        ("backends-heading", page.locator("#backends")),
+        ("inventory", page.locator("#vpnBackendsTable")),
+        ("diagnostics-heading", page.locator("#diagnostics")),
+        ("active-problems", page.locator("#active-problems")),
+        ("sessions", page.locator("#vpnSessionsTable")),
+        ("advanced-trigger", page.locator("#vpn-advanced-entry")),
+        ("advanced-panel", page.locator("#vpn-diagnostics")),
     ]
     boxes = []
-    for name, locator in sections:
+    for name, locator in ordered:
         expect(locator).to_be_visible()
         box = locator.bounding_box()
         assert box is not None, f"Bounding box for {name} was not found"
         boxes.append((name, box))
 
-    for i in range(len(boxes) - 1):
-        curr_name, curr_box = boxes[i]
-        next_name, next_box = boxes[i + 1]
-        assert curr_box["y"] < next_box["y"], f"Expected y({curr_name}) < y({next_name})"
-        assert (
-            next_box["y"] >= curr_box["y"] + curr_box["height"] - 1
-        ), f"Expected {next_name} y >= {curr_name} bottom"
+    for index in range(len(boxes) - 1):
+        current_name, current_box = boxes[index]
+        next_name, next_box = boxes[index + 1]
+        assert current_box["y"] < next_box["y"], f"Expected y({current_name}) < y({next_name})"
 
-    # The overview and the inventory are other documents: none of their blocks may
-    # render here, and the overview grid must not be duplicated.
-    expect(page.locator(".stats-grid")).to_have_count(0)
-    expect(page.locator("#vpnBackendsTable")).to_have_count(0)
-    expect(page.locator("#vpn-configuration")).to_have_count(0)
+    # The Advanced Diagnostics trigger sits immediately before the panel it controls,
+    # at the end of the Diagnostics section rather than in the page chrome.
+    trigger_box = dict(boxes)["advanced-trigger"]
+    panel_box = dict(boxes)["advanced-panel"]
+    assert trigger_box["y"] + trigger_box["height"] <= panel_box["y"] + 1
 
-    # Overview: the four signals, and none of the diagnostics or inventory blocks.
-    page.goto(f"{base_url}/vpn")
-    page.wait_for_load_state("networkidle")
-    expect(page.locator(".stats-grid")).to_have_count(1)
-    expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
-    expect(page.locator("#vpnSessionsTable")).to_have_count(0)
-    expect(page.locator("#vpn-diagnostics")).to_have_count(0)
-    expect(page.locator("#vpnBackendsTable")).to_have_count(0)
-    overview = page.locator(".stats-grid.vpn-overview")
-    configuration = page.locator("#vpn-configuration")
-    expect(overview).to_be_visible()
-    expect(configuration).to_be_visible()
-    overview_box = overview.bounding_box()
-    configuration_box = configuration.bounding_box()
-    assert overview_box is not None and configuration_box is not None
-    assert overview_box["y"] < configuration_box["y"]
-    assert configuration_box["y"] >= overview_box["y"] + overview_box["height"] - 1
-
-    # Backends: the inventory, and neither the health card nor the sessions table.
-    page.goto(f"{base_url}/vpn/backends")
-    page.wait_for_load_state("networkidle")
-    expect(page.locator("#vpnBackendsTable")).to_be_visible()
-    expect(page.locator("#vpn-forwarder-card")).to_have_count(0)
-    expect(page.locator("#vpnSessionsTable")).to_have_count(0)
-    expect(page.locator(".stats-grid")).to_have_count(0)
-    expect(page.locator("#vpn-diagnostics")).to_have_count(0)
-    expect(page.locator("#vpn-configuration")).to_have_count(0)

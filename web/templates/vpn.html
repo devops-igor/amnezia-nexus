@@ -1,80 +1,406 @@
-{{ define "title_extra" }} - {{ _ "vpn_overview_page_title" }}{{ end }}
+{{ define "title_extra" }} - {{ _ "nav_vpn" }}{{ end }}
 
 {{ define "content" }}
 <h1 class="section-title vpn-page-title" tabindex="-1">
     <span class="icon"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-shield"></use></svg></span>
-    {{ _ "vpn_overview_page_title" }}
+    {{ _ "nav_vpn" }}
 </h1>
 
-<!-- OVERVIEW: the four essential signals, in the reused grid -->
-<div class="stats-grid vpn-overview">
-    <div class="card stat-card" data-signal="backends">
-        <div class="stat-card-header">
-            <span class="stat-card-title">{{ _ "vpn_signal_backends" }}</span>
+{{/* One document, three sections. The rail is the Settings sub-navigation markup and
+     behaviour reused for this page: plain anchors, so it jumps with script off, and
+     vpn_page.js adds the current-section marker and the focus handoff. Each section is
+     a landmark with a stable id, which is what a link and a shared fragment point at. */}}
+<nav class="settings-subnav" id="vpnSubnav" aria-label="{{ _ "vpn_page_nav_label" }}">
+    <ul class="settings-subnav-list">
+        <li><a class="settings-subnav-link" href="#overview" aria-current="true">{{ _ "nav_vpn_overview" }}</a></li>
+        <li><a class="settings-subnav-link" href="#backends">{{ _ "nav_vpn_backends" }}</a></li>
+        <li><a class="settings-subnav-link" href="#diagnostics">{{ _ "nav_vpn_diagnostics" }}</a></li>
+    </ul>
+</nav>
+
+<!-- ============================= OVERVIEW ============================= -->
+<section class="vpn-section" id="overview-region" aria-labelledby="overview">
+    <h2 class="section-title vpn-region-target" id="overview" tabindex="-1">{{ _ "nav_vpn_overview" }}</h2>
+
+    <!-- The four essential signals, in the reused grid -->
+    <div class="stats-grid vpn-overview">
+        <div class="card stat-card" data-signal="backends">
+            <div class="stat-card-header">
+                <span class="stat-card-title">{{ _ "vpn_signal_backends" }}</span>
+                <svg class="icon text-muted" aria-hidden="true"><use href="#icon-server"></use></svg>
+            </div>
+            <div class="stat-card-value" id="vpn-signal-backends-value">-</div>
+            <div class="stat-card-sub" id="vpn-signal-backends-sub">{{ _ "vpn_diag_not_measured" }}</div>
+        </div>
+
+        <div class="card stat-card" data-signal="sessions">
+            <div class="stat-card-header">
+                <span class="stat-card-title">{{ _ "vpn_diag_active_sessions" }}</span>
+                <svg class="icon text-muted" aria-hidden="true"><use href="#icon-users"></use></svg>
+            </div>
+            <div class="stat-card-value font-mono" id="vpn-sessions">-</div>
+            <div class="stat-card-sub" id="vpn-session-mismatch" hidden></div>
+        </div>
+
+        <div class="card stat-card" data-signal="throughput">
+            <div class="stat-card-header">
+                <span class="stat-card-title">{{ _ "vpn_fwd_kpi_throughput" }}</span>
+                <svg class="icon text-muted" aria-hidden="true"><use href="#icon-activity"></use></svg>
+            </div>
+            <div class="stat-card-value" id="vpn-signal-throughput-value">-</div>
+            <div class="stat-card-sub" id="vpn-signal-throughput-sub">{{ _ "vpn_signal_throughput_horizon" }}</div>
+        </div>
+
+        <div class="card stat-card" data-signal="drops">
+            <div class="stat-card-header">
+                <span class="stat-card-title">{{ _ "vpn_col_packet_loss" }}</span>
+                <svg class="icon text-muted" aria-hidden="true"><use href="#icon-alert-triangle"></use></svg>
+            </div>
+            <div class="stat-card-value" id="vpn-signal-drops-value">-</div>
+            <div class="stat-card-sub" id="vpn-signal-drops-sub">{{ _ "vpn_dataplane_drops_scope" }}</div>
+        </div>
+    </div>
+
+    <!-- VPN HEALTH: one status, one sentence, problems first. The headline sits with
+         the operational picture; the actionable rows live in Diagnostics and the
+         headline links to them. Its id stays the legacy health destination. -->
+    <div class="card vpn-health" id="vpn-forwarder-card" aria-labelledby="vpn-health-title" aria-busy="true">
+        <div class="vpn-health-main">
+            <div class="vpn-health-copy">
+                <div class="vpn-health-head">
+                    <h3 class="card-title vpn-health-title" id="vpn-health-title" tabindex="-1">
+                        <svg class="icon" aria-hidden="true"><use href="#icon-activity"></use></svg>
+                        <span>{{ _ "vpn_forwarder_health" }}</span>
+                    </h3>
+                    <span class="badge" id="vpn-fwd-status-badge" hidden>
+                        <svg class="icon" aria-hidden="true"><use id="vpn-fwd-status-icon" href="#icon-activity"></use></svg>
+                        <span id="vpn-fwd-status-text">{{ _ "vpn_forwarder_unavailable" }}</span>
+                    </span>
+                </div>
+                <div class="vpn-health-live" id="vpn-fwd-health-live" role="status" aria-atomic="true">
+                    <p class="vpn-health-summary" id="vpn-fwd-headline-summary">{{ _ "vpn_health_checking" }}</p>
+                    <p class="vpn-health-counts" id="vpn-fwd-problem-counts" hidden></p>
+                    <!-- The visible rows live in #vpn-fwd-problem-list in Diagnostics;
+                         this sink carries the announcement text for the problem set, so
+                         a new affected entity is announced even when the headline is
+                         stable. Visually hidden, but inside the live region. -->
+                    <span class="vpn-visually-hidden" id="vpn-fwd-problem-announcement"></span>
+                </div>
+            </div>
+            <a class="btn btn-ghost btn-sm vpn-health-problems-link" id="vpn-view-problems-link" href="#active-problems" hidden>{{ _ "vpn_view_active_problems" }}</a>
+        </div>
+    </div>
+
+    <!-- LISTENER & PUBLIC ENDPOINT: reachable, not a health signal -->
+    <details class="card vpn-config" id="vpn-configuration">
+        <summary>
+            <span>{{ _ "vpn_configuration" }}</span>
+            <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
+        </summary>
+        <div class="vpn-config-body">
+            <div class="vpn-config-field">
+                <span class="vpn-config-label">{{ _ "vpn_listener" }}</span>
+                <span class="badge" id="vpn-listener-badge"><span class="badge-dot"></span> {{ _ "loading" }}</span>
+            </div>
+            <div class="vpn-config-field">
+                <span class="vpn-config-label">{{ _ "vpn_port" }}</span>
+                <strong class="font-mono" id="vpn-listen-port">-</strong>
+            </div>
+            <div class="vpn-config-field">
+                <span class="vpn-config-label">{{ _ "vpn_subnet" }}</span>
+                <strong class="font-mono" id="vpn-subnet">-</strong>
+            </div>
+            <div class="vpn-config-field vpn-config-grow">
+                <span class="vpn-config-label">{{ _ "vpn_public_endpoint" }}</span>
+                <span class="font-mono" id="vpn-public-endpoint">-</span>
+                <span class="vpn-secondary">{{ _ "vpn_entry_point_hint" }}</span>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm" id="vpn-edit-endpoint-btn" data-action="vpn-open-edit-endpoint" aria-label="{{ _ "vpn_edit_endpoint" }}">
+                <svg class="icon" aria-hidden="true"><use href="#icon-pencil"></use></svg>
+                <span>{{ _ "vpn_edit_endpoint" }}</span>
+            </button>
+        </div>
+    </details>
+</section>
+
+<!-- ============================= BACKENDS ============================= -->
+{{/* The inventory card IS the Backends section, so its heading is the section
+     heading the rail jumps to: #backends is the H2 itself, exactly as the approved
+     screen does. Add Backend sits at the trailing edge of the same header, outside
+     the table's horizontal scroller. The card carries its own region id for the
+     card-order check and for the boot's activation observer. */}}
+<section class="card vpn-table-card vpn-section" id="backends-region" aria-labelledby="backends" data-vpn-section="backends">
+    <div class="flex items-center justify-between vpn-card-head">
+        <div class="flex items-center gap-sm">
             <svg class="icon text-muted" aria-hidden="true"><use href="#icon-server"></use></svg>
+            <h2 class="section-title vpn-region-target" id="backends" tabindex="-1">{{ _ "nav_vpn_backends" }}</h2>
+            {{/* The destination heading owns a polite live region for an Inspect that
+                 names a backend absent from a successful read. */}}
+            <span class="vpn-visually-hidden" id="vpn-backends-announcement" role="status" aria-atomic="true"></span>
         </div>
-        <div class="stat-card-value" id="vpn-signal-backends-value">-</div>
-        <div class="stat-card-sub" id="vpn-signal-backends-sub">{{ _ "vpn_diag_not_measured" }}</div>
-    </div>
-
-    <div class="card stat-card" data-signal="sessions">
-        <div class="stat-card-header">
-            <span class="stat-card-title">{{ _ "vpn_diag_active_sessions" }}</span>
-            <svg class="icon text-muted" aria-hidden="true"><use href="#icon-users"></use></svg>
-        </div>
-        <div class="stat-card-value font-mono" id="vpn-sessions">-</div>
-        <div class="stat-card-sub" id="vpn-session-mismatch" hidden></div>
-    </div>
-
-    <div class="card stat-card" data-signal="throughput">
-        <div class="stat-card-header">
-            <span class="stat-card-title">{{ _ "vpn_fwd_kpi_throughput" }}</span>
-            <svg class="icon text-muted" aria-hidden="true"><use href="#icon-activity"></use></svg>
-        </div>
-        <div class="stat-card-value" id="vpn-signal-throughput-value">-</div>
-        <div class="stat-card-sub" id="vpn-signal-throughput-sub">{{ _ "vpn_signal_throughput_horizon" }}</div>
-    </div>
-
-    <div class="card stat-card" data-signal="drops">
-        <div class="stat-card-header">
-            <span class="stat-card-title">{{ _ "vpn_col_packet_loss" }}</span>
-            <svg class="icon text-muted" aria-hidden="true"><use href="#icon-alert-triangle"></use></svg>
-        </div>
-        <div class="stat-card-value" id="vpn-signal-drops-value">-</div>
-        <div class="stat-card-sub" id="vpn-signal-drops-sub">{{ _ "vpn_dataplane_drops_scope" }}</div>
-    </div>
-</div>
-
-<!-- LISTENER & PUBLIC ENDPOINT: reachable, not a health signal -->
-<details class="card vpn-config" id="vpn-configuration">
-    <summary>
-        <span>{{ _ "vpn_configuration" }}</span>
-        <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
-    </summary>
-    <div class="vpn-config-body">
-        <div class="vpn-config-field">
-            <span class="vpn-config-label">{{ _ "vpn_listener" }}</span>
-            <span class="badge" id="vpn-listener-badge"><span class="badge-dot"></span> {{ _ "loading" }}</span>
-        </div>
-        <div class="vpn-config-field">
-            <span class="vpn-config-label">{{ _ "vpn_port" }}</span>
-            <strong class="font-mono" id="vpn-listen-port">-</strong>
-        </div>
-        <div class="vpn-config-field">
-            <span class="vpn-config-label">{{ _ "vpn_subnet" }}</span>
-            <strong class="font-mono" id="vpn-subnet">-</strong>
-        </div>
-        <div class="vpn-config-field vpn-config-grow">
-            <span class="vpn-config-label">{{ _ "vpn_public_endpoint" }}</span>
-            <span class="font-mono" id="vpn-public-endpoint">-</span>
-            <span class="vpn-secondary">{{ _ "vpn_entry_point_hint" }}</span>
-        </div>
-        <button type="button" class="btn btn-secondary btn-sm" id="vpn-edit-endpoint-btn" data-action="vpn-open-edit-endpoint" aria-label="{{ _ "vpn_edit_endpoint" }}">
-            <svg class="icon" aria-hidden="true"><use href="#icon-pencil"></use></svg>
-            <span>{{ _ "vpn_edit_endpoint" }}</span>
+        <button type="button" class="btn btn-primary btn-sm" id="vpn-add-backend-btn" data-action="vpn-open-add-backend">
+            <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+            <span>{{ _ "vpn_add_backend" }}</span>
         </button>
     </div>
-</details>
+
+    <div class="table-container" id="vpnTableContainer">
+        <table class="table interactive-table" id="vpnBackendsTable">
+            <thead>
+                <tr>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_endpoint" }}</th>
+                    <th class="sortable" data-sort-type="string">{{ _ "vpn_status" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_latency" }}</th>
+                    <th class="sortable" data-sort-type="numeric">{{ _ "vpn_connections" }}</th>
+                    <th data-sortable="false" class="vpn-numeric">{{ _ "actions" }}</th>
+                </tr>
+            </thead>
+            <tbody id="vpn-backends-tbody">
+                <tr id="vpn-backends-loading" class="table-loading-row">
+                    <td colspan="6" class="vpn-table-loading">
+                        <div class="spinner"></div>
+                        <div class="vpn-secondary">{{ _ "loading" }}</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<!-- ============================= DIAGNOSTICS ============================= -->
+<section class="vpn-section" id="diagnostics-region" aria-labelledby="diagnostics" data-vpn-section="diagnostics">
+    <h2 class="section-title vpn-region-target" id="diagnostics" tabindex="-1">{{ _ "nav_vpn_diagnostics" }}</h2>
+
+    <!-- Active problems first: the actionable rows, without Advanced Diagnostics. -->
+    <section class="card vpn-problems-card" id="vpn-active-problems-card" aria-labelledby="active-problems">
+        <h3 class="card-title vpn-problems-title" id="active-problems" tabindex="-1">{{ _ "vpn_active_problems" }}</h3>
+        <p class="vpn-secondary" id="vpn-fwd-problems-empty" role="status">{{ _ "vpn_no_active_problems" }}</p>
+        <ul class="vpn-issue-list" id="vpn-fwd-problem-list" hidden></ul>
+    </section>
+
+    <!-- ACTIVE SESSIONS / CONNECTION TROUBLESHOOTING TABLE. The card names its own
+         heading, so a fragment naming the table (or a cell inside it) lands on
+         Connection Diagnostics rather than climbing to the section heading. -->
+    <div class="card vpn-table-card" id="vpn-sessions-card" aria-labelledby="vpn-troubleshooting-title">
+        <div class="flex items-center justify-between vpn-card-head">
+            <div class="flex items-center gap-sm">
+                <svg class="icon text-muted" aria-hidden="true"><use href="#icon-users"></use></svg>
+                <h3 class="card-title" id="vpn-troubleshooting-title" tabindex="-1">{{ _ "vpn_troubleshooting_title" }}</h3>
+                <span id="vpn-sessions-count-badge" class="badge badge-secondary">0</span>
+            </div>
+            <button type="button" class="btn btn-sm btn-ghost" id="vpn-sessions-toggle-problems-btn" data-action="vpn-toggle-problems-filter">
+                <svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"></use></svg>
+                <span id="vpn-sessions-toggle-problems-text">{{ _ "vpn_show_problems_only" }}</span>
+            </button>
+        </div>
+
+        <div class="table-container">
+            <table class="table interactive-table" id="vpnSessionsTable">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort-type="string">{{ _ "vpn_col_user_device" }}</th>
+                        <th class="sortable" data-sort-type="string">{{ _ "vpn_backend_server" }}</th>
+                        <th class="sortable" data-sort-type="numeric">{{ _ "vpn_col_live_traffic" }}</th>
+                        <th class="sortable vpn-transferred-head" data-sort-type="numeric">{{ _ "vpn_col_transferred" }}</th>
+                        <th class="sortable" data-sort-type="string">{{ _ "status" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="vpn-sessions-tbody">
+                    <tr id="vpn-sessions-loading" class="table-loading-row">
+                        <td colspan="5" class="vpn-table-loading">
+                            <div class="spinner"></div>
+                            <div class="vpn-secondary">{{ _ "loading" }}</div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ADVANCED DIAGNOSTICS: one on-page disclosure, user-owned open state, placed
+         last and immediately after the section it belongs to. -->
+    <div class="vpn-advanced-block">
+        <button type="button" class="btn btn-secondary btn-sm vpn-diag-entry" id="vpn-advanced-entry"
+                aria-expanded="false" aria-controls="vpn-diagnostics" data-action="vpn-toggle-diagnostics">
+            <span>{{ _ "vpn_advanced_diagnostics" }}</span>
+            <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
+        </button>
+
+        <section class="card vpn-diagnostics" id="vpn-diagnostics" aria-labelledby="vpn-diagnostics-title" hidden>
+            <header class="vpn-diag-header">
+                <div>
+                    <h3 class="card-title vpn-region-target" id="vpn-diagnostics-title" tabindex="-1">{{ _ "vpn_advanced_diagnostics" }}</h3>
+                    <p class="vpn-secondary">{{ _ "vpn_diagnostics_subtitle" }}</p>
+                </div>
+                <button type="button" class="btn btn-secondary btn-sm" id="vpn-close-diagnostics" data-action="vpn-close-diagnostics">
+                    {{ _ "vpn_close_diagnostics" }}
+                </button>
+            </header>
+
+            <!-- 1. Traffic & Performance -->
+            <section class="vpn-diag-section" id="vpn-traffic-performance" aria-labelledby="vpn-traffic-performance-title">
+                <div class="vpn-diag-heading">
+                    <h4 id="vpn-traffic-performance-title" tabindex="-1">{{ _ "vpn_diagnostics_traffic" }}</h4>
+                    <div class="btn-group vpn-windows" id="vpn-history-window-toggles" role="group" aria-label="{{ _ "vpn_history_range" }}">
+                        <button type="button" class="btn btn-sm btn-primary active" aria-pressed="true" data-action="vpn-set-history-window" data-window="15m">15m</button>
+                        <button type="button" class="btn btn-sm btn-secondary" aria-pressed="false" data-action="vpn-set-history-window" data-window="1h">1h</button>
+                        <button type="button" class="btn btn-sm btn-secondary" aria-pressed="false" data-action="vpn-set-history-window" data-window="24h">24h</button>
+                    </div>
+                </div>
+
+                <div class="vpn-chart-grid">
+                    <figure class="vpn-chart">
+                        <figcaption class="vpn-chart-caption">
+                            <span>{{ _ "vpn_fwd_kpi_throughput" }}</span>
+                            <span id="vpn-chart-throughput-badges" class="text-muted font-mono"></span>
+                        </figcaption>
+                        <div id="vpn-chart-throughput" class="vpn-chart-body"></div>
+                        <div id="vpn-chart-throughput-axis" class="vpn-chart-axis text-muted"></div>
+                    </figure>
+                    <figure class="vpn-chart">
+                        <figcaption class="vpn-chart-caption">
+                            <span>{{ _ "vpn_diag_drop_rate" }}</span>
+                            <span id="vpn-chart-drops-badges" class="text-muted font-mono"></span>
+                        </figcaption>
+                        <div id="vpn-chart-drops" class="vpn-chart-body"></div>
+                        <div id="vpn-chart-drops-axis" class="vpn-chart-axis text-muted"></div>
+                    </figure>
+                    <figure class="vpn-chart">
+                        <figcaption class="vpn-chart-caption">
+                            <span>{{ _ "vpn_diag_latency_p95" }}</span>
+                            <span id="vpn-chart-latency-badges" class="text-muted font-mono"></span>
+                        </figcaption>
+                        <div id="vpn-chart-latency" class="vpn-chart-body"></div>
+                        <div id="vpn-chart-latency-axis" class="vpn-chart-axis text-muted"></div>
+                    </figure>
+                    <figure class="vpn-chart">
+                        <figcaption class="vpn-chart-caption">
+                            <span>{{ _ "vpn_diag_queue_utilization" }}</span>
+                            <span id="vpn-chart-queue-badges" class="text-muted font-mono"></span>
+                        </figcaption>
+                        <div id="vpn-chart-queue" class="vpn-chart-body"></div>
+                        <div id="vpn-chart-queue-axis" class="vpn-chart-axis text-muted"></div>
+                    </figure>
+                </div>
+                <div id="vpn-chart-tooltip" class="vpn-chart-tooltip" role="tooltip" hidden></div>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_fwd_kpi_throughput" }} ({{ _ "vpn_fwd_horizon_current" }})</dt><dd class="font-mono" id="vpn-diag-throughput">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_packet_rate" }}</dt><dd class="font-mono" id="vpn-diag-packet-rate">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                    <div><dt>{{ _ "vpn_diag_avg_5m" }}</dt><dd class="font-mono" id="vpn-diag-ewma5m">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_avg_1h" }}</dt><dd class="font-mono" id="vpn-diag-ewma1h">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_forward_p95_recent" }}</dt><dd class="font-mono" id="vpn-diag-lat-percentiles">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                    <div><dt>{{ _ "vpn_diag_max_duration" }}</dt><dd class="font-mono" id="vpn-diag-lat-max">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                </dl>
+
+                <dl class="vpn-metrics" id="vpn-cumulative-totals">
+                    <div><dt>{{ _ "vpn_cumulative_totals" }}</dt><dd class="font-mono"><span class="vpn-io-down">&darr; {{ _ "vpn_rx_total" }}</span> <strong id="vpn-rx">-</strong> &bull; <span class="vpn-io-up">&uarr; {{ _ "vpn_tx_total" }}</span> <strong id="vpn-tx">-</strong></dd></div>
+                </dl>
+            </section>
+
+            <!-- 2. Routing & Drops -->
+            <section class="vpn-diag-section" id="vpn-routing-drops" aria-labelledby="vpn-routing-drops-title">
+                <h4 id="vpn-routing-drops-title" tabindex="-1">{{ _ "vpn_diagnostics_routing" }}</h4>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_diag_route_integrity" }}</dt><dd id="vpn-diag-routing-counts">-</dd></div>
+                    <div><dt>{{ _ "vpn_fwd_panel_integrity" }}</dt><dd><span class="badge badge-secondary" id="vpn-diag-routing-badge">{{ _ "vpn_fwd_consistent" }}</span></dd></div>
+                    <div><dt>{{ _ "vpn_forwarder_queue" }}</dt><dd class="font-mono" id="vpn-diag-queue-occ">-</dd></div>
+                    <div><dt>{{ _ "vpn_forwarder_peak" }}</dt><dd class="font-mono" id="vpn-diag-queue-peak">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_queue_above_50" }}</dt><dd class="font-mono" id="vpn-diag-queue-dwell">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                    <div><dt>{{ _ "vpn_fwd_counters_since" }}</dt><dd class="font-mono" id="vpn-fwd-counters-since">-</dd></div>
+                </dl>
+                <div id="vpn-diag-routing-alerts" class="vpn-alerts" hidden></div>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_diag_drops_outbound" }}</dt><dd class="font-mono" id="vpn-diag-drops-client">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_drops_inbound" }}</dt><dd class="font-mono" id="vpn-diag-drops-return">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_total_drop_rate" }}</dt><dd class="font-mono" id="vpn-diag-drops-total">-</dd></div>
+                </dl>
+                <div class="vpn-subsection">
+                    <h5>{{ _ "vpn_diag_loss_reasons" }}</h5>
+                    <div id="vpn-diag-drop-reasons"></div>
+                </div>
+
+                <details class="vpn-diag-fold" id="vpn-fwd-routes-details">
+                    <summary>
+                        <span class="vpn-fold-label">
+                            <svg class="icon text-muted" aria-hidden="true"><use href="#icon-network"></use></svg>
+                            <span>{{ _ "vpn_fwd_panel_problems" }}</span>
+                            <span id="vpn-fwd-routes-badge" class="badge badge-secondary">0</span>
+                        </span>
+                        <span class="vpn-fold-actions">
+                            <button type="button" class="btn btn-sm btn-ghost" id="vpn-routes-toggle-all-btn" data-action="vpn-toggle-show-all-routes">{{ _ "vpn_fwd_show_all" }}</button>
+                            <span id="vpn-fwd-routes-summary-status" class="text-muted">{{ _ "vpn_forwarder_no_route_pressure" }}</span>
+                            <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
+                        </span>
+                    </summary>
+                    <div class="table-container vpn-route-table-region" tabindex="0" role="region" aria-label="{{ _ "vpn_forwarder_routes" }}">
+                        <div id="vpn-fwd-routes-empty" class="vpn-empty">
+                            {{ _ "vpn_forwarder_no_route_pressure" }}
+                        </div>
+                        <table class="data-table" id="vpn-fwd-routes-table" hidden>
+                            <thead>
+                                <tr>
+                                    <th scope="col">{{ _ "vpn_forwarder_route_peer" }}</th>
+                                    <th scope="col" class="vpn-numeric">{{ _ "vpn_forwarder_route_queue" }}</th>
+                                    <th scope="col" class="vpn-numeric">{{ _ "vpn_forwarder_route_peak" }}</th>
+                                    <th scope="col" class="vpn-numeric">{{ _ "vpn_forwarder_route_drops" }}</th>
+                                    <th scope="col" class="vpn-numeric">{{ _ "vpn_forwarder_route_writes" }}</th>
+                                </tr>
+                            </thead>
+                            <tbody id="vpn-fwd-routes-tbody"></tbody>
+                        </table>
+                    </div>
+                </details>
+
+                <details class="vpn-diag-fold" id="vpn-reason-history">
+                    <summary>
+                        <span>{{ _ "vpn_diag_loss_backend_history" }}</span>
+                        <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
+                    </summary>
+                    <div id="vpn-chart-reasons"></div>
+                </details>
+            </section>
+
+            <!-- 3. Runtime Details -->
+            <section class="vpn-diag-section" id="vpn-runtime-details" aria-labelledby="vpn-runtime-details-title">
+                <h4 id="vpn-runtime-details-title" tabindex="-1">{{ _ "vpn_diagnostics_runtime" }}</h4>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_diag_engine" }}</dt><dd class="font-mono" id="vpn-diag-engine-status">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_peer_sync_peers" }}</dt><dd class="font-mono" id="vpn-diag-peers-status">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_handshake_freshness" }}</dt><dd class="font-mono" id="vpn-diag-hs-freshness">-</dd></div>
+                </dl>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_diag_recent_write_stalls" }}</dt><dd class="font-mono" id="vpn-diag-write-stalls-recent">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                    <div><dt>{{ _ "vpn_diag_write_stalls_cumulative" }}</dt><dd class="font-mono" id="vpn-diag-write-stalls-total">{{ _ "vpn_diag_not_measured" }}</dd></div>
+                </dl>
+
+                <dl class="vpn-metrics">
+                    <div><dt>{{ _ "vpn_diag_cpu_usage" }}</dt><dd class="font-mono" id="vpn-diag-res-cpu">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_memory" }}</dt><dd class="font-mono" id="vpn-diag-res-mem">-</dd></div>
+                    <div><dt>{{ _ "vpn_diag_file_descriptors" }}</dt><dd class="font-mono" id="vpn-diag-res-fd">-</dd></div>
+                </dl>
+
+                <details class="vpn-diag-fold" id="vpn-per-backend">
+                    <summary>
+                        <span>{{ _ "vpn_fwd_panel_backends" }}</span>
+                        <svg class="icon vpn-chevron" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
+                    </summary>
+                    <div id="vpn-diag-be-traffic"></div>
+                    <div id="vpn-chart-backends">
+                        <select id="vpn-history-backend-select" class="form-select form-select-sm vpn-backend-select" hidden></select>
+                        <div id="vpn-chart-backend-series"></div>
+                    </div>
+                    <div id="vpn-history-fleet-note" class="text-muted text-sm"></div>
+                </details>
+            </section>
+        </section>
+    </div>
+</section>
 
 <!-- EDIT PUBLIC ENDPOINT MODAL -->
 <div class="modal-backdrop" id="editEndpointModal">
@@ -109,13 +435,92 @@
         </form>
     </div>
 </div>
+
+<!-- ADD BACKEND MODAL -->
+<div class="modal-backdrop" id="addBackendModal">
+    <div class="modal" style="max-width: 520px;">
+        <div class="modal-header">
+            <div class="flex items-center gap-sm">
+                <svg class="icon" style="width: 20px; height: 20px;"><use href="#icon-plus"></use></svg>
+                <h2 class="modal-title">{{ _ "vpn_add_backend" }}</h2>
+            </div>
+            <button type="button" class="modal-close" data-action="vpn-close-modal" data-modal="addBackendModal" aria-label="{{ _ "cancel" }}">
+                <svg class="icon"><use href="#icon-x"></use></svg>
+            </button>
+        </div>
+        <form id="addBackendForm">
+            <p class="vpn-secondary vpn-modal-hint">
+                {{ _ "vpn_add_backend_hint" }}
+            </p>
+
+            <div class="form-group">
+                <label class="form-label" for="vpnServerSelect">{{ _ "vpn_select_server" }}</label>
+                <select class="form-select" id="vpnServerSelect" required>
+                    <option value="">- {{ _ "select" }} -</option>
+                </select>
+            </div>
+
+            <!-- Server Details Card -->
+            <div id="vpnServerDetails" class="info-card" style="display: none; margin-bottom: var(--space-md);">
+                <div class="info-card-grid">
+                    <div class="info-card-item">
+                        <span class="info-card-label">{{ _ "host" }}</span>
+                        <span class="info-card-value font-mono" id="vpnServerDetailHost">-</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">{{ _ "ssh_port" }}</span>
+                        <span class="info-card-value font-mono" id="vpnServerDetailPort">-</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">{{ _ "status" }}</span>
+                        <span class="info-card-value" id="vpnServerDetailStatus">-</span>
+                    </div>
+                    <div class="info-card-item">
+                        <span class="info-card-label">AmneziaWG</span>
+                        <span id="vpnServerDetailAwgBadge" class="badge">-</span>
+                    </div>
+                </div>
+                <div id="vpnServerDetailCheckRow" style="display: none; margin-top: var(--space-sm); padding-top: var(--space-sm); border-top: 1px dashed var(--border-color); align-items: center; justify-content: space-between; gap: var(--space-sm);">
+                    <span class="vpn-secondary" id="vpnServerDetailCheckHint"></span>
+                    <button type="button" class="btn btn-secondary btn-sm" id="vpnQuickCheckBtn" data-action="vpn-trigger-quick-check">
+                        <svg class="icon" id="vpnQuickCheckIcon" style="width:14px;height:14px;"><use href="#icon-refresh"></use></svg>
+                        <span id="vpnQuickCheckBtnText">{{ _ "server_check" }}</span>
+                        <div class="spinner hidden" id="vpnQuickCheckSpinner"></div>
+                    </button>
+                </div>
+            </div>
+
+            <div id="vpnNoServersNotice" class="vpn-empty" style="display: none;">
+                {{ _ "vpn_no_available_servers" }}
+            </div>
+
+            <div id="vpnModalError" class="modal-notice-error" style="display: none;"></div>
+
+            <div class="modal-footer vpn-modal-footer">
+                <button type="button" class="btn btn-secondary" data-action="vpn-close-modal" data-modal="addBackendModal">{{ _ "cancel" }}</button>
+                <button type="submit" class="btn btn-primary" id="vpnAddBackendSubmitBtn">
+                    {{ _ "vpn_enable_backend" }}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
 {{ end }}
 
 {{ define "scripts" }}
-{{/* The legacy-fragment handoff runs before anything on this page starts a read,
-     so a bookmark for a block that now lives on a child page costs one navigation
-     and no Overview polling. */}}
+{{/* One document: the fragment resolver runs first, before any section controller
+     starts a read, so an inherited or legacy fragment cannot cost a request it will
+     not use. Then the shared helpers, the section controllers, and the page boot that
+     activates a section when it approaches the viewport or is targeted. */}}
 <script src="{{ asset_url "/static/js/vpn/anchor_handoff.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/common.js" }}"></script>
 <script src="{{ asset_url "/static/js/vpn/overview.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/backends.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/backends_page.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/health_problems.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/health_summary.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/charts.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/sessions.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/diagnostics_page.js" }}"></script>
+<script src="{{ asset_url "/static/js/vpn/page.js" }}"></script>
 {{ end }}

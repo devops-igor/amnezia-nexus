@@ -84,6 +84,7 @@ var DeliveredAssets = []string{
 	"/static/js/vpn/health_problems.js",
 	"/static/js/vpn/health_summary.js",
 	"/static/js/vpn/overview.js",
+	"/static/js/vpn/page.js",
 	"/static/js/vpn/sessions.js",
 }
 

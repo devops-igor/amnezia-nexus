@@ -20,7 +20,7 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
@@ -43,17 +43,20 @@ func TestPhase5VPNAndUsersModernization(t *testing.T) {
 	}
 	for _, token := range []string{"href=\"#icon-server\"", "href=\"#icon-plus\"", "vpnBackendsTable", "vpnTableContainer", "data-sort-type", "/static/js/vpn/backends.js"} {
 		if !strings.Contains(string(backendsTemplate), token) {
-			t.Errorf("vpn_backends.html missing required modernized token %q", token)
+			t.Errorf("vpn.html missing required modernized token %q", token)
 		}
 	}
 
-	requiredPageTokens := []string{
-		"API.get",
-		"NexusTelemetry.poll",
-	}
-	for _, token := range requiredPageTokens {
+	// The Overview controller reads its own two endpoints; the stream that drives
+	// them lives in the page boot, which owns the single status tick for the page.
+	for _, token := range []string{"API.get", "/api/vpn/status", "/api/vpn/config"} {
 		if !strings.Contains(pageStr, token) {
 			t.Errorf("overview.js missing required modernized token %q", token)
+		}
+	}
+	for _, token := range []string{"NexusTelemetry.poll", "vpnTickOnce"} {
+		if !strings.Contains(fixture.PageBootJS, token) {
+			t.Errorf("page.js missing required modernized token %q", token)
 		}
 	}
 	for _, token := range []string{"NexusTable", "vpnTableInstance"} {
@@ -325,11 +328,11 @@ func TestIssue101VPNModernization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
-	diagnosticsTemplate, err := fs.ReadFile(templatesFS, "vpn_diagnostics.html")
+	diagnosticsTemplate, err := fs.ReadFile(templatesFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn_diagnostics.html: %v", err)
 	}
@@ -396,12 +399,12 @@ func TestIssue101VPNModernization(t *testing.T) {
 	}
 	for _, id := range backendsIDs {
 		if !strings.Contains(string(backendsTemplate), `id="`+id+`"`) {
-			t.Errorf("vpn_backends.html missing required DOM element id=%q", id)
+			t.Errorf("vpn.html missing required DOM element id=%q", id)
 		}
 	}
 	for _, id := range diagnosticsIDs {
 		if !strings.Contains(string(diagnosticsTemplate), `id="`+id+`"`) {
-			t.Errorf("vpn_diagnostics.html missing required DOM element id=%q", id)
+			t.Errorf("vpn.html missing required DOM element id=%q", id)
 		}
 	}
 
@@ -758,15 +761,15 @@ func TestIssue101VPNPolishRework(t *testing.T) {
 	if !strings.Contains(cssStr, ".table-container table {\n    width: 100%;\n    min-width: 100%;\n    border-collapse: collapse;\n}") {
 		t.Errorf("style.css missing .table-container table with width: 100%%, min-width: 100%%, and border-collapse: collapse")
 	}
-	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	backendsTemplate, err := fs.ReadFile(templatesFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
 	if !strings.Contains(string(backendsTemplate), `id="vpnTableContainer"`) {
-		t.Errorf("vpn_backends.html missing #vpnTableContainer")
+		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 	if !strings.Contains(string(backendsTemplate), `class="table interactive-table" id="vpnBackendsTable"`) {
-		t.Errorf("vpn_backends.html missing table.interactive-table#vpnBackendsTable")
+		t.Errorf("vpn.html missing table.interactive-table#vpnBackendsTable")
 	}
 }
 
@@ -795,13 +798,13 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 
 	// 2. Assert the inventory document contains table#vpnBackendsTable with 100%
 	// width and min-width. The table is on its own document now.
-	vpnData, err := fs.ReadFile(templatesFS, "vpn_backends.html")
+	vpnData, err := fs.ReadFile(templatesFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn_backends.html: %v", err)
 	}
 	vpnStr := string(vpnData)
 	if !strings.Contains(vpnStr, `<table class="table interactive-table" id="vpnBackendsTable">`) {
-		t.Errorf("vpn_backends.html missing table#vpnBackendsTable with the interactive-table contract")
+		t.Errorf("vpn.html missing table#vpnBackendsTable with the interactive-table contract")
 	}
 	// Full width is carried by .interactive-table in the stylesheet rather than an
 	// inline style, which #955 removed along with the rest of the large inline styling.
@@ -809,7 +812,7 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Errorf("vpn_backends.html must not carry inline full-width table styling")
 	}
 	if !strings.Contains(vpnStr, `id="vpnTableContainer"`) {
-		t.Errorf("vpn_backends.html missing #vpnTableContainer")
+		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 
 	// 3. Assert stylesheet cache identity across all shell and auth templates:

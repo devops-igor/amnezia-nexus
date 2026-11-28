@@ -334,6 +334,36 @@ function vpnAnnounceProblems(rows) {
     vpnAssignText(sink, parts.join(' \u00b7 '));
 }
 
+// vpnProblemState classifies the problem set ONCE. A refused status read and a
+// successful read with no problems are different facts, and the collapsed list,
+// the "no active problems" line and the headline's jump must all agree about
+// which one applies - so they are all derived from this one answer rather than
+// each re-testing the payload.
+function vpnProblemState(status) {
+    if (!status || status.forwarder_available !== true) return 'unavailable';
+    return vpnIssueRows(status).length > 0 ? 'present' : 'none';
+}
+
+// vpnRenderProblemState writes every surface that depends on the classification:
+// the list's empty/unavailable line, and whether the Overview headline offers the
+// jump into this section. An unavailable read never claims there are no issues.
+function vpnRenderProblemState(state) {
+    const emptyElem = document.getElementById('vpn-fwd-problems-empty');
+    if (emptyElem) {
+        if (state === 'unavailable') {
+            vpnAssignText(emptyElem, _('vpn_problems_unavailable'));
+            emptyElem.hidden = false;
+        } else if (state === 'none') {
+            vpnAssignText(emptyElem, _('vpn_no_active_problems'));
+            emptyElem.hidden = false;
+        } else {
+            emptyElem.hidden = true;
+        }
+    }
+    const jumpElem = document.getElementById('vpn-view-problems-link');
+    if (jumpElem) jumpElem.hidden = state !== 'present';
+}
+
 // vpnRenderActiveProblemsCards renders the problem rows and returns the number of
 // rows. It never changes the Advanced Diagnostics open state: a new problem is
 // surfaced here, not by expanding technical telemetry.
@@ -341,6 +371,8 @@ function vpnRenderActiveProblemsCards(status, context) {
     const ctx = context || {};
     const problemListElem = document.getElementById('vpn-fwd-problem-list');
     const rows = (status && status.forwarder_available === true) ? vpnIssueRows(status) : [];
+
+    vpnRenderProblemState(vpnProblemState(status));
 
     if (!problemListElem) return rows.length;
 
@@ -833,6 +865,8 @@ function vpnResetTechDiagnosticCards() {
 }
 
 if (typeof window !== 'undefined') {
+    window.vpnProblemState = vpnProblemState;
+    window.vpnRenderProblemState = vpnRenderProblemState;
     window.vpnLastActiveProblemKeys = vpnLastActiveProblemKeys;
     window.vpnLastActiveProblemCount = vpnLastActiveProblemCount;
     window.vpnFormatTime = vpnFormatTime;

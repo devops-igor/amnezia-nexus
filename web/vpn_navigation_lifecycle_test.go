@@ -47,7 +47,7 @@ func TestVPNPageSuccessfulActionsKeepTerminalFocus(t *testing.T) {
    await pending;
    assert.strictEqual(reads, before + 1, 'success really refreshed the owner');
    assert.strictEqual(opener.isConnected, false, 'refresh replaced the activated row');
-   if (action === 'delete') assert.strictEqual(d.activeElement.id, 'vpn-backends-title', 'removed backend falls back to its owner heading');
+   if (action === 'delete') assert.strictEqual(d.activeElement.id, 'backends', 'removed backend falls back to its owner heading');
    if (action === 'disable') {
      const replacement = d.querySelector('[data-backend-action="enable"]');
      assert(replacement, 'Disable refresh renders the now-disabled backend');
@@ -164,7 +164,7 @@ dom.window.close();
    reject = false;
    await w.vpnLoadBackends();
    assert.strictEqual(w.document.activeElement.getAttribute('data-backend-name'), '2', 'intended retry focuses tunnel 77 on distinct server 2');
-   assert.strictEqual(w.location.hash, '#vpn-backends-title', 'arrival token is removed before retry/reload');
+   assert.strictEqual(w.location.hash, '#backends', 'arrival token is removed before retry/reload');
  } else {
    if (arrival === '/vpn/backends') assert.strictEqual(w.document.activeElement, w.document.body, 'bare visit leaves focus untouched');
    assert(!w.document.activeElement.hasAttribute('data-backend-name'), 'unrelated fresh document does not replay abandoned Inspect');

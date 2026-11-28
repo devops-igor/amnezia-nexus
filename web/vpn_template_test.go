@@ -16,28 +16,22 @@ import (
 	"golang.org/x/net/html"
 )
 
-// vpnScriptsByPage is the synchronous chain each VPN document loads, in
-// evaluation order. The single VPN page became three documents, so the asset
-// list is no longer one list: an assertion about "the VPN page's scripts" has to
-// name the page, or it would assert against a superset no document ships.
+// vpnScriptsByPage is the synchronous chain the VPN page loads, in evaluation
+// order. The merged page is one document again, so there is one entry: the resolver,
+// the shared helpers, each section's controllers, and the boot that activates them.
 var vpnScriptsByPage = map[string][]string{
 	"vpn": {
 		"/static/js/vpn/anchor_handoff.js",
 		"/static/js/vpn/common.js",
 		"/static/js/vpn/overview.js",
-	},
-	"vpn_backends": {
-		"/static/js/vpn/common.js",
 		"/static/js/vpn/backends.js",
 		"/static/js/vpn/backends_page.js",
-	},
-	"vpn_diagnostics": {
-		"/static/js/vpn/common.js",
 		"/static/js/vpn/health_problems.js",
 		"/static/js/vpn/health_summary.js",
 		"/static/js/vpn/charts.js",
 		"/static/js/vpn/sessions.js",
 		"/static/js/vpn/diagnostics_page.js",
+		"/static/js/vpn/page.js",
 	},
 }
 
@@ -53,6 +47,7 @@ var canonicalVPNScripts = []string{
 	"/static/js/vpn/health_problems.js",
 	"/static/js/vpn/health_summary.js",
 	"/static/js/vpn/overview.js",
+	"/static/js/vpn/page.js",
 	"/static/js/vpn/sessions.js",
 }
 
@@ -441,15 +436,15 @@ func withExtraAttribute(attr, extra string) string {
 }
 
 func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
-	rendered := renderVPNPage(t, "vpn_backends")
-	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_backends")
+	rendered := renderVPNPage(t, "vpn")
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn")
 
 	target := emittedSrcAttr(t, rendered, "/static/js/vpn/backends.js")
 	mutated := strings.Replace(rendered, target, withExtraAttribute(target, "async"), 1)
 	if mutated == rendered {
 		t.Fatal("failed to apply async mutation")
 	}
-	err := validateRenderedVPNPageFor("vpn_backends", mutated)
+	err := validateRenderedVPNPageFor("vpn", mutated)
 	if err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject async mutant, but it passed")
 	}
@@ -462,7 +457,7 @@ func TestRenderedVPNTemplateRejectAsyncMutant(t *testing.T) {
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply async mutation to scripts block")
 	}
-	if err := validateVPNScriptsBlockFor("vpn_backends", mutatedBlock); err == nil || !strings.Contains(err.Error(), "async") {
+	if err := validateVPNScriptsBlockFor("vpn", mutatedBlock); err == nil || !strings.Contains(err.Error(), "async") {
 		t.Fatalf("expected validateVPNScriptsBlock to reject async mutant, got: %v", err)
 	}
 }
@@ -520,7 +515,7 @@ func TestRenderedVPNTemplateRejectExtraScriptMutant(t *testing.T) {
 }
 
 func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
-	rendered := renderVPNPage(t, "vpn_backends")
+	rendered := renderVPNPage(t, "vpn")
 
 	// Swap backends.js and backends_page.js on the inventory document, keeping
 	// each element's own identity query with it: the order is what this rejects,
@@ -533,11 +528,11 @@ func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	if mutated == rendered {
 		t.Fatal("failed to apply order mutation")
 	}
-	if err := validateRenderedVPNPageFor("vpn_backends", mutated); err == nil {
+	if err := validateRenderedVPNPageFor("vpn", mutated); err == nil {
 		t.Fatal("expected validateRenderedVPNPage to reject order mutant, but it passed")
 	}
 
-	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_backends")
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn")
 	blk1 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends.js")
 	blk2 := emittedScriptTag(t, scriptsBlock, "/static/js/vpn/backends_page.js")
 	mutatedBlock := strings.Replace(scriptsBlock, blk1, "__PLACEHOLDER__", 1)
@@ -546,14 +541,14 @@ func TestRenderedVPNTemplateRejectOrderMutant(t *testing.T) {
 	if mutatedBlock == scriptsBlock {
 		t.Fatal("failed to apply order mutation to scripts block")
 	}
-	if err := validateVPNScriptsBlockFor("vpn_backends", mutatedBlock); err == nil {
+	if err := validateVPNScriptsBlockFor("vpn", mutatedBlock); err == nil {
 		t.Fatal("expected validateVPNScriptsBlock to reject order mutant, but it passed")
 	}
 }
 
 func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
-	rendered := renderVPNPage(t, "vpn_diagnostics")
-	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn_diagnostics")
+	rendered := renderVPNPage(t, "vpn")
+	scriptsBlock := renderVPNPageScriptsBlock(t, "vpn")
 
 	typeMutants := []struct {
 		name      string
@@ -577,7 +572,7 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 			if mutatedPage == rendered {
 				t.Fatalf("failed to apply %s mutation to rendered page", tc.name)
 			}
-			if err := validateRenderedVPNPageFor("vpn_diagnostics", mutatedPage); err == nil {
+			if err := validateRenderedVPNPageFor("vpn", mutatedPage); err == nil {
 				t.Fatalf("expected validateRenderedVPNPage to reject %s mutant, but it passed", tc.name)
 			}
 
@@ -587,7 +582,7 @@ func TestRenderedVPNTemplateRejectDeferAndNonClassicTypeMutants(t *testing.T) {
 			if mutatedBlock == scriptsBlock {
 				t.Fatalf("failed to apply %s mutation to scripts block", tc.name)
 			}
-			if err := validateVPNScriptsBlockFor("vpn_diagnostics", mutatedBlock); err == nil {
+			if err := validateVPNScriptsBlockFor("vpn", mutatedBlock); err == nil {
 				t.Fatalf("expected validateVPNScriptsBlock to reject %s mutant, but it passed", tc.name)
 			}
 		})

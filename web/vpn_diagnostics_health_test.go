@@ -13,7 +13,7 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTemplatesSubFS failed: %v", err)
 	}
-	vpnData, err := fs.ReadFile(tmplFS, "vpn_diagnostics.html")
+	vpnData, err := fs.ReadFile(tmplFS, "vpn.html")
 	if err != nil {
 		t.Fatalf("failed to read vpn.html: %v", err)
 	}
@@ -110,12 +110,24 @@ func TestVPNDiagnosticsHealthAndStructure(t *testing.T) {
 		if !(healthIdx < diagStart) {
 			t.Errorf("page order must be health < diagnostics (got %d, %d)", healthIdx, diagStart)
 		}
-		// Diagnostics carries no overview signal grid.
-		if strings.Contains(vpnStr, `class="stats-grid vpn-overview"`) {
-			t.Error("the overview grid must not render on the diagnostics page")
+		// One page now carries both surfaces, so the grid is asserted once and the
+		// health headline is asserted to sit WITH it rather than inside it: the
+		// duplication that mattered when these were two documents was a second copy
+		// of the grid, and that is what is counted here.
+		if got := strings.Count(vpnStr, `class="stats-grid vpn-overview"`); got != 1 {
+			t.Errorf("the overview grid must render exactly once, found %d", got)
 		}
-		if strings.Contains(vpnStr, `data-signal="`) {
-			t.Error("the four overview signals must not render on the diagnostics page")
+		if got := strings.Count(vpnStr, `data-signal="`); got != 4 {
+			t.Errorf("exactly four overview signals must render, found %d", got)
+		}
+		// The problem rows live in Diagnostics, after the headline that summarises
+		// them: what the reader sees above the fold is the headline, not the list.
+		problemIdx := strings.Index(vpnStr, `id="vpn-fwd-problem-list"`)
+		if problemIdx < 0 {
+			t.Fatal("the problem list must render")
+		}
+		if problemIdx < healthIdx {
+			t.Error("the problem rows must not precede the headline they belong to")
 		}
 
 		// The diagnostics panel starts collapsed and its entry says so, so nothing

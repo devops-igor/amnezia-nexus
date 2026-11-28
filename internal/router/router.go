@@ -353,9 +353,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Get("/server/{server_id}", h.ServerPageHandler)
 		r.Get("/users", h.UsersPageHandler)
 		r.Get("/vpn", h.VPNPageHandler)
-		// The VPN subject is three documents: the overview, the backend
-		// inventory and diagnostics. They share this group's gate, so all three
-		// answer the same refusal to the same roles.
+		// The VPN subject is one document; these two routes are the retired child
+		// pages. They keep answering the same gate as the page they redirect to, so
+		// an anonymous visitor is still sent to the login page rather than being
+		// told the route is gone - and the redirect never reveals that a role it
+		// does not hold would have seen a VPN page.
 		r.Get("/vpn/backends", h.VPNBackendsPageHandler)
 		r.Get("/vpn/diagnostics", h.VPNDiagnosticsPageHandler)
 

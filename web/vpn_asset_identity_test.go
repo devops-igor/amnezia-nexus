@@ -44,33 +44,32 @@ import (
 // the VPN page depends on stayed outside the previous guard.
 var vpnDeliveredAssets = DeliveredAssets
 
-// vpnScriptDependencyOrderByPage is the synchronous chain each VPN document
-// loads. Each module calls the one before it (or a shared helper above it), so
-// the order is a contract and not a preference. The single page became three
-// documents, so the chain is per document.
+// vpnScriptDependencyOrderByPage is the synchronous chain the merged page loads.
+// Each module calls the one above it (a shared helper, the resolver, a section
+// controller, the boot), so the order is a contract and not a preference.
+//
+// There is one entry because there is one page. The section-keyed names the split
+// used are gone with it: a chain keyed by a document that no longer exists would
+// assert nothing, and the whole point of this guard is that it covers the shell a
+// reader actually loads.
 var vpnScriptDependencyOrderByPage = map[string][]string{
 	"vpn": {
 		"/static/js/vpn/anchor_handoff.js",
 		"/static/js/vpn/common.js",
 		"/static/js/vpn/overview.js",
-	},
-	"vpn_backends": {
-		"/static/js/vpn/common.js",
 		"/static/js/vpn/backends.js",
 		"/static/js/vpn/backends_page.js",
-	},
-	"vpn_diagnostics": {
-		"/static/js/vpn/common.js",
 		"/static/js/vpn/health_problems.js",
 		"/static/js/vpn/health_summary.js",
 		"/static/js/vpn/charts.js",
 		"/static/js/vpn/sessions.js",
 		"/static/js/vpn/diagnostics_page.js",
+		"/static/js/vpn/page.js",
 	},
 }
 
 // vpnPagesInOrder keeps page iteration deterministic.
-var vpnPagesInOrder = []string{"vpn", "vpn_backends", "vpn_diagnostics"}
+var vpnPagesInOrder = []string{"vpn"}
 
 // deliveredAssetDigest is the query a URL for path must carry: the SHA-256 of
 // the bytes this build embeds for it, in hex. It is computed here from the
@@ -241,7 +240,7 @@ func TestVPNScriptsCarryTheAssetBytes(t *testing.T) {
 // the query is an identity rather than a constant.
 func TestVPNScriptURLMovesWithTheAssetBytes(t *testing.T) {
 	const changed = "/static/js/vpn/charts.js"
-	const page = "vpn_diagnostics"
+	const page = "vpn"
 	order := vpnScriptDependencyOrderByPage[page]
 
 	root := deliveredStaticCopy(t, order...)

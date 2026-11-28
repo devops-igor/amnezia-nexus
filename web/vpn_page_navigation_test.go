@@ -239,8 +239,12 @@ func TestVPNPageBackendsDismissRestoresFocusAfterRefresh(t *testing.T) {
 
 // TestVPNPageOverviewColdSessionsFragmentFocusesANamedHeading covers the design
 // re-check's cold case: the Sessions signal value is not focusable, so a fragment
-// naming it must land on the overview's own heading - which therefore has to be
-// focusable - and focus must not stay on the document body.
+// naming it must land on the heading of the section that owns it - which therefore
+// has to be focusable - and focus must not stay on the document body.
+//
+// On the merged page that heading is the Overview H2, not the page H1: the reader
+// asked for a block inside Overview, so the named destination is the section it
+// belongs to, exactly as a jump rail link lands.
 func TestVPNPageOverviewColdSessionsFragmentFocusesANamedHeading(t *testing.T) {
 	fixture := NewVPNTestFixtureForPage(t, "vpn")
 	fixture.RequireJSDOM()
@@ -250,20 +254,21 @@ func TestVPNPageOverviewColdSessionsFragmentFocusesANamedHeading(t *testing.T) {
 (() => {
     const assert = require('assert');
     const value = w.document.getElementById('vpn-sessions');
-    const heading = w.document.querySelector('h1.section-title');
+    const heading = w.document.getElementById('overview');
     assert.ok(value, '#vpn-sessions must exist');
-    assert.ok(heading, 'the overview has a page heading');
+    assert.ok(heading, 'the Overview section has a heading');
 
-    // The value itself cannot take focus, so the heading is the landing.
+    // The value itself cannot take focus, so the owning section's heading is the
+    // landing.
     assert.strictEqual(value.getAttribute('tabindex'), null, 'the signal value is not made focusable');
-    assert.strictEqual(heading.getAttribute('tabindex'), '-1', 'the page heading is focusable for the landing');
+    assert.strictEqual(heading.getAttribute('tabindex'), '-1', 'the Overview heading is focusable for the landing');
     assert.strictEqual(w.document.activeElement, w.document.body, 'focus starts on the document body');
 
     w.history.replaceState(null, '', '/vpn#vpn-sessions');
     const landed = w.vpnLandOverviewAnchor();
     assert.strictEqual(landed, 'vpn-sessions', 'the fragment resolved');
     assert.strictEqual(w.document.activeElement, heading,
-        'a cold landing on the Sessions signal focuses the overview heading, not the body');
+        'a cold landing on the Sessions signal focuses the Overview heading, not the body');
 
     console.log('PASS_OVERVIEW_COLD_SESSIONS');
 })();

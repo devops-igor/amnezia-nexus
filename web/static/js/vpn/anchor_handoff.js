@@ -1,22 +1,179 @@
-/* Legacy-fragment handoff for the VPN overview.
+/* Fragment resolution for the merged VPN page.
  *
- * The VPN subject used to be one document, so old bookmarks and external links
- * point at /vpn#<id> for blocks that now render on /vpn/backends or
- * /vpn/diagnostics. Fragments never reach the server, so the overview resolves
- * them here, before its own controllers start: a recognised child-page id is
- * handed off with location.replace (so Back reaches the previous document, not
- * this redirecting URL) and the query string is carried across.
+ * The VPN subject is one document again: Overview, Backends and Diagnostics are
+ * sections of /vpn. The id families the three documents had are unchanged, so a
+ * bookmark, an Inspect handoff or an external link still names a real node. What
+ * changed is what happens to it: instead of navigating to another document, this
+ * page resolves the fragment locally - it decides which section owns the id and
+ * hands both facts to the page boot, which mounts that section before landing.
+ *
+ * The retired ROUTES are not here: /vpn/backends and /vpn/diagnostics are answered by
+ * the Go handlers, which own the redirect and its transient ?section= marker. A
+ * second copy of that map in JavaScript would be a third party to the same decision,
+ * and this page only has to know how to consume the marker it receives.
  *
  * The allowlist is literal and by owner, not by prefix: `vpn-sessions` is the
- * overview's session-count signal, while the sessions table is
- * `vpnSessionsTable`, and a prefix rule would send the signal away from its page.
- * An id this page owns needs no handoff; an unknown or malformed one does
- * nothing, leaving a usable overview.
+ * Overview's session-count signal while the sessions table is `vpnSessionsTable`,
+ * and a prefix rule would send the signal to the wrong section. An id this table
+ * does not know resolves to nothing at all, so an unknown or malformed fragment
+ * leaves a usable page rather than guessing.
  */
 (function () {
-    var PAGE_BY_OWNER = {
-        backends: '/vpn/backends',
-        diagnostics: '/vpn/diagnostics'
+    'use strict';
+
+    // Which section of the merged page owns an id. Every entry is a literal id
+    // that some shipped markup, controller or legacy link can name.
+    var SECTION_BY_ID = {
+        // --- Overview: the four signals, the health headline, the configuration ---
+        'overview': 'overview',
+        'overview-region': 'overview',
+        'vpn-signal-backends-value': 'overview',
+        'vpn-signal-backends-sub': 'overview',
+        'vpn-sessions': 'overview',
+        'vpn-session-mismatch': 'overview',
+        'vpn-signal-throughput-value': 'overview',
+        'vpn-signal-throughput-sub': 'overview',
+        'vpn-signal-drops-value': 'overview',
+        'vpn-signal-drops-sub': 'overview',
+        'vpn-forwarder-card': 'overview',
+        'vpn-health-title': 'overview',
+        'vpn-fwd-status-badge': 'overview',
+        'vpn-fwd-status-icon': 'overview',
+        'vpn-fwd-status-text': 'overview',
+        'vpn-fwd-health-live': 'overview',
+        'vpn-fwd-headline-summary': 'overview',
+        'vpn-fwd-problem-counts': 'overview',
+        'vpn-fwd-problem-announcement': 'overview',
+        'vpn-view-problems-link': 'overview',
+        'vpn-configuration': 'overview',
+        'vpn-listener-badge': 'overview',
+        'vpn-listen-port': 'overview',
+        'vpn-subnet': 'overview',
+        'vpn-public-endpoint': 'overview',
+        'vpn-edit-endpoint-btn': 'overview',
+        // The endpoint dialog's own ids canonicalise to the control that opens it.
+        'editEndpointModal': 'overview',
+        'editEndpointForm': 'overview',
+        'vpnPublicEndpointInput': 'overview',
+        'vpnEditEndpointSubmitBtn': 'overview',
+        'vpnEndpointModalError': 'overview',
+
+        // --- Backends: the inventory card and its add dialog ---
+        'backends': 'backends',
+        'backends-region': 'backends',
+        // The split's inventory card title. It is not a node any more: the section
+        // heading IS the card title, so this legacy id canonicalises to it below.
+        'vpn-backends-title': 'backends',
+        'vpn-backends-announcement': 'backends',
+        'vpn-add-backend-btn': 'backends',
+        'vpnTableContainer': 'backends',
+        'vpnBackendsTable': 'backends',
+        'vpn-backends-tbody': 'backends',
+        'vpn-backends-loading': 'backends',
+        'vpn-backends-stale': 'backends',
+        'vpnBackendsStaleBanner': 'backends',
+        'addBackendModal': 'backends',
+        'addBackendForm': 'backends',
+        'vpnServerSelect': 'backends',
+        'vpnServerDetails': 'backends',
+        'vpnServerDetailHost': 'backends',
+        'vpnServerDetailPort': 'backends',
+        'vpnServerDetailStatus': 'backends',
+        'vpnServerDetailAwgBadge': 'backends',
+        'vpnServerDetailCheckRow': 'backends',
+        'vpnServerDetailCheckHint': 'backends',
+        'vpnQuickCheckBtn': 'backends',
+        'vpnQuickCheckIcon': 'backends',
+        'vpnQuickCheckBtnText': 'backends',
+        'vpnQuickCheckSpinner': 'backends',
+        'vpnNoServersNotice': 'backends',
+        'vpnModalError': 'backends',
+        'vpnAddBackendSubmitBtn': 'backends',
+
+        // --- Diagnostics: active problems, sessions, Advanced Diagnostics ---
+        'diagnostics': 'diagnostics',
+        'diagnostics-region': 'diagnostics',
+        'active-problems': 'diagnostics',
+        'vpn-active-problems-card': 'diagnostics',
+        'vpn-fwd-problems-empty': 'diagnostics',
+        'vpn-fwd-problem-list': 'diagnostics',
+        'vpn-sessions-card': 'diagnostics',
+        'vpn-troubleshooting-title': 'diagnostics',
+        'vpn-sessions-count-badge': 'diagnostics',
+        'vpn-sessions-toggle-problems-btn': 'diagnostics',
+        'vpn-sessions-toggle-problems-text': 'diagnostics',
+        'vpnSessionsTable': 'diagnostics',
+        'vpn-sessions-tbody': 'diagnostics',
+        'vpn-sessions-loading': 'diagnostics',
+        'vpnSessionsStaleBanner': 'diagnostics',
+        'vpn-advanced-entry': 'diagnostics',
+        'vpn-advanced-block': 'diagnostics',
+        'vpn-diagnostics': 'diagnostics',
+        'vpn-diagnostics-title': 'diagnostics',
+        'vpn-close-diagnostics': 'diagnostics',
+        'vpn-traffic-performance': 'diagnostics',
+        'vpn-traffic-performance-title': 'diagnostics',
+        'vpn-history-window-toggles': 'diagnostics',
+        'vpn-chart-throughput-badges': 'diagnostics',
+        'vpn-chart-throughput': 'diagnostics',
+        'vpn-chart-throughput-axis': 'diagnostics',
+        'vpn-chart-drops-badges': 'diagnostics',
+        'vpn-chart-drops': 'diagnostics',
+        'vpn-chart-drops-axis': 'diagnostics',
+        'vpn-chart-latency-badges': 'diagnostics',
+        'vpn-chart-latency': 'diagnostics',
+        'vpn-chart-latency-axis': 'diagnostics',
+        'vpn-chart-queue-badges': 'diagnostics',
+        'vpn-chart-queue': 'diagnostics',
+        'vpn-chart-queue-axis': 'diagnostics',
+        'vpn-chart-tooltip': 'diagnostics',
+        'vpn-diag-throughput': 'diagnostics',
+        'vpn-diag-packet-rate': 'diagnostics',
+        'vpn-diag-ewma5m': 'diagnostics',
+        'vpn-diag-ewma1h': 'diagnostics',
+        'vpn-diag-lat-percentiles': 'diagnostics',
+        'vpn-diag-lat-max': 'diagnostics',
+        'vpn-cumulative-totals': 'diagnostics',
+        'vpn-rx': 'diagnostics',
+        'vpn-tx': 'diagnostics',
+        'vpn-routing-drops': 'diagnostics',
+        'vpn-routing-drops-title': 'diagnostics',
+        'vpn-diag-routing-counts': 'diagnostics',
+        'vpn-diag-routing-badge': 'diagnostics',
+        'vpn-diag-queue-occ': 'diagnostics',
+        'vpn-diag-queue-peak': 'diagnostics',
+        'vpn-diag-queue-dwell': 'diagnostics',
+        'vpn-fwd-counters-since': 'diagnostics',
+        'vpn-diag-routing-alerts': 'diagnostics',
+        'vpn-diag-drops-client': 'diagnostics',
+        'vpn-diag-drops-return': 'diagnostics',
+        'vpn-diag-drops-total': 'diagnostics',
+        'vpn-diag-drop-reasons': 'diagnostics',
+        'vpn-fwd-routes-details': 'diagnostics',
+        'vpn-fwd-routes-badge': 'diagnostics',
+        'vpn-routes-toggle-all-btn': 'diagnostics',
+        'vpn-fwd-routes-summary-status': 'diagnostics',
+        'vpn-fwd-routes-empty': 'diagnostics',
+        'vpn-fwd-routes-table': 'diagnostics',
+        'vpn-fwd-routes-tbody': 'diagnostics',
+        'vpn-reason-history': 'diagnostics',
+        'vpn-chart-reasons': 'diagnostics',
+        'vpn-runtime-details': 'diagnostics',
+        'vpn-runtime-details-title': 'diagnostics',
+        'vpn-diag-engine-status': 'diagnostics',
+        'vpn-diag-peers-status': 'diagnostics',
+        'vpn-diag-hs-freshness': 'diagnostics',
+        'vpn-diag-write-stalls-recent': 'diagnostics',
+        'vpn-diag-write-stalls-total': 'diagnostics',
+        'vpn-diag-res-cpu': 'diagnostics',
+        'vpn-diag-res-mem': 'diagnostics',
+        'vpn-diag-res-fd': 'diagnostics',
+        'vpn-per-backend': 'diagnostics',
+        'vpn-diag-be-traffic': 'diagnostics',
+        'vpn-chart-backends': 'diagnostics',
+        'vpn-history-backend-select': 'diagnostics',
+        'vpn-chart-backend-series': 'diagnostics',
+        'vpn-history-fleet-note': 'diagnostics'
     };
 
     // Ids inside a dialog canonicalise to the control that opens it. A fragment
@@ -39,142 +196,43 @@
         'vpnNoServersNotice': 'vpn-add-backend-btn',
         'vpnModalError': 'vpn-add-backend-btn',
         'vpnAddBackendSubmitBtn': 'vpn-add-backend-btn',
-        // The endpoint dialog's own ids: an inspector or an old link that named one
-        // of them lands on the control that opens it, never inside a closed dialog.
         'editEndpointModal': 'vpn-edit-endpoint-btn',
         'editEndpointForm': 'vpn-edit-endpoint-btn',
         'vpnPublicEndpointInput': 'vpn-edit-endpoint-btn',
         'vpnEditEndpointSubmitBtn': 'vpn-edit-endpoint-btn',
         'vpnEndpointModalError': 'vpn-edit-endpoint-btn',
-        'vpnEndpointModalTitle': 'vpn-edit-endpoint-btn',
-        'vpn-close-endpoint-modal': 'vpn-edit-endpoint-btn',
-        // Transient loading rows: the owning heading is the stable landing.
-        'vpn-backends-loading': 'vpn-backends-title',
-        'vpn-sessions-loading': 'vpn-troubleshooting-title'
+        // Transient loading rows and a conditional banner: the owning heading is
+        // the stable landing when the row is not rendered.
+        'vpn-backends-loading': 'backends',
+        'vpn-backends-title': 'backends',
+        'vpnBackendsStaleBanner': 'backends',
+        'vpn-backends-stale': 'backends',
+        'vpn-sessions-loading': 'vpn-troubleshooting-title',
+        'vpnSessionsStaleBanner': 'vpn-troubleshooting-title',
+        // A tooltip is not a landing target; its chart's section owns it.
+        'vpn-chart-tooltip': 'vpn-traffic-performance-title'
     };
 
-    var BACKENDS_IDS = [
-        'vpn-backends-title',
-        'vpn-add-backend-btn',
-        'vpnTableContainer',
-        'vpnBackendsTable',
-        'vpn-backends-tbody',
-        'vpn-backends-loading',
-        'vpn-backends-announcement',
-        'addBackendModal',
-        'addBackendForm',
-        'vpnServerSelect',
-        'vpnServerDetails',
-        'vpnServerDetailHost',
-        'vpnServerDetailPort',
-        'vpnServerDetailStatus',
-        'vpnServerDetailAwgBadge',
-        'vpnServerDetailCheckRow',
-        'vpnServerDetailCheckHint',
-        'vpnQuickCheckBtn',
-        'vpnQuickCheckIcon',
-        'vpnQuickCheckBtnText',
-        'vpnQuickCheckSpinner',
-        'vpnNoServersNotice',
-        'vpnModalError',
-        'vpnAddBackendSubmitBtn'
-    ];
+    // The three sections in document order. The default is the first one, which is
+    // also where a cold arrival with no fragment belongs.
+    var SECTION_ORDER = ['overview', 'backends', 'diagnostics'];
+    var SECTION_HEADING = {
+        overview: 'overview',
+        backends: 'backends',
+        diagnostics: 'diagnostics'
+    };
 
-    var DIAGNOSTICS_IDS = [
-        'vpn-forwarder-card',
-        'vpn-health-title',
-        'vpn-fwd-status-badge',
-        'vpn-fwd-status-icon',
-        'vpn-fwd-status-text',
-        'vpn-fwd-health-live',
-        'vpn-fwd-headline-summary',
-        'vpn-fwd-problem-counts',
-        'vpn-fwd-problem-announcement',
-        'vpn-fwd-problem-list',
-        'vpn-advanced-entry',
-        'vpn-diagnostics',
-        'vpn-diagnostics-title',
-        'vpn-close-diagnostics',
-        'vpn-traffic-performance',
-        'vpn-traffic-performance-title',
-        'vpn-history-window-toggles',
-        'vpn-chart-throughput-badges',
-        'vpn-chart-throughput',
-        'vpn-chart-throughput-axis',
-        'vpn-chart-drops-badges',
-        'vpn-chart-drops',
-        'vpn-chart-drops-axis',
-        'vpn-chart-latency-badges',
-        'vpn-chart-latency',
-        'vpn-chart-latency-axis',
-        'vpn-chart-queue-badges',
-        'vpn-chart-queue',
-        'vpn-chart-queue-axis',
-        'vpn-chart-tooltip',
-        'vpn-diag-throughput',
-        'vpn-diag-packet-rate',
-        'vpn-diag-ewma5m',
-        'vpn-diag-ewma1h',
-        'vpn-diag-lat-percentiles',
-        'vpn-diag-lat-max',
-        'vpn-cumulative-totals',
-        'vpn-rx',
-        'vpn-tx',
-        'vpn-routing-drops',
-        'vpn-routing-drops-title',
-        'vpn-diag-routing-counts',
-        'vpn-diag-routing-badge',
-        'vpn-diag-queue-occ',
-        'vpn-diag-queue-peak',
-        'vpn-diag-queue-dwell',
-        'vpn-fwd-counters-since',
-        'vpn-diag-routing-alerts',
-        'vpn-diag-drops-client',
-        'vpn-diag-drops-return',
-        'vpn-diag-drops-total',
-        'vpn-diag-drop-reasons',
-        'vpn-fwd-routes-details',
-        'vpn-fwd-routes-badge',
-        'vpn-routes-toggle-all-btn',
-        'vpn-fwd-routes-summary-status',
-        'vpn-fwd-routes-empty',
-        'vpn-fwd-routes-table',
-        'vpn-fwd-routes-tbody',
-        'vpn-reason-history',
-        'vpn-chart-reasons',
-        'vpn-runtime-details',
-        'vpn-runtime-details-title',
-        'vpn-diag-engine-status',
-        'vpn-diag-peers-status',
-        'vpn-diag-hs-freshness',
-        'vpn-diag-write-stalls-recent',
-        'vpn-diag-write-stalls-total',
-        'vpn-diag-res-cpu',
-        'vpn-diag-res-mem',
-        'vpn-diag-res-fd',
-        'vpn-per-backend',
-        'vpn-diag-be-traffic',
-        'vpn-chart-backends',
-        'vpn-history-backend-select',
-        'vpn-chart-backend-series',
-        'vpn-history-fleet-note',
-        'vpn-troubleshooting-title',
-        'vpn-sessions-count-badge',
-        'vpn-sessions-toggle-problems-btn',
-        'vpn-sessions-toggle-problems-text',
-        'vpnSessionsTable',
-        'vpn-sessions-tbody',
-        'vpn-sessions-loading',
-        'vpnSessionsStaleBanner'
-    ];
+    function vpnSectionHeadingId(section) {
+        return Object.prototype.hasOwnProperty.call(SECTION_HEADING, section)
+            ? SECTION_HEADING[section]
+            : SECTION_HEADING.overview;
+    }
 
-    var OWNER_BY_ID = {};
-    BACKENDS_IDS.forEach(function (id) { OWNER_BY_ID[id] = 'backends'; });
-    DIAGNOSTICS_IDS.forEach(function (id) { OWNER_BY_ID[id] = 'diagnostics'; });
-
-    function vpnAnchorOwner(id) {
-        if (!id || !Object.prototype.hasOwnProperty.call(OWNER_BY_ID, id)) return null;
-        return OWNER_BY_ID[id];
+    // vpnOwnsId reports which section an id belongs to, or null when this page
+    // knows nothing about it.
+    function vpnSectionForId(id) {
+        if (!id || !Object.prototype.hasOwnProperty.call(SECTION_BY_ID, id)) return null;
+        return SECTION_BY_ID[id];
     }
 
     function vpnCanonicalAnchorId(id) {
@@ -182,50 +240,49 @@
         return id;
     }
 
-    function vpnIsOverviewPath(path) {
-        return path === '/vpn' || path === '/vpn/';
-    }
-
-    // vpnLegacyHandoffDestination resolves a legacy fragment to the URL of its
-    // owning page, or null when this page owns the id (or does not know it). It is
-    // a pure function so the whole allowlist can be exercised without driving a
-    // real navigation.
-    function vpnLegacyHandoffDestination(path, search, hash) {
-        if (!vpnIsOverviewPath(path)) return null;
-        if (!hash || hash.length < 2) return null;
-        let id;
+    // vpnDecodeFragment decodes a raw location.hash once. A malformed escape, an
+    // empty fragment or a nested '#' yields null.
+    function vpnDecodeFragment(hash) {
+        if (!hash || hash.length < 2 || hash.charAt(0) !== '#') return null;
+        var id;
         try {
             id = decodeURIComponent(hash.slice(1));
         } catch (_) {
             return null;
         }
         if (!id || id.indexOf('#') !== -1) return null;
-        const owner = vpnAnchorOwner(id);
-        if (!owner) return null;
-        const target = vpnCanonicalAnchorId(id);
-        return PAGE_BY_OWNER[owner] + (search || '') + '#' + encodeURIComponent(target);
+        if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(id)) return null;
+        return id;
     }
 
-    // vpnHandoffLegacyFragment returns true when it started a navigation. The
-    // overview's own controller checks that flag so a handoff never runs a poll
-    // for a page it is leaving.
-    function vpnHandoffLegacyFragment() {
-        if (typeof window === 'undefined' || !window.location) return false;
-        const destination = vpnLegacyHandoffDestination(
-            window.location.pathname, window.location.search, window.location.hash);
-        if (!destination) return false;
-        window.vpnHandoffPending = true;
-        window.location.replace(destination);
-        return true;
+    // vpnResolveFragment maps a fragment to the section that owns it and the id the
+    // landing should focus. An id this page does not know returns null, and the
+    // caller then leaves the page where the browser put it.
+    function vpnResolveFragment(hash) {
+        var id = vpnDecodeFragment(hash);
+        if (!id) return null;
+        var section = vpnSectionForId(id);
+        if (!section) return null;
+        return { id: id, section: section, target: vpnCanonicalAnchorId(id) };
+    }
+
+    // vpnSectionFromMarker reads the transient marker a retired child route leaves
+    // behind. The value is matched against the fixed section list, so a query
+    // string can never decide where the page goes beyond naming a section that
+    // exists.
+    function vpnSectionFromMarker(search) {
+        if (!search) return null;
+        var match = /[?&]section=([A-Za-z]+)/.exec(search);
+        if (!match) return null;
+        var name = match[1].toLowerCase();
+        return SECTION_ORDER.indexOf(name) === -1 ? null : name;
     }
 
     if (typeof window !== 'undefined') {
-        window.vpnHandoffPending = false;
-        window.vpnAnchorOwner = vpnAnchorOwner;
+        window.vpnSectionForId = vpnSectionForId;
         window.vpnCanonicalAnchorId = vpnCanonicalAnchorId;
-        window.vpnLegacyHandoffDestination = vpnLegacyHandoffDestination;
-        window.vpnHandoffLegacyFragment = vpnHandoffLegacyFragment;
-        vpnHandoffLegacyFragment();
-        window.addEventListener('hashchange', vpnHandoffLegacyFragment);
+        window.vpnResolveFragment = vpnResolveFragment;
+        window.vpnSectionFromMarker = vpnSectionFromMarker;
+        window.vpnSectionHeadingId = vpnSectionHeadingId;
     }
 })();

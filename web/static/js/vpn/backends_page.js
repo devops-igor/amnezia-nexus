@@ -1,10 +1,13 @@
-// VPN Backends page controller.
+// VPN Backends section controller.
 //
-// This document owns the backend inventory: the table, its row actions and the
+// This section owns the backend inventory: the table, its row actions and the
 // add-backend dialog. It reads /api/vpn/backends on each tick and /api/servers
 // once for the display-name enrichment the rows already had (the add dialog
 // refreshes that list itself when it opens, as before). It reads no status,
-// config or session data, so a failure on another VPN page cannot blank it.
+// config or session data, so a failure in another section cannot blank it.
+//
+// The page boot (page.js) starts the tick and reads the server list, because on
+// the merged page the inventory must not start before the reader is near it.
 
 let vpnCachedServers = [];
 let vpnCurrentBackends = [];
@@ -97,19 +100,23 @@ function vpnRenderBackendsStaleRow() {
     vpnAnnounceBackends(message);
 }
 
-// vpnModalFocusFallback answers where focus goes when the control that opened a
+// vpnModalFocusFallbackFor answers where focus goes when the control that opened a
 // dialog no longer exists: the permanent Add control for the add dialog (the
 // empty-state CTA that may have opened it is replaced by the next render), and the
-// inventory's own heading otherwise.
-function vpnModalFocusFallback(modalId) {
+// inventory's own heading for anything else this section does not own.
+//
+// The page has one window-level handler (page.js), because both dialogs now live in
+// the same document: two modules assigning window.vpnModalFocusFallback would leave
+// whichever loaded last answering for the other section's dialog.
+function vpnModalFocusFallbackFor(modalId) {
     if (modalId === 'addBackendModal') {
-        return document.getElementById('vpn-add-backend-btn') || document.getElementById('vpn-backends-title');
+        return document.getElementById('vpn-add-backend-btn') || document.getElementById('backends');
     }
-    return document.getElementById('vpn-backends-title') || document.getElementById('vpn-add-backend-btn');
+    return null;
 }
 
 if (typeof window !== 'undefined') {
-    window.vpnModalFocusFallback = vpnModalFocusFallback;
+    window.vpnModalFocusFallbackFor = vpnModalFocusFallbackFor;
 }
 
 // Resolve a replaced row control by its action and server identity, never by
@@ -122,7 +129,7 @@ function vpnReplacementBackendFocus(focused, tbody) {
         return candidate.dataset.action === focused.dataset.action && candidate.dataset.serverId === focused.dataset.serverId;
     });
     if (equivalent && equivalent.closest('tr').style.display !== 'none') return equivalent;
-    return document.getElementById('vpn-backends-title');
+    return document.getElementById('backends');
 }
 
 // vpnLoadBackends refreshes the inventory only.
@@ -218,7 +225,7 @@ function vpnAnnounceBackends(message) {
 // vpnFocusBackendsHeading lands on the inventory heading, which is focusable and
 // never destroyed by a re-render.
 function vpnFocusBackendsHeading() {
-    const heading = document.getElementById('vpn-backends-title');
+    const heading = document.getElementById('backends');
     if (heading) {
         vpnScrollToTarget(heading);
         vpnFocusIfFocusable(heading);
@@ -280,7 +287,7 @@ function vpnApplyBackendsLanding() {
     // converges with legacy links on the permanent opener without opening it.
     const modal = document.getElementById('addBackendModal');
     const target = modal && modal.contains(el) ? document.getElementById('vpn-add-backend-btn') : el;
-    const focusTarget = vpnIsFocusable(target) ? target : vpnNearestHeading(target, 'vpn-backends-title');
+    const focusTarget = vpnIsFocusable(target) ? target : vpnNearestHeading(target, 'backends');
     vpnScrollToTarget(focusTarget);
     vpnFocusIfFocusable(focusTarget);
     return target.id;
@@ -291,14 +298,6 @@ function vpnApplyBackendsLanding() {
 const VPN_BACKENDS_ACTIONS = {
     'vpn-open-add-backend': function () {
         if (typeof vpnOpenAddBackendModal === 'function') vpnOpenAddBackendModal();
-    },
-    'vpn-close-modal': function (btn) {
-        const modalId = btn.dataset ? btn.dataset.modal : (btn.getAttribute ? btn.getAttribute('data-modal') : null);
-        if (typeof closeModal === 'function') {
-            closeModal(modalId);
-        } else if (typeof UI !== 'undefined' && UI.modal && typeof UI.modal.close === 'function') {
-            UI.modal.close(modalId);
-        }
     },
     'vpn-trigger-quick-check': function () {
         if (typeof vpnTriggerQuickCheck === 'function') vpnTriggerQuickCheck();
@@ -348,23 +347,9 @@ if (typeof document !== 'undefined') {
     initVpnBackendsListeners();
 }
 
-document.addEventListener('DOMContentLoaded', function () {
-    initVpnBackendsListeners();
-
-    // Server metadata for the row names: read once, not on every poll. The add
-    // dialog refreshes the same list when it opens.
-    if (typeof API !== 'undefined' && typeof API.get === 'function') {
-        API.get('/api/servers').then(function (servers) {
-            if (Array.isArray(servers)) vpnCachedServers = servers;
-        }).catch(function () {});
-    }
-
-    if (typeof NexusTelemetry !== 'undefined' && typeof NexusTelemetry.poll === 'function') {
-        NexusTelemetry.poll('vpn-backends', async function () {
-            await vpnLoadBackends();
-        }, 5000);
-    }
-});
+// The tick and the one-off server read are the page boot's (page.js), which starts
+// them when this section approaches the viewport or is targeted. A module that
+// also polled here would double every inventory request on the merged page.
 
 if (typeof window !== 'undefined') {
     window.vpnLoadBackends = vpnLoadBackends;

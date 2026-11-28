@@ -777,8 +777,14 @@ func TestRouterVPNPage(t *testing.T) {
 	if !strings.Contains(adminBody, "vpn-listener-badge") {
 		t.Errorf("expected /vpn body to contain 'vpn-listener-badge'")
 	}
-	if strings.Contains(adminBody, "vpn-backends-tbody") {
-		t.Errorf("the overview document must not render the backend inventory")
+	// /vpn is one document with three sections, so the inventory and the
+	// diagnostics surfaces render in it - that merge is what this delivery does,
+	// and the sections' own fold and lazy-activation rules are asserted in the web
+	// package. What must never appear is a SECOND navigation to the retired routes.
+	for _, retired := range []string{`href="/vpn/backends"`, `href="/vpn/diagnostics"`} {
+		if strings.Contains(adminBody, retired) {
+			t.Errorf("/vpn must not link the retired route %s", retired)
+		}
 	}
 
 	// 3. Authenticated Support request -> 200 OK with rendered VPN dashboard
