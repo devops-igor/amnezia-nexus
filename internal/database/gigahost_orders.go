@@ -243,18 +243,23 @@ func (d *DB) InsertGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 		}
 		recordedAt = o.PurchaseRecordedAt.UTC().Format(time.RFC3339Nano)
 	}
+	// The panel's own registration is part of the row's provenance: a deployment records the
+	// server it created on the order it was created for. Without this the ledger holds no
+	// attribution between an order and the backend it admitted, so the one durable fact that
+	// answers "may this backend be admitted?" cannot be asked for an immediate setup at all -
+	// only a saved job carried it, on the intent row.
 	q := `INSERT INTO gigahost_orders
 	      (order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
 	       created_at, updated_at, price_id, monthly_cap_nok, currency,
-	       purchase_origin, purchase_recorded_at)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	       purchase_origin, purchase_recorded_at, nexus_server_id)
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
 		o.OrderID, o.ServerID, o.Status, o.PlanID, o.RegionID, o.HourlyPriceNOK, o.AssignedIP,
 		o.CreatedAt.Format(time.RFC3339), o.UpdatedAt.Format(time.RFC3339),
 		o.PriceID, o.MonthlyCapNOK, o.Currency,
-		origin, recordedAt,
+		origin, recordedAt, o.NexusServerID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert gigahost order: %w", err)

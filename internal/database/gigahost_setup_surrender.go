@@ -55,6 +55,16 @@ const SetupStepOrderEnded = "order_ended"
 // here would be a second, weaker authority.
 const setupEndedReason = "the order ended, so this setup job was closed without further work"
 
+// ErrOrderEnded reports that the panel has recorded this order as over, so no setup work may
+// produce an effect for it. It is a refusal, not a failure: the deployment the caller described
+// no longer exists at the provider, and the panel has its own durable record of that.
+//
+// It lives here, beside the transition that closes a job for it, because every layer that
+// refuses work for an ended order must refuse for the same stated reason. The HTTP surface
+// re-exports it rather than declaring a second error, so a refusal raised at any depth is
+// reported to the operator with the same code.
+var ErrOrderEnded = errors.New("the order has ended; its deployment no longer exists")
+
 // SurrenderGigahostSetupForEndedOrder closes a saved setup job whose order the panel has
 // recorded as over, and reports whether the order has ended.
 //
@@ -137,6 +147,26 @@ func (d *DB) surrenderSetupForEndedOrderLocked(
 
 // gigahostOrderEndedLocked reports whether the panel's own records say this order's life
 // has ended. The caller holds the database write mutex.
+func (d *DB) gigahostOrderEndedLocked(ctx context.Context, orderID string) (bool, error) {
+	if d == nil || d.sqlDB == nil {
+		return false, nil
+	}
+	return gigahostOrderEndedFrom(ctx, d.sqlDB, orderID)
+}
+
+// gigahostOrderQueryer is everything that can ask the ledger a question: the connection
+// pool and one open transaction both satisfy it.
+//
+// It exists so the "has this order ended?" answer is written ONCE. A transactional fence
+// and a mutex-guarded fence that each carried their own copy of the query could disagree
+// about the same order, and the two places that decide whether work may continue for an
+// order are exactly the places that must not disagree.
+type gigahostOrderQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// gigahostOrderEndedFrom answers the retirement question from q, which may be the pool or
+// a transaction the caller is about to commit through.
 //
 // It reads the canonical ledger row and applies models.GigahostOrder.Retired - the one
 // predicate every other consumer of an order's life uses - so the decision here cannot
@@ -149,11 +179,11 @@ func (d *DB) surrenderSetupForEndedOrderLocked(
 // A database that has never created the ledger table answers the same way and for the same
 // reason - it holds no order at all - which is the reading this package's own list read
 // already applies to that table. Every other failure is returned.
-func (d *DB) gigahostOrderEndedLocked(ctx context.Context, orderID string) (bool, error) {
-	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+func gigahostOrderEndedFrom(ctx context.Context, q gigahostOrderQueryer, orderID string) (bool, error) {
+	if q == nil || strings.TrimSpace(orderID) == "" {
 		return false, nil
 	}
-	row := d.sqlDB.QueryRowContext(ctx,
+	row := q.QueryRowContext(ctx,
 		`SELECT `+gigahostOrderSelectColumns+`
 		   FROM gigahost_orders WHERE order_id = ? ORDER BY id DESC LIMIT 1`, orderID)
 	order, err := scanGigahostOrder(row)

@@ -32,6 +32,17 @@ func promoteAndRelease(
 	if revoked {
 		return false, ErrSetupApprovalRevoked
 	}
+	// The order the backend is being admitted for can end the same way, and the
+	// approval row is not where that is recorded. Asked here, in the same
+	// transaction, so a retirement committed during qualification or an immediate
+	// setup that never had an approval is refused instead of admitted.
+	ended, err := orderAdmissionRefused(ctx, tx, serverID)
+	if err != nil {
+		return false, err
+	}
+	if ended {
+		return false, ErrOrderEndedBeforeAdmission
+	}
 
 	const casQuery = `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
 		WHERE id = ? AND enabled = 1 AND status = ? AND disable_reason = ? AND state_version = ?`

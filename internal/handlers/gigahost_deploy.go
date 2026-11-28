@@ -349,7 +349,11 @@ func (h *Handlers) registerDeployServer(
 	if err := validateFingerprintFormat(fingerprint); err != nil {
 		return nil, err
 	}
-	createdID, err := h.db.CreateServerWithFingerprint(ctx, newServer, fingerprint)
+	// The row is created by the writer that asks the order's ending inside the same
+	// transaction as the insert. Registration is authorized here, and the account read
+	// above is network work: without this the row would be created on the strength of a
+	// decision taken before that read returned.
+	createdID, err := h.db.CreateDeployedServer(ctx, newServer, fingerprint, req.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register server in database: %w", err)
 	}
@@ -575,6 +579,14 @@ func (h *Handlers) admitQualifiedBackend(
 		if errors.Is(err, tunnel.ErrTunnelGenerationRetired) {
 			return h.failBackendAdmission(ctx, observed, "qualified backend was replaced during qualification", err)
 		}
+		// The approval, or the order it installs for, lost its authority while this
+		// backend was being qualified. Either way the backend must not stay selectable
+		// behind a job that will never claim it, so the same withdrawal runs. It is
+		// reported as a refusal rather than a probe failure: nothing about the traffic
+		// was wrong.
+		if errors.Is(err, tunnel.ErrOrderEndedBeforeAdmission) {
+			return h.failBackendAdmission(ctx, observed, "backend admission refused: the order ended", err)
+		}
 		return h.failBackendAdmission(ctx, observed, "failed to commit active status after canary probe", err)
 	}
 	return nil
@@ -666,6 +678,13 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 
 	// 3. Server Registration & Deduplication
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
+	// SSH verification above waits on the network, and the order can end during that wait.
+	// Registration is the first persistent effect of this deployment, so the order question
+	// is asked again here, against the ledger rather than the record loaded at entry.
+	if stopped, stopErr := h.refuseRetiredOrderBeforeEffect(ctx, req,
+		providerServerID, nexusServerID, assignedIP, "server_registration"); stopped != nil {
+		return stopped, stopErr
+	}
 	// 3. Server Registration & Deduplication. The association recorded with the row
 	// is the account the provider says owns this server, read from the server
 	// itself. A key that cannot see it leaves the association unknown rather than
@@ -733,6 +752,14 @@ func (h *Handlers) installAndEnableDeploy(
 		_ = h.vpnSvc.DisableBackend(ctx, nexusServerID)
 	}
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, DeployStatusInstallingProtocol, "", providerServerID, nexusServerID, assignedIP)
+	// Registration above waited on the provider's account read, and each remaining step
+	// waits on the host. The order question is therefore asked again before every effect:
+	// installing a protocol is remote work on a deployment the panel may already record as
+	// gone, and enablement would leave a selectable backend behind it.
+	if stopped, stopErr := h.refuseRetiredOrderBeforeEffect(ctx, req,
+		providerServerID, nexusServerID, assignedIP, DeployStatusInstallingProtocol); stopped != nil {
+		return stopped, stopErr
+	}
 	protocol := req.GetEffectiveProtocol()
 	port, err := h.installDeployProtocol(ctx, server, req)
 	if err != nil {
@@ -741,6 +768,10 @@ func (h *Handlers) installAndEnableDeploy(
 
 	// 5. Backend Enablement
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusEnablingBackend, DeployStatusEnablingBackend, "", providerServerID, nexusServerID, assignedIP)
+	if stopped, stopErr := h.refuseRetiredOrderBeforeEffect(ctx, req,
+		providerServerID, nexusServerID, assignedIP, DeployStatusEnablingBackend); stopped != nil {
+		return stopped, stopErr
+	}
 	if err := h.enableDeployBackend(ctx, server, protocol); err != nil {
 		if errors.Is(err, tunnel.ErrProviderAbsent) {
 			return nil, err
@@ -754,6 +785,13 @@ func (h *Handlers) installAndEnableDeploy(
 	}
 
 	// 6. Ready State
+	// Enablement ends in traffic qualification, which is the longest network wait in this
+	// function. A job may not be reported ready for an order that ended while that probe
+	// ran, so the question is asked once more before the terminal report.
+	if stopped, stopErr := h.refuseRetiredOrderBeforeEffect(ctx, req,
+		providerServerID, nexusServerID, assignedIP, DeployStatusReady); stopped != nil {
+		return stopped, stopErr
+	}
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusReady, DeployStatusReady, "", providerServerID, nexusServerID, assignedIP)
 	return &GigahostDeployStatus{
 		OrderID:          req.OrderID,

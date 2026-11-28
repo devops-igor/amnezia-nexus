@@ -54,6 +54,12 @@ type installCounters struct {
 	// It is how a test places an administrative revocation in the middle of a real
 	// install effect instead of simulating that window from outside.
 	duringInstall func()
+	// perServerReads counts the provider's per-server reads. It is the observation the
+	// account-read boundary is measured from, and a count of zero AFTER a retirement is how a
+	// test proves an earlier fence refused before that network work began.
+	perServerReads int
+	// retirementReads is perServerReads at the instant the retirement was committed.
+	retirementReads int
 }
 
 func newInstallCounters() *installCounters {
@@ -73,6 +79,30 @@ func (c *installCounters) recordInstall(protocol string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.installs[protocol]++
+}
+
+// recordAccountRead counts one provider per-server read.
+func (c *installCounters) recordAccountRead() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.perServerReads++
+}
+
+// markRetirementReads records how many per-server reads had happened when the retirement was
+// committed. A test compares the final count against this to assert that no provider read was
+// issued AFTER the retirement - which is a different, smaller claim than "no read at all",
+// because the request legitimately reads this server earlier in its own verification.
+func (c *installCounters) markRetirementReads() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retirementReads = c.perServerReads
+}
+
+// readsAfterRetirement reports the per-server reads issued after the retirement was committed.
+func (c *installCounters) readsAfterRetirement() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.perServerReads - c.retirementReads
 }
 
 // installEnv is one isolated lifecycle environment.
