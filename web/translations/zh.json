@@ -791,6 +791,7 @@
   "gigahost_status_health_disabled": "已禁用",
   "gigahost_status_address": "地址",
   "gigahost_status_ip_deleted": "提供商不再列出此服务器，因此该地址不再为此面板保留，也不会再被连接。",
+  "gigahost_status_ip_ended": "订单已结束，因此该地址仅作为历史记录：本面板不再使用它，也不会再连接该地址。",
   "gigahost_status_ip_while_provisioning": "服务商已分配此地址，但尚未确认服务器就绪。它还不能作为 VPN 后端使用。",
   "gigahost_status_last_check": "上次成功检查",
   "gigahost_status_last_change": "服务商上次变更",

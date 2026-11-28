@@ -105,6 +105,18 @@ function gigahostOrderStatusDetail(container, labelKey, valueNode) {
     container.appendChild(row);
 }
 
+/* gigahostOrderStatusProviderDetail states the provider axis, labelled with what it is.
+ *
+ * The value is either a provider answer read in this response or the panel's own recorded
+ * copy, which is served whether or not anybody was reachable. Labelling the copy "Provider"
+ * claims a read that did not happen: a cancelled order is deliberately never asked. The
+ * recorded role reuses the string the inventory cards already use for the same meaning. */
+function gigahostOrderStatusProviderDetail(panel, model) {
+    const labelKey = model.providerConfirmed ? 'gigahost_status_provider' : 'gigahost_deployment_recorded_state';
+    gigahostOrderStatusDetail(panel, labelKey,
+        _('gigahost_status_stage_' + model.stage) + (model.providerStatus ? ' (' + model.providerStatus + ')' : ''));
+}
+
 /* gigahostOrderStatusPanel builds the read-only details for one order. It reads
  * the model only and makes no request. */
 function gigahostOrderStatusPanel(model) {
@@ -120,8 +132,8 @@ function gigahostOrderStatusPanel(model) {
     note.textContent = _('gigahost_status_read_only');
     panel.appendChild(note);
 
-    gigahostOrderStatusDetail(panel, 'gigahost_status_provider',
-        _('gigahost_status_stage_' + model.stage) + (model.providerStatus ? ' (' + model.providerStatus + ')' : ''));
+    gigahostOrderStatusProviderDetail(panel, model);
+
     gigahostOrderStatusDetail(panel, 'gigahost_status_vpn_setup', _('gigahost_status_setup_' + model.setup));
     gigahostOrderStatusDetail(panel, 'gigahost_status_backend_health', _('gigahost_status_health_' + model.health));
     gigahostOrderStatusAddressDetail(panel, model);
@@ -175,12 +187,21 @@ function gigahostOrderStatusAddressDetail(panel, model) {
     gigahostOrderStatusDetail(panel, 'gigahost_status_address', model.assignedIP);
     // A deleted deployment keeps its last recorded address as a fact about the past. The
     // provisioning explanation would be false for it - the provider is not deploying
-    // anything - and the honest warning is that the address is no longer reserved for
-    // this panel, which is exactly why nothing here may dial it.
+    // anything - and the address is not contacted, which is why nothing here may dial it.
+    //
+    // What the sentence may claim depends on which fact ended the order. Only a recorded
+    // omission from a successful server inventory is evidence that the provider no longer
+    // lists the server, and only that case may say so. A cancellation is the order's own
+    // final decision and a recorded `deleted` spelling is the provider's word about the
+    // order; neither establishes anything about the inventory, so neither may borrow the
+    // inventory sentence. The address is the same address either way, so the fact shown
+    // is unchanged and only the claim about it narrows to what was observed.
     if (model.stage === 'deleted') {
         const stale = document.createElement('div');
         stale.style.color = 'var(--text-secondary)';
-        stale.textContent = _('gigahost_status_ip_deleted');
+        stale.textContent = _(model.providerAbsent
+            ? 'gigahost_status_ip_deleted'
+            : 'gigahost_status_ip_ended');
         panel.appendChild(stale);
         return;
     }
@@ -219,6 +240,10 @@ function gigahostOrderStatusCell(order, context, classification) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'badge gigahost-order-status-toggle ' + gigahostOrderStatusBadgeClass(model.stage);
+    // The state is carried on the badge itself, not only on its wrapper, because the
+    // ink is the badge's: the shared danger ink does not clear 4.5:1 on the danger fill
+    // it is painted on at the 12 px this label sets, so the state decides the colour.
+    toggle.setAttribute('data-stage', model.stage);
     toggle.setAttribute('aria-expanded', 'false');
     toggle.setAttribute('aria-controls', detailsID);
     model.chain.forEach((entry, index) => {

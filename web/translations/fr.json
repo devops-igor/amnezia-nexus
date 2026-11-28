@@ -791,6 +791,7 @@
   "gigahost_status_health_disabled": "Désactivé",
   "gigahost_status_address": "Adresse",
   "gigahost_status_ip_deleted": "Le fournisseur ne liste plus ce serveur : cette adresse n'est plus réservée à ce panneau et n'est plus contactée.",
+  "gigahost_status_ip_ended": "La commande est terminée : cette adresse relève de l'historique, elle n'est plus utilisée par ce panneau et n'est plus contactée.",
   "gigahost_status_ip_while_provisioning": "Le fournisseur a attribué cette adresse mais n'a pas confirmé que le serveur est prêt. Il n'est pas encore joignable comme backend VPN.",
   "gigahost_status_last_check": "Dernière vérification réussie",
   "gigahost_status_last_change": "Dernier changement chez le fournisseur",

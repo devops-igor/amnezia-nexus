@@ -66,6 +66,7 @@ func AssetVersion(root fs.FS, name string) (string, error) {
 // VPN-only guard. A delivery that changes another shipped asset adds it here and
 // the checks that consume this list cover it without further edits.
 var DeliveredAssets = []string{
+	"/static/css/components.css",
 	"/static/css/layout.css",
 	"/static/css/settings.css",
 	"/static/css/vpn.css",

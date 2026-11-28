@@ -94,8 +94,12 @@
                 </div>
             </div>
 
+            {{/* The state is carried as data as well as in the label, so the stylesheet can
+                 give each state its own ink. The shared danger ink does not clear 4.5:1 on
+                 this badge's own fill in the dark theme, and the label is normal text at
+                 12 px, so the state decides the colour rather than the badge class alone. */}}
             <div class="server-protocols">
-                <span class="badge {{ if or $deployment.Deleted $deployment.IsFailed }}badge-danger{{ else if $deployment.IsDeploying }}badge-info{{ else }}badge-secondary{{ end }}">{{ _ $deployment.StageKey }}</span>
+                <span class="badge {{ if or $deployment.Deleted $deployment.IsFailed }}badge-danger{{ else if $deployment.IsDeploying }}badge-info{{ else }}badge-secondary{{ end }}" data-stage="{{ $deployment.Stage }}">{{ _ $deployment.StageKey }}</span>
             </div>
 
             <p class="form-hint">{{ _ "gigahost_deployment_recorded_state" }}: {{ $deployment.Status }}</p>

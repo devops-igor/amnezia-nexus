@@ -1071,6 +1071,25 @@ button:focus-visible,
 [data-theme="light"] .badge-danger { color: #be123c; }
 [data-theme="light"] .badge-info { color: #0369a1; }
 
+/* A badge that carries its own state gets that state's readable ink, because the
+   shared danger ink does not clear 4.5:1 on the danger fill it is painted on: it
+   measures 4.42:1 in the dark theme at the 12 px these labels set, under the
+   normal-text minimum. The fill and the border stay the shared danger ones, so the
+   badge still means "this is the dangerous outcome" while the label stays legible.
+
+   This is keyed on the state the badge declares, not on the class alone, so a plain
+   danger control keeps the token it had. DELETED and FAILED are two different facts
+   and keep two different roles: the deletion's own step (--text-deleted-badge) and
+   the status ink a reader must act on (--text-danger). Both measure 6.03:1 dark and
+   5.79:1 light on the composited fill over a card. */
+.badge[data-stage="deleted"] {
+    color: var(--text-deleted-badge);
+}
+
+.badge[data-stage="failed"] {
+    color: var(--text-danger);
+}
+
 /* ===== Form Elements ===== */
 .form-group {
     margin-bottom: var(--space-md);
@@ -4324,3 +4343,42 @@ td[data-backend-name]:focus-visible {
         justify-content: flex-start;
     }
 }
+
+/* The association controls' labels are whole sentences in some locales, and the shared
+   .btn rule sets white-space: nowrap, so a sentence-sized label could not wrap: it ran
+   past the Hosting card and widened the document instead. Measured on the Russian
+   preview at the 320 CSS px review floor, its right edge was 7.9px past the viewport
+   while English, French, Chinese and Persian all fitted.
+
+   The fix is the wrap, not the size: the font-size the card's button scale gives these
+   controls and the touch height it gives them are unchanged, and nothing is hidden.
+   Only the label may take a second line and the control may shrink to the card rather
+   than past it. Scoped to this one section so no other button's single-line treatment
+   moves. overflow stays hidden because it is what clips the shared .btn gradient to the
+   rounded border; the wrap happens inside that box. */
+.settings-section-card #gigahostAssociationSection .btn {
+    max-width: 100%;
+    white-space: normal;
+    text-align: start;
+}
+
+/* A flex item's automatic minimum size is its content width, which keeps a long label
+   on one line and overflows anyway. The min-content floor of wrapping text is its
+   longest word, so the item can shrink to the line and wrap within it. */
+.settings-section-card #gigahostAssociationSection .btn > span {
+    min-width: 0;
+}
+
+/* The optional unlisted-servers choice is the other sentence-sized label in this
+   section: a bare inline-flex row cannot break its text either, so it would widen the
+   card the same way once the preview reveals it. */
+.settings-section-card #gigahostAssociationSection .switch-container {
+    max-width: 100%;
+    align-items: flex-start;
+}
+
+.settings-section-card #gigahostAssociationSection .switch-label-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+

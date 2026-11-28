@@ -184,22 +184,9 @@ func (h *Handlers) gigahostOrderObservations(
 				if rowUpdated {
 					updated = true
 				}
-				// The order detail is the more specific read, so a confirmed answer from
-				// it outranks the inventory answer for the same order. A failed or silent
-				// detail read does not: the inventory already established a real provider
-				// status for this order, and overwriting it with "unavailable" would mark
-				// a confirmed order stale and refuse to advance its confirmed check time.
-				//
-				// The exception is when the inventory itself could not be read: then the
-				// provenance of this whole read is "the provider was not fully reachable",
-				// and a confirmation from the detail alone must not erase that, because the
-				// view has to stay visibly stale and keep its last confirmed time.
-				if inventoryKnown && (obs.confirmed() || !observations[orders[i].OrderID].confirmed()) {
-					observations[orders[i].OrderID] = obs
-				} else if !inventoryKnown && obs.authoritativeTerminal() {
-					// An explicit terminal status is a real provider answer about the order
-					// itself, so it still applies even while the inventory read failed.
-					observations[orders[i].OrderID] = obs
+				if merged, keep := gigahostDetailObservationPrecedence(
+					observations[orders[i].OrderID], obs, inventoryKnown); keep {
+					observations[orders[i].OrderID] = merged
 				}
 			}
 		}
@@ -210,6 +197,35 @@ func (h *Handlers) gigahostOrderObservations(
 		}
 	}
 	return observations
+}
+
+// gigahostDetailObservationPrecedence decides whether one order's detail read replaces the
+// observation already recorded for it, and returns the value to keep.
+//
+// The order detail is the more specific read, so a confirmed answer from it outranks the
+// inventory answer for the same order. A failed or silent detail read does not: the
+// inventory already established a real provider status for this order, and overwriting it
+// with "unavailable" would mark a confirmed order stale and refuse to advance its confirmed
+// check time.
+//
+// The exception is when the inventory itself could not be read: then the provenance of this
+// whole read is "the provider was not fully reachable", and a confirmation from the detail
+// alone must not erase that, because the view has to stay visibly stale and keep its last
+// confirmed time. An explicit terminal status is still a real provider answer about the
+// order itself, so it applies even then.
+//
+// It is one function rather than a branch inside the loop because it is the whole
+// precedence rule, and the rule is what a reader comes to this file to find.
+func gigahostDetailObservationPrecedence(
+	current, detail GigahostProviderObservation, inventoryKnown bool,
+) (GigahostProviderObservation, bool) {
+	if inventoryKnown && (detail.confirmed() || !current.confirmed()) {
+		return detail, true
+	}
+	if !inventoryKnown && detail.authoritativeTerminal() {
+		return detail, true
+	}
+	return GigahostProviderObservation{}, false
 }
 
 // gigahostListObservations answers, per order, what the list request could prove about the

@@ -14,7 +14,7 @@ package handlers
 // while this page was rendered (this page performs no provider call).
 //
 // An order whose life has ended is listed rather than dropped. Dropping it was why a
-// cancelled order and an order the provider no longer lists looked, to an administrator,
+// canceled order and an order the provider no longer lists looked, to an administrator,
 // like deployments still waiting for setup: they simply were not there, or they appeared
 // with the same not-set-up treatment as a live one. It is presented as the deletion it is,
 // with nothing to click.

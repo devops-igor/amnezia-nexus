@@ -562,7 +562,7 @@ func TestDeliveredAssetURLMovesWithTheBytes(t *testing.T) {
 	// Include every shell asset resolved through asset_url, even when its URL
 	// is not one of the two this byte-mutation check follows.
 	root := deliveredStaticCopy(t, changed, other, "/static/css/settings.css",
-		"/static/css/layout.css", "/static/js/ui.js")
+		"/static/css/layout.css", "/static/css/components.css", "/static/js/ui.js")
 	before := renderBaseShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, changed)
 	if beforeURL == "" {
@@ -835,7 +835,7 @@ func TestServerPageControllerURLMovesWithTheBytes(t *testing.T) {
 	// controller's URL is followed here.
 	root := deliveredStaticCopy(t, controller, other, "/static/css/settings.css",
 		"/static/js/tables.js", "/static/js/server_telemetry.js", "/static/css/layout.css",
-		"/static/js/ui.js")
+		"/static/css/components.css", "/static/js/ui.js")
 	before := renderServerShellWithIdentityRoot(t, root)
 	beforeURL := urlForAsset(t, before, controller)
 	if beforeURL == "" {

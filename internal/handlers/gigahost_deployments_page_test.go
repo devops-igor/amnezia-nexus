@@ -35,6 +35,18 @@ func insertServersPageOrder(t *testing.T, db *database.DB, order models.Gigahost
 	}
 }
 
+// badgeWithState reports a card's state badge matching the badge class, the state it
+// declares and its visible label.
+//
+// The declaration is asserted rather than tolerated: the badge's ink is keyed on the state
+// it carries, so a badge without it keeps the shared danger colour and the label falls
+// under the contrast floor. Asserting only the class and the word would let the attribute
+// disappear while the markup still "looked" right.
+func badgeWithState(card, class, stage, label string) bool {
+	want := `<span class="badge ` + class + `" data-stage="` + stage + `">` + label + `</span>`
+	return strings.Contains(card, want)
+}
+
 // deploymentCard returns one deployment card's markup. The grid holds server cards and
 // deployment cards side by side, so the card is cut where the next one begins rather than
 // at a section boundary that no longer exists.
@@ -134,7 +146,7 @@ func TestServersPageListsDeploymentInTheSameGridAsTheServerCard(t *testing.T) {
 	}
 	// The state is the recorded one, labelled in the deployment state vocabulary, and it
 	// never reads as a usable server.
-	if !strings.Contains(card, `<span class="badge badge-info">Deploying</span>`) {
+	if !badgeWithState(card, "badge-info", "deploying", "Deploying") {
 		t.Fatalf("the deployment card does not carry its state label: %s", card)
 	}
 	if strings.Contains(card, "badge-success") {
@@ -292,7 +304,7 @@ func TestServersPagePresentsAFinishedOrderAsDeleted(t *testing.T) {
 
 	for _, orderID := range []string{"ord_1005_cancelled", "ord_1005_gone"} {
 		card := deploymentCard(t, body, orderID)
-		if !strings.Contains(card, `<span class="badge badge-danger">Deleted</span>`) {
+		if !badgeWithState(card, "badge-danger", "deleted", "Deleted") {
 			t.Fatalf("%s must be presented as the deletion it is: %s", orderID, card)
 		}
 		if strings.Contains(card, "triggerGigahostSetup") || strings.Contains(card, "server-actions") {
@@ -318,7 +330,7 @@ func TestServersPageNeverPresentsAnUnsetUpDeploymentAsUsable(t *testing.T) {
 	body := renderServersPage(t, h)
 
 	card := deploymentCard(t, body, "ord_1005_active_no_setup")
-	if !strings.Contains(card, `<span class="badge badge-secondary">Ready at provider</span>`) {
+	if !badgeWithState(card, "badge-secondary", "ready", "Ready at provider") {
 		t.Fatalf("the card's state label must say the deployment is ready at the provider: %s", card)
 	}
 	if strings.Contains(card, "badge-success") {
