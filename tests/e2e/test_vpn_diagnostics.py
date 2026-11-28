@@ -9,6 +9,41 @@ from playwright.sync_api import Page, expect
 from tests.e2e.conftest import api_get, assert_response_shape
 
 
+def _wait_for_advanced_modules(page: Page) -> None:
+    """Wait until every module the Advanced panel declares has been evaluated.
+
+    #1008 moved the chart module out of the eager boot: #vpn-diagnostics declares
+    charts.js in ``data-vpn-modules`` and the page fetches it when the panel is
+    opened, so the disclosure becomes VISIBLE in vpnSetDiagnosticsOpen before the
+    file that renders into it has arrived. A check that calls a chart global right
+    after opening would race that fetch and see ``undefined``.
+
+    The wait is the page's own readiness predicate - the same one the boot asks
+    before it starts a section's controllers - read off the panel's own declared
+    module list (``charts={url}`` in ``data-vpn-modules``), so this helper tracks
+    the template instead of spelling an asset name, and a panel that declares no
+    module fails here rather than passing vacuously. It holds for an eagerly
+    included module too - registration is what it asserts - so it does not depend
+    on the load being deferred.
+
+    Registration implies the renderer exists: a module records itself at the END of
+    its own evaluation, so ``vpnRenderHistoryCharts`` is already on the global by
+    the time its name is present. The predicate therefore states the arrival once
+    instead of restating the module's exports here, where they would drift.
+    """
+    page.wait_for_function(
+        """() => {
+            const panel = document.getElementById('vpn-diagnostics');
+            if (!panel) return false;
+            if (typeof vpnDeclaredModules !== 'function' || typeof vpnModulesReady !== 'function') return false;
+            const declared = vpnDeclaredModules(panel);
+            if (!declared.length) return false;
+            return vpnModulesReady(declared);
+        }""",
+        timeout=15000,
+    )
+
+
 def _ensure_diagnostics_open(page: Page) -> None:
     """Open Advanced Diagnostics through its own entry, only when closed.
 
@@ -16,11 +51,28 @@ def _ensure_diagnostics_open(page: Page) -> None:
     #vpn-advanced-entry / #vpn-diagnostics disclosure. The panel is never
     auto-opened, so a check that needs it open must do so explicitly without
     toggling an already-open panel shut.
+
+    This returns as soon as the panel is open. Opening also requests the panel's
+    deferred modules, but a check that reads them asks for their arrival
+    separately (_open_advanced_charts), so a check about the routes table or the
+    sessions filter is not made to fail on the chart module it never uses.
     """
     entry = page.locator("#vpn-advanced-entry")
     if entry.get_attribute("aria-expanded") != "true":
         entry.click()
     expect(page.locator("#vpn-diagnostics")).to_be_visible()
+
+
+def _open_advanced_charts(page: Page) -> None:
+    """Open Advanced Diagnostics AND wait for the panel's deferred modules.
+
+    A check that reads or drives the historical charts needs both: the panel open,
+    and the module the panel declares evaluated. Until the second has happened the
+    chart globals do not exist, and calling one from the test is the race #1008
+    introduced when it moved this module out of the eager boot.
+    """
+    _ensure_diagnostics_open(page)
+    _wait_for_advanced_modules(page)
 
 
 def _goto_section(page: Page, base_url: str, section: str) -> None:
@@ -106,7 +158,7 @@ def test_vpn_sparklines_window_toggle(authenticated_page: Page, base_url: str) -
     _goto_section(page, base_url, "diagnostics")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
-    _ensure_diagnostics_open(page)
+    _open_advanced_charts(page)
 
     for chart in _HISTORICAL_CHARTS:
         expect(page.locator(chart)).to_be_visible()
@@ -152,7 +204,7 @@ def test_vpn_historical_charts_interaction_and_kpis(
     _goto_section(page, base_url, "diagnostics")
 
     # Advanced Diagnostics is closed by default; open it explicitly.
-    _ensure_diagnostics_open(page)
+    _open_advanced_charts(page)
 
     toggles = page.locator("#vpn-history-window-toggles")
     expect(toggles).to_be_visible()
@@ -197,7 +249,7 @@ def test_vpn_historical_charts_availability_transition_and_tooltip_lifecycle(
     _goto_section(page, base_url, "diagnostics")
 
     # Open technical details disclosure if collapsed
-    _ensure_diagnostics_open(page)
+    _open_advanced_charts(page)
 
     # Inject an unavailable history series with unavailable flags and zero sample count
     page.evaluate("""() => {
@@ -246,7 +298,7 @@ def test_vpn_historical_charts_hover_preserved_across_live_polling(
     page = authenticated_page
     _goto_section(page, base_url, "diagnostics")
 
-    _ensure_diagnostics_open(page)
+    _open_advanced_charts(page)
 
     page.evaluate("""() => {
         const pt = { t: 82800, rx_bps: 41943040, tx_bps: 41943040, traffic_available: true, q_pct: 10, drop_rate: 1, drop_rates_available: true, fwd_p95_ms: 5, fwd_p95_samples: 1 };
