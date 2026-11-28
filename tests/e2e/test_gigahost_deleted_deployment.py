@@ -31,13 +31,14 @@ NO_TRANSITIONS = (
 )
 
 
-GIGAHOST_DELETED_RENDER = """({orders, intents, observations, deploys}) => {
+GIGAHOST_DELETED_RENDER = """({orders, intents, observations, deploys, absence}) => {
   stopGigahostOrderStatusRefresh();
   const detail = id => (deploys || {})[id] || {};
   window.API = {
     get: async url => {
       if (url === '/api/admin/hosting/gigahost/orders')
-        return {orders, provider_observations: observations};
+        return {orders, provider_observations: observations,
+                provider_absent_orders: absence || {}};
       if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents: intents};
       if (url === '/api/vpn/backends') return {backends: []};
       const m = String(url).match(/\\/orders\\/(.+)\\/status$/);
@@ -84,10 +85,20 @@ DELETED_DEPLOYMENT = {
             "order_id": "ord-deleted",
             "status": "failed",
             "assigned_ip": "198.51.100.9",
+            # The ledger row really does carry the journal step: the column is on the
+            # same row the list serves (see gigahostOrderSelectColumns), and the setup
+            # path writes it. It is load-bearing here, not decoration - the refresh asks
+            # it before deciding whether a status request is worth issuing, so a fixture
+            # without it makes the row retired for a reason this state does not have.
+            "step": "installing_protocol",
         }
     ],
     "intents": [],
     "observations": {"ord-deleted": {"outcome": "confirmed", "status": "failed"}},
+    # The durable absence record the list carries for this order. It is the panel's own
+    # written answer that the provider no longer lists the server, which is a different
+    # fact from the deploy read's copy and survives that read failing.
+    "absence": {"ord-deleted": True},
     # The failed journal is what offers a Retry control on an ordinary row, so the
     # fixture makes the absence of that control observable rather than trivially true.
     "deploys": {
@@ -102,11 +113,14 @@ DELETED_DEPLOYMENT = {
 }
 
 # The same order as though the provider still had it. It is the control: the row is
-# classified normally, keeps its status and offers the action its state allows.
+# classified normally, keeps its status and offers the action its state allows. Only the
+# absence record differs from the fixture above, which is what makes the pair a control
+# rather than two unrelated states.
 LISTED_DEPLOYMENT = {
     "orders": DELETED_DEPLOYMENT["orders"],
     "intents": [],
     "observations": DELETED_DEPLOYMENT["observations"],
+    "absence": {},
     "deploys": {
         "ord-deleted": {
             "status": "failed",
